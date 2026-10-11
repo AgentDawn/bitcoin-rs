@@ -57,7 +57,7 @@ with Clippy's compatibility behavior mirrored in `clippy.toml`.
 
 ## 4. Workspace Versioning and Semver Commitment
 
-All crates in `bitcoin-rs` share a single workspace version managed by `[workspace.package] version` (currently `0.13.0`).
+All crates in `bitcoin-rs` share a single workspace version managed by `[workspace.package] version` (currently `0.14.0`).
 
 | Workspace Crate | Path | Description |
 | :--- | :--- | :--- |
@@ -75,7 +75,7 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs-node` | `crates/node` | Full node state machine and event loop |
 | `bitcoin-rs` | `bin/bitcoin-rs` | Command-line node binary |
 
-The 0.13.0 change adds the required `ChainHandles::active_tip_wait` field to
+Active-tip waits add the required `ChainHandles::active_tip_wait` field to
 RPC composition. Callers supply the chain owner's read-only capability (or
 `None` when no active-tip wait service exists); no compatibility adapter is
 retained. `Handler::new` now creates service-local cancellation/admission state
