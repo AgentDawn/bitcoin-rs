@@ -91,6 +91,9 @@ macro_rules! declare_rows {
     (@handler $handler:expr, Blocking) => {
         match $handler { Some(handler) => Some(Dispatch::Cancellable(handler)), None => None }
     };
+    (@handler $handler:expr, Scan) => {
+        match $handler { Some(handler) => Some(Dispatch::Cancellable(handler)), None => None }
+    };
     (@handler $handler:expr $(, $execution:ident)?) => {
         match $handler { Some(handler) => Some(Dispatch::Immediate(handler)), None => None }
     };
@@ -156,7 +159,7 @@ declare_rows! {
     "getindexinfo", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getindexinfo);
     "pruneblockchain", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::pruneblockchain);
     "invalidateblock", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::invalidateblock);
-    "scantxoutset", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Accepts only addr() scan descriptors; Core supports the full descriptor set (crates/rpc/src/handlers/chain.rs). Response uses the v28 scan contract; the status action answers null.", "0.4.0", Some(chain::scantxoutset), Scan;
+    "scantxoutset", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Public fixed addr/raw/pkh/wpkh/sh(wpkh)/key-only tr descriptors; wildcard/multipath expansion and other forms are unsupported. A range on a fixed descriptor is validated and ignored. Cancellable traversal holds chain-transition exclusion; ancestry and response projection use the retained tip after release. Input, traversal, result and 60-second limits apply (docs/contracts/external-api.md, API-35).", "0.4.0", Some(chain::scantxoutset), Scan;
     "getrawtransaction", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(tx::getrawtransaction);
     "gettxout", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(tx::gettxout);
     "gettxoutproof", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(tx::gettxoutproof);
