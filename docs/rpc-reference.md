@@ -25,7 +25,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | surface | since | notes |
 |---|---|---|
 | `getblockchaininfo` | 0.4.0 | Unavailable optional fields are omitted. Pruning mode/target and signet challenge are not reported (automatic_pruning, prune_target_size, signet_challenge); pruneheight reflects the backing prune service (crates/rpc/src/handlers/chain.rs). |
-| `getblock` | 0.4.0 | Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape because no prevout source exists — Core returns prevouts at verbosity 3 (crates/rpc/src/handlers/chain.rs). |
+| `getblock` | 0.4.0 | Verbosity 2 fees and verbosity 3 prevouts use bounded certified undo. Older stale bodies whose receipt is no longer retained omit undo fields; transient history and explicit query budgets may refuse reads. Raw/txid shapes remain; stale block headers omit competing-branch successor links. See docs/contracts/external-api.md#retained-block-inputs. |
 | `verifychain` | 0.4.0 | Levels 3 and 4 omit Core's block disconnect and reconnect checks; level 3 behaves as level 2 and level 4 does not replay the UTXO set (crates/rpc/src/handlers/chain.rs). |
 | `scantxoutset` | 0.4.0 | Public fixed addr/raw/pkh/wpkh/sh(wpkh)/key-only tr descriptors; wildcard/multipath expansion and other forms are unsupported. A range on a fixed descriptor is validated and ignored. Cancellable traversal holds chain-transition exclusion; ancestry and response projection use the retained tip after release. Input, traversal, result and 60-second limits apply (docs/contracts/external-api.md, API-35). |
 | `sendrawtransaction` | 0.4.0 | Core 31.1 replacement, modified-fee, cluster and TRUC cases are process-verified in overhaul_process_harness::policy_cases. Exact optimal graph ordering does not emulate Core transient SFL work-budget states. Capacity/floor accounting and generic consensus error details retain the differences in docs/policies/mempool-policy.md; aggregate package submission is unsupported. |
@@ -203,11 +203,12 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
+| `/rest/block/` | 0.4.0 | Full transaction projection omits undo fees and prevouts; the shared undo read capability is used by spenttxouts and getblock verbosity 2/3. |
 | `/rest/headers/` | 0.4.0 | Unknown but well-formed block hashes answer an empty 200 rather than 404; query parameters other than count are ignored (crates/rpc/src/rest.rs). |
 | `/rest/getutxos` | 0.4.0 | GET and bounded canonical binary/hex POST share UTXO and mempool lookup. Intentionally corrects Core 31.1 POST string-length-prefix decoding; rejects mixed inputs, JSON bodies and trailing data. POST limit: 2048 bytes, 15 outpoints. |
 | `/rest/deploymentinfo/` | 0.4.0 | Reports actual native activation: CSV/Segwit use historical BIP9 on mainnet/testnet3; Taproot is height-based and testdummy is absent. Native regtest heights and historical script flags differ from Core 31.1; off-header-chain queries have a 2,000,000-ancestor budget. See docs/contracts/external-api.md#native-deployment-reporting. |
 | `/rest/deploymentinfo` | 0.4.0 | Reports actual native activation: CSV/Segwit use historical BIP9 on mainnet/testnet3; Taproot is height-based and testdummy is absent. Native regtest heights and historical script flags differ from Core 31.1; off-header-chain queries have a 2,000,000-ancestor budget. See docs/contracts/external-api.md#native-deployment-reporting. |
-| `/rest/spenttxouts/` | 0.4.0 | Always answers undo-unavailable: undo data is not persisted (crates/rpc/src/rest.rs). |
+| `/rest/spenttxouts/` | 0.4.0 | Serves retained certified undo in Core bin/hex/json formats. Older uncertified stale rows remain unavailable; transient retained-body absence and resource budgets return retry responses. See docs/contracts/external-api.md#retained-block-inputs. |
 
 ### Implemented (unverified)
 
@@ -215,7 +216,6 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 |---|---|---|
 | `/rest/tx/` | 0.4.0 |  |
 | `/rest/block/notxdetails/` | 0.4.0 |  |
-| `/rest/block/` | 0.4.0 |  |
 | `/rest/blockpart/` | 0.4.0 | bin/hex only; JSON rejected, matching Core's /rest/blockpart (bitcoin-core/src/rest.cpp rest_block_part). |
 | `/rest/chaininfo` | 0.4.0 |  |
 | `/rest/mempool/` | 0.4.0 |  |
@@ -239,4 +239,4 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `rawtx` | 0.4.0 | Requires the zmq feature and a --zmqpubrawtx endpoint. |
 | `sequence` | 0.4.0 | Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/rpc/src/zmq.rs). |
 
-Row counts: Supported 0, Deviation 29, Implemented (unverified) 58, Extension 2, Disabled 0, Unimplemented 86 - total 175.
+Row counts: Supported 0, Deviation 30, Implemented (unverified) 57, Extension 2, Disabled 0, Unimplemented 86 - total 175.
