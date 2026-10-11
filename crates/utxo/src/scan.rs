@@ -101,6 +101,39 @@ impl<'a> UtxoScanPermit<'a> {
         Ok(false)
     }
 
+    /// Prepares the existing complete-scan API's needles without copying
+    /// unchecked caller input. Duplicate scripts consume no additional needle budget.
+    pub(crate) fn scan_scripts(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoScanError> {
+        let mut needles = BTreeSet::<Vec<u8>>::new();
+        let mut script_bytes = 0usize;
+        for script in scripts {
+            if self.cancelled(|| false)? {
+                return Err(UtxoScanError::Aborted);
+            }
+            if script.len() > MAX_SCAN_SCRIPT_BYTES {
+                return Err(UtxoScanError::Limit("1 MiB of scripts"));
+            }
+            if needles.contains(script.as_slice()) {
+                continue;
+            }
+            if needles.len() == MAX_SCAN_SCRIPTS {
+                return Err(UtxoScanError::Limit("1024 scripts"));
+            }
+            script_bytes = script_bytes
+                .checked_add(script.len())
+                .filter(|bytes| *bytes <= MAX_SCAN_SCRIPT_BYTES)
+                .ok_or(UtxoScanError::Limit("1 MiB of scripts"))?;
+            // Both the next payload and tree entry have been admitted before
+            // allocation. A repeated needle is never cloned speculatively.
+            needles.insert(script.clone());
+        }
+        let (complete, scan) = self.scan(&needles, || false)?;
+        if !complete {
+            return Err(UtxoScanError::Aborted);
+        }
+        Ok(scan)
+    }
+
     /// Visits a stable view, returning false with partial results on abort.
     ///
     /// Script matching is logarithmic in the bounded needle set. Traversal
@@ -234,6 +267,86 @@ mod tests {
         commit_block_changes(&set, &changes, &Hash256::default())
             .unwrap_or_else(|error| panic!("fixture coins: {error}"));
         set
+    }
+
+    #[test]
+    fn complete_scan_deduplicates_before_charging_script_budgets() {
+        let reader = UtxoReader::new(coins(1));
+        // Raw input exceeds both budgets, but there are only two distinct
+        // needles. The compatibility API retains distinct-script semantics.
+        let mut scripts = vec![vec![0u8; 1_024]; MAX_SCAN_SCRIPTS + 1];
+        scripts.push(vec![0x51]);
+        let scan = reader
+            .scan_script_pubkeys(&scripts)
+            .unwrap_or_else(|error| panic!("duplicate needles: {error}"));
+        assert_eq!(scan.txouts, 1);
+        assert_eq!(scan.unspents.len(), 1);
+        assert_eq!(scan.unspents[0].txout.value, Amount::from_sat(7));
+        assert_eq!(reader.scan_progress(), None);
+    }
+
+    #[test]
+    fn complete_scan_input_bounds_are_inclusive_and_release_reservations() {
+        let reader = UtxoReader::new(coins(1));
+        let mut scripts: Vec<_> = (0..MAX_SCAN_SCRIPTS)
+            .map(|n| n.to_le_bytes().to_vec())
+            .collect();
+        assert!(reader.scan_script_pubkeys(&scripts).is_ok());
+        scripts.push(MAX_SCAN_SCRIPTS.to_le_bytes().to_vec());
+        assert!(matches!(
+            reader.scan_script_pubkeys(&scripts),
+            Err(crate::UtxoError::Scan(UtxoScanError::Limit("1024 scripts")))
+        ));
+        assert_eq!(reader.scan_progress(), None);
+
+        let script = vec![0u8; MAX_SCAN_SCRIPT_BYTES];
+        assert!(
+            reader
+                .scan_script_pubkeys(std::slice::from_ref(&script))
+                .is_ok()
+        );
+        for scripts in [
+            vec![vec![0u8; MAX_SCAN_SCRIPT_BYTES + 1]],
+            vec![script, vec![1u8]],
+        ] {
+            assert!(matches!(
+                reader.scan_script_pubkeys(&scripts),
+                Err(crate::UtxoError::Scan(UtxoScanError::Limit(
+                    "1 MiB of scripts"
+                )))
+            ));
+            assert_eq!(reader.scan_progress(), None);
+        }
+        assert!(reader.scan_script_pubkeys(&[vec![0x51]]).is_ok());
+    }
+
+    #[test]
+    fn complete_scan_preparation_observes_abort_and_deadline() {
+        let reader = UtxoReader::new(coins(1));
+        let scripts = [vec![0u8; MAX_SCAN_SCRIPT_BYTES + 1]];
+        let permit = reader
+            .reserve_scan()
+            .unwrap_or_else(|error| panic!("reserve: {error}"));
+        assert!(reader.abort_scan());
+        assert!(matches!(
+            permit.scan_scripts(&scripts),
+            Err(UtxoScanError::Aborted)
+        ));
+        drop(permit);
+        assert_eq!(reader.scan_progress(), None);
+
+        let mut permit = reader
+            .reserve_scan()
+            .unwrap_or_else(|error| panic!("reserve: {error}"));
+        permit.started = Instant::now()
+            .checked_sub(MAX_DURATION)
+            .unwrap_or_else(|| panic!("monotonic clock has no prior instant"));
+        assert!(matches!(
+            permit.scan_scripts(&scripts),
+            Err(UtxoScanError::Limit("60 seconds"))
+        ));
+        drop(permit);
+        assert_eq!(reader.scan_progress(), None);
     }
 
     #[test]

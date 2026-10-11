@@ -1,6 +1,6 @@
 # External API contract
 
-`API-01`–`API-33` govern RPC, REST, Esplora and ZMQ under the
+`API-01`–`API-34` govern RPC, REST, Esplora and ZMQ under the
 [contracts precedence rule](README.md). The clauses below own each behavior;
 [Proven by](#proven-by) separates existing tests from planned comparisons.
 
@@ -99,9 +99,9 @@
   Errors and guard drop release the reservation; restart has no active scan.
 - Input limits are 1,024 descriptors, 16 KiB per descriptor, 1 MiB combined
   descriptor bytes and 1 MiB of distinct scripts. The reservation has a
-  60-second deadline, checked while waiting for exclusion and every 256 coins
-  or shard boundary. Traversal permits at most 250 million coins, 10,000
-  matches and 8 MiB of matched script bytes; projection additionally caps
+  60-second deadline, checked during script preparation, while waiting for
+  exclusion and every 256 coins or shard boundary. Traversal permits at most
+  250 million coins, 10,000 matches and 8 MiB of matched script bytes; projection additionally caps
   estimated JSON materialization at 16 MiB, including repeated descriptors.
   Retained-branch ancestry resolves requested distinct heights in one walk
   capped at 2 million nodes, with timed lock acquisition and cancellation

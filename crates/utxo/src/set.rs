@@ -372,12 +372,7 @@ impl UtxoSet {
     /// Scans a stable whole-set view for exact scriptPubKey matches.
     pub fn scan_script_pubkeys(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoError> {
         let permit = crate::scan::UtxoScanPermit::reserve(self)?;
-        let scripts = scripts.iter().cloned().collect();
-        let (complete, scan) = permit.scan(&scripts, || false)?;
-        if !complete {
-            return Err(crate::scan::UtxoScanError::Aborted.into());
-        }
-        Ok(scan)
+        Ok(permit.scan_scripts(scripts)?)
     }
 
     /// Returns true when any output of `txid` is live in the set.
