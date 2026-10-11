@@ -63,7 +63,9 @@ CPU and memory budget.
 
 Spent-output reads retain the existing durable-head and pruning authorities.
 The native undo codec is unchanged. Input order is reconstructed from the
-verified body and net undo, including same-block spends and BIP30 restores.
+verified body and net undo. Same-block spends resolve from earlier transactions
+in the body; BIP30 overwritten-output restores are rollback facts and are excluded
+from input rows.
 The read is rechecked after I/O against its full receipt and retention lease.
 The [external API contract](contracts/external-api.md#retained-block-inputs)
 records the native stale-history limitation, query budgets, and backend

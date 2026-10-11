@@ -620,7 +620,9 @@ fn route_spent_txouts(ctx: &Context, suffix: &str) -> Response {
                 "value": tx_render::btc_amount_json(coin.txout.value.to_sat()),
                 "scriptPubKey": tx_render::script_pub_key_json(&coin.txout.script_pubkey, ctx.chain.chain_network)
             })).collect::<Vec<_>>()).collect::<Vec<_>>();
-            text_response("application/json", sonic_bytes(&json!(rows)))
+            let mut body = sonic_bytes(&json!(rows));
+            body.push(b'\n');
+            text_response("application/json", body)
         }
         "hex" | "bin" => {
             let mut bytes = Vec::new();
@@ -2007,6 +2009,16 @@ mod tests {
             route(&ctx, "/rest/deploymentinfo.json", "", true).status,
             200
         );
+    }
+
+    #[test]
+    fn spenttxouts_genesis_json_ends_with_core_newline() {
+        let ctx = Arc::new(Context::new());
+        let hash = ctx.chain.chain_network.genesis_block_hash();
+        let response = route(&ctx, &format!("/rest/spenttxouts/{hash}.json"), "", true);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(response.body, b"[[]]\n");
     }
 
     #[test]
