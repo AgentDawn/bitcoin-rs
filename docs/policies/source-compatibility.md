@@ -75,6 +75,12 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs-node` | `crates/node` | Full node state machine and event loop |
 | `bitcoin-rs` | `bin/bitcoin-rs` | Command-line node binary |
 
+Active-tip waits add the required `ChainHandles::active_tip_wait` field to
+RPC composition. Callers supply the chain owner's read-only capability (or
+`None` when no active-tip wait service exists); no compatibility adapter is
+retained. `Handler::new` now creates service-local cancellation/admission state
+and is no longer a const constructor.
+
 ### 4.1 Semver Rules
 - Semver compatibility is assessed between published releases, not between pull requests or intermediate development commits. Merging a pull request does not itself publish a release.
 - Unreleased APIs may change within the planned development version, including before the first public release. Such changes still update their contracts, callers, and tests together and follow the clean-cutover policy below; they do not require a fresh minor bump for each development change.

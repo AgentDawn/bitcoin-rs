@@ -1512,6 +1512,13 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     command = ?std::mem::discriminant(&message),
                     "p2p message received",
                 );
+                // Publish announced identities before dispatch can consult the
+                // gateway or invoke callbacks while the relay worker runs.
+                if let crate::Message::Inv(items) = &message {
+                    shared
+                        .peer_table
+                        .note_transaction_inventory(lease.source(peer_addr), items);
+                }
                 let dispatched = crate::dispatch::dispatch_inbound_full(
                     peer,
                     &message,
@@ -1542,6 +1549,26 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                         continue;
                     }
                     return Err(error);
+                }
+                match &message {
+                    crate::Message::FeeFilter(rate) => shared
+                        .peer_table
+                        .receive_fee_filter(lease.source(peer_addr), *rate),
+                    crate::Message::Tx(tx) => {
+                        use bitcoin::hashes::Hash as _;
+                        shared.peer_table.note_transaction_inventory(
+                            lease.source(peer_addr),
+                            &[
+                                bitcoin::p2p::message_blockdata::Inventory::Transaction(
+                                    bitcoin::Txid::from_byte_array(*tx.txid().as_bytes()),
+                                ),
+                                bitcoin::p2p::message_blockdata::Inventory::WTx(
+                                    bitcoin::Wtxid::from_byte_array(*tx.wtxid().as_bytes()),
+                                ),
+                            ],
+                        );
+                    }
+                    _ => {}
                 }
                 if tx_relay_open() {
                     shared.update_transaction_requests(lease.source(peer_addr), &message);
@@ -2443,6 +2470,7 @@ mod writer_setup_cleanup_tests {
             addr,
             version: 70_016,
             wtxid_relay: false,
+            relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
             services: 0,
@@ -2581,6 +2609,7 @@ mod writer_shutdown_tests {
             addr,
             version: 70_016,
             wtxid_relay: false,
+            relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
             services: 1,
@@ -2780,6 +2809,7 @@ mod writer_shutdown_tests {
                 addr,
                 version: 70_016,
                 wtxid_relay: false,
+                relay_transactions: true,
                 compact_block_relay: false,
                 send_headers: false,
                 services: 0,
@@ -3220,6 +3250,7 @@ mod writer_shutdown_tests {
                 addr: peer_addr,
                 version: 70_016,
                 wtxid_relay: false,
+                relay_transactions: true,
                 compact_block_relay: false,
                 send_headers: false,
                 services: 0,
@@ -3304,6 +3335,7 @@ mod writer_shutdown_tests {
                 addr: peer_addr,
                 version: 70_016,
                 wtxid_relay: false,
+                relay_transactions: true,
                 compact_block_relay: false,
                 send_headers: false,
                 services: 9,
@@ -3338,6 +3370,129 @@ mod writer_shutdown_tests {
                     "full-relay disconnect must refresh last_seen"
                 );
             }
+        }
+    }
+
+    struct RelayDuringInventoryLookup {
+        table: Arc<crate::PeerTable>,
+        gateway: Arc<bitcoin_rs_mempool::MempoolGateway>,
+        lease: crate::PeerLease,
+        due: std::time::Instant,
+        calls: AtomicUsize,
+    }
+
+    impl crate::TxInventory for RelayDuringInventoryLookup {
+        fn have_tx(&self, hash: bitcoin_rs_primitives::Hash256, witness: bool) -> bool {
+            use bitcoin::secp256k1::rand::SeedableRng as _;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut rng = bitcoin::secp256k1::rand::rngs::StdRng::seed_from_u64(1484);
+            // Force the worker interleaving at the real dispatch callback,
+            // before dispatch returns, without a timing race or test hook.
+            self.table
+                .poll_transaction_relay(&self.gateway, self.due, false, &mut rng);
+            self.lease.cancel();
+            self.gateway.have_tx(hash, witness)
+        }
+
+        fn get_tx(&self, txid: bitcoin_rs_primitives::Txid) -> Option<bitcoin_rs_primitives::Tx> {
+            self.gateway.get_tx(txid)
+        }
+
+        fn get_tx_by_wtxid(
+            &self,
+            wtxid: bitcoin_rs_primitives::Wtxid,
+        ) -> Option<bitcoin_rs_primitives::Tx> {
+            self.gateway.get_tx_by_wtxid(wtxid)
+        }
+    }
+
+    #[test]
+    fn announced_inventory_is_known_before_dispatch_gateway_callbacks() {
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::p2p::message_blockdata::Inventory;
+        use bitcoin::secp256k1::rand::SeedableRng as _;
+        use bitcoin_rs_mempool::{
+            AdmissionOrigin, Mempool, MempoolEntry, MempoolGateway, MempoolLimits,
+        };
+
+        for announces_pending in [false, true] {
+            let table = Arc::new(crate::PeerTable::new());
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));
+            let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+            let lease = crate::PeerLease::new(outbound_tx);
+            table.register(addr, lease.clone());
+            table.publish_info(addr, &lease, peer_info(addr, 0));
+            let gateway = Arc::new(MempoolGateway::new(
+                Arc::new(parking_lot::RwLock::new(Mempool::new(
+                    MempoolLimits::default(),
+                ))),
+                None,
+                bitcoin_rs_consensus::ValidationEngine::Native,
+            ));
+            let tx = Arc::new(bitcoin_rs_primitives::Tx::default());
+            let sequence = gateway
+                .insert_entry(
+                    AdmissionOrigin::Rpc,
+                    MempoolEntry::new(Arc::clone(&tx), 100, 1_000, 1, 0, 0),
+                )
+                .expect("relay fixture admitted")
+                .sequence_of(0)
+                .expect("admission epoch");
+            let now = std::time::Instant::now();
+            let mut rng = bitcoin::secp256k1::rand::rngs::StdRng::seed_from_u64(1484);
+            assert_eq!(
+                table
+                    .queue_transaction_relay(
+                        crate::RelayRequest::new(tx.txid(), tx.wtxid(), None, sequence),
+                        now,
+                        &mut rng,
+                    )
+                    .attempted,
+                1
+            );
+            let inventory = Arc::new(RelayDuringInventoryLookup {
+                table: Arc::clone(&table),
+                gateway,
+                lease: lease.clone(),
+                due: now + Duration::from_secs(31),
+                calls: AtomicUsize::new(0),
+            });
+            let mut shared = test_shared(
+                table,
+                crossbeam_channel::unbounded().0,
+                crossbeam_channel::unbounded().0,
+            );
+            shared.tx_inventory = Some(inventory.clone());
+            let announced = if announces_pending {
+                *tx.txid().as_bytes()
+            } else {
+                [9; 32]
+            };
+            let mut wire = Vec::new();
+            crate::wire::write_message(
+                &mut wire,
+                shared.magic,
+                &crate::Message::Inv(vec![Inventory::Transaction(
+                    bitcoin::Txid::from_byte_array(announced),
+                )]),
+            )
+            .expect("inventory frame");
+            let mut peer = Peer::new(
+                ScriptedStream {
+                    script: io::Cursor::new(wire),
+                },
+                shared.magic,
+            );
+            peer.state = PeerState::Ready;
+            assert!(run_message_loop(&mut peer, addr, &lease, &shared, None).is_ok());
+            assert_eq!(inventory.calls.load(Ordering::Relaxed), 1);
+            let echoed = outbound_rx
+                .try_iter()
+                .any(|message| matches!(message, crate::Message::Inv(_)));
+            assert_eq!(
+                echoed, !announces_pending,
+                "only the announced identity suppresses the pending relay"
+            );
         }
     }
 
@@ -3425,6 +3580,7 @@ mod ready_notify_tests {
             addr,
             version: 70_016,
             wtxid_relay: false,
+            relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
             services: 1,

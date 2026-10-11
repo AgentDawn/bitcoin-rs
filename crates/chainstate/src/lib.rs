@@ -35,6 +35,7 @@ mod disconnect;
 mod durable;
 mod prepare;
 mod publication;
+mod tip_wait;
 mod window;
 pub use prepare::bytes_are_block;
 pub use window::classify_apply_error;
@@ -432,6 +433,7 @@ pub struct Chainstate {
     pub(crate) durable_head: Arc<dyn DurableHeadStore>,
     pub(crate) admission: Arc<ApplyAdmission>,
     pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) tip_notification: Arc<tip_wait::TipNotification>,
     /// Serializes whole chain transitions against each other.
     pub(crate) chain_transition: TransitionAuthority,
     pub(crate) assume_valid_height: u32,
@@ -611,6 +613,7 @@ impl Chainstate {
             durable_head: parts.durable_head,
             admission: Arc::new(ApplyAdmission::new()),
             shutdown,
+            tip_notification: Arc::default(),
             chain_transition: parts.chain_transition,
             assume_valid_height: parts.assume_valid_height,
             assume_valid_gate,
@@ -826,6 +829,7 @@ impl Chainstate {
             durable_head: historical_head,
             admission: Arc::new(ApplyAdmission::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            tip_notification: Arc::default(),
             chain_transition: bitcoin_rs_chain::TransitionDomain::new().authority(),
             assume_valid_height: 0,
             assume_valid_gate,
@@ -853,13 +857,15 @@ impl Chainstate {
 
     /// Requests process shutdown across the node.
     pub fn request_shutdown(&self) {
+        let _gate = self.tip_notification.gate.lock();
         self.shutdown.store(true, Ordering::Release);
+        self.tip_notification.changed.notify_all();
     }
 
     /// Permanently closes chain mutation and asks the process to shut down.
     pub fn fail_closed_for_recovery(&self) {
         self.admission.close_permanently();
-        self.shutdown.store(true, Ordering::Release);
+        self.request_shutdown();
     }
 
     /// Reports whether chain mutation admission is closed.
@@ -878,7 +884,7 @@ impl Chainstate {
     /// Permanently closes mutation admission and waits for in-flight mutations.
     #[must_use]
     pub fn close(&self) -> AdmissionGuard<'_> {
-        self.shutdown.store(true, Ordering::Release);
+        self.request_shutdown();
         AdmissionGuard {
             _guard: self.admission.close(),
         }
@@ -1175,6 +1181,7 @@ impl Chainstate {
             durable_head: Arc::new(bitcoin_rs_storage::InMemoryDurableHeadStore::new()),
             admission: Arc::new(ApplyAdmission::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            tip_notification: Arc::default(),
             chain_transition: TransitionDomain::new().authority(),
             assume_valid_height: 0,
             assume_valid_gate,

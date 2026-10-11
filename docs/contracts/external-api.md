@@ -1,6 +1,6 @@
 # External API contract
 
-`API-01`–`API-33` govern RPC, REST, Esplora and ZMQ under the
+`API-01`–`API-35` govern RPC, REST, Esplora and ZMQ under the
 [contracts precedence rule](README.md). The clauses below own each behavior;
 [Proven by](#proven-by) separates existing tests from planned comparisons.
 
@@ -54,13 +54,44 @@
   Duplicate, collision and unknown-name validation precedes this method-owned
   arity check. The registry declares this transaction-creation deviation.
 - Amounts are integer satoshis internally. Adapters render the exact
-  external BTC or sat-per-vB units and precision.
+  external BTC or sat-per-vB units and precision. Shared transaction JSON
+  interprets raw version bits as Core's unsigned 32-bit value and raw output
+  amounts as signed 64-bit values. `decoderawtransaction`, verbose
+  `getrawtransaction` and verbose block transaction entries reuse that owner;
+  block `coinbase_tx.version` uses the same unsigned conversion, while block
+  header versions keep their signed interpretation. Raw transaction chain
+  times appear only for positive confirmations. Native transaction
+  representations, consensus checks and undo availability are unchanged.
 - The node ships no wallet and holds no private key material. Methods
   that would reveal, import, create, or use private keys return
   `RpcError::MethodNotFound`. The key-free helpers `getdescriptorinfo`,
-  `deriveaddresses`, `scantxoutset`, `combinepsbt`, and `finalizepsbt`
+  `deriveaddresses`, `decodescript`, `scantxoutset`, `combinepsbt`, and `finalizepsbt`
   remain supported. `scantxoutset` is a bounded and cancellable domain
   query, not wallet access to a live mutable map.
+
+- Core script JSON has one projection owner in `tx_render.rs`: decimal short
+  pushes, malformed-instruction markers, checksummed inferred descriptors,
+  and optional address/hex fields. Transaction inputs alone decode defined
+  sighash suffixes. Esplora retains its separate opcode/push spelling.
+- `decodescript` uses the native instruction parser and script validity
+  predicates. Wrapper eligibility follows Core 31.1, and P2WSH inference
+  receives only its redeem script, with no key provider. Parsed Miniscript
+  properties enforce Core's sanity checks, including sane unsatisfiable
+  scripts; no second script parser or signing state is introduced.
+- `decodescript` accepts positional and named `hexstring` forms. Its
+  declared differences are compact usage text for missing/extra arguments,
+  a direct-call hex-input limit equal to the 16 MiB HTTP body budget, and
+  address-descriptor fallback when a complex Miniscript contains an
+  invalid-curve public key rejected by the Miniscript parser. Core can
+  infer `wsh(...)` from that syntactically encoded key; the fallback retains
+  the same script, addresses and wrappers. Bare P2PK/multisig inference
+  keeps Core's syntactic key handling.
+  This is an input/work limit, not a response-size limit: disassembly and
+  descriptors can be larger than their input. No response-memory or
+  performance claim follows from the input limit. The pinned process matrix
+  in `overhaul_process_harness::script_decode_cases` covers script classes,
+  invalid encodings, wrappers, descriptor checksums, parameters, network
+  addresses, and shared RPC/REST/UTXO projections.
 
 #### Native deployment reporting
 
@@ -255,6 +286,16 @@
   internal or is a documented extension. Lag, reorg, or a disabled
   capability returns the declared unavailable response, never an empty
   successful history.
+- `/txs/chain[/<last_seen_txid>]` reads are bounded to the requested page
+  (up to 25 items): confirmation status, block metadata, and transaction
+  projections are hydrated only for the selected page slice, never for the entire
+  confirmed history. Unselected older blocks being pruned or absent does not fail
+  earlier pages.
+- `/txs/chain` queries decouple from unspent queries: they do not enumerate
+  `ScriptLive` UTXOs or query mempool state.
+- Sentinel `last == Some("")` (`/txs/mempool`) queries resolve mempool activity
+  directly from mempool locators without scanning confirmed history or taking
+  block metadata snapshot locks.
 
 ### `API-10`: Broadcast and preview through the admission gateway
 
@@ -675,6 +716,106 @@ and the existing checkpoint/replay contract.
 The process contract is exercised by `e2e/tests/assumeutxo.rs`, using an actual
 Core 31.1 dump of the deterministic, compiled regtest 200-height pin. Regtest
 evidence does not establish mainnet memory or throughput qualifications.
+
+### `API-34`: Active-tip waits
+
+- `waitfornewblock`, `waitforblock`, and `waitforblockheight` observe the
+  Chainstate-owned durable applied tip through `chain::ActiveTipWait`.
+  Header-only admission, mempool changes, and historical AssumeUTXO replay
+  do not publish the active tip. No mining capability is required.
+- New-block waits compare hashes, including the optional Core 31.1
+  `current_tip`; block waits require the target to be the current tip;
+  height waits compare the signed target with the current height. A missing
+  `current_tip` captures the starting hash once. Deadlines are absolute and
+  use milliseconds; zero/null means indefinite and negative timeouts are
+  Core `-1`. Timeout and cancellation return the current tip.
+- The owner's notification gate serializes applied-tip publication, shutdown,
+  predicate checks and parking. It holds no duplicate tip value and performs
+  no I/O. A satisfied predicate releases this gate before acquiring transition
+  exclusion and rechecks the settled tip, so an intermediate reorg prefix
+  cannot satisfy normal success as if it were the completed transition.
+  Timeout, caller cancellation, normal shutdown, recovery closure and explicit
+  owner closure return the latest durable published prefix without waiting for
+  a busy transition to finish. Connect, grouped-connect and disconnect publish
+  only after their durable-head commit; a published prefix can be durable
+  without being the final tip of an in-flight reorg. This bounded return
+  differs from Core's final `GetTip` acquiring `cs_main`, and is an explicit
+  deviation. Transition acquisition uses bounded cancellation checks;
+  unsatisfied predicates sleep on a condition variable without periodically
+  reading the chain.
+- Normal shutdown, recovery closure, and explicit owner closure wake waiters.
+  RPC-server-only shutdown sets the bound dispatcher's cancellation latch before
+  waking the owner, and does not stop chainstate. The listener retains its
+  existing detached connection-worker lifecycle; this change adds no joins.
+  Each binding owns its dispatcher latch and quota. Rebinding the same Context
+  creates a fresh dispatcher, while old requests retain the old cancellation
+  latch; an old server's shutdown cannot cancel or revive the new service.
+- Registry execution metadata classifies the three wait methods and
+  `scantxoutset`'s `start` action. Every `Handler::dispatch`, including direct
+  callers, batch entries and notifications, acquires its dispatcher's
+  bounded blocking quota. A bound listener permits at most `max_connections - 1`
+  such calls (zero with one worker); the total connection bound is unchanged.
+  A standalone dispatcher defaults to 16 blocking calls. Admission never
+  waits for capacity. Scan status/abort remain ordinary calls.
+- Admission exhaustion is the intentional `-1` error
+  `RPC blocking request limit reached`. HTTP requests containing a classified
+  blocking call close keep-alive after their response, including refusals, so
+  a refused call cannot retain the last ordinary worker as an idle connection.
+  Notification-only calls retain HTTP 204; mixed batches retain response order.
+  Existing `getblocktemplate` long polling is outside this admission and
+  RPC-only cancellation contract and can still occupy ordinary workers.
+- Arity errors retain Core's `-1` but return concise method usage rather than
+  its generated help body. These cancellation, overload, transport and help
+  differences are declared `Deviation`; no full compatibility promotion is made.
+- Evidence: `chainstate::tip_wait::tests`,
+  `rpc::server::tip_wait_tests`, and the live pinned-Core process comparisons
+  in `e2e/tests/rpc_tip_waits.rs` exercise reorgs, deadlines, shutdown responses,
+  parameter errors and restored startup. Header-only process checks complete
+  finite waits after admission and compare the applied tip; deterministic
+  waiter registration/publication and admitted cancellation are proved by the
+  owner and real-server tests, which also prove ordinary HTTP availability.
+
+### `API-35`: Bounded public-descriptor UTXO scans
+
+- `scantxoutset` accepts strings and `{desc, range}` objects with optional
+  verified checksums. Public fixed `addr`, `raw`, `pkh`, `wpkh`, `sh(wpkh)`
+  and key-only `tr` are supported. Private keys, wildcard/multipath expansion,
+  Taproot trees and other descriptors are refused; these are explicit Core
+  deviations. A valid range on a fixed descriptor is checked and ignored.
+- One transient reservation belongs to the authoritative `UtxoSet`. A second
+  start returns -8. Status is null when idle, otherwise approximate progress;
+  abort requests cancellation and returns whether a reservation exists.
+  Abort produces `success: false` with actual visited `txouts` and only fully
+  projected unspents; abort during ancestry resolution may leave these empty.
+  The amount sums only that projected prefix.
+  Errors and guard drop release the reservation; restart has no active scan.
+- Input limits are 1,024 descriptors, 16 KiB per descriptor, 1 MiB combined
+  descriptor bytes and 1 MiB of distinct scripts. The reservation has a
+  60-second deadline, checked during script preparation, while waiting for
+  exclusion and every 256 coins or shard boundary. Traversal permits at most
+  250 million coins, 10,000 matches and 8 MiB of matched script bytes; projection additionally caps
+  estimated JSON materialization at 16 MiB, including repeated descriptors.
+  Retained-branch ancestry resolves requested distinct heights in one walk
+  capped at 2 million nodes, with timed lock acquisition and cancellation
+  checks every 256 nodes; sorting and projection also recheck cancellation.
+  Limit failures return errors, never a complete/truncated success.
+- Script lookup uses one bounded set; duplicate scripts preserve the first
+  descriptor's inferred attribution. Unspents follow Core outpoint order.
+  `raw` and `addr` use shared script descriptor inference; public key
+  descriptors retain specialized key/origin data and checksums.
+- The applied publication and UTXO view are captured under the existing
+  chain-transition read exclusion. Coin creation hashes and confirmations use
+  that retained publication even if a reorg happens during projection.
+  Missing ancestry is unavailable, never a fabricated hash. This bounded read
+  blocks chain transitions; it is not Core's independently retained DB cursor.
+- Active traversal observes the shared RPC shutdown lifecycle. Blocking scan
+  starts share the server's bounded blocking-operation admission; status and
+  abort remain ordinary requests. No second HTTP worker pool or scan index is
+  introduced.
+- Evidence owners: UTXO scan unit tests, RPC `scantxoutset_tests`, and
+  `e2e/tests/scantxoutset.rs`, which runs the pinned unmodified Core
+  process and retains exact request/reply comparisons in process evidence.
+  The presence of these tests is not itself a successful execution claim.
 
 ## Live gaps
 
