@@ -238,6 +238,13 @@ impl PeerTable {
     }
 
     pub(crate) fn note_transaction_inventory(&self, source: PeerSource, items: &[Inventory]) {
+        let mut identities = items
+            .iter()
+            .filter_map(|item| Identity::from_inventory(*item))
+            .peekable();
+        if identities.peek().is_none() {
+            return;
+        }
         let sessions = self.usable_peers();
         let Some(session) = sessions
             .iter()
@@ -253,6 +260,16 @@ impl PeerTable {
             .lease
             .is_inbound()
             .then(|| InboundClockKey::new(session.addr.ip(), info.addr_bind));
+        {
+            let mut policy = self.tx_policy.lock();
+            if let Some(peer) = policy.relay.get_mut(&source) {
+                for identity in identities {
+                    peer.note_known(identity);
+                }
+                return;
+            }
+        }
+        // Entropy is needed only for a new peer, and stays outside the policy lock.
         let mut rng = bitcoin::secp256k1::rand::rngs::StdRng::from_entropy();
         let mut policy = self.tx_policy.lock();
         let TxPolicy {
@@ -261,10 +278,8 @@ impl PeerTable {
         let peer = relay
             .entry(source)
             .or_insert_with(|| RelayPeer::new(Instant::now(), inbound, inbound_inv, &mut rng));
-        for item in items {
-            if let Some(identity) = Identity::from_inventory(*item) {
-                peer.note_known(identity);
-            }
+        for identity in identities {
+            peer.note_known(identity);
         }
     }
 
@@ -290,6 +305,13 @@ impl PeerTable {
             .lease
             .is_inbound()
             .then(|| InboundClockKey::new(session.addr.ip(), info.addr_bind));
+        {
+            let mut policy = self.tx_policy.lock();
+            if let Some(peer) = policy.relay.get_mut(&source) {
+                peer.fee_filter = rate;
+                return;
+            }
+        }
         let mut rng = bitcoin::secp256k1::rand::rngs::StdRng::from_entropy();
         let mut policy = self.tx_policy.lock();
         let TxPolicy {
@@ -715,6 +737,22 @@ mod tests {
     }
 
     #[test]
+    fn nontransaction_inventory_does_not_create_relay_state_or_clocks() {
+        let table = PeerTable::new();
+        let (source, _) = clock_peer(&table, "8.8.8.8:1000", "10.0.0.1:8333", true);
+        table.note_transaction_inventory(source, &[]);
+        table.note_transaction_inventory(
+            source,
+            &[Inventory::Block(bitcoin::BlockHash::from_byte_array(
+                [1; 32],
+            ))],
+        );
+        let policy = table.tx_policy.lock();
+        assert!(policy.relay.is_empty());
+        assert!(policy.inbound_inv.is_empty());
+    }
+
+    #[test]
     fn inbound_clock_key_uses_network_class_and_canonical_bind_endpoint() {
         // Core v31.1 net.cpp's inbound key uses GetNetClass, GetAddrBytes and
         // GetPort. IPv4 mapped bind bytes are identical; scope/flow are absent.
@@ -798,7 +836,12 @@ mod tests {
         let (b, _) = clock_peer(&table, "9.9.9.9:2000", "10.0.0.1:8333", true);
         table.receive_fee_filter(b, 1_000);
         let (c, _) = clock_peer(&table, "1.1.1.1:3000", "10.0.0.1:8333", true);
-        table.note_transaction_inventory(c, &[]);
+        table.note_transaction_inventory(
+            c,
+            &[Inventory::Transaction(bitcoin::Txid::from_byte_array(
+                *request.txid.as_bytes(),
+            ))],
+        );
         let (d, _) = clock_peer(&table, "8.8.4.4:4000", "10.0.0.1:8333", true);
         table.poll_transaction_relay(&gateway, now, false, &mut rng);
         for source in [a, b, c, d] {

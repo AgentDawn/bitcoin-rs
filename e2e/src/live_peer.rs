@@ -50,7 +50,7 @@ pub struct LivePeer {
     pub headers: Vec<BlockHeader>,
     /// Every decoded getdata frame in arrival order.
     pub getdata_seen: Vec<GetdataSeen>,
-    /// Transaction inventory observed from the node.
+    /// Inventory announcements observed from the node, including blocks.
     pub inventory_seen: Vec<Inventory>,
     /// Proactive BIP133 thresholds observed from the node (sat/kvB).
     pub fee_filters_seen: Vec<i64>,

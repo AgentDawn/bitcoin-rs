@@ -59,6 +59,8 @@ const READ_POLL: Duration = Duration::from_millis(200);
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// How long a socket is drained while asserting a message never arrives.
 const ABSENCE_WINDOW: Duration = Duration::from_millis(700);
+/// Covers the native 30-second relay ceiling plus a worker-poll margin.
+const RELAY_ABSENCE_WINDOW: Duration = Duration::from_secs(31);
 /// Upper bound for admission and relay to become observable.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(35);
 /// Slice between deadline checks in the frame collectors.
@@ -811,7 +813,7 @@ fn witness_transaction_relays_txid_and_wtxid_to_mixed_peers() -> anyhow::Result<
     let source_frames = collect_frames(
         &harness.source.dialer,
         harness.magic,
-        Instant::now() + ABSENCE_WINDOW,
+        Instant::now() + RELAY_ABSENCE_WINDOW,
     )?;
     assert_eq!(inventories(&source_frames), []);
     Ok(())
@@ -862,7 +864,7 @@ fn accepted_peer_tx_is_admitted_and_relayed_excluding_the_source() -> anyhow::Re
     let source_frames = collect_frames(
         &harness.source.dialer,
         harness.magic,
-        Instant::now() + ABSENCE_WINDOW,
+        Instant::now() + RELAY_ABSENCE_WINDOW,
     )?;
     assert!(
         !announces_tx(&source_frames, &txid),

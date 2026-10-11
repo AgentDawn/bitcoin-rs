@@ -482,8 +482,10 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
    the policy owner's lifetime, keyed only by local endpoints and network
    classes, so disconnecting and reconnecting cannot redraw a future deadline.
    Deadlines use Core's 5-second inbound and 2-second outbound means, with an
-   additional 30-second maximum delay. Each tick orders queued parents before
-   children and prefers higher-fee eligible entries, then sends at most
+   additional 30-second maximum delay. During IBD, due ticks advance the
+   deadline without draining pending inventory. Outside IBD, each due tick
+   orders queued parents before children and prefers higher-fee eligible
+   entries, then sends at most
    `min(1000, 70 + 5 * (pending / 1000))` inventory vectors, matching Core's
    target and cap. Empty ticks also advance the deadline so a new admission
    does not define the broadcast clock. Additional bounds are 5,000 pending
