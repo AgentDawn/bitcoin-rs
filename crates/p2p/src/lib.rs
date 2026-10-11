@@ -3,6 +3,8 @@
 
 /// Persistent, bounded peer discovery and automatic address selection.
 pub(crate) mod addrman;
+/// BIP324 v2 transport cryptography: key schedule and packet ciphers.
+pub(crate) mod bip324;
 /// Outbound block announcements: headers-first, high-bandwidth compact, inv fallback.
 pub mod block_announce;
 /// Out-of-order inbound block staging bounded by the download window budget.
