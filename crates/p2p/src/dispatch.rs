@@ -50,7 +50,8 @@ pub trait ChainQuery: Send + Sync {
     }
 
     /// Serves a bounded BIP157 request from persisted filters only. Returns
-    /// false only when publication is pending and no response has been sent.
+    /// false only when publication or send headroom is pending and no response
+    /// has been sent. The caller retains the request until its existing deadline.
     fn serve_compact_filters(
         &self,
         _request: &Message,

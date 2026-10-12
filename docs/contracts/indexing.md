@@ -86,6 +86,9 @@ only scheduling mechanics.
   `enabled: false` / `Disabled`; an attached worker supplies the row through
   `DerivedIndexCapabilitySource`. Proof: `crates/index/src/capabilities.rs` tests
   `missing_source_is_the_disabled_txindex_row`, `attached_source_is_the_worker_row`.
+  This row covers transaction/script capabilities only; filter-only operation
+  leaves it disabled. Filter progress, reconciliation and local failures do not
+  change that row. Filter status is reported by `getindexinfo` and service flags.
 
 `ScriptLive` is not a duplicate coin table. Its empty-valued key is
 `script-hash-prefix || full-outpoint`; the prefix is only a scan accelerator.
@@ -284,8 +287,8 @@ is not replayed; an interrupted prefix closes the connection instead of silently
 abandoning the tail. Disabled, unavailable, unknown, non-basic and oversized requests
 receive no filter answer.
 To bridge a just-announced tip and asynchronous publication, a valid P2P request
-can be deferred for up to five seconds while the query reports retry. The existing
-socket poll retries one pending request per connection, so inbound traffic, ping
+can be deferred for up to five seconds while publication or send headroom is
+pending. The existing socket poll retries one pending request per connection, so inbound traffic, ping
 and cancellation remain responsive. A second pending filter request or an expired
 deadline closes the connection. No response is replayed after streaming a payload;
 chain validation never waits and filters are never generated synchronously.

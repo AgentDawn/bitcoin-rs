@@ -112,13 +112,13 @@ fn compact_filter_rpc_exposes_only_enabled_ready_data() -> Result<(), Box<dyn st
             (json!(["00"]), -8),
             (json!(["zz".repeat(32)]), -8),
         ] {
-            assert_eq!(
-                handler
-                    .dispatch("getblockfilter", &params)
-                    .expect_err("invalid request")
-                    .code(),
-                code
-            );
+            let error = handler
+                .dispatch("getblockfilter", &params)
+                .expect_err("invalid request");
+            assert_eq!(error.code(), code);
+            if code == -8 {
+                assert_eq!(error.to_string(), "hash must be 64 hex characters");
+            }
         }
     }
     let index = Arc::new(Filters(AtomicBool::new(false)));

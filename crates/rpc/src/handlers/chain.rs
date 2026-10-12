@@ -1157,8 +1157,13 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
 pub(crate) fn getblockfilter(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let bound = super::bind_named_params(params, &["blockhash", "filtertype"])?;
     let params = bound.as_ref();
-    let hash = parse_hash(required_str(params, 0, "block hash is required")?)
-        .map_err(|error| RpcError::InvalidParameter(error.to_string()))?;
+    let hash =
+        parse_hash(required_str(params, 0, "block hash is required")?).map_err(
+            |error| match error {
+                RpcError::InvalidParams(message) => RpcError::InvalidParameter(message.into()),
+                error => error,
+            },
+        )?;
     let args = params_array(params)?;
     if args.len() > 2 {
         return Err(RpcError::InvalidParams(

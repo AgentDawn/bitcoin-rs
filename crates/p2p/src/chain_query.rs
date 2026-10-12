@@ -211,9 +211,6 @@ impl ChainQuery for ActiveChainQuery {
         let Some(index) = &self.compact_filters else {
             return Ok(true);
         };
-        if !headroom() {
-            return Ok(true);
-        }
         let (kind, start, stop, limit, step) = match request {
             Message::GetCFilters(r) => (r.filter_type, r.start_height, r.stop_hash, 1000, 1),
             Message::GetCFHeaders(r) => (r.filter_type, r.start_height, r.stop_hash, 2000, 1),
@@ -229,6 +226,9 @@ impl ChainQuery for ActiveChainQuery {
         };
         if step == 1 && (end < start || end - start >= limit) {
             return Ok(true);
+        }
+        if !headroom() {
+            return Ok(false);
         }
         let mut hashes = Vec::new();
         let mut headers = Vec::new();
@@ -265,12 +265,13 @@ impl ChainQuery for ActiveChainQuery {
         }
         // Never replay a sent prefix or silently abandon its tail. A completed
         // range remains complete even if the final snapshot check reports Retry.
-        if halted || (emitted > 0 && emitted != end - start + 1) {
+        if emitted > 0 && emitted != end - start + 1 {
             return Err(PeerError::Io(std::io::Error::other(
                 "compact filter range interrupted",
             )));
         }
-        if emitted == 0 && matches!(result, Err(bitcoin_rs_index::TxQueryError::Retry)) {
+        if emitted == 0 && (halted || matches!(result, Err(bitcoin_rs_index::TxQueryError::Retry)))
+        {
             return Ok(false);
         }
         let Ok(Some(previous_header)) = result else {
@@ -768,9 +769,9 @@ mod tests {
             assert_eq!(responses.len(), 1);
             assert!(matches!(&responses[0], Message::CFilter(filter)
                 if filter.filter == [0] && filter.block_hash == wire_hash(header.compute_hash())));
-            query.serve_compact_filters(&request, &|| false, &mut |_| {
+            assert!(!query.serve_compact_filters(&request, &|| false, &mut |_| {
                 panic!("backpressured peer must not receive a filter")
-            })?;
+            })?);
             let headers = seed_headers(2);
             let stop = headers[1].compute_hash();
             let query = query_with(headers)?.with_compact_filters(Some(index));
@@ -783,6 +784,111 @@ mod tests {
                 query.serve_compact_filters(&request, &|| true, &mut |_| Ok(())),
                 Err(PeerError::Io(_))
             ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filter_backpressure_defers_unsent_responses_but_disconnects_a_partial_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+        use std::cell::Cell;
+
+        struct Filters;
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("range only")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                Ok(DerivedIndexInfo {
+                    synced: true,
+                    best_block_height: 2000,
+                })
+            }
+            fn for_each_filter(
+                &self,
+                _: u32,
+                stop: Hash256,
+                _: u32,
+                emit: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                for _ in 0..2 {
+                    if !emit(
+                        stop,
+                        BasicFilter {
+                            filter: vec![0],
+                            hash: [1; 32],
+                            header: [2; 32],
+                        },
+                    ) {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some([0; 32]))
+            }
+        }
+        let headers = seed_headers(2001);
+        let stop = wire_hash(headers[1].compute_hash());
+        let checkpoint_stop = wire_hash(headers[2000].compute_hash());
+        let query = query_with(headers)?.with_compact_filters(Some(Arc::new(Filters)));
+        for request in [
+            Message::GetCFilters(GetCFilters {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: stop,
+            }),
+            Message::GetCFHeaders(GetCFHeaders {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: stop,
+            }),
+            Message::GetCFCheckpt(GetCFCheckpt {
+                filter_type: 0,
+                stop_hash: checkpoint_stop,
+            }),
+        ] {
+            // Exhaust headroom at the entry gate, before the first item, or
+            // after one item. Header/checkpoint buffers have not reached wire.
+            for allowed in 0_u8..=2 {
+                let remaining = Cell::new(allowed);
+                let mut responses = Vec::new();
+                let result = query.serve_compact_filters(
+                    &request,
+                    &|| {
+                        let slots = remaining.get();
+                        remaining.set(slots.saturating_sub(1));
+                        slots > 0
+                    },
+                    &mut |message| {
+                        responses.push(message);
+                        Ok(())
+                    },
+                );
+                if allowed == 2 && matches!(request, Message::GetCFilters(_)) {
+                    assert!(matches!(result, Err(PeerError::Io(_))));
+                    assert_eq!(responses.len(), 1);
+                    continue;
+                }
+                assert!(!result?, "unsent request must remain pending");
+                assert_eq!(responses, Vec::<Message>::new());
+                assert!(
+                    query.serve_compact_filters(&request, &|| true, &mut |message| {
+                        responses.push(message);
+                        Ok(())
+                    })?
+                );
+                match (&request, &responses[..]) {
+                    (Message::GetCFilters(_), [Message::CFilter(_), Message::CFilter(_)]) => {}
+                    (Message::GetCFHeaders(_), [Message::CFHeaders(reply)]) => {
+                        assert_eq!(reply.filter_hashes.len(), 2);
+                    }
+                    (Message::GetCFCheckpt(_), [Message::CFCheckpt(reply)]) => {
+                        assert_eq!(reply.filter_headers.len(), 2);
+                    }
+                    _ => panic!("retry must deliver the complete response"),
+                }
+            }
         }
         Ok(())
     }

@@ -1,6 +1,7 @@
 # Optional compact-filter interoperability
 
-Run this opt-in evidence lane on Linux (including WSL) from the repository root.
+Run this opt-in evidence lane on Linux (including WSL), with Python 3.10 or newer,
+from the repository root.
 It uses only public RPC and P2P interfaces; it does not import node internals.
 Kyoto's `bip157` crate is unmodified and pinned to commit
 `0169dc3514c8238147302535a1123d5c37468de6`. The small application driver supplies

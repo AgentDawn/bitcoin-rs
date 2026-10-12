@@ -8,6 +8,7 @@ import pathlib
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -266,6 +267,8 @@ def compare(core, node, heights):
 
 
 def main():
+    if sys.version_info < (3, 10):
+        raise SystemExit("compact-filter-interop requires Python 3.10 or newer")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bitcoind", required=True, type=pathlib.Path)
     parser.add_argument("--bitcoin-rs", required=True, type=pathlib.Path)
