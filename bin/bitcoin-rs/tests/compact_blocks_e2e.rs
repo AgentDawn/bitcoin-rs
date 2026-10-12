@@ -207,7 +207,7 @@ fn expired_block_batch_reports_first_unsent_hash() -> Result<(), Error> {
         .map(|block| Inventory::WitnessBlock(block.block_hash()))
         .collect();
     let error = peer
-        .serve_batch(&items, Instant::now() - Duration::from_millis(1))
+        .serve_batch(&items, Instant::now())
         .expect_err("expired batch must fail");
     let detail = error.to_string();
     assert!(detail.contains(&chain[0].block_hash().to_string()));
@@ -558,6 +558,8 @@ fn wrong_root_compact_block_falls_back_to_same_peer() -> Result<(), Error> {
 /// (9be056a8a72b624dae9623b2f7bded92c2a21c91, net_processing.cpp:4333-4391).
 #[test]
 fn stale_compact_block_finishes_reconstruction_after_reorg() -> Result<(), Error> {
+    use NetworkMessage::{BlockTxn, NotFound};
+
     let (mut node, mut peer, common) = synced_peer_with_len("stale-race", 100)?;
     let parent = common.last().expect("common tip");
     let mut stale = segwit_coinbase_block(parent, 101, 0xD1);
@@ -584,12 +586,9 @@ fn stale_compact_block_finishes_reconstruction_after_reorg() -> Result<(), Error
         NetworkMessage::GetData(vec![Inventory::CompactBlock(stale.block_hash())]),
         Instant::now() + Duration::from_secs(10),
     )?;
-    let Some(NetworkMessage::CmpctBlock(compact)) =
-        peer.await_reply(Duration::from_secs(10), &|m| {
-            matches!(
-                m,
-                NetworkMessage::CmpctBlock(_) | NetworkMessage::NotFound(_)
-            )
+    let Some(NetworkMessage::CmpctBlock(compact)) = peer
+        .await_reply(Duration::from_secs(10), &|m| {
+            matches!(m, NetworkMessage::CmpctBlock(_) | NotFound(_))
         })?
     else {
         return Err(Error::Assertion(
@@ -622,15 +621,9 @@ fn stale_compact_block_finishes_reconstruction_after_reorg() -> Result<(), Error
         }),
         Instant::now() + Duration::from_secs(10),
     )?;
-    let Some(NetworkMessage::BlockTxn(reply)) =
-        peer.await_reply(Duration::from_secs(10), &|m| {
-            matches!(
-                m,
-                NetworkMessage::BlockTxn(_)
-                    | NetworkMessage::Block(_)
-                    | NetworkMessage::NotFound(_)
-            )
-        })?
+    let Some(BlockTxn(reply)) = peer.await_reply(Duration::from_secs(10), &|m| {
+        matches!(m, BlockTxn(_) | NetworkMessage::Block(_) | NotFound(_))
+    })?
     else {
         return Err(Error::Assertion(
             "stored stale block must answer getblocktxn after reorg".into(),
@@ -655,7 +648,7 @@ fn stale_compact_block_finishes_reconstruction_after_reorg() -> Result<(), Error
     for expected in [&stale, &branch[0]] {
         let Some(NetworkMessage::Block(body)) = peer
             .await_reply(Duration::from_secs(10), &|m| {
-                matches!(m, NetworkMessage::Block(_) | NetworkMessage::NotFound(_))
+                matches!(m, NetworkMessage::Block(_) | NotFound(_))
             })?
         else {
             return Err(Error::Assertion(
