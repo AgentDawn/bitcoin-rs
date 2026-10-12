@@ -316,7 +316,7 @@ impl UtxoSet {
     /// Attaches the coinstats listener for subsequently committed UTXO changes.
     ///
     /// The set keeps one listener slot and the node keeps one listener: the
-    /// [`CoinStatsListener`](crate::stats::CoinStatsListener) whose `MuHash` and
+    /// [`CoinStatsListener`] whose `MuHash` and
     /// accounting track every commit. Replay and recovery attach the same one.
     pub fn track_coin_stats(&mut self, listener: CoinStatsListener) {
         self.listener = Some(listener);

@@ -514,14 +514,14 @@ pub fn bind_listener(addr: SocketAddr) -> Result<TcpListener, ListenerError> {
 ///
 /// On each accepted connection, spawns a thread that runs the inbound
 /// handshake followed by a message-dispatch loop. Socket flags come from
-/// [`crate::socket::configure_peer_stream`]. The handshake uses
-/// [`crate::socket::HANDSHAKE_TIMEOUT`]; after handshake, the message loop
-/// polls inbound reads every [`crate::socket::STREAM_POLL_INTERVAL`], probing
-/// a quiet peer with one `ping` per [`PING_INTERVAL`] and ending the
-/// connection once a direction is silent past [`TIMEOUT_INTERVAL`].
+/// `crate::socket::configure_peer_stream`. The handshake uses
+/// `crate::socket::HANDSHAKE_TIMEOUT`; after handshake, the message loop
+/// polls inbound reads every `crate::socket::STREAM_POLL_INTERVAL`, probing
+/// a quiet peer with one `ping` per `PING_INTERVAL` and ending the
+/// connection once a direction is silent past `TIMEOUT_INTERVAL`.
 /// The thread terminates on:
 ///   - successful handshake then inactivity (no send or receive for
-///     [`TIMEOUT_INTERVAL`])
+///     `TIMEOUT_INTERVAL`)
 ///   - wire / FSM error
 ///   - explicit FSM disconnect transition
 ///
@@ -917,7 +917,7 @@ pub(crate) fn approximate_best_block_depth(query: Option<&dyn crate::ChainQuery>
 ///
 /// PRE: `remote_services` is the flags received in `version`;
 ///   `best_block_depth` is the local approximate tip age in target-spacing
-///   units ([`approximate_best_block_depth`]).
+///   units (`approximate_best_block_depth`).
 /// POST: a peer with NETWORK and WITNESS is accepted; a LIMITED peer is
 ///   accepted only when it also has WITNESS and `best_block_depth < 144`;
 ///   every other service set is rejected.

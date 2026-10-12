@@ -747,7 +747,7 @@ impl Context {
     /// PRE: `chain_transition` is the read role over the same
     ///   [`bitcoin_rs_chain::TransitionDomain`] chainstate's mutation role uses.
     /// POST: exclusive chainstate reads use it; see
-    ///   [`ChainHandles::with_stable_chainstate`].
+    ///   `ChainHandles::with_stable_chainstate`.
     /// INVARIANT: published status reads do not acquire it, so a block
     ///   transition cannot stall `getblockchaininfo` or `getchaintxstats`.
     #[must_use]

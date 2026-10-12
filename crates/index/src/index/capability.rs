@@ -123,9 +123,9 @@ impl IndexCapability {
 /// Named subset of [`IndexCapability`]: one prepared transition, an
 /// enabled configuration, or one query requirement.
 ///
-/// PRE: build only from the named constants, [`Self::insert`], or
+/// PRE: build only from the named constants, `Self::insert`, or
 /// `FromIterator`.
-/// POST: [`Self::contains`], [`Self::iter`], and [`Self::leftover`] answer
+/// POST: `Self::contains`, `Self::iter`, and [`Self::leftover`] answer
 /// over the selected capabilities.
 /// INVARIANT: bit `capability.index()` is set iff `capability` is selected;
 /// `to_mask` persists exactly this byte, so the on-disk reset-marker
