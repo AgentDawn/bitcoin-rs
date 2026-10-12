@@ -46,8 +46,8 @@ impl Bip9Cache {
     /// invalidation bitmap in one cache scan.
     pub(crate) fn invalidate_nodes(&self, invalid: &[bool]) {
         self.entries.write().retain(|(id, _), _| {
-            !id.index()
-                .is_some_and(|index| invalid.get(index) == Some(&true))
+            id.index()
+                .is_none_or(|index| invalid.get(index) != Some(&true))
         });
     }
 }
