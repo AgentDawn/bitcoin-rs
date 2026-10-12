@@ -77,7 +77,9 @@ pub(crate) fn decode(contents: &Bytes) -> Option<(String, Bytes)> {
     let first = *contents.first()?;
     if first == LONG_FORM {
         let field = contents.get(1..=COMMAND_LEN)?;
-        let command = read_command(field).ok()?;
+        let command = read_command(field)
+            .ok()
+            .filter(|command| !command.is_empty())?;
         return Some((command, contents.slice(1 + COMMAND_LEN..)));
     }
     let command = SHORT_IDS.get(usize::from(first))?;
@@ -148,5 +150,7 @@ mod tests {
         assert_eq!(decode(&Bytes::from_static(b"\0ping")), None);
         // A command field with bytes after its zero padding.
         assert_eq!(decode(&Bytes::from_static(b"\0ping\0\0\0\0\0\0\0x")), None);
+        // A long form whose command field is all padding names no type.
+        assert_eq!(decode(&Bytes::from(vec![0u8; 1 + COMMAND_LEN + 4])), None);
     }
 }
