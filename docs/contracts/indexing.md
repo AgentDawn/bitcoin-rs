@@ -61,6 +61,11 @@ only scheduling mechanics.
   `DerivedIndexRuntime` worker thread. Enabling both permits both capability row
   families to share a single block-body parse and atomic forward commit batch
   when their watermarks are aligned.
+- CLI `--blockfilterindex` (env `BITCOIN_RS_BLOCKFILTERINDEX`, configuration
+  `blockfilterindex=1`) enables `CompactFilters` in that same worker and store.
+  It defaults to false and enables neither transaction lookup nor script indexes.
+  With all indexes off, no derived worker or index namespace is opened. Filter
+  generation runs only for this capability, asynchronously after validation.
 
 ### `IDX-02`: Capability advertisement and Core compatibility
 
@@ -73,6 +78,10 @@ only scheduling mechanics.
   routes without advertising Core `txindex` unless `--txindex` is also set.
 - `getindexinfo` reports `synced: true` if and only if the advertised
   capability watermark matches the height and block hash of the active chain tip.
+- Compact filters appear as `basic block filter index` in `getindexinfo`.
+  `NODE_COMPACT_FILTERS` is added to new P2P handshakes and `getnetworkinfo` only
+  while this index is healthy and caught up. Existing connections cannot change
+  their version message; every filter request still checks query readiness.
 - `getcapabilities` reports one compiled txindex row. A missing worker is
   `enabled: false` / `Disabled`; an attached worker supplies the row through
   `DerivedIndexCapabilitySource`. Proof: `crates/index/src/capabilities.rs` tests
@@ -219,9 +228,13 @@ unneeded funding record lists when callers only require history records.
   branch block pruned before rollback completed), the worker resets the
   affected capability watermark and initiates a fresh rebuild from the active
   chain.
-- A missing or unreadable undo record is fatal only for `ScriptLive`. The
-  worker resets that capability and reseeds from the authoritative UTXO view;
-  `TxLookup` and `ScriptHistory` continue their body-only rollback.
+- A missing or unreadable undo record affects `ScriptLive` and `CompactFilters`. The
+  worker resets that capability and reseeds from the authoritative UTXO view
+  when compact filters are disabled; `TxLookup` and `ScriptHistory` use body-only
+  rollback. With `CompactFilters` enabled, missing undo instead fails the shared
+  index worker explicitly: a current UTXO snapshot cannot recreate spent scripts
+  for historical filters. Validation continues; queries on that worker become
+  unavailable until the required data is restored and the node restarted.
 - When `ScriptLive` has no watermark after restoration or reset, the worker
   rebuilds it by scanning one stable authoritative UTXO view. Each seed batch
   and the watermark stamp are ordinary fenced writes (reset, revision, and
@@ -231,6 +244,53 @@ unneeded funding record lists when callers only require history records.
   storage failure or panic marks the worker as failed (`publish_failed`) and
   stops the worker. Block validation, UTXO commits, and chainstate progress
   continue unimpeded: the apply path never depends on index writes.
+
+### Compact-filter data and serving
+
+`index/filters.rs` owns BIP158 basic-filter encoding (P=19, M=784931) and BIP157
+hash/header commitments. Inputs are distinct nonempty output scripts excluding
+OP_RETURN, plus nonempty spent-prevout scripts. Same-block spends resolve from
+the parsed block before consulting the existing authoritative undo record.
+Genesis outputs and oversized scripts follow BIP158, not UTXO admission rules.
+There is no second UTXO set or consensus-validation path.
+
+The existing format-5 `UtxoMeta` table gains an additive namespace:
+`01 46 || block_hash` stores `filter_hash || filter_header || serialized_filter`
+(hashes in wire byte order); watermark key `00 46` stores the usual height/hash.
+Rows, header-chain advancement, cursor and watermark commit atomically through
+the existing writer fence. No storage table or schema conversion is introduced.
+Selective reset deletes only this prefix and watermark; rollback removes the
+disconnected block's row before reconnecting the active branch.
+
+Activation after IBD backfills from genesis using the existing bounded batches.
+All required block bodies and undo records must be retained. Pruning and
+`blockfilterindex` are rejected together at configuration time. An already
+pruned prefix or missing undo fails explicitly; a filter watermark is never
+anchored above missing history. Restore complete history before enabling it.
+
+`getblockfilter` serves only basic filters on the applied active chain. Unlike
+Core, disconnected filters are not retained for stale-block RPC lookups. A
+disabled index returns RPC -1, an unknown block or filter type returns -5, and
+catch-up/reconciliation returns RPC -1 with a retry reason rather than a
+partial filter or waiting for the index to synchronize.
+
+The query engine captures immutable block identities and one index snapshot
+without acquiring chain-transition authority. P2P streams at most one filter
+payload at a time under the send-headroom gate; header/checkpoint replies retain
+only commitments. Requests are bounded to 1,000 filters, 2,000 hashes, or 100,000
+checkpoint headers (below the 4 MB envelope). If the tip changes during streaming,
+already-sent filters still belong to the captured stop chain, but completion can
+be refused. Disabled, unavailable, unknown, non-basic and oversized requests
+receive no filter answer.
+To bridge a just-announced tip and asynchronous publication, a valid P2P request
+may wait up to five seconds on its own connection while the query reports retry.
+It stops waiting on backpressure or permanent failure, and never retries after
+streaming a payload. This does not block chain validation or generate filters
+synchronously.
+
+Pinned Core vectors, durable reset/reopen tests, and the opt-in public-interface
+Core/Kyoto runner are described in
+[`tools/compact-filter-interop/README.md`](../../tools/compact-filter-interop/README.md).
 
 ## Live gaps
 

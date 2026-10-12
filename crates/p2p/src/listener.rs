@@ -147,6 +147,18 @@ pub struct ConnectionShared {
 }
 
 impl ConnectionShared {
+    fn advertised_services(&self) -> ServiceFlags {
+        if self
+            .chain_query
+            .as_deref()
+            .is_some_and(crate::ChainQuery::compact_filters_ready)
+        {
+            self.local_services | ServiceFlags::COMPACT_FILTERS
+        } else {
+            self.local_services
+        }
+    }
+
     /// Construct the complete wiring for one start epoch.
     ///
     /// PRE: The stores belong to the same P2P start epoch. `extras` carries
@@ -946,7 +958,7 @@ fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
         nonce,
         start_height,
         lease.role(),
-        shared.local_services,
+        shared.advertised_services(),
     );
     for message in outbound_messages {
         peer.send(&message)?;
@@ -1159,7 +1171,7 @@ fn run_handshake(
         &mut peer,
         nonce,
         0,
-        shared.local_services,
+        shared.advertised_services(),
         &lease,
         handshake_deadline,
     ) {

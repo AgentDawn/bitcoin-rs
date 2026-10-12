@@ -448,6 +448,8 @@ pub struct IndexHandles {
     pub derived_index: Option<Arc<dyn DerivedIndexQuery>>,
     /// Generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+    /// Optional snapshot-gated BIP158 basic-filter index.
+    pub compact_filters: Option<Arc<dyn bitcoin_rs_index::CompactFilterQuery>>,
     /// Complete transaction lookup used by Esplora output projections. It may
     /// exist without [`Self::derived_index`] because it does not advertise
     /// the Core `--txindex` contract.
@@ -2110,6 +2112,7 @@ mod tests {
                 derived_index: None,
                 esplora_tx_index: None,
                 script_index: None,
+                compact_filters: None,
                 derived_index_status: Some(Arc::clone(&status)),
             },
             network: NetworkHandles::default(),

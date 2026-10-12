@@ -179,6 +179,34 @@ struct Harness {
     worker: Worker,
 }
 
+#[test]
+fn compact_filters_refuse_missing_undo_and_pruned_prefix_without_inventing_a_cursor() {
+    let fixture = ForkFixture::new(2);
+    for pruned in [false, true] {
+        let harness = Harness::with_enabled(&fixture, u32::MAX, IndexCapabilities::COMPACT_FILTERS);
+        harness.set_tip(&fixture.tip(fixture.a[1]));
+        if pruned {
+            harness.retention.reserve(1).commit(1);
+        }
+        let error = harness
+            .worker
+            .reconcile_once(&mut None)
+            .expect_err("historical facts are unavailable");
+        if pruned {
+            assert!(matches!(
+                error,
+                DerivedIndexWorkerError::HistoryUnavailable(HistoryUnavailable::Pruned { .. })
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                DerivedIndexWorkerError::UndoUnavailable { height: 1, .. }
+            ));
+        }
+        assert!(harness.watermarks().compact_filters.is_none());
+    }
+}
+
 impl Harness {
     fn new(fixture: &ForkFixture, rollback_rebuild_cutover: u32) -> Self {
         Self::with_enabled(

@@ -44,6 +44,20 @@ pub struct InventoryServing {
 
 /// Read-only active-chain view used by server-side P2P responders.
 pub trait ChainQuery: Send + Sync {
+    /// Whether the optional filter index currently covers the applied chain.
+    fn compact_filters_ready(&self) -> bool {
+        false
+    }
+
+    /// Serves a bounded BIP157 request from persisted filters only.
+    fn serve_compact_filters(
+        &self,
+        _request: &Message,
+        _headroom: &dyn Fn() -> bool,
+        _send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+    ) -> Result<(), PeerError> {
+        Ok(())
+    }
     /// Returns a bounded contiguous active-chain header response.
     fn headers_after(
         &self,
@@ -300,6 +314,12 @@ pub fn dispatch_inbound_full<S>(
             )?;
             step(peer, message)?;
             send(headers_response(chain, request))?;
+        }
+        Message::GetCFilters(_) | Message::GetCFHeaders(_) | Message::GetCFCheckpt(_) => {
+            step(peer, message)?;
+            if let Some(chain) = chain {
+                chain.serve_compact_filters(message, headroom, send)?;
+            }
         }
         Message::GetBlocks(request) => {
             ensure_block_locator_within_bounds(

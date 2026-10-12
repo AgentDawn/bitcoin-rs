@@ -13,6 +13,7 @@ use super::{
     record_at_height,
 };
 
+mod filters;
 mod scripts;
 mod transactions;
 
@@ -211,7 +212,7 @@ impl CapabilityFloors {
         match capability {
             IndexCapability::TxLookup => self.tx_lookup = floor,
             IndexCapability::ScriptHistory => self.script_history = floor,
-            IndexCapability::ScriptLive => {}
+            IndexCapability::ScriptLive | IndexCapability::CompactFilters => {}
         }
     }
 }
@@ -397,7 +398,7 @@ impl DerivedIndexQueryEngine {
         let snapshot = reader
             .snapshot()
             .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-        let mut marks = [None; 3];
+        let mut marks = [None; 4];
         for capability in IndexCapability::ALL {
             if !required.contains(capability) {
                 continue;

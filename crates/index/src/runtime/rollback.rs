@@ -143,10 +143,10 @@ impl Worker {
             Err(error) => return Err(DerivedIndexWorkerError::HistoryUnavailable(error)),
         };
         let body = self.load_body(watermark.height, watermark_hash, &lease)?;
-        let anchor = capabilities
-            .contains(IndexCapability::ScriptLive)
-            .then(|| self.live_anchor(watermark.height, watermark.hash))
-            .transpose()?;
+        let anchor = (capabilities.contains(IndexCapability::ScriptLive)
+            || capabilities.contains(IndexCapability::CompactFilters))
+        .then(|| self.live_anchor(watermark.height, watermark.hash))
+        .transpose()?;
         lease.release();
 
         let spent: &dyn crate::SpentCoinScripts =
@@ -227,6 +227,11 @@ impl Worker {
         height: u32,
         hash_bytes: [u8; 32],
     ) -> Result<UndoScripts, DerivedIndexWorkerError> {
+        if height == 0 {
+            return Ok(UndoScripts {
+                scripts: hashbrown::HashMap::new(),
+            });
+        }
         let hash = Hash256::from_le_bytes(&hash_bytes);
         let Some(store) = self.body_store.as_ref() else {
             return Err(DerivedIndexWorkerError::NoBodyStore);

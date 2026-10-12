@@ -50,6 +50,7 @@ pub struct ActiveChainQuery {
     applied_tip: TipReader,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
     network: Network,
+    compact_filters: Option<Arc<dyn bitcoin_rs_index::CompactFilterQuery>>,
 }
 
 impl ActiveChainQuery {
@@ -69,6 +70,7 @@ impl ActiveChainQuery {
             applied_tip,
             block_body_source: None,
             network,
+            compact_filters: None,
         }
     }
 
@@ -76,6 +78,16 @@ impl ActiveChainQuery {
     #[must_use]
     pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
         self.block_body_source = Some(source);
+        self
+    }
+
+    /// Attaches the existing optional derived-index query owner.
+    #[must_use]
+    pub fn with_compact_filters(
+        mut self,
+        filters: Option<Arc<dyn bitcoin_rs_index::CompactFilterQuery>>,
+    ) -> Self {
+        self.compact_filters = filters;
         self
     }
 
@@ -178,6 +190,116 @@ impl core::fmt::Debug for ActiveChainQuery {
 }
 
 impl ChainQuery for ActiveChainQuery {
+    fn compact_filters_ready(&self) -> bool {
+        self.compact_filters
+            .as_ref()
+            .is_some_and(|index| index.filter_index_info().is_ok_and(|info| info.synced))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep BIP157 bounds, bounded catch-up and streaming in one serving owner"
+    )]
+    fn serve_compact_filters(
+        &self,
+        request: &Message,
+        headroom: &dyn Fn() -> bool,
+        send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+    ) -> Result<(), PeerError> {
+        use bitcoin::bip158::{FilterHash, FilterHeader};
+        use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
+        let Some(index) = &self.compact_filters else {
+            return Ok(());
+        };
+        if !headroom() {
+            return Ok(());
+        }
+        let (kind, start, stop, limit, step) = match request {
+            Message::GetCFilters(r) => (r.filter_type, r.start_height, r.stop_hash, 1000, 1),
+            Message::GetCFHeaders(r) => (r.filter_type, r.start_height, r.stop_hash, 2000, 1),
+            Message::GetCFCheckpt(r) => (r.filter_type, 1000, r.stop_hash, u32::MAX, 1000),
+            _ => return Ok(()),
+        };
+        if kind != 0 {
+            return Ok(());
+        }
+        let stop_hash = Hash256::from_le_bytes(stop.as_byte_array());
+        let Some(end) = self.active_height(BlockHash(stop_hash)) else {
+            return Ok(());
+        };
+        if step == 1 && (end < start || end - start >= limit) {
+            return Ok(());
+        }
+        let mut hashes = Vec::new();
+        let mut headers = Vec::new();
+        let mut send_error = None;
+        // A committed tip can be announced before its asynchronous filter batch
+        // is published. Wait only on this connection, never on the apply path.
+        // Retry only before any payload was sent, so a moving tip cannot cause
+        // duplicate cfilters. Permanent failures and backpressure return at once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            hashes.clear();
+            headers.clear();
+            let mut emitted = false;
+            let result = index.for_each_filter(start, stop_hash, step, &mut |hash, filter| {
+                if !headroom() {
+                    return false;
+                }
+                match request {
+                    Message::GetCFilters(_) => {
+                        emitted = true;
+                        if let Err(error) = send(Message::CFilter(CFilter {
+                            filter_type: 0,
+                            block_hash: bitcoin::BlockHash::from_byte_array(hash.to_le_bytes()),
+                            filter: filter.filter,
+                        })) {
+                            send_error = Some(error);
+                            return false;
+                        }
+                    }
+                    Message::GetCFHeaders(_) => {
+                        hashes.push(FilterHash::from_byte_array(filter.hash));
+                    }
+                    Message::GetCFCheckpt(_) => {
+                        headers.push(FilterHeader::from_byte_array(filter.header));
+                    }
+                    _ => {}
+                }
+                true
+            });
+            if matches!(result, Err(bitcoin_rs_index::TxQueryError::Retry))
+                && !emitted
+                && headroom()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            break result;
+        };
+        if let Some(error) = send_error {
+            return Err(error);
+        }
+        let Ok(Some(previous_header)) = result else {
+            return Ok(());
+        };
+        match request {
+            Message::GetCFHeaders(_) => send(Message::CFHeaders(CFHeaders {
+                filter_type: 0,
+                stop_hash: stop,
+                previous_filter_header: FilterHeader::from_byte_array(previous_header),
+                filter_hashes: hashes,
+            }))?,
+            Message::GetCFCheckpt(_) => send(Message::CFCheckpt(CFCheckpt {
+                filter_type: 0,
+                stop_hash: stop,
+                filter_headers: headers,
+            }))?,
+            _ => {}
+        }
+        Ok(())
+    }
     fn headers_after(
         &self,
         locator_hashes: &[BlockHash],
@@ -575,6 +697,89 @@ mod tests {
 
     fn wire_hash(hash: BlockHash) -> WireBlockHash {
         WireBlockHash::from_byte_array(*hash.as_bytes())
+    }
+
+    /// A newly announced block may precede filter publication; a snapshot that
+    /// changes after streaming must not cause duplicate payloads on the wire.
+    #[test]
+    fn compact_filters_wait_for_publication_without_replaying_sent_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Filters {
+            ready: AtomicBool,
+            moves_after_delivery: bool,
+        }
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("range serving only")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                Ok(DerivedIndexInfo {
+                    synced: self.ready.load(Ordering::Acquire),
+                    best_block_height: 0,
+                })
+            }
+            fn for_each_filter(
+                &self,
+                _: u32,
+                stop: Hash256,
+                _: u32,
+                emit: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                if !self.ready.load(Ordering::Acquire) {
+                    return Err(TxQueryError::Retry);
+                }
+                if !emit(
+                    stop,
+                    BasicFilter {
+                        filter: vec![0],
+                        hash: [1; 32],
+                        header: [2; 32],
+                    },
+                ) {
+                    return Ok(None);
+                }
+                if self.moves_after_delivery {
+                    Err(TxQueryError::Retry)
+                } else {
+                    Ok(Some([0; 32]))
+                }
+            }
+        }
+        let header = seed_headers(1)[0];
+        for moves_after_delivery in [false, true] {
+            let index = Arc::new(Filters {
+                ready: AtomicBool::new(false),
+                moves_after_delivery,
+            });
+            let query = query_with(vec![header])?.with_compact_filters(Some(index.clone()));
+            assert!(!query.compact_filters_ready());
+            let publisher = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                index.ready.store(true, Ordering::Release);
+            });
+            let request = Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: wire_hash(header.compute_hash()),
+            });
+            let mut responses = Vec::new();
+            query.serve_compact_filters(&request, &|| true, &mut |message| {
+                responses.push(message);
+                Ok(())
+            })?;
+            publisher.join().map_err(|_| "publisher panicked")?;
+            assert!(query.compact_filters_ready());
+            assert_eq!(responses.len(), 1);
+            assert!(matches!(&responses[0], Message::CFilter(filter)
+                if filter.filter == [0] && filter.block_hash == wire_hash(header.compute_hash())));
+            query.serve_compact_filters(&request, &|| false, &mut |_| {
+                panic!("backpressured peer must not receive a filter")
+            })?;
+        }
+        Ok(())
     }
 
     #[test]

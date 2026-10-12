@@ -213,6 +213,9 @@ impl Worker {
                     watermarks = next_watermarks;
                 }
                 Err(error @ DerivedIndexWorkerError::UndoUnavailable { .. }) => {
+                    if capabilities.contains(IndexCapability::CompactFilters) {
+                        return Err(error);
+                    }
                     // Undo is the ScriptLive spend-script authority. TxLookup
                     // and ScriptHistory roll back from the block body alone,
                     // so a pruned undo must not force those families through

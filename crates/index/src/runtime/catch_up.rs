@@ -115,6 +115,11 @@ impl Worker {
                 // Prepared rows belong to the pre-reset position: the rebuild
                 // re-derives from the frontier, so they cannot be carried.
                 *pending = None;
+                if capabilities.contains(IndexCapability::CompactFilters) {
+                    return Err(DerivedIndexWorkerError::HistoryUnavailable(
+                        HistoryUnavailable::Pruned { below },
+                    ));
+                }
                 return self.rebuild_from_pruned(capabilities, below, target);
             }
             Err(error) => {
@@ -234,12 +239,17 @@ impl Worker {
         let loaded = bodies.len();
         let sub_chunk = &identities[..loaded];
 
-        let anchors = if capabilities.contains(IndexCapability::ScriptLive) {
+        let anchors = if capabilities.contains(IndexCapability::ScriptLive)
+            || capabilities.contains(IndexCapability::CompactFilters)
+        {
             let mut anchors = Vec::with_capacity(sub_chunk.len());
             for identity in sub_chunk {
                 match self.live_anchor(identity.height, identity.hash) {
                     Ok(anchor) => anchors.push(anchor),
                     Err(error @ DerivedIndexWorkerError::UndoUnavailable { .. }) => {
+                        if capabilities.contains(IndexCapability::CompactFilters) {
+                            return Err(error);
+                        }
                         *pending = None;
                         self.writer
                             .reset_capabilities(IndexCapabilities::SCRIPT_LIVE)

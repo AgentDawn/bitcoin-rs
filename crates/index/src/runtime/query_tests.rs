@@ -258,7 +258,7 @@ impl QueryFixture {
             QueryEngineLive {
                 utxo: None::<bitcoin_rs_utxo::UtxoReader>,
                 chain_transition: Some(chain_transition),
-                enabled: IndexCapabilities::ALL,
+                enabled: IndexCapabilities::TX_AND_SCRIPTS,
             },
         );
         Ok(Self {

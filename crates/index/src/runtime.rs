@@ -171,6 +171,30 @@ impl DerivedIndexRuntime {
     }
 }
 
+impl crate::CompactFilterQuery for DerivedIndexQueryAdapter {
+    fn block_filter(&self, hash: Hash256) -> Result<Option<crate::BasicFilter>, TxQueryError> {
+        crate::CompactFilterQuery::block_filter(self.load_engine()?.as_ref(), hash)
+    }
+    fn for_each_filter(
+        &self,
+        start: u32,
+        stop: Hash256,
+        step: u32,
+        emit: &mut dyn FnMut(Hash256, crate::BasicFilter) -> bool,
+    ) -> Result<Option<[u8; 32]>, TxQueryError> {
+        crate::CompactFilterQuery::for_each_filter(
+            self.load_engine()?.as_ref(),
+            start,
+            stop,
+            step,
+            emit,
+        )
+    }
+    fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+        crate::CompactFilterQuery::filter_index_info(self.load_engine()?.as_ref())
+    }
+}
+
 impl DerivedIndexQuery for DerivedIndexQueryAdapter {
     fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
         let engine = self.load_engine()?;
