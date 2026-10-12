@@ -221,7 +221,14 @@ impl ChainQuery for ActiveChainQuery {
             return Ok(true);
         }
         let stop_hash = Hash256::from_le_bytes(stop.as_byte_array());
-        let Some(end) = self.active_height(BlockHash(stop_hash)) else {
+        // Filters follow validated, applied blocks even while a competing
+        // headers-only branch leads. The index query rechecks its snapshot.
+        let end = self.applied_tip.load_full().and_then(|tip| {
+            self.block_tree
+                .read()
+                .active_height_of(tip.tip_id, stop_hash)
+        });
+        let Some(end) = end else {
             return Ok(true);
         };
         if step == 1 && (end < start || end - start >= limit) {
@@ -887,6 +894,111 @@ mod tests {
                         assert_eq!(reply.filter_headers.len(), 2);
                     }
                     _ => panic!("retry must deliver the complete response"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_filters_follow_applied_chain_when_competing_headers_lead()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+
+        struct Filters(Hash256);
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("range only")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                Ok(DerivedIndexInfo {
+                    synced: true,
+                    best_block_height: 1,
+                })
+            }
+            fn for_each_filter(
+                &self,
+                start: u32,
+                stop: Hash256,
+                step: u32,
+                emit: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                assert_eq!(stop, self.0, "only the applied branch has filters");
+                if step == 1 {
+                    assert_eq!(start, 1);
+                    assert!(emit(
+                        stop,
+                        BasicFilter {
+                            filter: vec![0],
+                            hash: [1; 32],
+                            header: [2; 32],
+                        }
+                    ));
+                }
+                Ok(Some([0; 32]))
+            }
+        }
+        let headers = seed_headers(2);
+        let applied_hash = headers[1].compute_hash();
+        let query = query_with(headers.clone())?
+            .with_compact_filters(Some(Arc::new(Filters(applied_hash.into()))));
+        let fork_tip = {
+            let mut tree = query.block_tree.write();
+            let genesis = tree
+                .lookup(headers[0].compute_hash().into())
+                .ok_or("genesis")?;
+            let fork = test_header(headers[0].compute_hash(), 100);
+            let fork_id = tree.insert_node(Some(genesis), fork, NodeStatus::HeaderValid)?;
+            let fork_tip = test_header(fork.compute_hash(), 101);
+            tree.insert_node(Some(fork_id), fork_tip, NodeStatus::HeaderValid)?;
+            fork_tip.compute_hash()
+        };
+        assert_eq!(query.active_height(fork_tip), Some(2));
+        assert!(query.compact_filters_ready());
+        for stop in [applied_hash, fork_tip] {
+            let stop_hash = wire_hash(stop);
+            for request in [
+                Message::GetCFilters(GetCFilters {
+                    filter_type: 0,
+                    start_height: 1,
+                    stop_hash,
+                }),
+                Message::GetCFHeaders(GetCFHeaders {
+                    filter_type: 0,
+                    start_height: 1,
+                    stop_hash,
+                }),
+                Message::GetCFCheckpt(GetCFCheckpt {
+                    filter_type: 0,
+                    stop_hash,
+                }),
+            ] {
+                let mut replies = Vec::new();
+                assert!(
+                    query.serve_compact_filters(&request, &|| true, &mut |message| {
+                        replies.push(message);
+                        Ok(())
+                    })?
+                );
+                if stop == fork_tip {
+                    assert!(replies.is_empty(), "unapplied headers have no filters");
+                    continue;
+                }
+                match (&request, &replies[..]) {
+                    (Message::GetCFilters(_), [Message::CFilter(reply)]) => {
+                        assert_eq!(reply.block_hash, stop_hash);
+                        assert_eq!(reply.filter, [0]);
+                    }
+                    (Message::GetCFHeaders(_), [Message::CFHeaders(reply)]) => {
+                        assert_eq!(reply.stop_hash, stop_hash);
+                        assert_eq!(reply.filter_hashes.len(), 1);
+                    }
+                    (Message::GetCFCheckpt(_), [Message::CFCheckpt(reply)]) => {
+                        assert_eq!(reply.stop_hash, stop_hash);
+                        assert_eq!(reply.filter_headers.len(), 0);
+                    }
+                    _ => panic!("the applied branch must remain servable"),
                 }
             }
         }

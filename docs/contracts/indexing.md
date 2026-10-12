@@ -89,6 +89,12 @@ only scheduling mechanics.
   This row covers transaction/script capabilities only; filter-only operation
   leaves it disabled. Filter progress, reconciliation and local failures do not
   change that row. Filter status is reported by `getindexinfo` and service flags.
+  Proof: `crates/index/src/runtime/query_tests.rs` test
+  `filter_failure_refuses_filters_but_preserves_durable_progress_and_tx_queries`;
+  `crates/rpc/tests/handler_smoke.rs` test
+  `compact_filter_rpc_exposes_only_enabled_ready_data`;
+  `crates/p2p/src/listener.rs` test
+  `unbacked_filter_service_bit_is_removed_from_handshake`.
 
 `ScriptLive` is not a duplicate coin table. Its empty-valued key is
 `script-hash-prefix || full-outpoint`; the prefix is only a scan accelerator.
@@ -278,8 +284,12 @@ catch-up/reconciliation returns RPC -1 with a retry reason rather than a
 partial filter or waiting for the index to synchronize.
 
 The query engine captures immutable block identities and one index snapshot
-without acquiring chain-transition authority. P2P streams at most one filter
-payload at a time under the send-headroom gate; header/checkpoint replies retain
+without acquiring chain-transition authority. P2P resolves filter stop hashes
+against the applied chain; a competing headers-only branch does not change which
+filters are servable. Proof: `crates/p2p/src/chain_query.rs` test
+`compact_filters_follow_applied_chain_when_competing_headers_lead`.
+P2P streams at most one filter payload at a time under the send-headroom gate;
+header/checkpoint replies retain
 only commitments. Requests are bounded to 1,000 filters, 2,000 hashes, or 100,000
 checkpoint headers (below the 4 MB envelope). If the tip changes during streaming,
 already-sent filters still belong to the captured stop chain. A completed range
