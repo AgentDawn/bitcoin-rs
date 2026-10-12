@@ -755,7 +755,9 @@ fn encode_command(command: &CommandString) -> Result<[u8; COMMAND_LEN], PeerErro
     Ok(raw)
 }
 
-fn read_command(raw: &[u8]) -> Result<String, PeerError> {
+/// Parses a 12-byte command field: a UTF-8 name, then only zero padding. The
+/// v1 header and the BIP324 long message type share this encoding.
+pub(crate) fn read_command(raw: &[u8]) -> Result<String, PeerError> {
     let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
     if raw[end..].iter().any(|byte| *byte != 0) {
         return Err(PeerError::InvalidCommand(
