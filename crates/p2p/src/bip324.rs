@@ -1,9 +1,10 @@
-//! BIP324 v2 transport cryptography.
+//! BIP324 v2 transport.
 //!
-//! Sans-I/O: the `ElligatorSwift` key agreement, the HKDF key schedule, and the
-//! forward-secure ciphers that seal and open packets. Nothing here reads or
-//! writes a socket; connections still speak v1 until the transport is wired
-//! in (#1503).
+//! The `ElligatorSwift` key agreement, the HKDF key schedule, the
+//! forward-secure ciphers that seal and open packets, the handshake state
+//! machine, resumable packet reads, and the message type encoding. Nothing
+//! here owns a socket; connections still speak v1 until the transport is
+//! wired in (#1503).
 #![cfg_attr(
     not(test),
     expect(
@@ -13,8 +14,38 @@
 )]
 
 mod cipher;
+mod handshake;
 mod keys;
+mod msg_type;
 mod packet;
+mod reader;
+
+/// A BIP324 transport failed. A poll-timeout [`TransportError::Io`] is
+/// retried with all progress kept; every other error ends the connection.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TransportError {
+    /// No garbage terminator within the 4095 bytes of garbage BIP324 allows.
+    #[error("BIP324 garbage terminator not found within the garbage limit")]
+    TerminatorNotFound,
+    /// A responder received a v1 `version` header for another network.
+    #[error("peer sent a v1 version header for another network")]
+    WrongNetworkV1,
+    /// A packet declared more contents than a peer may send.
+    #[error("BIP324 packet contents of {0} bytes exceed the receive limit")]
+    PacketTooLarge(usize),
+    /// A packet could not be sealed or failed authentication.
+    #[error(transparent)]
+    Packet(#[from] packet::PacketError),
+    /// HKDF refused an output length.
+    #[error("BIP324 key schedule failed: {0}")]
+    KeySchedule(hkdf::InvalidLength),
+    /// The handshake was advanced after it finished.
+    #[error("BIP324 handshake already completed")]
+    Completed,
+    /// The stream failed, or its poll interval elapsed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
 
 #[cfg(test)]
 mod vector_tests {
