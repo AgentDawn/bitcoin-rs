@@ -42,11 +42,12 @@ job set.
 ## Pull-request verification
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs for pull requests
-against any base branch, including stacked PRs, and for pushes to `main`. Its
-jobs are `fmt`, `deny` (parallel, no workspace compile), `clippy`, and three
-test lanes (`test-crates`, `test-binary`, `test-workspace`), all parallel;
-every lane fails fast at its first failing profile, so the first actionable
-failure is not delayed behind unrelated profiles (issue #1081). Every gate
+against any base branch, including stacked PRs, on merge-group requests, and
+for pushes to `main`. PR green means fast feedback only: `fmt`, `deny`,
+`clippy`, and `test-crates` passed; `test-binary` and `test-workspace` are
+skipped. Merge-group green includes those two heavy lanes and is the
+pre-main integration signal. Main checks are post-merge evidence.
+Every lane fails fast at its first failing profile. Every gate
 command lives in [`scripts/ci-pr.sh`](scripts/ci-pr.sh) -- CI, the
 pre-commit hooks, and this guide all invoke that script, so the commands
 cannot drift:
