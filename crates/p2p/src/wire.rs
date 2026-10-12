@@ -471,7 +471,7 @@ pub fn write_message<W: Write + ?Sized>(
 ///
 /// One-shot: a read timeout part-way through a frame discards the bytes
 /// already consumed. Connection loops that retry poll timeouts read through
-/// [`V1Receiver`] instead.
+/// [`Peer::read_message`](crate::Peer::read_message) instead.
 pub fn read_message<R: Read>(
     reader: &mut R,
     expected_magic: Magic,
