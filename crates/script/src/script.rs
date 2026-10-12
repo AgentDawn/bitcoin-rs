@@ -1,12 +1,8 @@
 //! Native script parsing, classification, and building helpers.
-//!
-//! Byte-level replacements for the `bitcoin::Script` utilities the workspace
-//! consumed before the native-primitives migration. Semantics are bug-for-bug
-//! with rust-bitcoin 0.32's `Script` helpers (and Core's `GetOp` loop behind
-//! them); differential tests pin the parity where the two overlap.
 
 /// Opcode byte constants the workspace builds and inspects scripts with.
 pub mod opcode {
+
     macro_rules! opcodes {
         ($($(#[$doc:meta])* $visibility:vis $name:ident = $value:literal,)*) => {
             $(
@@ -141,7 +137,6 @@ pub struct EarlyEndOfScript;
 /// Iterator over the instructions of a script, yielding a parse error at the
 /// first malformed push (and never again, matching Core's `GetOp` loop).
 ///
-/// Byte semantics mirror rust-bitcoin's non-minimal `Script::instructions`:
 /// `0x01..=0x4b` are direct pushes, `OP_PUSHDATA1/2/4` carry an explicit
 /// little-endian length, `0x00` pushes an empty slice, and every other byte
 /// is an [`Instruction::Op`].
@@ -162,11 +157,8 @@ pub const fn instructions(script: &[u8]) -> Instructions<'_> {
     }
 }
 
-/// Whether every instruction has Core's valid legacy opcode and element encoding.
-///
-/// This checks parsing, the maximum opcode valid in legacy scripts (`OP_NOP10`),
-/// and the 520-byte push limit; it does not evaluate the script or impose a
-/// total script-size limit.
+/// Checks legacy opcode and push validity (`OP_NOP10`, 520-byte elements).
+/// Does not evaluate scripts or enforce the total script-size limit.
 #[must_use]
 pub fn has_valid_ops(script: &[u8]) -> bool {
     instructions(script).all(|instruction| match instruction {
@@ -226,7 +218,6 @@ impl<'a> Iterator for Instructions<'a> {
 }
 
 impl<'a> Instructions<'a> {
-    /// Consumes `len` bytes from `rest`, failing the iterator on truncation.
     fn take_slice(&mut self, len: usize, rest: &'a [u8]) -> Result<&'a [u8], EarlyEndOfScript> {
         if let Some(data) = rest.get(..len) {
             self.remaining = &rest[len..];
@@ -237,8 +228,6 @@ impl<'a> Instructions<'a> {
         }
     }
 
-    /// Reads a little-endian push length of `len_bytes` width starting one byte
-    /// into `self.remaining`; `u64::MAX` marks truncation.
     fn read_len_le(&mut self, len_bytes: usize) -> u64 {
         if self.remaining.len() < 1 + len_bytes {
             self.failed = true;
@@ -251,8 +240,6 @@ impl<'a> Instructions<'a> {
         value
     }
 
-    /// Completes a length-prefixed push whose payload starts `start` bytes into
-    /// the original `rest` slice.
     fn take_len_slice(
         &mut self,
         len: usize,
@@ -270,9 +257,8 @@ impl<'a> Instructions<'a> {
 
 /// Returns `true` when every instruction of `script` is a push.
 ///
-/// Small-integer pushnum opcodes count as pushes. This mirrors Core's
-/// `IsPushOnly` as rust-bitcoin implements it: parse failure or any opcode
-/// above `OP_16` fails.
+/// Small-integer pushnum opcodes count as pushes. Mirrors Core's
+/// `IsPushOnly`: parse failure or any opcode above `OP_16` fails.
 #[must_use]
 pub fn is_push_only(script: &[u8]) -> bool {
     instructions(script).all(|instruction| match instruction {
@@ -386,9 +372,8 @@ pub fn is_witness_program(script: &[u8]) -> bool {
 
 /// Returns `true` for a bare multisig script.
 ///
-/// Shape: `OP_m <n key pushes> OP_n OP_CHECKMULTISIG` with `m <= n`, mirroring
-/// rust-bitcoin's `Script::is_multisig`. Key-length checking is the caller's
-/// policy decision, not a script-shape property.
+/// Shape: `OP_m <n key pushes> OP_n OP_CHECKMULTISIG` with `m <= n`.
+/// Key-length checking is the caller's policy decision, not a script-shape property.
 #[must_use]
 pub fn is_multisig(script: &[u8]) -> bool {
     let mut iter = instructions(script);
@@ -405,8 +390,6 @@ pub fn is_multisig(script: &[u8]) -> bool {
         match instruction {
             Instruction::PushBytes(_) => num_pubkeys = num_pubkeys.saturating_add(1),
             Instruction::Op(op) => {
-                // The opcode after the key pushes must be the OP_n key count;
-                // any other opcode makes the script malformed, not multisig.
                 match opcode::decode_pushnum(op) {
                     Some(pushnum) if pushnum == num_pubkeys => {}
                     _ => return false,
@@ -426,15 +409,6 @@ pub fn is_multisig(script: &[u8]) -> bool {
     iter.next().is_none()
 }
 
-/// Counts the pubkeys in a bare multisig script, or `None` unless it matches
-/// Core's `MatchMultisig` exactly.
-///
-/// `m` and `n` are small integers in `1..=MAX_PUBKEYS_PER_MULTISIG` encoded as
-/// `OP_1..=OP_16` or minimally encoded script-number pushes, every key push
-/// decodes as a `CPubKey` (33 bytes starting `0x02`/`0x03`, 65 bytes starting
-/// `0x04`/`0x06`/`0x07`), `m <= n` equals the number of key pushes, and
-/// `OP_CHECKMULTISIG` ends the script.
-/// Core `MAX_PUBKEYS_PER_MULTISIG`.
 const MAX_BARE_MULTISIG_PUBKEYS: i64 = 20;
 
 /// Yields the next element as Core's `CScript::GetOp` does: the opcode
@@ -561,8 +535,7 @@ pub fn multisig_key_count(script: &[u8]) -> Option<u8> {
 /// Returns the smallest non-dust value in satoshis for an output paying
 /// `script` under `dust_relay_fee_sat_per_kvb`.
 ///
-/// Mirrors Core's `GetDustThreshold` as rust-bitcoin's
-/// `minimal_non_dust_custom` implements it (spend overhead copied from Core;
+/// Mirrors Core's `GetDustThreshold` (spend overhead copied from Core;
 /// division by 1000 at the end only).
 #[must_use]
 pub fn minimal_non_dust(script: &[u8], dust_relay_fee_sat_per_kvb: u64) -> u64 {
@@ -642,7 +615,6 @@ pub fn push_int(value: i64) -> Vec<u8> {
     push_data(&bytes)
 }
 
-/// Compact-size (Bitcoin varint) encoding length in bytes.
 const fn varint_size(value: usize) -> usize {
     if value < 0xfd {
         1
