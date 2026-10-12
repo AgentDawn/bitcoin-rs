@@ -27,7 +27,7 @@
 //! Three prune meanings stay separate. The *requested* height is operator
 //! intent (`node:pruneheight`). The *effective* line is that intent folded
 //! with reorg safety, live retention, and the byte target. The
-//! [`ExecutedFrontier`] (`node:prune_executed`) is the durable, monotonic
+//! [`pruning::ExecutedFrontier`] (`node:prune_executed`) is the durable, monotonic
 //! fact of what a committed pass deleted, written in the same batch as its
 //! deletions: it is what a restart reconstructs and what refuses a lease,
 //! and no consumer infers it from the intent line.

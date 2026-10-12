@@ -12,7 +12,7 @@
 //!
 //! BIP152 identity direction: a peer serializes the compact blocks it sends
 //! us with the version we advertised in our own `sendcmpct`
-//! ([`COMPACT_BLOCK_VERSION`], v2 = wtxid identity, witness-bearing
+//! ([`compact_blocks::COMPACT_BLOCK_VERSION`], v2 = wtxid identity, witness-bearing
 //! prefills). Conversely, we serve peers at the version they recorded with
 //! us (`CompactBlockNegotiation::servable_version`, used by the chain
 //! query). The two directions are independent; decoding incoming compact

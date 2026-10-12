@@ -32,7 +32,7 @@ const PARALLEL_MUHASH_MAX_LANES: usize = 32;
 /// Exact byte length of the stable `CoinStats` encoding.
 pub const COIN_STATS_ENCODED_LEN: usize = 804;
 
-/// Why a [`CoinStats::rewind_block`] was refused.
+/// Why a `CoinStats::rewind_block` was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CoinStatsRewindError {
     /// The stats are not at the block being disconnected.
@@ -685,7 +685,7 @@ impl CoinStatsListener {
             .rewind_block(disconnected_height, parent_height, tx_delta)
     }
 
-    /// [`CoinStats::check_rewind`] against the current stats.
+    /// `CoinStats::check_rewind` against the current stats.
     pub fn check_rewind(
         &self,
         disconnected_height: u32,

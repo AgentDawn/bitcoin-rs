@@ -127,9 +127,9 @@ pub(super) const FAST_BLOCKS_IN_TRANSIT_PER_PEER: usize = 8;
 pub(super) const FAST_MIN_PEERS_FOR_FANOUT: usize = 2;
 /// Fast-sync outbound peer target.
 ///
-/// The peer count that fully stripes [`PENDING_BUDGET`] (and thus
-/// [`PENDING_BYTE_BUDGET`], the estimated in-flight bandwidth) at
-/// [`FAST_BLOCKS_IN_TRANSIT_PER_PEER`] each. More peers would sit idle behind
+/// The peer count that fully stripes `PENDING_BUDGET` (and thus
+/// `PENDING_BYTE_BUDGET`, the estimated in-flight bandwidth) at
+/// `FAST_BLOCKS_IN_TRANSIT_PER_PEER` each. More peers would sit idle behind
 /// the window; fewer leave the stripe deeper.
 pub const FAST_OUTBOUND_PEER_TARGET: usize = PENDING_BUDGET / FAST_BLOCKS_IN_TRANSIT_PER_PEER;
 /// Initial window-blocked stalling threshold.

@@ -69,7 +69,7 @@ pub struct RelayRequest {
     /// injection.
     pub source: Option<u64>,
     /// The mempool admission epoch the request was queued under, from
-    /// [`bitcoin_rs_mempool::mutation::MutationResult::sequence_of`]. Removal
+    /// [`bitcoin_rs_mempool::MutationResult::sequence_of`]. Removal
     /// and re-admission of the same body invalidates the epoch, so the
     /// send-time check matches the exact admission that queued the request.
     pub sequence: u64,

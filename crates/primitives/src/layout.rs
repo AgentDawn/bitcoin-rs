@@ -1,17 +1,17 @@
 //! Checked borrowed wire layout for blocks and transactions.
 //!
 //! This module is the sole owner of block and transaction wire parsing. Every
-//! byte range it hands out is a [`ByteSpan`] that was bounds-checked against
+//! byte range it hands out is a [`layout::ByteSpan`] that was bounds-checked against
 //! one immutable byte image at parse time, and the `'a` borrow on
-//! [`ParsedBlock`] and [`ParsedTransaction`] ties every offset to that image,
+//! [`layout::ParsedBlock`] and [`layout::ParsedTransaction`] ties every offset to that image,
 //! so a span can never outlive the bytes it indexes. Positions inside the
-//! parsed metadata vectors use the distinct [`MetadataRange`] type, so byte
+//! parsed metadata vectors use the distinct [`layout::MetadataRange`] type, so byte
 //! offsets and metadata indices can never be confused.
 //!
 //! Parsing establishes wire *shape* only: BIP144 marker/flag rules, canonical
 //! compact-size lengths, and counts that could still fit in the remaining
 //! bytes. Consensus acceptance (amounts, maturity, script validity, weight
-//! limits) is deliberately not evaluated here; [`ParsedTransaction::materialize`]
+//! limits) is deliberately not evaluated here; [`layout::ParsedTransaction::materialize`]
 //! hands the owned form to the callers that own those rules. Record counts
 //! whose minimal serialized footprint already exceeds the remaining bytes are
 //! rejected up front, so a malformed length can never drive an oversized
