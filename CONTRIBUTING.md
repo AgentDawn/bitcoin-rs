@@ -42,11 +42,12 @@ job set.
 ## Pull-request verification
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs for pull requests
-against any base branch, including stacked PRs, and for pushes to `main`. Its
-jobs are `fmt`, `deny` (parallel, no workspace compile), `clippy`, and three
-test lanes (`test-crates`, `test-binary`, `test-workspace`), all parallel;
-every lane fails fast at its first failing profile, so the first actionable
-failure is not delayed behind unrelated profiles (issue #1081). Every gate
+against any base branch, including stacked PRs, on merge-group requests, and
+for pushes to `main`. PR green means fast feedback only: `fmt`, `deny`,
+`clippy`, and `test-crates` passed; `test-binary` and `test-workspace` are
+skipped. Merge-group green includes those two heavy lanes and is the
+pre-main integration signal. Main checks are post-merge evidence.
+Every lane fails fast at its first failing profile. Every gate
 command lives in [`scripts/ci-pr.sh`](scripts/ci-pr.sh) -- CI, the
 pre-commit hooks, and this guide all invoke that script, so the commands
 cannot drift:
@@ -94,6 +95,14 @@ combinations, and MSRV checks run daily in
 [`compatibility-campaign.yml`](.github/workflows/compatibility-campaign.yml).
 Fuzz target builds run on `fuzz/**` pull requests; execution has its own
 daily campaign.
+
+Repository protection must require the existing `ci-gate` on the latest
+merge-group commit before updating `main`, together with the configured
+`kernel-consensus` and `full-node-compile` merge checks. A green ordinary PR
+does not authorize a direct merge. Queue and required-check enforcement,
+including bypass permissions, are GitHub settings; workflow triggers alone
+do not enforce them. Validate enforcement with a sampled merge: the checks
+must have passed on its current-base integration commit before `main` moved.
 
 ## Post-merge CI lanes
 
