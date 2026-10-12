@@ -160,12 +160,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # ── Single required check ────────────────────────────────────────
+  # ── Aggregate CI result ────────────────────────────────────────
   #
   # PR green is fast feedback only: fmt, deny, clippy, test-crates.
   # Merge-group green includes test-binary/test-workspace before main.
-  # Main green is post-merge evidence. GitHub protection must require this
-  # check on the latest merge-group ref; the trigger alone is not a gate.
+  # Main green is post-merge evidence.
 
   ci-gate:
     if: always()
@@ -214,10 +213,10 @@ jobs:
           echo "Gate passed."
           case "${{ github.event_name }}" in
             pull_request)
-              echo 'Fast PR checks passed. Binary/workspace tests were skipped; merge-group checks are required before main integration.' >> "$GITHUB_STEP_SUMMARY"
+              echo 'Fast PR checks passed. Binary/workspace tests were skipped and run on merge-group requests and main pushes.' >> "$GITHUB_STEP_SUMMARY"
               ;;
             merge_group)
-              echo 'Fast and heavy integration checks passed for this merge-group commit. Configured production/kernel checks must also pass.' >> "$GITHUB_STEP_SUMMARY"
+              echo 'Fast and heavy integration checks passed for this merge-group commit. Production/kernel results are reported by ci-merge-gate.' >> "$GITHUB_STEP_SUMMARY"
               ;;
             push)
               echo 'Fast and heavy checks passed as post-merge main evidence.' >> "$GITHUB_STEP_SUMMARY"

@@ -96,14 +96,6 @@ combinations, and MSRV checks run daily in
 Fuzz target builds run on `fuzz/**` pull requests; execution has its own
 daily campaign.
 
-Repository protection must require the existing `ci-gate` on the latest
-merge-group commit before updating `main`, together with the configured
-`kernel-consensus` and `full-node-compile` merge checks. A green ordinary PR
-does not authorize a direct merge. Queue and required-check enforcement,
-including bypass permissions, are GitHub settings; workflow triggers alone
-do not enforce them. Validate enforcement with a sampled merge: the checks
-must have passed on its current-base integration commit before `main` moved.
-
 ## Post-merge CI lanes
 
 [`.github/workflows/main.yml`](.github/workflows/main.yml) runs kernel-enabled
