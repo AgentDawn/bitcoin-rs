@@ -40,16 +40,14 @@ mod block_pruner;
 mod lease;
 /// Pruning policy shapes matching Bitcoin Core semantics.
 mod policy;
-/// Undo-data pruning over persisted undo rows.
-mod undo_pruner;
 
+pub use crate::undo::block_undo_key;
 pub use block_pruner::{BLOCK_DATA_CF, block_body_key};
 pub use lease::{
     HistoryAccess, HistoryLease, HistoryUnavailable, MandatoryRetention, PruneReservation,
     RetentionBudget, RetentionError, RetentionLease, RetentionRegistry,
 };
 pub use policy::PrunePolicy;
-pub use undo_pruner::block_undo_key;
 
 use crate::{BufferedWriteBatch, StorageError};
 use thiserror::Error;
@@ -196,8 +194,8 @@ impl ExecutedFrontier {
         )?;
         let undo = block_pruner::lowest_stored_height(
             store,
-            undo_pruner::BLOCK_UNDO_CF,
-            undo_pruner::BLOCK_UNDO_PREFIX_BYTES,
+            crate::ColumnFamily::UndoData,
+            crate::undo::BLOCK_UNDO_PREFIX_BYTES,
         )?;
         let frontier = match (bodies, undo) {
             (Some(bodies), Some(undo)) => bodies.max(undo),
@@ -362,8 +360,8 @@ pub fn stage_block_and_undo_prune<S: crate::KvStore>(
     let undo = block_pruner::prune_prefixed_rows_into_batch(
         store,
         batch,
-        undo_pruner::BLOCK_UNDO_CF,
-        undo_pruner::BLOCK_UNDO_PREFIX_BYTES,
+        crate::ColumnFamily::UndoData,
+        crate::undo::BLOCK_UNDO_PREFIX_BYTES,
         prune_line,
         policy,
     )?;
