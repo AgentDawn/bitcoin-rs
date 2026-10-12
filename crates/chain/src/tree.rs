@@ -636,11 +636,9 @@ impl BlockTree {
             if invalid[index] {
                 node.status = NodeStatus::Invalid;
                 hashes.push(node.hash);
-                if let Ok(id) = u32::try_from(index) {
-                    self.bip9_cache.invalidate_node(NodeId::new(id));
-                }
             }
         }
+        self.bip9_cache.invalidate_nodes(&invalid);
 
         if let Some(best) = best {
             self.publish_tip_if_best(best)?;
@@ -1359,6 +1357,8 @@ mod tests {
     #[test]
     fn invalidate_subtree_marks_root_and_descendants_invalid_and_reselects_tip()
     -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin_rs_consensus::{CSV_DEPLOYMENT_ID, SEGWIT_DEPLOYMENT_ID};
+
         // Main chain: genesis -> a1 -> a2.
         let (mut tree, main_ids) = linear_chain(2)?;
         let (genesis_id, a2_id) = (main_ids[0], main_ids[2]);
@@ -1369,6 +1369,12 @@ mod tests {
             .iter()
             .map(|id| tree.node(*id).map(|node| node.hash))
             .collect::<Result<Vec<_>, _>>()?;
+
+        for &id in main_ids.iter().chain(&side_ids) {
+            for deployment_id in [CSV_DEPLOYMENT_ID, SEGWIT_DEPLOYMENT_ID] {
+                tree.cache_bip9_state(id, deployment_id, 1);
+            }
+        }
 
         // The side chain is the active tip because it is longer.
         assert_eq!(tree.tip_id(), Some(side_ids[2]));
@@ -1392,6 +1398,14 @@ mod tests {
         assert_eq!(tree.active_by_height.get(2), Some(a2_id));
         assert!(tree.active_by_height.is_trusted());
         assert_ne!(tree.node(genesis_id)?.status, NodeStatus::Invalid);
+        for deployment_id in [CSV_DEPLOYMENT_ID, SEGWIT_DEPLOYMENT_ID] {
+            for &id in &side_ids {
+                assert_eq!(tree.cached_bip9_state(id, deployment_id), None);
+            }
+            for &id in &main_ids {
+                assert_eq!(tree.cached_bip9_state(id, deployment_id), Some(1));
+            }
+        }
         Ok(())
     }
 
