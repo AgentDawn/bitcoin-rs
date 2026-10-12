@@ -276,14 +276,16 @@ impl<S: KvStore> IndexWriter<S> {
         hash: [u8; 32],
         body: &[u8],
     ) -> Result<PreparedBlock, IndexError> {
-        if capabilities.contains(IndexCapability::ScriptLive) {
+        if capabilities.contains(IndexCapability::ScriptLive)
+            || capabilities.contains(IndexCapability::CompactFilters)
+        {
             return Err(IndexError::MissingSpentScripts);
         }
         self.prepare_block_with_spent_scripts(capabilities, height, hash, body, &NoSpentScripts)
     }
 
     /// [`Self::prepare_block_for`] with the spent-coin script source
-    /// `ScriptLive` preparation requires.
+    /// `ScriptLive` and `CompactFilters` preparation require.
     pub fn prepare_block_with_spent_scripts(
         &self,
         capabilities: IndexCapabilities,

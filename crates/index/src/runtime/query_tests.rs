@@ -258,7 +258,7 @@ impl QueryFixture {
             QueryEngineLive {
                 utxo: None::<bitcoin_rs_utxo::UtxoReader>,
                 chain_transition: Some(chain_transition),
-                enabled: IndexCapabilities::TX_AND_SCRIPTS,
+                enabled: IndexCapabilities::ALL,
             },
         );
         Ok(Self {
@@ -301,6 +301,31 @@ fn unusable_worker_makes_queries_unavailable() -> Result<(), Box<dyn std::error:
             Err(TxQueryError::Unavailable(reason)) if reason == expected
         ));
     }
+    Ok(())
+}
+
+#[test]
+fn filter_failure_refuses_filters_but_preserves_durable_progress_and_tx_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::CompactFilterQuery;
+    let block = Network::Regtest.genesis_block();
+    let hash = Hash256::from(block.block_hash());
+    let fixture = QueryFixture::new(FixtureConfig {
+        block,
+        retain_body: true,
+        scans: Vec::new(),
+        watermark: None,
+    })?;
+    fixture
+        .runtime
+        .fail_compact_filters(&DerivedIndexWorkerError::UndoUnavailable { height: 1, hash });
+    assert!(matches!(
+        fixture.engine.block_filter(hash),
+        Err(TxQueryError::Unavailable(_))
+    ));
+    assert!(!fixture.engine.filter_index_info()?.synced);
+    assert!(fixture.engine.index_info()?.synced);
+    assert!(!fixture.runtime.should_stop());
     Ok(())
 }
 

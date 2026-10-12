@@ -109,6 +109,8 @@ fn compact_filter_rpc_exposes_only_enabled_ready_data() -> Result<(), Box<dyn st
             (json!([hash, "unknown"]), -5),
             (json!([hash, 1]), -3),
             (json!(["00".repeat(32)]), -5),
+            (json!(["00"]), -8),
+            (json!(["zz".repeat(32)]), -8),
         ] {
             assert_eq!(
                 handler
@@ -123,6 +125,7 @@ fn compact_filter_rpc_exposes_only_enabled_ready_data() -> Result<(), Box<dyn st
     let context = Arc::get_mut(&mut fixture.ctx).ok_or("fixture context still shared")?;
     context.indexes.derived_index = None;
     context.indexes.compact_filters = Some(index.clone());
+    context.network.local_services |= 64;
     let handler = Handler::new(Arc::clone(&fixture.ctx));
     assert_eq!(
         handler
@@ -584,7 +587,33 @@ fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dy
 
 #[test]
 fn getindexinfo_named_request_returns_only_that_index() -> Result<(), Box<dyn std::error::Error>> {
+    struct UnavailableFilters;
+    impl bitcoin_rs_index::CompactFilterQuery for UnavailableFilters {
+        fn block_filter(
+            &self,
+            _: Hash256,
+        ) -> Result<Option<bitcoin_rs_index::BasicFilter>, bitcoin_rs_index::TxQueryError> {
+            unreachable!("status only")
+        }
+        fn for_each_filter(
+            &self,
+            _: u32,
+            _: Hash256,
+            _: u32,
+            _: &mut dyn FnMut(Hash256, bitcoin_rs_index::BasicFilter) -> bool,
+        ) -> Result<Option<[u8; 32]>, bitcoin_rs_index::TxQueryError> {
+            unreachable!("status only")
+        }
+        fn filter_index_info(
+            &self,
+        ) -> Result<bitcoin_rs_index::DerivedIndexInfo, bitcoin_rs_index::TxQueryError> {
+            Err(bitcoin_rs_index::TxQueryError::Unavailable(
+                "history unavailable".into(),
+            ))
+        }
+    }
     let mut ctx = Context::new();
+    ctx.indexes.compact_filters = Some(Arc::new(UnavailableFilters));
     ctx.indexes.derived_index = Some(Arc::new(FakeTxIndex {
         transactions: HashMap::new(),
         values: HashMap::new(),

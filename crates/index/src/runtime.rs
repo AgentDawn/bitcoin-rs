@@ -95,6 +95,7 @@ pub struct DerivedIndexRuntime {
     pub(super) failed: AtomicBool,
     wake_tx: Sender<()>,
     failure_message: RwLock<Option<CompactString>>,
+    compact_filter_failure: RwLock<Option<CompactString>>,
     phase: arc_swap::ArcSwap<ReconcilePhase>,
 }
 
@@ -108,6 +109,7 @@ impl DerivedIndexRuntime {
             failed: AtomicBool::new(false),
             wake_tx,
             failure_message: RwLock::new(None),
+            compact_filter_failure: RwLock::new(None),
             phase: arc_swap::ArcSwap::from_pointee(ReconcilePhase::FORWARD),
         }
     }
@@ -144,6 +146,15 @@ impl DerivedIndexRuntime {
     pub(crate) fn publish_failed(&self, message: impl Into<CompactString>) {
         *self.failure_message.write() = Some(message.into());
         self.failed.store(true, Ordering::Release);
+    }
+
+    /// Unavailable filter history disables only that capability for this run.
+    /// Preserve its durable rows so a restart can retry after history is restored.
+    pub(crate) fn fail_compact_filters(&self, error: &DerivedIndexWorkerError) {
+        tracing::error!(%error, "compact filter index unavailable; other indexes continue");
+        *self.compact_filter_failure.write() = Some(error.to_string().into());
+        self.publish_leg(IndexCapabilities::COMPACT_FILTERS, ReconcileLeg::Forward);
+        self.wake();
     }
 
     /// Reads the wake revision.

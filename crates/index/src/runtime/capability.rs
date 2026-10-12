@@ -40,6 +40,11 @@ impl DerivedIndexCapability {
                 reason: message.to_string(),
             };
         }
+        if let Some(message) = runtime.compact_filter_failure.read().as_ref() {
+            return CapabilityState::Failed {
+                reason: message.to_string(),
+            };
+        }
         let engine = match lifecycle {
             DerivedIndexLifecycle::Opening => return CapabilityState::Opening,
             DerivedIndexLifecycle::ShutdownAbandoned => return CapabilityState::ShutdownAbandoned,

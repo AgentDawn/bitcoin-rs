@@ -1,13 +1,13 @@
 # Indexing contract
 
-**Contract version: 1.1** (2025-02-14)
+**Contract version: 1.2** (2026-10-13)
 
 The normative contract for node-owned indexing runtimes, capability gating, and
 asynchronous reconciliation across restarts, reorganizations, and selective
 rebuilds.
 
-This version adds the scheduling requirements in `IDX-08`; changes to those
-requirements must update this clause and its executable proof together.
+Changes to capability, persistence or scheduling requirements must update the
+owning clause and its executable proof together.
 
 Owners:
 - `DerivedIndexRuntime` and worker state in `crates/index/src/runtime.rs`;
@@ -228,13 +228,13 @@ unneeded funding record lists when callers only require history records.
   branch block pruned before rollback completed), the worker resets the
   affected capability watermark and initiates a fresh rebuild from the active
   chain.
-- A missing or unreadable undo record affects `ScriptLive` and `CompactFilters`. The
-  worker resets that capability and reseeds from the authoritative UTXO view
-  when compact filters are disabled; `TxLookup` and `ScriptHistory` use body-only
-  rollback. With `CompactFilters` enabled, missing undo instead fails the shared
-  index worker explicitly: a current UTXO snapshot cannot recreate spent scripts
-  for historical filters. Validation continues; queries on that worker become
-  unavailable until the required data is restored and the node restarted.
+- A missing or unreadable undo record affects `ScriptLive` and `CompactFilters`.
+  The worker resets `ScriptLive` and reseeds from the authoritative UTXO view;
+  `TxLookup` and `ScriptHistory` use body-only rollback. `CompactFilters` instead
+  becomes unavailable for this run: a current UTXO snapshot cannot recreate spent
+  scripts for historical filters. Its durable rows and watermark are preserved,
+  its queries refuse and its status is unsynced; sibling indexes and validation
+  continue. Restore the required history and restart to retry filter reconciliation.
 - When `ScriptLive` has no watermark after restoration or reset, the worker
   rebuilds it by scanning one stable authoritative UTXO view. Each seed batch
   and the watermark stamp are ordinary fenced writes (reset, revision, and
@@ -265,12 +265,12 @@ disconnected block's row before reconnecting the active branch.
 Activation after IBD backfills from genesis using the existing bounded batches.
 All required block bodies and undo records must be retained. Pruning and
 `blockfilterindex` are rejected together at configuration time. An already
-pruned prefix or missing undo fails explicitly; a filter watermark is never
+pruned prefix or missing undo makes only filters unavailable; a filter watermark is never
 anchored above missing history. Restore complete history before enabling it.
 
 `getblockfilter` serves only basic filters on the applied active chain. Unlike
 Core, disconnected filters are not retained for stale-block RPC lookups. A
-disabled index returns RPC -1, an unknown block or filter type returns -5, and
+disabled index returns RPC -1, a malformed hash returns -8, an unknown block or filter type returns -5, and
 catch-up/reconciliation returns RPC -1 with a retry reason rather than a
 partial filter or waiting for the index to synchronize.
 
@@ -279,14 +279,16 @@ without acquiring chain-transition authority. P2P streams at most one filter
 payload at a time under the send-headroom gate; header/checkpoint replies retain
 only commitments. Requests are bounded to 1,000 filters, 2,000 hashes, or 100,000
 checkpoint headers (below the 4 MB envelope). If the tip changes during streaming,
-already-sent filters still belong to the captured stop chain, but completion can
-be refused. Disabled, unavailable, unknown, non-basic and oversized requests
+already-sent filters still belong to the captured stop chain. A completed range
+is not replayed; an interrupted prefix closes the connection instead of silently
+abandoning the tail. Disabled, unavailable, unknown, non-basic and oversized requests
 receive no filter answer.
 To bridge a just-announced tip and asynchronous publication, a valid P2P request
-may wait up to five seconds on its own connection while the query reports retry.
-It stops waiting on backpressure or permanent failure, and never retries after
-streaming a payload. This does not block chain validation or generate filters
-synchronously.
+can be deferred for up to five seconds while the query reports retry. The existing
+socket poll retries one pending request per connection, so inbound traffic, ping
+and cancellation remain responsive. A second pending filter request or an expired
+deadline closes the connection. No response is replayed after streaming a payload;
+chain validation never waits and filters are never generated synchronously.
 
 Pinned Core vectors, durable reset/reopen tests, and the opt-in public-interface
 Core/Kyoto runner are described in

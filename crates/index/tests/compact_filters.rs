@@ -43,6 +43,18 @@ fn filter_rows_and_cursor_publish_atomically_and_reset_preserves_txindex()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(common::MemoryStore::default());
     let mut writer = IndexWriter::open(Arc::clone(&store), 1)?;
+    // The anchorless entry point must refuse capabilities that need undo,
+    // including a coinbase-only block whose filter could otherwise be built.
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    assert!(matches!(
+        writer.prepare_block_for(
+            IndexCapabilities::COMPACT_FILTERS,
+            0,
+            genesis.block_hash().to_byte_array(),
+            &serialize(&genesis)
+        ),
+        Err(IndexError::MissingSpentScripts)
+    ));
     let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Testnet);
     let hash = genesis.block_hash().to_byte_array();
     let caps = IndexCapabilities::TX_LOOKUP.with_compact_filters(true);

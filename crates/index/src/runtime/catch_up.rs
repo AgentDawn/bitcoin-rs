@@ -100,8 +100,9 @@ impl Worker {
         // lives no row at or above `start_height` is deleted, so a body that
         // reads back absent is transient absence rather than lost history,
         // and the pass never has to re-derive a prune line. A refusal is the
-        // owner's typed answer: `Pruned` is permanent and routes to a rebuild
-        // from what remains, while `Reserved` and the transient answers only
+        // owner's typed answer: `Pruned` disables filters (their header chain
+        // needs the full prefix); other indexes rebuild from what remains.
+        // `Reserved` and the transient answers only
         // wait — a reservation can abort and release its range, and a missing
         // row can still arrive.
         let pass_history = match self.history.request_history(start_height) {
@@ -116,9 +117,12 @@ impl Worker {
                 // re-derives from the frontier, so they cannot be carried.
                 *pending = None;
                 if capabilities.contains(IndexCapability::CompactFilters) {
-                    return Err(DerivedIndexWorkerError::HistoryUnavailable(
-                        HistoryUnavailable::Pruned { below },
-                    ));
+                    self.runtime.fail_compact_filters(
+                        &DerivedIndexWorkerError::HistoryUnavailable(HistoryUnavailable::Pruned {
+                            below,
+                        }),
+                    );
+                    return Ok(ReconcileAction::Progressed);
                 }
                 return self.rebuild_from_pruned(capabilities, below, target);
             }
@@ -200,6 +204,10 @@ impl Worker {
     /// the loaded prefix. Returns `Stalled` if a body is missing or shutdown
     /// was requested, `Progressed` if the batch filled and was committed, or
     /// `Continue` to keep processing.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep bounded preparation, capability failure and batch admission in one owner"
+    )]
     pub(super) fn prepare_and_admit_chunk(
         &self,
         identities: &mut &[BlockIdentity],
@@ -248,7 +256,9 @@ impl Worker {
                     Ok(anchor) => anchors.push(anchor),
                     Err(error @ DerivedIndexWorkerError::UndoUnavailable { .. }) => {
                         if capabilities.contains(IndexCapability::CompactFilters) {
-                            return Err(error);
+                            *pending = None;
+                            self.runtime.fail_compact_filters(&error);
+                            return Ok(ChunkAction::Progressed);
                         }
                         *pending = None;
                         self.writer

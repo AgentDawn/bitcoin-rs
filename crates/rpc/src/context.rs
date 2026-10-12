@@ -283,7 +283,7 @@ pub struct ContextHandles {
     pub chain: ChainHandles,
     /// Mempool capability: the mutation gateway in front of the pool.
     pub mempool: MempoolHandles,
-    /// Index capability: transaction and script index query adapters.
+    /// Index capability: transaction, script and compact-filter query adapters.
     pub indexes: IndexHandles,
     /// Network capability: peer registry, reachability, and connection control.
     pub network: NetworkHandles,

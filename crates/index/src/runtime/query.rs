@@ -307,6 +307,11 @@ impl DerivedIndexQueryEngine {
     {
         self.query_health()?;
         self.require_enabled(required)?;
+        if required.contains(IndexCapability::CompactFilters)
+            && let Some(reason) = self.runtime.compact_filter_failure.read().clone()
+        {
+            return Err(TxQueryError::Unavailable(reason));
+        }
 
         // Live answers compose the index snapshot, the authoritative UTXO set,
         // and the applied tip. Apply mutates UTXO before publishing that tip,
@@ -368,6 +373,11 @@ impl DerivedIndexQueryEngine {
         let result = f(snapshot.as_ref(), &tip_before, &mut budget, floors);
 
         self.query_health()?;
+        if required.contains(IndexCapability::CompactFilters)
+            && let Some(reason) = self.runtime.compact_filter_failure.read().clone()
+        {
+            return Err(TxQueryError::Unavailable(reason));
+        }
         let tip_after = self.applied_tip.load_full();
         let revision_after = self.runtime.revision();
         if revision_before != revision_after

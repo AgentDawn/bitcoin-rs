@@ -119,7 +119,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `preciousblock` | n/a | No manual block-preference surface. |
 | `reconsiderblock` | n/a | No manual reorg-control surface. |
 | `savemempool` | n/a | Mempool dump/reload persistence not implemented. |
-| `scanblocks` | n/a | No BIP157/158 filter index to scan. |
+| `scanblocks` | n/a | Scanning is not implemented; optional basic filters are available through getblockfilter. |
 | `help` | n/a | No per-method help text renderer. |
 | `logging` | n/a | Log-category controls not exposed over RPC. |
 | `stop` | n/a | Lifecycle control not exposed over RPC. |

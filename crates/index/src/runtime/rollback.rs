@@ -134,7 +134,10 @@ impl Worker {
         // body load and the live-anchor lookup.
         let lease = match self.history.request_history(watermark.height) {
             Ok(lease) => lease,
-            Err(HistoryUnavailable::Pruned { .. }) => {
+            Err(error @ HistoryUnavailable::Pruned { .. }) => {
+                if capabilities.contains(IndexCapability::CompactFilters) {
+                    return Err(DerivedIndexWorkerError::HistoryUnavailable(error));
+                }
                 return Err(DerivedIndexWorkerError::MissingBody {
                     height: watermark.height,
                     hash: watermark_hash,

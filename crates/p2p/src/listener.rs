@@ -148,14 +148,17 @@ pub struct ConnectionShared {
 
 impl ConnectionShared {
     fn advertised_services(&self) -> ServiceFlags {
+        let services = ServiceFlags::from(
+            self.local_services.to_u64() & !ServiceFlags::COMPACT_FILTERS.to_u64(),
+        );
         if self
             .chain_query
             .as_deref()
             .is_some_and(crate::ChainQuery::compact_filters_ready)
         {
-            self.local_services | ServiceFlags::COMPACT_FILTERS
+            services | ServiceFlags::COMPACT_FILTERS
         } else {
-            self.local_services
+            services
         }
     }
 
@@ -1641,6 +1644,33 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 
         compact_reconstruction.prune(Instant::now());
 
+        // Retry publication on the existing socket poll, keeping ping, inbound
+        // traffic and lease cancellation responsive while the index catches up.
+        if let Some((request, deadline)) = peer.pending_filter_request.take()
+            && let Some(chain) = shared.chain_query.as_deref()
+        {
+            if Instant::now() >= deadline {
+                return Err(crate::wire::PeerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "compact filter index publication timed out",
+                )));
+            }
+            if !chain.serve_compact_filters(
+                &request,
+                &|| !lease.is_cancelled() && budget.has_block_production_headroom(),
+                &mut |response| {
+                    lease
+                        .send(response)
+                        .map(|()| keepalive.record_send(Instant::now()))
+                        .map_err(|_| {
+                            crate::wire::PeerError::Protocol("outbound queue closed or saturated")
+                        })
+                },
+            )? {
+                peer.pending_filter_request = Some((request, deadline));
+            }
+        }
+
         let read_result = peer.read_message();
         if lease.is_cancelled() {
             tracing::debug!(peer_addr = %peer_addr, "p2p peer lease revoked during read; closing");
@@ -2751,6 +2781,21 @@ mod writer_shutdown_tests {
 
     fn ping_len() -> usize {
         crate::wire::wire_len(&crate::Message::Ping(9)).expect("ping encodes")
+    }
+
+    #[test]
+    fn unbacked_filter_service_bit_is_removed_from_handshake() {
+        let mut shared = test_shared(
+            Arc::new(crate::PeerTable::new()),
+            crossbeam_channel::unbounded().0,
+            crossbeam_channel::unbounded().0,
+        );
+        shared.local_services |= bitcoin::p2p::ServiceFlags::COMPACT_FILTERS;
+        assert!(
+            !shared
+                .advertised_services()
+                .has(bitcoin::p2p::ServiceFlags::COMPACT_FILTERS)
+        );
     }
 
     fn peer_info(addr: SocketAddr, start_height: i32) -> crate::PeerInfo {

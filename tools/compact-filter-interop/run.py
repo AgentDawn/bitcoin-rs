@@ -14,12 +14,6 @@ import urllib.error
 import urllib.request
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def wait_for(predicate, timeout=40):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -40,7 +34,10 @@ class Node:
     def __init__(self, binary, directory, core=False, filters=False, prune=False):
         self.directory = pathlib.Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.p2p, self.rpcport = free_port(), free_port()
+        self.reservations = [socket.socket(), socket.socket()]
+        for sock in self.reservations:
+            sock.bind(("127.0.0.1", 0))
+        self.p2p, self.rpcport = [sock.getsockname()[1] for sock in self.reservations]
         self.core = core
         self.process = None
         self.log_path = self.directory.with_suffix(".log")
@@ -56,6 +53,10 @@ class Node:
                 self.args += ["--prune-target-mb=550"]
 
     def start(self):
+        # Reserve distinct ports until the process is ready to bind them.
+        for sock in self.reservations:
+            sock.close()
+        self.reservations.clear()
         self.process = subprocess.Popen(self.args, stdout=self.log, stderr=self.log)
         def ready():
             if self.process.poll() is not None:
@@ -109,6 +110,9 @@ class Node:
         wait_for(ready)
 
     def stop(self, crash=False):
+        for sock in self.reservations:
+            sock.close()
+        self.reservations.clear()
         if self.process is not None and self.process.poll() is None:
             if crash:
                 self.process.kill()
@@ -248,7 +252,7 @@ def consumer(client, node, target, evidence, label):
     filters = [event for event in events if event["event"] == "filter"]
     assert len(filters) == target, len(filters)
     expected = node.batch("getblockfilter", [[event["hash"]] for event in filters])
-    for event, result in zip(filters, expected):
+    for event, result in zip(filters, expected, strict=True):
         assert bytes(event["bytes"]).hex() == result["filter"], event
     assert any(event["matched"] for event in filters), "watched same-block output was not found"
     assert events[-1] == {"event": "block", "height": target, "hash": node.rpc("getblockhash", target)}
@@ -364,7 +368,10 @@ def main():
                 try:
                     def synced():
                         assert live.poll() is None, live_log.read_text()
-                        return any(json.loads(line).get("event") == "synced" for line in live_path.read_text().splitlines())
+                        # The producer may still be writing its last JSON record.
+                        return any(json.loads(line).get("event") == "synced"
+                                   for line in live_path.read_text().splitlines(keepends=True)
+                                   if line.endswith("\n"))
                     wait_for(synced)
                     perform_reorg(core, node, last, evidence, report, blocks, args.client)
                     assert live.wait(timeout=100) == 0, live_log.read_text()

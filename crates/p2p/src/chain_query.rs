@@ -205,84 +205,76 @@ impl ChainQuery for ActiveChainQuery {
         request: &Message,
         headroom: &dyn Fn() -> bool,
         send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
-    ) -> Result<(), PeerError> {
+    ) -> Result<bool, PeerError> {
         use bitcoin::bip158::{FilterHash, FilterHeader};
         use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
         let Some(index) = &self.compact_filters else {
-            return Ok(());
+            return Ok(true);
         };
         if !headroom() {
-            return Ok(());
+            return Ok(true);
         }
         let (kind, start, stop, limit, step) = match request {
             Message::GetCFilters(r) => (r.filter_type, r.start_height, r.stop_hash, 1000, 1),
             Message::GetCFHeaders(r) => (r.filter_type, r.start_height, r.stop_hash, 2000, 1),
             Message::GetCFCheckpt(r) => (r.filter_type, 1000, r.stop_hash, u32::MAX, 1000),
-            _ => return Ok(()),
+            _ => return Ok(true),
         };
         if kind != 0 {
-            return Ok(());
+            return Ok(true);
         }
         let stop_hash = Hash256::from_le_bytes(stop.as_byte_array());
         let Some(end) = self.active_height(BlockHash(stop_hash)) else {
-            return Ok(());
+            return Ok(true);
         };
         if step == 1 && (end < start || end - start >= limit) {
-            return Ok(());
+            return Ok(true);
         }
         let mut hashes = Vec::new();
         let mut headers = Vec::new();
         let mut send_error = None;
-        // A committed tip can be announced before its asynchronous filter batch
-        // is published. Wait only on this connection, never on the apply path.
-        // Retry only before any payload was sent, so a moving tip cannot cause
-        // duplicate cfilters. Permanent failures and backpressure return at once.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let result = loop {
-            hashes.clear();
-            headers.clear();
-            let mut emitted = false;
-            let result = index.for_each_filter(start, stop_hash, step, &mut |hash, filter| {
-                if !headroom() {
-                    return false;
-                }
-                match request {
-                    Message::GetCFilters(_) => {
-                        emitted = true;
-                        if let Err(error) = send(Message::CFilter(CFilter {
-                            filter_type: 0,
-                            block_hash: bitcoin::BlockHash::from_byte_array(hash.to_le_bytes()),
-                            filter: filter.filter,
-                        })) {
-                            send_error = Some(error);
-                            return false;
-                        }
-                    }
-                    Message::GetCFHeaders(_) => {
-                        hashes.push(FilterHash::from_byte_array(filter.hash));
-                    }
-                    Message::GetCFCheckpt(_) => {
-                        headers.push(FilterHeader::from_byte_array(filter.header));
-                    }
-                    _ => {}
-                }
-                true
-            });
-            if matches!(result, Err(bitcoin_rs_index::TxQueryError::Retry))
-                && !emitted
-                && headroom()
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                continue;
+        let mut emitted = 0_u32;
+        let mut halted = false;
+        let result = index.for_each_filter(start, stop_hash, step, &mut |hash, filter| {
+            if !headroom() {
+                halted = true;
+                return false;
             }
-            break result;
-        };
+            match request {
+                Message::GetCFilters(_) => {
+                    if let Err(error) = send(Message::CFilter(CFilter {
+                        filter_type: 0,
+                        block_hash: bitcoin::BlockHash::from_byte_array(hash.to_le_bytes()),
+                        filter: filter.filter,
+                    })) {
+                        send_error = Some(error);
+                        return false;
+                    }
+                    emitted += 1;
+                }
+                Message::GetCFHeaders(_) => hashes.push(FilterHash::from_byte_array(filter.hash)),
+                Message::GetCFCheckpt(_) => {
+                    headers.push(FilterHeader::from_byte_array(filter.header));
+                }
+                _ => {}
+            }
+            true
+        });
         if let Some(error) = send_error {
             return Err(error);
         }
+        // Never replay a sent prefix or silently abandon its tail. A completed
+        // range remains complete even if the final snapshot check reports Retry.
+        if halted || (emitted > 0 && emitted != end - start + 1) {
+            return Err(PeerError::Io(std::io::Error::other(
+                "compact filter range interrupted",
+            )));
+        }
+        if emitted == 0 && matches!(result, Err(bitcoin_rs_index::TxQueryError::Retry)) {
+            return Ok(false);
+        }
         let Ok(Some(previous_header)) = result else {
-            return Ok(());
+            return Ok(true);
         };
         match request {
             Message::GetCFHeaders(_) => send(Message::CFHeaders(CFHeaders {
@@ -298,7 +290,7 @@ impl ChainQuery for ActiveChainQuery {
             }))?,
             _ => {}
         }
-        Ok(())
+        Ok(true)
     }
     fn headers_after(
         &self,
@@ -699,8 +691,8 @@ mod tests {
         WireBlockHash::from_byte_array(*hash.as_bytes())
     }
 
-    /// A newly announced block may precede filter publication; a snapshot that
-    /// changes after streaming must not cause duplicate payloads on the wire.
+    /// Publication lag defers without blocking; completed responses are never
+    /// replayed and an interrupted prefix terminates the connection.
     #[test]
     fn compact_filters_wait_for_publication_without_replaying_sent_payloads()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -756,21 +748,22 @@ mod tests {
             });
             let query = query_with(vec![header])?.with_compact_filters(Some(index.clone()));
             assert!(!query.compact_filters_ready());
-            let publisher = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(30));
-                index.ready.store(true, Ordering::Release);
-            });
             let request = Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
                 filter_type: 0,
                 start_height: 0,
                 stop_hash: wire_hash(header.compute_hash()),
             });
             let mut responses = Vec::new();
-            query.serve_compact_filters(&request, &|| true, &mut |message| {
-                responses.push(message);
-                Ok(())
-            })?;
-            publisher.join().map_err(|_| "publisher panicked")?;
+            assert!(!query.serve_compact_filters(&request, &|| true, &mut |_| {
+                panic!("pending publication must not emit a response")
+            })?);
+            index.ready.store(true, Ordering::Release);
+            assert!(
+                query.serve_compact_filters(&request, &|| true, &mut |message| {
+                    responses.push(message);
+                    Ok(())
+                })?
+            );
             assert!(query.compact_filters_ready());
             assert_eq!(responses.len(), 1);
             assert!(matches!(&responses[0], Message::CFilter(filter)
@@ -778,6 +771,18 @@ mod tests {
             query.serve_compact_filters(&request, &|| false, &mut |_| {
                 panic!("backpressured peer must not receive a filter")
             })?;
+            let headers = seed_headers(2);
+            let stop = headers[1].compute_hash();
+            let query = query_with(headers)?.with_compact_filters(Some(index));
+            let request = Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: wire_hash(stop),
+            });
+            assert!(matches!(
+                query.serve_compact_filters(&request, &|| true, &mut |_| Ok(())),
+                Err(PeerError::Io(_))
+            ));
         }
         Ok(())
     }

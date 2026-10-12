@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .response_timeout(Duration::from_secs(10))
         .build();
     let task = tokio::spawn(node.run());
+    let mut target_hash = None;
     let result = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             tokio::select! {
@@ -33,13 +34,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(warning) = client.warn_rx.recv() => eprintln!("{warning:?}"),
                 event = client.event_rx.recv() => match event.ok_or("consumer stopped before reaching target")? {
                     Event::IndexedFilter(filter) => {
+                        if filter.height() == height { target_hash = Some(filter.block_hash()); }
                         let matched = filter.contains_any(std::iter::once(&watched));
                         println!("{}", json!({"event": "filter", "height": filter.height(), "hash": filter.block_hash().to_string(), "matched": matched, "bytes": filter.into_contents()}));
                     },
                     Event::FiltersSynced(update) => {
                         println!("{}", json!({"event": "synced", "height": update.tip.height, "hash": update.tip.hash.to_string()}));
                         if update.tip.height >= height {
-                            let block = client.requester.get_block(update.tip.hash).await?;
+                            let block = client.requester.get_block(target_hash.ok_or("target filter was not received")?).await?;
+                            if block.height != height { return Err("fetched block does not match target height".into()); }
                             println!("{}", json!({"event": "block", "height": block.height, "hash": block.block.block_hash().to_string()}));
                             return Ok::<(), Box<dyn std::error::Error>>(());
                         }

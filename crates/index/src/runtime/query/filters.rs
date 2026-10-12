@@ -85,7 +85,7 @@ impl CompactFilterQuery for DerivedIndexQueryEngine {
         self.require_enabled(IndexCapabilities::COMPACT_FILTERS)?;
         let progress = self.index_progress_for(IndexCapabilities::COMPACT_FILTERS)?;
         Ok(DerivedIndexInfo {
-            synced: progress.synced,
+            synced: progress.synced && self.runtime.compact_filter_failure.read().is_none(),
             best_block_height: progress.processed_height,
         })
     }

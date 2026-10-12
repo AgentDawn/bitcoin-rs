@@ -1157,7 +1157,8 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
 pub(crate) fn getblockfilter(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let bound = super::bind_named_params(params, &["blockhash", "filtertype"])?;
     let params = bound.as_ref();
-    let hash = parse_hash(required_str(params, 0, "block hash is required")?)?;
+    let hash = parse_hash(required_str(params, 0, "block hash is required")?)
+        .map_err(|error| RpcError::InvalidParameter(error.to_string()))?;
     let args = params_array(params)?;
     if args.len() > 2 {
         return Err(RpcError::InvalidParams(
@@ -1211,6 +1212,7 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         .indexes
         .derived_index
         .as_ref()
+        .filter(|_| index_name.as_deref().is_none_or(|name| name == "txindex"))
         .map(|derived_index| derived_index.index_info())
         .transpose()?;
     let txindex_entry = txindex_entry.map(|info| v31::GetIndexInfoName {
@@ -1221,8 +1223,12 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     if let Some(entry) = txindex_entry {
         indexes.insert("txindex".to_owned(), entry);
     }
-    if let Some(filters) = &ctx.indexes.compact_filters {
-        let info = filters.filter_index_info()?;
+    if let Some(filters) = &ctx.indexes.compact_filters
+        && index_name
+            .as_deref()
+            .is_none_or(|name| name == "basic block filter index")
+        && let Ok(info) = filters.filter_index_info()
+    {
         indexes.insert(
             "basic block filter index".to_owned(),
             v31::GetIndexInfoName {

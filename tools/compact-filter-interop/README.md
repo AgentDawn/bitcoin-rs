@@ -63,7 +63,7 @@ distributed under Bitcoin Core's MIT license. Run it with
 
 Enable serving with `--blockfilterindex` (boolean; default false). Only basic
 filters on the active chain are supported. Catch-up/reconciliation refuses
-queries instead of returning partial data; missing undo or a pruned prefix fails
-the shared derived-index worker explicitly without blocking validation. Restore
+queries instead of returning partial data; missing undo or a pruned prefix makes
+only filters unavailable, preserving their rows while sibling indexes and validation continue. Restore
 the required history and restart. Stale-block filters and `scanblocks` are not
 implemented. See [the indexing contract](../../docs/contracts/indexing.md).

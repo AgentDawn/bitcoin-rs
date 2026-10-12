@@ -114,7 +114,7 @@ impl IndexCapability {
         }
     }
 
-    /// POST: the display name (`tx_lookup`, `script_history`, `script_live`).
+    /// POST: the display name (`tx_lookup`, `script_history`, `script_live`, `compact_filters`).
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::TxLookup => "tx_lookup",
@@ -443,6 +443,15 @@ mod tests {
                 &[ColumnFamily::ScriptLive][..],
                 "script_live",
                 "script live is disabled",
+            ),
+            (
+                IndexCapability::CompactFilters,
+                0b1000,
+                3,
+                &[0, b'F'][..],
+                &[][..],
+                "compact_filters",
+                "blockfilterindex is disabled",
             ),
         ] {
             assert_eq!(capability.bit(), bit);

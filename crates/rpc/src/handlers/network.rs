@@ -125,7 +125,8 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         proxy_randomize_credentials: false,
     })
     .collect::<Vec<_>>();
-    let mut local_services = ctx.network.local_services;
+    let mut local_services =
+        ctx.network.local_services & !bitcoin::p2p::ServiceFlags::COMPACT_FILTERS.to_u64();
     if ctx
         .indexes
         .compact_filters
