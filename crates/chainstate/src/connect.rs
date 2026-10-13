@@ -1,11 +1,11 @@
 //! Validated block connection and its ordered persistence/publication transaction.
 
+use super::SameBlockSpentSet;
 use super::durable::{
     ConnectCommitFacts, commit_connect_head, stored_body_row, sync_appended_blocks,
 };
 use super::prepare::{prepare_apply, verify_block_transactions};
-use super::publication::{publish_applied, tx_count_delta_for};
-use super::scratch::ApplyScratch;
+use super::tx_count_delta_for;
 use super::window::{PendingBlockCommit, PublishMode};
 use super::{
     ApplyFinish, ApplyIntent, Bip68Context, BlockLocalUtxoView, BlockProvenance, BlockTxPlan,
@@ -21,6 +21,66 @@ use bitcoin_rs_storage::CommitRecords;
 use bitcoin_rs_utxo::contract::{BlockChangeError, build_block_changes};
 use hashbrown::HashMap;
 use std::sync::Arc;
+
+struct ApplyScratch {
+    txids: Vec<Txid>,
+    raw_txs: Option<Vec<Vec<u8>>>,
+    same_block_spent: Option<SameBlockSpentSet>,
+    utxo_add_capacity: usize,
+    utxo_remove_capacity: usize,
+}
+
+impl ApplyScratch {
+    fn from_prepared_parts(
+        block: &Block,
+        include_raw_txs: bool,
+        txids: Vec<Txid>,
+        tx_plan: crate::BlockTxPlan,
+    ) -> Self {
+        debug_assert_eq!(txids.len(), block.txs.len());
+        let mut raw_txs = include_raw_txs.then(|| Vec::with_capacity(block.txs.len()));
+
+        if let Some(raw_txs) = &mut raw_txs {
+            for tx in &block.txs {
+                raw_txs.push(consensus_bytes(tx));
+            }
+        }
+        let same_block_spent_len = tx_plan
+            .same_block_spent
+            .as_ref()
+            .map_or(0_usize, SameBlockSpentSet::len);
+        let utxo_add_capacity = tx_plan
+            .created_output_count
+            .saturating_sub(same_block_spent_len);
+        let utxo_remove_capacity = tx_plan
+            .spent_input_count
+            .saturating_sub(tx_plan.same_block_spent_input_count);
+        Self {
+            txids,
+            raw_txs,
+            same_block_spent: tx_plan.same_block_spent,
+            utxo_add_capacity,
+            utxo_remove_capacity,
+        }
+    }
+
+    fn txids(&self) -> &[Txid] {
+        &self.txids
+    }
+
+    /// Takes the derived-consumer payloads out of scratch after the UTXO commit.
+    fn into_payloads(self) -> (Vec<Txid>, Option<Vec<Vec<u8>>>) {
+        (self.txids, self.raw_txs)
+    }
+
+    fn same_block_spent(&self) -> Option<&SameBlockSpentSet> {
+        self.same_block_spent.as_ref()
+    }
+
+    fn utxo_change_capacity(&self) -> (usize, usize) {
+        (self.utxo_add_capacity, self.utxo_remove_capacity)
+    }
+}
 
 /// Commit path. Callers reach this only through an admitted chain transition.
 pub(super) fn apply_committed_block_admitted<'b>(
@@ -591,7 +651,7 @@ pub(super) fn apply_block_admitted<'b>(
         ),
         height,
     );
-    publish_applied(handles, &outcome.tip, crate::events::HintKind::Connected);
+    handles.publish_applied(&outcome.tip, crate::events::HintKind::Connected);
     outcome.commit_id = commit_id;
     Ok(ApplyFinish::Committed(Box::new(outcome)))
 }

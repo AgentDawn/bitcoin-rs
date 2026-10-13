@@ -2,19 +2,55 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_primitives::Hash256;
-use hashbrown::HashTable;
+use hashbrown::{HashMap, HashTable};
+use parking_lot::RwLock;
 use slab::Slab;
 
 use crate::{
-    ChainError, ChainTxCount,
-    bip9_cache::Bip9Cache,
+    ChainError, ChainTxCount, TipSnapshot,
     node::{BlockHeader, BlockTreeNode, NodeId, NodeStatus},
-    tip::TipSnapshot,
 };
 
 #[path = "active_index.rs"]
 mod active_index;
 use active_index::ActiveHeightIndex;
+
+/// Cached BIP9 deployment-state lookup.
+///
+/// Wraps an interior `RwLock<HashMap>` so the cache is `Send + Sync` and the
+/// reader/writer paths are non-blocking under contention. State is stored as
+/// a stable `u8` tag supplied by the deployment-state encoder in consensus;
+/// the chain crate does not interpret it.
+///
+/// PRE: a tag is the deployment state's encoded discriminant.
+/// POST: cache readers obtain the same tag for a live `(node_id, deployment_id)`.
+/// INVARIANT: Branch invalidation discards entries by node, not by height.
+#[derive(Default)]
+struct Bip9Cache {
+    entries: RwLock<HashMap<(NodeId, u32), u8>>,
+}
+
+impl Bip9Cache {
+    /// Inserts or updates the cached state for `(node_id, deployment_id)`.
+    fn insert(&self, node_id: NodeId, deployment_id: u32, tag: u8) {
+        self.entries.write().insert((node_id, deployment_id), tag);
+    }
+
+    /// Returns the cached state tag for `(node_id, deployment_id)`, if any.
+    #[must_use]
+    fn get(&self, node_id: NodeId, deployment_id: u32) -> Option<u8> {
+        self.entries.read().get(&(node_id, deployment_id)).copied()
+    }
+
+    /// Removes all deployment states selected by the tree's node-indexed
+    /// invalidation bitmap in one cache scan.
+    fn invalidate_nodes(&self, invalid: &[bool]) {
+        self.entries.write().retain(|(id, _), _| {
+            id.index()
+                .is_none_or(|index| invalid.get(index) != Some(&true))
+        });
+    }
+}
 
 /// In-memory block tree keyed by compact slab ids and header hashes.
 pub struct BlockTree {

@@ -1,6 +1,6 @@
 //! Exact serialized-body validation, transaction planning, and resolved prevout preparation.
 
-use super::scratch::SameBlockSpentSet;
+use super::SameBlockSpentSet;
 use super::{
     BlockLocalUtxoView, BlockProvenance, BlockTxPlan, BlockValidationContext, ByteEquality,
     Chainstate, LOCAL_OVERLAY_TXID_SET_THRESHOLD, PreparedApply, ResolvedUtxoView,
