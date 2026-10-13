@@ -102,6 +102,7 @@ fn derive(tx: &Tx, scripts: &[Script]) -> Result<Option<TransactionTweak>> {
     Ok(transaction_tweak(
         tx,
         &scripts.iter().map(Some).collect::<Vec<_>>(),
+        true,
     )?)
 }
 
@@ -154,14 +155,17 @@ fn pinned_bip352_public_vectors() -> Result {
 #[test]
 fn missing_prevouts_never_become_empty_success() -> Result {
     let (mut tx, scripts, _) = sample()?;
-    assert_eq!(transaction_tweak(&tx, &[]), Err(TweakError::PrevoutCount));
     assert_eq!(
-        transaction_tweak(&tx, &[Some(&scripts[0]), None]),
+        transaction_tweak(&tx, &[], true),
+        Err(TweakError::PrevoutCount)
+    );
+    assert_eq!(
+        transaction_tweak(&tx, &[Some(&scripts[0]), None], true),
         Err(TweakError::Unavailable { input: 1 })
     );
     tx.outputs.clear();
     assert_eq!(
-        transaction_tweak(&tx, &[Some(&scripts[0]), None]),
+        transaction_tweak(&tx, &[Some(&scripts[0]), None], true),
         Err(TweakError::Unavailable { input: 1 })
     );
     assert!(derive(&tx, &scripts)?.is_none());
@@ -326,20 +330,20 @@ fn view(tx: Tx, scripts: &[Script]) -> BlockSpends {
 fn retained_block_projection_is_hash_scoped_and_deterministic() -> Result {
     let (tx, scripts, material) = sample()?;
     let mut view = view(tx, &scripts);
-    let first = block_tweaks(&view)?;
+    let first = block_tweaks(&view, true)?;
     assert_eq!(first.transactions, vec![material]);
     assert_eq!(first.hash, view.block.block_hash());
-    assert_eq!(block_tweaks(&view)?, first);
+    assert_eq!(block_tweaks(&view, true)?, first);
     view.block.header.nonce ^= 1;
-    let replacement = block_tweaks(&view)?;
+    let replacement = block_tweaks(&view, true)?;
     assert_ne!(replacement.hash, first.hash);
     assert_eq!(replacement.transactions, first.transactions);
     // Replaying the original body has no cache/cursor to recover or invalidate.
     view.block.header.nonce ^= 1;
-    assert_eq!(block_tweaks(&view)?, first);
+    assert_eq!(block_tweaks(&view, true)?, first);
     view.spent.as_mut().map_err(|_| "spent")?[0].reverse();
     assert!(matches!(
-        block_tweaks(&view),
+        block_tweaks(&view, true),
         Err(BlockSpendsError::Corrupt(_))
     ));
     Ok(())
@@ -352,7 +356,11 @@ fn incomplete_history_is_typed_even_for_empty_blocks() -> Result {
         spent: Ok(vec![]),
     };
     assert_eq!(
-        block_tweaks(&view)?.transactions,
+        block_tweaks(&view, true)?.transactions,
+        Vec::<TransactionTweak>::new()
+    );
+    assert_eq!(
+        block_tweaks(&view, false)?.transactions,
         Vec::<TransactionTweak>::new()
     );
     for reason in [
@@ -363,12 +371,15 @@ fn incomplete_history_is_typed_even_for_empty_blocks() -> Result {
     ] {
         view.spent = Err(reason);
         assert!(
-            matches!(block_tweaks(&view), Err(BlockSpendsError::History(actual)) if actual == reason)
+            matches!(block_tweaks(&view, true), Err(BlockSpendsError::History(actual)) if actual == reason)
+        );
+        assert!(
+            matches!(block_tweaks(&view, false), Err(BlockSpendsError::History(actual)) if actual == reason)
         );
     }
     view.spent = Ok(vec![vec![]]);
     assert!(matches!(
-        block_tweaks(&view),
+        block_tweaks(&view, true),
         Err(BlockSpendsError::Corrupt(_))
     ));
     Ok(())
@@ -384,18 +395,57 @@ fn materialization_limits_fail_explicitly() -> Result {
     );
     let oversized_view = view(tx.clone(), &scripts);
     assert!(matches!(
-        block_tweaks(&oversized_view),
+        block_tweaks(&oversized_view, true),
         Err(BlockSpendsError::ResourceLimit)
     ));
     scripts[0] = Script::new();
     tx.outputs[0].script_pubkey = vec![0x51; MAX_BODY_BYTES + 1].into();
     assert!(matches!(
-        transaction_tweak(&tx, &[]),
+        transaction_tweak(&tx, &[], true),
         Err(TweakError::ResourceLimit)
     ));
     assert!(matches!(
-        block_tweaks(&view(tx, &scripts)),
+        block_tweaks(&view(tx, &scripts), true),
         Err(BlockSpendsError::ResourceLimit)
+    ));
+    Ok(())
+}
+
+#[test]
+fn pre_activation_witness_v1_spends_produce_no_tweaks_without_failing() -> Result {
+    let tx = Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid::default(), 0),
+            witness: Witness::new(), // Pre-activation consensus allowed empty witness on v1
+            ..TxIn::default()
+        }],
+        outputs: vec![TxOut {
+            script_pubkey: [vec![0x51, 0x20], vec![0x33; 32]].concat().into(),
+            value: Amount::from_sat(1000),
+        }],
+        ..Tx::default()
+    };
+    let v1_prevout: Script = [vec![0x51, 0x20], vec![0x44; 32]].concat().into();
+    let scripts = [Some(&v1_prevout)];
+
+    // Pre-activation: caller specifies taproot_active = false.
+    // Transaction produces no tweaks and block projection succeeds with empty tweaks.
+    assert_eq!(transaction_tweak(&tx, &scripts, false)?, None);
+    let view_inactive = view(tx.clone(), std::slice::from_ref(&v1_prevout));
+    let tweaks_inactive = block_tweaks(&view_inactive, false)?;
+    assert_eq!(tweaks_inactive.transactions.len(), 0);
+
+    // Post-activation: caller specifies taproot_active = true.
+    // The empty witness is now an invalid Taproot spend, failing as corrupt material.
+    assert_eq!(
+        transaction_tweak(&tx, &scripts, true),
+        Err(TweakError::InvalidInput { input: 0 })
+    );
+    let view_active = view(tx, std::slice::from_ref(&v1_prevout));
+    assert!(matches!(
+        block_tweaks(&view_active, true),
+        Err(BlockSpendsError::Corrupt(_))
     ));
     Ok(())
 }

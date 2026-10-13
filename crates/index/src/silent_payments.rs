@@ -66,8 +66,13 @@ pub enum TweakError {
     ResourceLimit,
 }
 
-/// Derives public material from a validated transaction and exact input-ordered
+/// Projects one consensus-validated transaction using caller-supplied exact
 /// prevout scripts. `None` means BIP352 v0 ineligibility, never incomplete history.
+///
+/// When `taproot_active` is false, pre-activation witness v1 scripts are unassigned
+/// programs rather than BIP341 Taproot outputs; the transaction produces no tweaks
+/// without misinterpreting pre-activation witness spends. When true, Taproot witness
+/// shape rules are enforced.
 ///
 /// Native witness programs with version greater than one exclude the whole
 /// transaction. Unsupported scripts and uncompressed keys contribute no key.
@@ -78,14 +83,16 @@ pub enum TweakError {
 pub fn transaction_tweak(
     tx: &Tx,
     prevouts: &[Option<&Script>],
+    taproot_active: bool,
 ) -> Result<Option<TransactionTweak>, TweakError> {
     let secp = Secp256k1::verification_only();
-    transaction_tweak_with_ctx(tx, prevouts, &secp)
+    transaction_tweak_with_ctx(tx, prevouts, taproot_active, &secp)
 }
 
 fn transaction_tweak_with_ctx<C: secp256k1::Verification>(
     tx: &Tx,
     prevouts: &[Option<&Script>],
+    taproot_active: bool,
     secp: &Secp256k1<C>,
 ) -> Result<Option<TransactionTweak>, TweakError> {
     if tx.total_size() > MAX_BODY_BYTES {
@@ -106,6 +113,9 @@ fn transaction_tweak_with_ctx<C: secp256k1::Verification>(
         if bytes > MAX_PREVOUT_BYTES {
             return Err(TweakError::ResourceLimit);
         }
+    }
+    if !taproot_active {
+        return Ok(None);
     }
     let outputs = tx
         .outputs
@@ -174,10 +184,16 @@ fn transaction_tweak_with_ctx<C: secp256k1::Verification>(
 ///
 /// The caller obtains `view` directly from `BlockUndoSource::block_spends` with
 /// its captured applied hash. That owner checks receipts/leases and body/witness
-/// commitments. The caller owns active-chain height resolution and publication
-/// rechecks after projection: this codec only claims the returned body's hash.
+/// commitments. The caller owns active-chain height resolution, Taproot consensus
+/// activation status (`taproot_active`), and publication rechecks after projection:
+/// this codec only claims the returned body's hash.
+/// When `taproot_active` is false, pre-activation history returns empty tweaks
+/// without rejecting pre-activation witness v1 spends as corrupt.
 /// Missing/pruned/snapshot history retains its typed failure even for empty blocks.
-pub fn block_tweaks(view: &BlockSpends) -> Result<BlockTweaks, BlockSpendsError> {
+pub fn block_tweaks(
+    view: &BlockSpends,
+    taproot_active: bool,
+) -> Result<BlockTweaks, BlockSpendsError> {
     let spent = view
         .spent
         .as_ref()
@@ -195,6 +211,12 @@ pub fn block_tweaks(view: &BlockSpends) -> Result<BlockTweaks, BlockSpendsError>
     });
     if bytes > MAX_PREVOUT_BYTES {
         return Err(BlockSpendsError::ResourceLimit);
+    }
+    if !taproot_active {
+        return Ok(BlockTweaks {
+            hash: view.block.block_hash(),
+            transactions: Vec::new(),
+        });
     }
     let secp = Secp256k1::verification_only();
     let mut transactions = Vec::new();
@@ -220,7 +242,7 @@ pub fn block_tweaks(view: &BlockSpends) -> Result<BlockTweaks, BlockSpendsError>
             .iter()
             .map(|coin| Some(&coin.txout.script_pubkey))
             .collect();
-        match transaction_tweak_with_ctx(tx, &scripts, &secp) {
+        match transaction_tweak_with_ctx(tx, &scripts, true, &secp) {
             Ok(Some(tweak)) => transactions.push(tweak),
             Ok(None) => {}
             Err(TweakError::ResourceLimit) => return Err(BlockSpendsError::ResourceLimit),

@@ -14,11 +14,15 @@ The [WIP index-server specification](https://github.com/silent-payments/BIP0352-
 is separately pinned to `dc705a055e72024e332e232cf038c96afd42d50e`.
 Its JSON examples do not define BIP352 cryptography.
 
-Given a **consensus-validated** transaction and exact input-ordered prevout
-scripts, the codec requires a P2TR output and an eligible input. Spending a
-native witness program with version greater than one excludes the whole
-transaction (`coin.out.scriptPubKey.IsWitnessProgram && version > 1`, matching
-Core `src/common/bip352.cpp`). Inputs spending non-v0 P2SH programs (including
+Given a **consensus-validated** transaction, exact input-ordered prevout scripts,
+and an explicit Taproot activation status (`taproot_active`), the codec requires
+a P2TR output and an eligible input. When Taproot is not active, pre-activation
+native witness v1 scripts are unassigned programs rather than BIP341 Taproot
+outputs: the transaction produces no tweaks, and blocks return empty tweaks
+without misinterpreting pre-activation witness spends as corrupt. When Taproot
+is active, spending a native witness program with version greater than one
+excludes the whole transaction (`coin.out.scriptPubKey.IsWitnessProgram && version > 1`,
+matching Core `src/common/bip352.cpp`). Inputs spending non-v0 P2SH programs (including
 P2SH-wrapped future witness scripts) contribute no key to shared-secret derivation
 rather than disqualifying other eligible inputs. It extracts compressed keys from
 P2PKH (hash-matching even malleated scriptSigs), P2WPKH and P2SH-P2WPKH.
@@ -66,8 +70,9 @@ or second UTXO owner is needed.
 
 The codec checks row counts and outpoint alignment and returns the body's exact
 hash. It makes no unverified height or active-tip claim. A future adapter must
-resolve height/hash on one applied ancestry and recheck publication after
-projection; a completed source read cannot prevent a subsequent tip move.
+resolve height/hash and Taproot activation on one applied ancestry and recheck
+publication after projection; `BlockSpends` does not carry activation context or
+height, and a completed source read cannot prevent a subsequent tip move.
 
 | Situation | Coverage and error policy |
 | --- | --- |
