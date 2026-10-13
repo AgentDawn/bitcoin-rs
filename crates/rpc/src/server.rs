@@ -1,8 +1,9 @@
 use alloc::sync::Arc;
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, IoSlice, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
@@ -13,6 +14,9 @@ use crate::error::RpcError;
 use crate::handlers::Handler;
 
 const MAX_HEADER_BYTES: usize = 16 * 1_024;
+const MAX_CONNECTIONS_PER_IP: usize = 16;
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 
@@ -88,12 +92,12 @@ impl RpcServer {
         self.handler
             .configure_blocking_admission(self.max_connections);
         self.listener.set_nonblocking(true)?;
-        let active = Arc::new(Mutex::new(0_usize));
+        let active = Arc::new(Mutex::new(ActiveConnections::default()));
         while !shutdown.is_triggered() {
             match self.listener.accept() {
-                Ok((stream, _addr)) => {
+                Ok((stream, addr)) => {
                     stream.set_nonblocking(false)?;
-                    if let Err(error) = self.handle_accept(&active, stream) {
+                    if let Err(error) = self.handle_accept(&active, stream, addr.ip()) {
                         debug!(%error, "rpc connection setup failed");
                     }
                 }
@@ -108,7 +112,12 @@ impl RpcServer {
         Ok(())
     }
 
-    fn handle_accept(&self, active: &Arc<Mutex<usize>>, stream: TcpStream) -> io::Result<()> {
+    fn handle_accept(
+        &self,
+        active: &Arc<Mutex<ActiveConnections>>,
+        stream: TcpStream,
+        peer: IpAddr,
+    ) -> io::Result<()> {
         // Connection-local: a nodelay failure must not stop the accept loop.
         let mut stream = match prepare_http_socket(stream) {
             Ok(stream) => stream,
@@ -117,21 +126,16 @@ impl RpcServer {
                 return Ok(());
             }
         };
-        let should_accept = {
-            let mut count = active.lock();
-            if *count >= self.max_connections {
-                false
-            } else {
-                *count += 1;
-                true
-            }
-        };
+        let should_accept = active.lock().admit(peer, self.max_connections);
         if !should_accept {
             write_status(&mut stream, 503, "Service Unavailable", b"busy", false)?;
             return Ok(());
         }
 
-        let permit = ConnectionPermit(Arc::clone(active));
+        let permit = ConnectionPermit {
+            active: Arc::clone(active),
+            peer,
+        };
         let auth = Arc::clone(&self.auth);
         let handler = Arc::clone(&self.handler);
         let rest_enabled = self.rest_enabled;
@@ -150,11 +154,52 @@ impl RpcServer {
     }
 }
 
-struct ConnectionPermit(Arc<Mutex<usize>>);
+#[derive(Default)]
+struct ActiveConnections {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+impl ActiveConnections {
+    fn admit(&mut self, peer: IpAddr, max_connections: usize) -> bool {
+        // Leave at least one slot for another peer, including with small
+        // configured pools. One IP cannot claim the entire production pool.
+        let per_ip_limit = max_connections
+            .saturating_sub(1)
+            .clamp(1, MAX_CONNECTIONS_PER_IP);
+        if self.total >= max_connections
+            || self
+                .per_ip
+                .get(&peer)
+                .is_some_and(|&count| count >= per_ip_limit)
+        {
+            return false;
+        }
+        self.total += 1;
+        *self.per_ip.entry(peer).or_default() += 1;
+        true
+    }
+
+    fn release(&mut self, peer: IpAddr) {
+        let Some(count) = self.per_ip.get_mut(&peer) else {
+            unreachable!("connection released without admission");
+        };
+        self.total -= 1;
+        *count -= 1;
+        if *count == 0 {
+            self.per_ip.remove(&peer);
+        }
+    }
+}
+
+struct ConnectionPermit {
+    active: Arc<Mutex<ActiveConnections>>,
+    peer: IpAddr,
+}
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        *self.0.lock() -= 1;
+        self.active.lock().release(self.peer);
     }
 }
 
@@ -166,6 +211,50 @@ impl Drop for RpcStop {
     }
 }
 
+/// Applies a single wall-clock budget across all socket reads for a request
+/// phase. A trickle of bytes cannot restart this deadline as with SO_RCVTIMEO.
+struct RequestDeadlineStream {
+    stream: TcpStream,
+    idle_timeout: Duration,
+    deadline: Instant,
+}
+
+impl RequestDeadlineStream {
+    fn new(stream: TcpStream, idle_timeout: Duration) -> Self {
+        Self {
+            stream,
+            idle_timeout,
+            deadline: Instant::now() + REQUEST_HEAD_TIMEOUT,
+        }
+    }
+
+    fn reset_deadline(&mut self, budget: Duration) {
+        self.deadline = Instant::now() + budget;
+    }
+
+    fn socket_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+}
+
+impl Read for RequestDeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP request deadline exceeded",
+            ));
+        }
+        self.stream
+            .set_read_timeout(Some(self.idle_timeout.min(remaining)))?;
+        self.stream.read(buffer)
+    }
+}
+
 fn serve_connection(
     stream: TcpStream,
     auth: &Auth,
@@ -173,14 +262,14 @@ fn serve_connection(
     rest_enabled: bool,
     idle_timeout: Duration,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(idle_timeout))?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(RequestDeadlineStream::new(stream, idle_timeout));
     loop {
         if handler.is_stopping() {
             return Ok(());
         }
-        let request = match read_request(&mut reader) {
+        reader.get_mut().reset_deadline(REQUEST_HEAD_TIMEOUT);
+        let request = match read_request(&mut reader, REQUEST_BODY_TIMEOUT) {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(RequestReadError::RestBodyTooLarge) => {
@@ -189,14 +278,14 @@ fn serve_connection(
                 } else {
                     crate::rest::not_found()
                 };
-                write_response(reader.get_mut(), &response, false, CorsPolicy::Disabled)?;
+                write_response(reader.get_mut().socket_mut(), &response, false, CorsPolicy::Disabled)?;
                 return Ok(());
             }
             Err(RequestReadError::Io(error)) => {
                 let rpc_error = RpcError::InvalidRequest("malformed http request");
                 let response =
                     JsonRpcVersion::Legacy.error_response(&rpc_error, &Value::new_null());
-                write_json(reader.get_mut(), 400, "Bad Request", &response, false)?;
+                write_json(reader.get_mut().socket_mut(), 400, "Bad Request", &response, false)?;
                 return Err(error);
             }
         };
@@ -204,7 +293,13 @@ fn serve_connection(
             return Ok(());
         }
         let keep_alive = request.keep_alive;
-        if dispatch_http_request(reader.get_mut(), &request, auth, handler, rest_enabled)? {
+        if dispatch_http_request(
+            reader.get_mut().socket_mut(),
+            &request,
+            auth,
+            handler,
+            rest_enabled,
+        )? {
             return Ok(());
         }
         if !keep_alive {
@@ -304,7 +399,7 @@ fn read_head_line(reader: &mut impl BufRead, remaining: usize) -> io::Result<(St
 /// Reads header lines until the blank terminator, enforcing the header size
 /// ceiling and capturing the three headers the demux consumes.
 fn read_headers(
-    reader: &mut BufReader<TcpStream>,
+    reader: &mut BufReader<RequestDeadlineStream>,
     mut header_bytes: usize,
 ) -> io::Result<(usize, Option<usize>, Option<String>, bool)> {
     let mut content_length = None;
@@ -367,7 +462,8 @@ impl From<io::Error> for RequestReadError {
 }
 
 fn read_request(
-    reader: &mut BufReader<TcpStream>,
+    reader: &mut BufReader<RequestDeadlineStream>,
+    body_timeout: Duration,
 ) -> Result<Option<HttpRequest>, RequestReadError> {
     let (request_line, bytes) = read_head_line(reader, MAX_HEADER_BYTES)?;
     if bytes == 0 {
@@ -428,6 +524,7 @@ fn read_request(
     {
         return Err(RequestReadError::RestBodyTooLarge);
     }
+    reader.get_mut().reset_deadline(body_timeout);
     let mut body = vec![0_u8; content_length];
     reader.read_exact(&mut body)?;
     Ok(Some(HttpRequest {
@@ -903,6 +1000,81 @@ mod tests {
         client.read_to_end(&mut response)?;
         let _result = join.join().expect("server thread");
         Ok(response)
+    }
+
+    /// A peer continuously writes a byte before the idle timeout expires.
+    /// Request-line, header, and body parsing must still expire promptly.
+    fn assert_dripped_request_expires(prefix: &[u8]) -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.set_nodelay(true)?;
+        let (server, _) = listener.accept()?;
+        client.write_all(prefix)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
+        let writer = thread::spawn(move || {
+            for _ in 0..80 {
+                if stop_writer.load(Ordering::Acquire) || client.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            let _ = client.shutdown(Shutdown::Write);
+        });
+
+        let mut reader =
+            BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(3)));
+        reader.get_mut().reset_deadline(Duration::from_millis(200));
+        let start = Instant::now();
+        let result = read_request(&mut reader, Duration::from_millis(200));
+        stop.store(true, Ordering::Release);
+        writer.join().expect("writer thread");
+        assert!(
+            start.elapsed() < Duration::from_millis(1_500),
+            "request exceeded its wall-clock budget"
+        );
+        match result {
+            Err(RequestReadError::Io(error)) => assert!(
+                matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+                "unexpected read error: {error}"
+            ),
+            Err(RequestReadError::RestBodyTooLarge) => panic!("unexpected size rejection"),
+            Ok(_) => panic!("incomplete request was accepted"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn slow_drip_request_line_headers_and_body_expire() -> io::Result<()> {
+        for prefix in [
+            b"GET /".as_slice(),
+            b"GET / HTTP/1.1\r\nX-Slow: ".as_slice(),
+            b"POST / HTTP/1.1\r\nContent-Length: 256\r\n\r\n".as_slice(),
+        ] {
+            assert_dripped_request_expires(prefix)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn connection_admission_reserves_slots_for_other_peers() {
+        let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let other = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let mut active = ActiveConnections::default();
+        for _ in 0..MAX_CONNECTIONS_PER_IP {
+            assert!(active.admit(source, 128));
+        }
+        assert!(!active.admit(source, 128));
+        assert!(active.admit(other, 128));
+        active.release(source);
+        assert!(active.admit(source, 128));
+
+        let mut small_pool = ActiveConnections::default();
+        for _ in 0..3 {
+            assert!(small_pool.admit(source, 4));
+        }
+        assert!(!small_pool.admit(source, 4));
+        assert!(small_pool.admit(other, 4));
     }
 
     #[test]
