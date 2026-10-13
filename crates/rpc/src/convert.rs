@@ -75,8 +75,9 @@ pub(crate) fn i32_saturated(value: i64) -> i32 {
 
 /// Converts satoshis to the BTC float carried by the versioned Core types.
 ///
-/// Consensus bounds money at 2.1e15 sat, well inside the 2^53 range where
-/// `f64` is exact, so the division is value-exact.
+/// Consensus bounds money at 2.1e15 sat, within the range where integer
+/// conversion to `f64` is exact. Division by 100,000,000 can still round
+/// because many BTC fractions are not exactly representable in binary.
 #[must_use]
 pub(crate) fn sat_to_btc(sats: u64) -> f64 {
     signed_sat_to_btc(i128::from(sats))

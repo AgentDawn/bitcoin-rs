@@ -26,11 +26,14 @@ script-history resolution.
 
 ## Implementation boundaries
 
-`index.rs` is the public facade. Its private modules separate block preparation
+`lib.rs` exports the public API through the private `index.rs` facade.
+Its private modules separate block preparation
 (`block`, `prepared`), canonical row mutation (`rows`), durable writes (`write`),
 and coherent fences/reset recovery (`state`). Read-side scans (`reader`,
 `snapshot`) and exact resolution (`resolve`) remain separate from mutations;
 `capability` and `error` own shared representations and typed outcomes.
+The facade limits shared implementation details to the index module. Backend
+opening and legacy-format rebuild decisions live in `runtime/startup.rs`.
 Public paths and on-disk encodings do not depend on this layout.
 
 ## Features

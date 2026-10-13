@@ -26,9 +26,9 @@
 //! deletions: it is what a restart reconstructs and what refuses a lease,
 //! and no consumer infers it from the intent line.
 //!
-//! [`crate::pruning::PrunePolicy`] carries no behaviour of its own: the node builds one from
-//! configuration and hands it in, which is the policy/mechanism split this
-//! module keeps.
+//! [`PrunePolicy`] converts the configured mebibyte target to bytes and applies the
+//! reorg-safety retention floor. The node supplies the policy; the pruning
+//! pass selects and stages deletions.
 
 use alloc::sync::Arc;
 use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
