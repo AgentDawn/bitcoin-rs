@@ -1994,9 +1994,9 @@ fn process_compact_message(
     match message {
         crate::Message::CmpctBlock(cmpct) => match compact_hints {
             Some(hints) => reconstruction.receive_cmpctblock(cmpct, identity_version, hints, now),
-            None => crate::compact_blocks::Outcome::Fallback(
-                crate::compact_blocks::native_block_hash(cmpct.compact_block.header.block_hash()),
-            ),
+            None => crate::compact_blocks::Outcome::Fallback(crate::inv::native_block_hash(
+                cmpct.compact_block.header.block_hash(),
+            )),
         },
         crate::Message::BlockTxn(txns) => reconstruction.receive_blocktxn(txns, now),
         _ => crate::compact_blocks::Outcome::Idle,
