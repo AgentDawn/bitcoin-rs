@@ -510,9 +510,8 @@ Proof: `crates/p2p/src/sync/tests/headers_presync.rs` tests
 `unowned_below_floor_peer_receives_one_tracked_chain_sync_probe`,
 `owned_header_requests_suppress_competing_frontier_and_chain_sync_requests`,
 `expired_header_syncs_drop_delayed_pages_before_recovery`, and
-`replaced_connection_cannot_admit_queued_predecessor_headers` and
-`staged_body_retries_after_source_replacement_without_replacement_credit`, and
-pins the presync lifecycle end to end — first-pass commitment collection, the
+`replaced_connection_cannot_admit_queued_predecessor_headers`, and pins the
+presync lifecycle end to end — first-pass commitment collection, the
 work-floor crossing that restarts the sync at the fork point, commitment
 divergence on a substituted redownload header, salted-commitment spends, the
 benign lost-continuity break, and the disconnects every other failure costs the
@@ -523,6 +522,9 @@ and `expired_chain_sync_probe_does_not_suppress_frontier_request` prove its
 unanswered two-minute gate; `empty_chain_sync_probe_keeps_original_five_second_pacing`
 and `replacing_expired_frontier_with_chain_sync_probe_releases_owner` cover
 answered pacing and selector ownership.
+`crates/p2p/src/sync/tests/head_sync.rs` test
+`staged_body_retries_after_source_replacement_without_replacement_credit`
+proves staged-body recovery without replacement credit after disconnect.
 `crates/p2p/benches/headers_presync.rs` measures the hashing bound the first
 pass pays per page.
 
