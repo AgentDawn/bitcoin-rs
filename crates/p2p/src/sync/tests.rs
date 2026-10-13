@@ -465,25 +465,32 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
         assert!(
             sync.scheduler
                 .lock()
-                .header_request
+                .header_request()
                 .is_some_and(|request| request.source == a_source),
             "a body-forwarded batch is not an answer: the gate stays with `a`",
         );
 
+        let timeout = sync
+            .scheduler
+            .lock()
+            .header_request()
+            .map(super::HeaderRequest::timeout)
+            .ok_or("the request must still be registered")?;
         let almost = Instant::now()
-            .checked_sub(super::HEADER_REQUEST_TIMEOUT.saturating_sub(Duration::from_millis(1)))
+            .checked_sub(timeout.saturating_sub(Duration::from_millis(1)))
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()
-            .header_request
-            .as_mut()
+            .headers_sync
+            .get_mut(&a_source)
+            .and_then(|owned| owned.request.as_mut())
             .ok_or("the request must still be registered")?
             .requested_at = almost;
         sync.tick();
         assert!(
             sync.scheduler
                 .lock()
-                .header_request
+                .header_request()
                 .is_some_and(|request| request.source == a_source && request.requested_at == almost),
             "a request short of its deadline keeps its owner and stamp",
         );
@@ -496,12 +503,13 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
         );
 
         let backdated = Instant::now()
-            .checked_sub(super::HEADER_REQUEST_TIMEOUT)
+            .checked_sub(timeout)
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()
-            .header_request
-            .as_mut()
+            .headers_sync
+            .get_mut(&a_source)
+            .and_then(|owned| owned.request.as_mut())
             .ok_or("the request must still be registered")?
             .requested_at = backdated;
         sync.tick();
@@ -519,7 +527,7 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
         assert!(
             sync.scheduler
                 .lock()
-                .header_request
+                .header_request()
                 .is_some_and(|request| request.requested_at > backdated),
             "the re-issued request must carry a fresh deadline",
         );

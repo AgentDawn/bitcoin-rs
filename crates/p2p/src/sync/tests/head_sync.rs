@@ -197,7 +197,7 @@ fn body_carried_rejection_keeps_the_live_pending_gate() -> TestResult {
     let first_requested_at = sync
         .scheduler
         .lock()
-        .header_request
+        .header_request()
         .map(|request| request.requested_at)
         .ok_or("the first rejection must install the pending gate")?;
 
@@ -212,7 +212,7 @@ fn body_carried_rejection_keeps_the_live_pending_gate() -> TestResult {
     let second_requested_at = sync
         .scheduler
         .lock()
-        .header_request
+        .header_request()
         .map(|request| request.requested_at)
         .ok_or("the suppressed re-request must leave the gate installed")?;
     assert_eq!(
@@ -746,12 +746,19 @@ fn body_carried_header_does_not_consume_a_pending_getheaders() -> TestResult {
     let peer = test_addr(9705, 0)?;
     let _rx = connect_peer(&peers, synthetic_peer(peer, 0));
     let source = current_source(&peers, peer);
-    sync.scheduler.lock().header_request = Some(super::super::PendingHeaderRequest {
-        source,
-        locator_tip_hash: Hash256::default(),
-        target_height: 1,
-        requested_at: Instant::now(),
-    });
+    {
+        let mut scheduler = sync.scheduler.lock();
+        scheduler.headers_sync.entry(source).or_default().request =
+            Some(super::super::HeaderRequest {
+                source,
+                kind: super::super::HeaderRequestKind::Frontier,
+                locator_tip_hash: Hash256::default(),
+                target_height: 1,
+                requested_at: Instant::now(),
+                state: super::super::HeaderRequestState::AwaitingResponse,
+            });
+        scheduler.header_request_owner = Some(source);
+    }
 
     let body_tip = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
         .or_fail("regtest fixture header");
@@ -763,7 +770,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders() -> TestResult {
     })?;
     sync.drain_inbound_headers();
     assert!(
-        sync.scheduler.lock().header_request.is_some(),
+        sync.scheduler.lock().header_request().is_some(),
         "a body-carried header must not consume the pending request"
     );
 
@@ -775,7 +782,7 @@ fn body_carried_header_does_not_consume_a_pending_getheaders() -> TestResult {
     })?;
     sync.drain_inbound_headers();
     assert!(
-        sync.scheduler.lock().header_request.is_none(),
+        sync.scheduler.lock().header_request().is_none(),
         "a wire `headers` response consumes the pending request"
     );
     Ok(())
