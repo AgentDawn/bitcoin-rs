@@ -36,6 +36,13 @@
 # counts do not (`ECO-03`, `ECO-09`).
 
 [[row]]
+surface = "BIP352 public scan codec (library only)"
+core_reference = "BIP352 v0; not a Bitcoin Core RPC"
+status = "experimental"
+representative_consumer = "evaluated: BlindBit Oracle f9ab7fd8bc35467c492324f743ba1b69049a2bb6; no wallet run"
+evidence = "29 public receiving-vector projections pin sums/tweaks; the pinned upstream Python reference passes the full vectors. Existing certified BlockSpends supplies historical prevouts. Draft HTTP shapes differ from the evaluated consumer's gRPC data API. No tweak HTTP/gRPC endpoint or funded wallet discovery is claimed; see docs/silent-payments.md."
+
+[[row]]
 surface = "P2P v1 wire protocol"
 core_reference = "Bitcoin Core 31.1 net protocol (docs/policies/p2p-compatibility.md pin)"
 status = "externally verified"

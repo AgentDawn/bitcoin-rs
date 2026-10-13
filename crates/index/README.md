@@ -34,6 +34,10 @@ and coherent fences/reset recovery (`state`). Read-side scans (`reader`,
 Public paths and on-disk encodings do not depend on this layout.
 
 ## Features
+- `silent-payments`: experimental, stateless BIP352 v0 public tweak codec over
+  complete prevout scripts or a certified `BlockSpends`. No startup scan,
+  durable rows, wallet keys or network endpoints. See the
+  [feasibility note](../../docs/silent-payments.md).
 - `rocksdb`: enables the `RocksDB` backend in `bitcoin-rs-storage`
 - `fjall`: enables the fjall backend in `bitcoin-rs-storage`
 - `redb`: enables the redb backend in `bitcoin-rs-storage`
