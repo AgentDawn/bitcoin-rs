@@ -1,6 +1,7 @@
 #![cfg(feature = "silent-payments")]
 
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
+use bitcoin_hashes::{Hash as _, hash160};
 use bitcoin_rs_index::silent_payments::{
     MAX_BODY_BYTES, MAX_PREVOUT_BYTES, TransactionTweak, TweakError, block_tweaks,
     transaction_tweak,
@@ -167,9 +168,19 @@ fn missing_prevouts_never_become_empty_success() -> Result {
     Ok(())
 }
 
+fn p2sh_script(redeem_script: &[u8]) -> Script {
+    let hash = hash160::Hash::hash(redeem_script);
+    let mut script = Vec::with_capacity(23);
+    script.extend_from_slice(&[0xa9, 0x14]);
+    script.extend_from_slice(hash.as_byte_array());
+    script.push(0x87);
+    script.into()
+}
+
 #[test]
 fn future_witness_excludes_transaction_but_malformed_program_does_not() -> Result {
     let (mut tx, mut scripts, initial) = sample()?;
+    let mut last_p2sh_script = None;
     for len in [2_u8, 20, 32, 40] {
         for version in [0x52, 0x60] {
             let future_prog = [vec![version, len], vec![0x11; usize::from(len)]].concat();
@@ -178,19 +189,24 @@ fn future_witness_excludes_transaction_but_malformed_program_does_not() -> Resul
             scripts[1] = future_prog.clone().into();
             assert!(derive(&tx, &scripts)?.is_none());
 
-            // P2SH-wrapped future witness: P2SH scriptPubKey is not a witness program,
-            // so the input contributes no key (per BIP352 input list and Core
-            // GetSilentPaymentsPrevoutsSummary), but does not disqualify other eligible inputs.
-            tx.inputs[1].script_sig = [vec![len + 2], future_prog].concat().into();
-            scripts[1] = [vec![0xa9, 0x14], vec![0x11; 20], vec![0x87]]
-                .concat()
-                .into();
+            // P2SH-wrapped future witness: P2SH scriptPubKey is derived from HASH160(redeem_script).
+            // It is not a witness program, so the input contributes no key (per BIP352 input list
+            // and Core GetSilentPaymentsPrevoutsSummary), but does not disqualify other eligible inputs.
+            tx.inputs[1].script_sig = [vec![len + 2], future_prog.clone()].concat().into();
+            let p2sh = p2sh_script(&future_prog);
+            scripts[1] = p2sh.clone();
             let p2sh_derived = derive(&tx, &scripts)?.ok_or("eligible via input 0")?;
             assert_eq!(p2sh_derived.outputs.len(), initial.outputs.len());
+            last_p2sh_script = Some(p2sh);
         }
     }
-    scripts[1] = vec![0x52, 0x20, 0x11].into();
-    assert!(derive(&tx, &scripts)?.is_some());
+    let p2sh_script = last_p2sh_script.ok_or("p2sh script")?;
+
+    // A malformed native witness program in input 1 does not exclude the transaction,
+    // and input 0 remains eligible:
+    let mut malformed_scripts = scripts.clone();
+    malformed_scripts[1] = vec![0x52, 0x20, 0x11].into();
+    assert!(derive(&tx, &malformed_scripts)?.is_some());
 
     // When the only input is P2SH-wrapped future witness, the transaction has
     // no eligible keys and produces None.
@@ -200,7 +216,7 @@ fn future_witness_excludes_transaction_but_malformed_program_does_not() -> Resul
         outputs: tx.outputs.clone(),
         ..Tx::default()
     };
-    assert!(derive(&single_input_tx, &[scripts[1].clone()])?.is_none());
+    assert!(derive(&single_input_tx, &[p2sh_script])?.is_none());
     Ok(())
 }
 

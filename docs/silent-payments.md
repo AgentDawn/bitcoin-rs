@@ -39,7 +39,12 @@ The receiver performs ECDH, label/output derivation and discovery locally.
 Candidates must be verified with complete block/transaction data and chain
 membership. A tweak does not prove an output is unspent or a wallet balance.
 This codec does not authenticate caller-supplied scripts or execute consensus
-validation. Malformed Taproot witness/control material is an error.
+validation; full validity comes from the already-validated chainstate/input
+contract. Only local structural checks are performed on Taproot witness and
+control blocks (rejecting empty witnesses and invalid control-block lengths,
+while accepting a correctly sized control block without validating its internal
+key or leaf-version byte); shape violations produce an error rather than
+consensus verification.
 
 ## Owners and coverage
 
