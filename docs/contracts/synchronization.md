@@ -60,6 +60,14 @@ different frontier. `sync_progress` reports blocks and headers separately for
 this reason (`crates/rpc/src/context.rs`); a `blocks == headers` projection is
 not validation progress when an AssumeUTXO historical role is still replaying.
 
+- Proof: `crates/node/tests/unit/state/tests/events.rs`
+  `record_returns_hints_in_commit_order_and_advances_the_snapshot` and
+  `active_chain_snapshot_anchors_at_restored_tip_after_restart` (applied-tip
+  publication identity); `crates/rpc/src/context.rs` `sync_progress_at`
+  invariant (header/applied reported separately); `getchainstates` typed
+  unavailability when lifecycle work owns the report (`API-33`,
+  `crates/node/src/snapshot.rs`).
+
 ### `SYNC-02`: Canonical applied progress; transient work is a hint
 
 The selected header ancestry plus the chainstate's committed applied frontier
@@ -70,6 +78,11 @@ becomes requestable again after cancellation, peer replacement, rejection,
 rollback, or reorg; this clause owns the system consequence: a stalled or
 cancelled scheduler run never leaves the node without a discoverable next
 block, and no transient completed state is read back as chain progress.
+
+- Proof: `crates/p2p/src/sync/tests/` (frontier recovery, peer handover, and
+  cold-start hedge regressions); `crates/node/tests/unit/state/tests/events.rs`
+  `record_returns_hints_in_commit_order_and_advances_the_snapshot` (hints are
+  transient work; the snapshot is the published fact).
 
 ### `SYNC-03`: Foreground progress, resource, and failure isolation
 
@@ -93,6 +106,15 @@ resource, fairness, and data-availability assumptions.
 - This clause warrants conditional progress only. It is not absolute
   scheduling fairness and not a throughput or latency SLA under globally
   saturated storage.
+
+- Proof: `crates/index/src/runtime/{lifecycle,query_tests}.rs`
+  (`unusable_worker_makes_queries_unavailable`,
+  `transaction_rejects_watermark_from_rival_tip` — consumer failure stays
+  isolated and torn reads are refused); `crates/p2p/src/sync/telemetry.rs`
+  and the event-loop tick tests
+  (`crates/node/src/event_loop.rs` runtime-stall evidence, `EMB-10`) — the
+  tick drives sync without index work on the apply path; `EVT-02` step 1–7
+  fencing tests (fences held only around the mutation window).
 
 ### `SYNC-04`: Failure classification and recovery semantics
 
@@ -118,6 +140,12 @@ Distinguish, and never conflate:
 Failed validation publishes nothing; settlement failure closes admission for
 recovery and stays an error even when the anchor committed (`API-33`).
 
+- Proof: `crates/node/tests/crash_recovery.rs` (`RCV-04` crash points);
+  `crates/chainstate/src/assumeutxo.rs` fail-closed unit tests and
+  `e2e/tests/assumeutxo.rs` (settlement failure never converts into success);
+  `crates/p2p/src/sync/` body-rejection regressions (a bad body clears the
+  gate without invalidating the header branch).
+
 ### `SYNC-05`: Validated/durable progress and coherent cross-consumer views
 
 Received, staged, and decoded bytes are not validated or committed progress.
@@ -140,6 +168,13 @@ availability of stored bytes, or partial index history is a bug:
 A feature must not introduce mixed-tip or mixed-generation responses, stale
 admission, or false-ready projections.
 
+- Proof: `crates/index/src/runtime/query_tests.rs` (`transaction_rejects_watermark_from_rival_tip`,
+  torn-read refusal); `crates/mempool/src/gateway.rs` generation-fencing
+  tests (`MPL-04`: `stale_generation_rejects_without_mutation_or_publication`,
+  `begin_chain_change_rejects_nested_begin`); `crates/rpc/tests/` capability
+  and coherence suites; the applied-tip publication tests in
+  `crates/node/tests/unit/state/tests/events.rs`.
+
 ### `SYNC-06`: Liveness assumptions and proof obligations
 
 Distinguish:
@@ -154,11 +189,19 @@ Distinguish:
   unusable peers, or terminal fail-closed conditions.
 
 Stalled-work ownership: the download orchestrators detect unreleased window
-work each tick (`crates/p2p/src/sync.rs`, `P2P-05`); the index worker detects
-its own unrested cursor each wake (`IDX-08`); the event loop's sync tick
-drives both. Progress is observable through `getchainstates`, `getindexinfo`,
+work each tick (`crates/p2p/src/sync.rs`, `P2P-05`), driven by the event
+loop's sync tick (`crates/node/src/event_loop.rs::on_sync_tick`); the index
+worker detects its own unrested cursor each wake (`IDX-08`), woken by the
+committed chain effects (`crates/node/src/chain_effects.rs::wake_index`), not
+by the tick. Progress is observable through `getchainstates`, `getindexinfo`,
 and `getblockchaininfo`; no new global sync manager, mirrored cursor,
 persistent verdict, or extra state machine is implied by this clause.
+
+- Proof: `crates/p2p/src/sync.rs` and its `sync/tests/` modules (tick
+  discovery/handover regressions); `crates/index/src/runtime.rs` revision
+  coalescing tests (`IDX-08`); `crates/node/src/event_loop.rs` telemetry test
+  (`EMB-10` runtime-stall evidence); the observability columns in
+  `docs/observability.md` (tick counters).
 
 ### `SYNC-07`: Required history remains available until consumed
 
@@ -180,13 +223,19 @@ currently required synchronization/recovery operation still depends on them.
   history are not violations; do not promise archival availability on a pruned
   node.
 
+- Proof: `crates/index/src/runtime/recovery_tests.rs`
+  (`pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`);
+  `crates/storage/src/` pruning retention tests and the `RCV-05` deep-rollback
+  matrix; `crates/chainstate/src/reorg.rs` bounded disconnect streaming under
+  a retention lease (`RCV-08`).
+
 ## Ownership map
 
 | Frontier/work item | Owning authority | Published by | Read by |
 | :--- | :--- | :--- | :--- |
 | Header tip | Chainstate transition (`ARCH-07`) | `SyncChain::chain_tip` / `TipReader` | download policy, `getblockchaininfo.headers` |
 | Applied tip | Durable commit (`P2P-05`, `IDX-10`) | `SyncChain::applied_tip` / `ArcSwap<TipSnapshot>` | RPC tip reads, index gating, getchainstates |
-| AssumeUTXO historical frontier | `AssumeUtxoManager` historical role (`ARCH-07b`) | `getchainstates`/`getindexinfo` via `API-33` | operators, `SYNC-06` observability |
+| AssumeUTXO historical frontier | `AssumeUtxoManager` historical role (`ARCH-07b`) | `getchainstates` via `API-33` | operators, `SYNC-06` observability |
 | Capability watermark | `IndexWriter::commit_block` (`IDX-10`) | `getindexinfo`, `getcapabilities` (IDX-02) | RPC queries, wallet consumers |
 | Download window/staging | P2P `BlockSync` (`P2P-05`) | — transient | header/body admission |
 | Index worker cursor | `DerivedIndexRuntime` (`IDX-08`) | capability watermarks | query gate |
