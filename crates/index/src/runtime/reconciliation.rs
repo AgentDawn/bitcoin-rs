@@ -141,6 +141,10 @@ impl Worker {
         Ok(ReconcileAction::CaughtUp)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep rollback recovery decisions and their fence updates together"
+    )]
     pub(super) fn reconcile_pass(
         &self,
         pending: &mut Option<PendingForward>,
@@ -213,6 +217,10 @@ impl Worker {
                     watermarks = next_watermarks;
                 }
                 Err(error @ DerivedIndexWorkerError::UndoUnavailable { .. }) => {
+                    if capabilities.contains(IndexCapability::CompactFilters) {
+                        self.runtime.fail_compact_filters(&error);
+                        continue;
+                    }
                     // Undo is the ScriptLive spend-script authority. TxLookup
                     // and ScriptHistory roll back from the block body alone,
                     // so a pruned undo must not force those families through
@@ -225,6 +233,16 @@ impl Worker {
                     continue;
                 }
                 Err(error @ DerivedIndexWorkerError::HistoryUnavailable(_)) => {
+                    if matches!(
+                        error,
+                        DerivedIndexWorkerError::HistoryUnavailable(
+                            bitcoin_rs_storage::pruning::HistoryUnavailable::Pruned { .. }
+                        )
+                    ) && capabilities.contains(IndexCapability::CompactFilters)
+                    {
+                        self.runtime.fail_compact_filters(&error);
+                        continue;
+                    }
                     // Every answer here is provisional: an outstanding
                     // reservation can abort and release the range, the owner
                     // granted the history and the row is not there yet, or
@@ -372,8 +390,13 @@ impl Worker {
         watermarks: IndexWatermarks,
         target: Option<&TipSnapshot>,
     ) -> Option<(IndexCapabilities, IndexWatermark)> {
-        let enabled_watermark = |capability: IndexCapability| {
+        let enabled = if self.runtime.compact_filter_failure.read().is_some() {
+            self.enabled.without(IndexCapability::CompactFilters)
+        } else {
             self.enabled
+        };
+        let enabled_watermark = |capability: IndexCapability| {
+            enabled
                 .contains(capability)
                 .then_some(watermarks.get(capability))
                 .flatten()
@@ -398,8 +421,13 @@ impl Worker {
         watermarks: IndexWatermarks,
         target: &TipSnapshot,
     ) -> Option<(IndexCapabilities, Option<IndexWatermark>)> {
-        let enabled_watermark = |capability: IndexCapability| {
+        let enabled = if self.runtime.compact_filter_failure.read().is_some() {
+            self.enabled.without(IndexCapability::CompactFilters)
+        } else {
             self.enabled
+        };
+        let enabled_watermark = |capability: IndexCapability| {
+            enabled
                 .contains(capability)
                 .then_some(watermarks.get(capability))
         };

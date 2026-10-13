@@ -601,6 +601,13 @@ macro_rules! option_rows {
                         toml native("txindex")
                         conf["txindex"]
                     }
+                    /// Enable the optional BIP158 basic-filter index and BIP157 serving.
+                    blockfilterindex as blockfilterindex: Option<bool> {
+                        cli[#[arg(long = "blockfilterindex", num_args = 0..=1, default_missing_value = "true")]]
+                        env["BITCOIN_RS_BLOCKFILTERINDEX", parse_bool]
+                        toml native("blockfilterindex")
+                        conf["blockfilterindex"]
+                    }
                     /// Script index mode.
                     script_index as script_index: Option<ScriptIndexMode> {
                         cli[#[arg(long = "scriptindex", visible_alias = "script-index", num_args = 0..=1, default_missing_value = "true", value_parser = parse_script_index)]]

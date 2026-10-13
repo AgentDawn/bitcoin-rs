@@ -82,7 +82,7 @@ fn coinbase_tx(height: u32, extra: i64) -> Transaction {
         }],
         output: vec![TxOut {
             value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::new(),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     }
 }
@@ -105,6 +105,14 @@ fn mine_block(prev_hash: Hash256, height: u32, extra: i64) -> (Block, Hash256) {
         },
         txdata: vec![coinbase_tx(height, extra)],
     };
+    if height > 0 {
+        let mut spend = coinbase_tx(height, extra);
+        spend.input[0].previous_output = bitcoin::OutPoint {
+            txid: coinbase_tx(height - 1, if height == 1 { 0 } else { extra }).compute_txid(),
+            vout: 0,
+        };
+        block.txdata.push(spend);
+    }
     block.header.merkle_root = block
         .compute_merkle_root()
         .unwrap_or_else(TxMerkleNode::all_zeros);
@@ -177,6 +185,33 @@ struct Harness {
     /// The pruning authority this worker reads through.
     retention: Arc<RetentionRegistry>,
     worker: Worker,
+}
+
+#[test]
+fn unavailable_filter_history_preserves_sibling_indexes_and_filter_watermark() {
+    let fixture = ForkFixture::new(2);
+    for pruned in [false, true] {
+        let harness = Harness::with_enabled(
+            &fixture,
+            u32::MAX,
+            IndexCapabilities::HISTORICAL.with_compact_filters(true),
+        );
+        harness.set_tip(&fixture.tip(fixture.a[1]));
+        if pruned {
+            harness.retention.reserve(1).commit(1);
+        }
+        harness.settle(&mut None);
+        harness.assert_at(&fixture.tip(fixture.a[1]));
+        assert!(harness.runtime.compact_filter_failure.read().is_some());
+        assert!(!harness.runtime.should_stop());
+        assert!(harness.watermarks().compact_filters.is_none());
+        assert!(harness.writer.consumer_cursor().expect("cursor").is_none());
+        // A later reorg still rolls back and catches up both body-only indexes.
+        harness.set_tip(&fixture.tip(fixture.b[1]));
+        harness.settle(&mut None);
+        harness.assert_at(&fixture.tip(fixture.b[1]));
+        assert!(harness.watermarks().compact_filters.is_none());
+    }
 }
 
 impl Harness {
@@ -287,6 +322,56 @@ impl Harness {
                 (cap.clone(), *ih, *th, thb.clone(), ihb.clone(), *d)
             })
     }
+}
+
+#[test]
+fn missing_undo_during_filter_rollback_does_not_reset_filters_or_stop_siblings() {
+    struct SpentScript;
+    impl crate::SpentCoinScripts for SpentScript {
+        fn script_bytes(&self, _: &[u8; 32], _: u32) -> Option<&[u8]> {
+            Some(&[0x51])
+        }
+    }
+    let f = ForkFixture::new(2);
+    let h = Harness::with_enabled(
+        &f,
+        u32::MAX,
+        IndexCapabilities::HISTORICAL.with_compact_filters(true),
+    );
+    let a2 = f.tip(f.a[1]);
+    // Publish valid filter rows from the fixture's known spent script. The
+    // history store has bodies but no undo when the worker later rolls back.
+    let identities = h.worker.collect_target_chain(&a2, 0, 2).expect("chain");
+    let mut batch = PreparedBatch::new(DEFAULT_BATCH_LIMITS);
+    for identity in identities {
+        let body = f.bodies.bodies.lock()[&(identity.height, identity.hash)].clone();
+        let prepared = h
+            .writer
+            .prepare_block_with_spent_scripts(
+                h.worker.enabled,
+                identity.height,
+                identity.hash,
+                &body,
+                &SpentScript,
+            )
+            .expect("prepare");
+        assert!(batch.try_push(prepared).is_ok());
+    }
+    let fence = h.writer.fenced_watermarks().expect("fence").0;
+    h.writer
+        .commit_forward_with_cursor(fence, batch, crate::ConsumerCursorUpdate::Keep)
+        .expect("initial filter publication");
+    let original = h.watermarks().compact_filters;
+    h.set_tip(&f.tip(f.b[1]));
+    h.settle(&mut None);
+    h.assert_at(&f.tip(f.b[1]));
+    assert_eq!(
+        h.watermarks().compact_filters,
+        original,
+        "preserve failed capability data"
+    );
+    assert!(h.runtime.compact_filter_failure.read().is_some());
+    assert!(!h.runtime.should_stop());
 }
 
 /// `RCV-04`: a watermark above the applied tip is an operator-visible

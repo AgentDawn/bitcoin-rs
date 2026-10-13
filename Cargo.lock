@@ -445,6 +445,7 @@ dependencies = [
  "bitcoin-rs-chain",
  "bitcoin-rs-chainstate",
  "bitcoin-rs-consensus",
+ "bitcoin-rs-index",
  "bitcoin-rs-mempool",
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",

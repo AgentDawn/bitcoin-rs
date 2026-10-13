@@ -61,6 +61,107 @@ fn required_handlers_report_the_fixture_chain_mempool_and_network_facts()
 
 type Expectation = (&'static str, sonic_rs::Value, sonic_rs::Value);
 
+#[test]
+fn compact_filter_rpc_exposes_only_enabled_ready_data() -> Result<(), Box<dyn std::error::Error>> {
+    use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+    struct Filters(AtomicBool);
+    impl CompactFilterQuery for Filters {
+        fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+            if !self.0.load(Ordering::Acquire) {
+                return Err(TxQueryError::Retry);
+            }
+            let mut header = [0; 32];
+            header[0] = 1;
+            Ok(Some(BasicFilter {
+                filter: vec![0],
+                hash: [2; 32],
+                header,
+            }))
+        }
+        fn for_each_filter(
+            &self,
+            _: u32,
+            _: Hash256,
+            _: u32,
+            _: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+        ) -> Result<Option<[u8; 32]>, TxQueryError> {
+            unreachable!("single-block RPC only")
+        }
+        fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+            Ok(DerivedIndexInfo {
+                synced: self.0.load(Ordering::Acquire),
+                best_block_height: 0,
+            })
+        }
+    }
+    let mut fixture = Fixture::new()?;
+    let hash = fixture.block_hash.to_string();
+    {
+        let handler = Handler::new(Arc::clone(&fixture.ctx));
+        assert_eq!(
+            handler
+                .dispatch("getblockfilter", &json!([hash]))
+                .expect_err("disabled")
+                .code(),
+            -1
+        );
+        for (params, code) in [
+            (json!([hash, "unknown"]), -5),
+            (json!([hash, 1]), -3),
+            (json!(["00".repeat(32)]), -5),
+            (json!(["00"]), -8),
+            (json!(["zz".repeat(32)]), -8),
+        ] {
+            let error = handler
+                .dispatch("getblockfilter", &params)
+                .expect_err("invalid request");
+            assert_eq!(error.code(), code);
+            if code == -8 {
+                assert_eq!(error.to_string(), "hash must be 64 hex characters");
+            }
+        }
+    }
+    let index = Arc::new(Filters(AtomicBool::new(false)));
+    let context = Arc::get_mut(&mut fixture.ctx).ok_or("fixture context still shared")?;
+    context.indexes.derived_index = None;
+    context.indexes.compact_filters = Some(index.clone());
+    context.network.local_services |= 64;
+    let handler = Handler::new(Arc::clone(&fixture.ctx));
+    assert_eq!(
+        handler
+            .dispatch("getblockfilter", &json!([hash]))
+            .expect_err("catching up")
+            .code(),
+        -1
+    );
+    let services = handler.dispatch("getnetworkinfo", &json!([]))?;
+    assert_eq!(
+        u64::from_str_radix(services["localservices"].as_str().ok_or("services")?, 16)? & 64,
+        0
+    );
+    index.0.store(true, Ordering::Release);
+    for params in [
+        json!([hash]),
+        json!([hash, null]),
+        json!({"blockhash": hash, "filtertype": "basic"}),
+    ] {
+        assert_eq!(
+            handler.dispatch("getblockfilter", &params)?,
+            json!({"filter": "00", "header": format!("{}01", "00".repeat(31))})
+        );
+    }
+    assert_eq!(
+        handler.dispatch("getindexinfo", &json!([]))?,
+        json!({"basic block filter index": {"synced": true, "best_block_height": 0}})
+    );
+    let services = handler.dispatch("getnetworkinfo", &json!([]))?;
+    assert_ne!(
+        u64::from_str_radix(services["localservices"].as_str().ok_or("services")?, 16)? & 64,
+        0
+    );
+    Ok(())
+}
+
 fn chain_and_mempool_expectations(fixture: &Fixture) -> Vec<Expectation> {
     let tip = fixture.block_hash.to_string();
     let txid = fixture.txid.to_string();
@@ -486,7 +587,33 @@ fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dy
 
 #[test]
 fn getindexinfo_named_request_returns_only_that_index() -> Result<(), Box<dyn std::error::Error>> {
+    struct UnavailableFilters;
+    impl bitcoin_rs_index::CompactFilterQuery for UnavailableFilters {
+        fn block_filter(
+            &self,
+            _: Hash256,
+        ) -> Result<Option<bitcoin_rs_index::BasicFilter>, bitcoin_rs_index::TxQueryError> {
+            unreachable!("status only")
+        }
+        fn for_each_filter(
+            &self,
+            _: u32,
+            _: Hash256,
+            _: u32,
+            _: &mut dyn FnMut(Hash256, bitcoin_rs_index::BasicFilter) -> bool,
+        ) -> Result<Option<[u8; 32]>, bitcoin_rs_index::TxQueryError> {
+            unreachable!("status only")
+        }
+        fn filter_index_info(
+            &self,
+        ) -> Result<bitcoin_rs_index::DerivedIndexInfo, bitcoin_rs_index::TxQueryError> {
+            Err(bitcoin_rs_index::TxQueryError::Unavailable(
+                "history unavailable".into(),
+            ))
+        }
+    }
     let mut ctx = Context::new();
+    ctx.indexes.compact_filters = Some(Arc::new(UnavailableFilters));
     ctx.indexes.derived_index = Some(Arc::new(FakeTxIndex {
         transactions: HashMap::new(),
         values: HashMap::new(),

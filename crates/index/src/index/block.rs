@@ -161,6 +161,13 @@ fn pending_rows_for_block_with_header(
     if capabilities.contains(IndexCapability::ScriptLive) {
         push_live_ops(&mut rows, live_created, live_spent, height, spent_scripts)?;
     }
+    if capabilities.contains(IndexCapability::CompactFilters) {
+        let hash = encode::double_sha256(header_bytes).to_le_bytes();
+        rows.filter_rows.push((
+            hash,
+            super::filters::build(&parsed, height, &hash, spent_scripts)?,
+        ));
+    }
     Ok((rows, header_row))
 }
 
@@ -269,14 +276,16 @@ impl<S: KvStore> IndexWriter<S> {
         hash: [u8; 32],
         body: &[u8],
     ) -> Result<PreparedBlock, IndexError> {
-        if capabilities.contains(IndexCapability::ScriptLive) {
+        if capabilities.contains(IndexCapability::ScriptLive)
+            || capabilities.contains(IndexCapability::CompactFilters)
+        {
             return Err(IndexError::MissingSpentScripts);
         }
         self.prepare_block_with_spent_scripts(capabilities, height, hash, body, &NoSpentScripts)
     }
 
     /// [`Self::prepare_block_for`] with the spent-coin script source
-    /// `ScriptLive` preparation requires.
+    /// `ScriptLive` and `CompactFilters` preparation require.
     pub fn prepare_block_with_spent_scripts(
         &self,
         capabilities: IndexCapabilities,
