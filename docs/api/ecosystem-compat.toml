@@ -66,9 +66,9 @@ evidence = "black-box request/response and relay outcomes only: Core serving res
 [[row]]
 surface = "Compact block filters (BIP157/BIP158)"
 core_reference = "BIP157/BIP158"
-status = "intentionally unsupported"
-representative_consumer = "none"
-evidence = "NODE_COMPACT_FILTERS not advertised, filter P2P commands ignored (docs/policies/p2p-compatibility.md section 5 message table)."
+status = "externally verified"
+representative_consumer = "unmodified Kyoto/bip157 pinned to 0169dc3514c8238147302535a1123d5c37468de6"
+evidence = "Recorded regtest run: https://github.com/gosuda/bitcoin-rs/pull/1554 (commands, pinned consumer, binary identity and results). Unmodified Kyoto consumed both Core 31.1 and bitcoin-rs through BIP157, fetched matching blocks and followed a reorg while connected. tools/compact-filter-interop reproduces that public-interface run; its companion Core oracle covers byte/header equality, request bounds, backfill, restart and disabled/pruned behavior. Verification is scoped to these regtest outcomes, with no mainnet IBD performance or retained main-workflow qualification claim. Stale filters are not retained."
 
 [[row]]
 surface = "Peer lifecycle and address management"

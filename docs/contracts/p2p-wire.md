@@ -510,6 +510,17 @@ bound the first pass pays per page.
   sent only up to 4,000,000 bytes; a stalled packet retains only the bytes it
   received.
 
+Proof: `crates/p2p/src/listener/v2_transport_tests.rs` tests
+`a_v2_listener_negotiates_bip324_with_a_v2_initiator`,
+`a_v2_listener_still_serves_a_v1_peer`, `an_outbound_v2_dial_negotiates_bip324`,
+`an_unanswered_v2_dial_retries_once_over_v1`, and
+`a_silent_responder_ends_at_the_handshake_deadline` cover negotiation over
+loopback sockets in both directions with the remote message loop answering
+over the session, v1 detection on a v2 listener, the single v1 retry against a
+v1-only listener, and the handshake deadline against a silent peer. The
+`crates/p2p/src/bip324` unit tests pin the BIP vectors, the handshake
+misbehaviours of Core's `p2p_v2_misbehaving.py`, and the packet bounds.
+
 ## Live gaps
 
 - **BIP324 default and interoperability**: `v2transport` stays off until a
@@ -580,13 +591,6 @@ bound the first pass pays per page.
   constructor owns `TCP_NODELAY` (P2P-04).
 - `crates/p2p/src/listener.rs` test `session_sockets_disable_nagle`: inbound
   and outbound session sockets set `TCP_NODELAY` (`P2P-04`).
-- `crates/p2p/src/listener/v2_transport_tests.rs`: v2 negotiation over
-  loopback sockets in both directions, with the remote message loop answering
-  over the session; v1 detection on a v2 listener; the single v1 retry
-  against a v1-only listener; and the handshake deadline against a silent
-  peer. The `crates/p2p/src/bip324` unit tests pin the BIP vectors, the
-  handshake misbehaviours of Core's `p2p_v2_misbehaving.py`, and the packet
-  bounds (`P2P-11`).
 - `crates/p2p/src/handshake.rs` test
   `inbound_handshake_reaches_ready_after_remote_version_and_verack`: inbound
   handshake writes framed version, feature, and verack bytes once and reaches

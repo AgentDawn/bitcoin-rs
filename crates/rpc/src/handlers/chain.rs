@@ -1148,6 +1148,52 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     })
 }
 
+pub(crate) fn getblockfilter(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let bound = super::bind_named_params(params, &["blockhash", "filtertype"])?;
+    let params = bound.as_ref();
+    let hash =
+        parse_hash(required_str(params, 0, "block hash is required")?).map_err(
+            |error| match error {
+                RpcError::InvalidParams(message) => RpcError::InvalidParameter(message.into()),
+                error => error,
+            },
+        )?;
+    let args = params_array(params)?;
+    if args.len() > 2 {
+        return Err(RpcError::InvalidParams(
+            "expected blockhash and optional filtertype",
+        ));
+    }
+    if let Some(kind) = args.get(1).filter(|value| !value.is_null()) {
+        let kind = kind
+            .as_str()
+            .ok_or_else(|| RpcError::InvalidType("filtertype must be a string".into()))?;
+        if kind != "basic" {
+            return Err(RpcError::InvalidAddressOrKey("Unknown filtertype".into()));
+        }
+    }
+    if ctx.chain.block_tree.read().lookup(hash).is_none() {
+        return Err(RpcError::NotFound("Block not found"));
+    }
+    let index = ctx
+        .indexes
+        .compact_filters
+        .as_ref()
+        .ok_or_else(|| RpcError::Misc("Index is not enabled for filtertype basic".into()))?;
+    let filter = index.block_filter(hash).map_err(|error| {
+        use bitcoin_rs_index::TxQueryError;
+        match error {
+            TxQueryError::Retry => RpcError::Misc("Block filter index is still catching up; retry later".into()),
+            TxQueryError::Unavailable(reason) | TxQueryError::Storage(reason) =>
+                RpcError::Misc(format!("Block filter index unavailable: {reason}")),
+        }
+    })?.ok_or_else(|| RpcError::Misc("Filter not found. This could be because the block was not connected to the active chain.".into()))?;
+    Ok(json!({
+        "filter": filter.filter.to_lower_hex_string(),
+        "header": Hash256::from_le_bytes(&filter.header).to_string_be(),
+    }))
+}
+
 pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let index_name = if params.is_null() {
         None
@@ -1165,6 +1211,7 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         .indexes
         .derived_index
         .as_ref()
+        .filter(|_| index_name.as_deref().is_none_or(|name| name == "txindex"))
         .map(|derived_index| derived_index.index_info())
         .transpose()?;
     let txindex_entry = txindex_entry.map(|info| v31::GetIndexInfoName {
@@ -1174,6 +1221,20 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     let mut indexes = alloc::collections::BTreeMap::new();
     if let Some(entry) = txindex_entry {
         indexes.insert("txindex".to_owned(), entry);
+    }
+    if let Some(filters) = &ctx.indexes.compact_filters
+        && index_name
+            .as_deref()
+            .is_none_or(|name| name == "basic block filter index")
+        && let Ok(info) = filters.filter_index_info()
+    {
+        indexes.insert(
+            "basic block filter index".to_owned(),
+            v31::GetIndexInfoName {
+                synced: info.synced,
+                best_block_height: info.best_block_height,
+            },
+        );
     }
     // Core answers a named request with only that index; an unknown name
     // yields an empty object, as does a name for a disabled index.

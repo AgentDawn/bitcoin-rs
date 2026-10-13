@@ -52,6 +52,7 @@ pub struct ActiveChainQuery {
     applied_tip: TipReader,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
     network: Network,
+    compact_filters: Option<Arc<dyn bitcoin_rs_index::CompactFilterQuery>>,
 }
 
 impl ActiveChainQuery {
@@ -71,6 +72,7 @@ impl ActiveChainQuery {
             applied_tip,
             block_body_source: None,
             network,
+            compact_filters: None,
         }
     }
 
@@ -78,6 +80,16 @@ impl ActiveChainQuery {
     #[must_use]
     pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
         self.block_body_source = Some(source);
+        self
+    }
+
+    /// Attaches the existing optional derived-index query owner.
+    #[must_use]
+    pub fn with_compact_filters(
+        mut self,
+        filters: Option<Arc<dyn bitcoin_rs_index::CompactFilterQuery>>,
+    ) -> Self {
+        self.compact_filters = filters;
         self
     }
 
@@ -180,6 +192,116 @@ impl core::fmt::Debug for ActiveChainQuery {
 }
 
 impl ChainQuery for ActiveChainQuery {
+    fn compact_filters_ready(&self) -> bool {
+        self.compact_filters
+            .as_ref()
+            .is_some_and(|index| index.filter_index_info().is_ok_and(|info| info.synced))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep BIP157 bounds, bounded catch-up and streaming in one serving owner"
+    )]
+    fn serve_compact_filters(
+        &self,
+        request: &Message,
+        headroom: &dyn Fn() -> bool,
+        send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+    ) -> Result<bool, PeerError> {
+        use bitcoin::bip158::{FilterHash, FilterHeader};
+        use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
+        let Some(index) = &self.compact_filters else {
+            return Ok(true);
+        };
+        let (kind, start, stop, limit, step) = match request {
+            Message::GetCFilters(r) => (r.filter_type, r.start_height, r.stop_hash, 1000, 1),
+            Message::GetCFHeaders(r) => (r.filter_type, r.start_height, r.stop_hash, 2000, 1),
+            Message::GetCFCheckpt(r) => (r.filter_type, 1000, r.stop_hash, u32::MAX, 1000),
+            _ => return Ok(true),
+        };
+        if kind != 0 {
+            return Ok(true);
+        }
+        let stop_hash = Hash256::from_le_bytes(stop.as_byte_array());
+        // Filters follow validated, applied blocks even while a competing
+        // headers-only branch leads. The index query rechecks its snapshot.
+        let end = self.applied_tip.load_full().and_then(|tip| {
+            self.block_tree
+                .read()
+                .active_height_of(tip.tip_id, stop_hash)
+        });
+        let Some(end) = end else {
+            return Ok(true);
+        };
+        if step == 1 && (end < start || end - start >= limit) {
+            return Ok(true);
+        }
+        if !headroom() {
+            return Ok(false);
+        }
+        let mut hashes = Vec::new();
+        let mut headers = Vec::new();
+        let mut send_error = None;
+        let mut emitted = 0_u32;
+        let mut halted = false;
+        let result = index.for_each_filter(start, stop_hash, step, &mut |hash, filter| {
+            if !headroom() {
+                halted = true;
+                return false;
+            }
+            match request {
+                Message::GetCFilters(_) => {
+                    if let Err(error) = send(Message::CFilter(CFilter {
+                        filter_type: 0,
+                        block_hash: bitcoin::BlockHash::from_byte_array(hash.to_le_bytes()),
+                        filter: filter.filter,
+                    })) {
+                        send_error = Some(error);
+                        return false;
+                    }
+                    emitted += 1;
+                }
+                Message::GetCFHeaders(_) => hashes.push(FilterHash::from_byte_array(filter.hash)),
+                Message::GetCFCheckpt(_) => {
+                    headers.push(FilterHeader::from_byte_array(filter.header));
+                }
+                _ => {}
+            }
+            true
+        });
+        if let Some(error) = send_error {
+            return Err(error);
+        }
+        // Never replay a sent prefix or silently abandon its tail. A completed
+        // range remains complete even if the final snapshot check reports Retry.
+        if emitted > 0 && emitted != end - start + 1 {
+            return Err(PeerError::Io(std::io::Error::other(
+                "compact filter range interrupted",
+            )));
+        }
+        if emitted == 0 && (halted || matches!(result, Err(bitcoin_rs_index::TxQueryError::Retry)))
+        {
+            return Ok(false);
+        }
+        let Ok(Some(previous_header)) = result else {
+            return Ok(true);
+        };
+        match request {
+            Message::GetCFHeaders(_) => send(Message::CFHeaders(CFHeaders {
+                filter_type: 0,
+                stop_hash: stop,
+                previous_filter_header: FilterHeader::from_byte_array(previous_header),
+                filter_hashes: hashes,
+            }))?,
+            Message::GetCFCheckpt(_) => send(Message::CFCheckpt(CFCheckpt {
+                filter_type: 0,
+                stop_hash: stop,
+                filter_headers: headers,
+            }))?,
+            _ => {}
+        }
+        Ok(true)
+    }
     fn headers_after(
         &self,
         locator_hashes: &[BlockHash],
@@ -570,6 +692,379 @@ mod tests {
             Ok(())
         })?;
         Ok((outcome, blocks.into_inner()))
+    }
+
+    /// Invalid decoded requests are ignored before invoking the query engine.
+    /// Core 31.1 disconnects them; retaining the connection is deliberate.
+    #[test]
+    fn invalid_compact_filter_requests_are_ignored_without_querying_the_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+
+        struct Filters;
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("invalid request must not query the index")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                unreachable!("invalid request must not query the index")
+            }
+            fn for_each_filter(
+                &self,
+                _: u32,
+                _: Hash256,
+                _: u32,
+                _: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                unreachable!("invalid request must not query the index")
+            }
+        }
+
+        let headers = seed_headers(2001);
+        let stop = wire_block_hash(headers[2000].compute_hash());
+        let query = query_with(headers)?.with_compact_filters(Some(Arc::new(Filters)));
+        for command in 0..3 {
+            for (kind, start, stop) in [
+                (1, 2000, stop),
+                (0, 2000, WireBlockHash::all_zeros()),
+                (0, 2001, stop),
+                (0, 0, stop),
+            ] {
+                // Checkpoints have no start/range limit; these two cases are valid.
+                if command == 2 && kind == 0 && stop != WireBlockHash::all_zeros() {
+                    continue;
+                }
+                let request = match command {
+                    0 => Message::GetCFilters(GetCFilters {
+                        filter_type: kind,
+                        start_height: start,
+                        stop_hash: stop,
+                    }),
+                    1 => Message::GetCFHeaders(GetCFHeaders {
+                        filter_type: kind,
+                        start_height: start,
+                        stop_hash: stop,
+                    }),
+                    _ => Message::GetCFCheckpt(GetCFCheckpt {
+                        filter_type: kind,
+                        stop_hash: stop,
+                    }),
+                };
+                assert!(query.serve_compact_filters(
+                    &request,
+                    &|| panic!("invalid request must not consume headroom"),
+                    &mut |_| panic!("invalid request must not emit a response"),
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Publication lag defers without blocking; completed responses are never
+    /// replayed and an interrupted prefix terminates the connection.
+    #[test]
+    fn compact_filters_wait_for_publication_without_replaying_sent_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Filters {
+            ready: AtomicBool,
+            moves_after_delivery: bool,
+        }
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("range serving only")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                Ok(DerivedIndexInfo {
+                    synced: self.ready.load(Ordering::Acquire),
+                    best_block_height: 0,
+                })
+            }
+            fn for_each_filter(
+                &self,
+                _: u32,
+                stop: Hash256,
+                _: u32,
+                emit: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                if !self.ready.load(Ordering::Acquire) {
+                    return Err(TxQueryError::Retry);
+                }
+                if !emit(
+                    stop,
+                    BasicFilter {
+                        filter: vec![0],
+                        hash: [1; 32],
+                        header: [2; 32],
+                    },
+                ) {
+                    return Ok(None);
+                }
+                if self.moves_after_delivery {
+                    Err(TxQueryError::Retry)
+                } else {
+                    Ok(Some([0; 32]))
+                }
+            }
+        }
+        let header = seed_headers(1)[0];
+        for moves_after_delivery in [false, true] {
+            let index = Arc::new(Filters {
+                ready: AtomicBool::new(false),
+                moves_after_delivery,
+            });
+            let query = query_with(vec![header])?.with_compact_filters(Some(index.clone()));
+            assert!(!query.compact_filters_ready());
+            let request = Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: wire_block_hash(header.compute_hash()),
+            });
+            let mut responses = Vec::new();
+            assert!(!query.serve_compact_filters(&request, &|| true, &mut |_| {
+                panic!("pending publication must not emit a response")
+            })?);
+            index.ready.store(true, Ordering::Release);
+            assert!(
+                query.serve_compact_filters(&request, &|| true, &mut |message| {
+                    responses.push(message);
+                    Ok(())
+                })?
+            );
+            assert!(query.compact_filters_ready());
+            assert_eq!(responses.len(), 1);
+            assert!(matches!(&responses[0], Message::CFilter(filter)
+                if filter.filter == [0] && filter.block_hash == wire_block_hash(header.compute_hash())));
+            assert!(!query.serve_compact_filters(&request, &|| false, &mut |_| {
+                panic!("backpressured peer must not receive a filter")
+            })?);
+            let headers = seed_headers(2);
+            let stop = headers[1].compute_hash();
+            let query = query_with(headers)?.with_compact_filters(Some(index));
+            let request = Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: wire_block_hash(stop),
+            });
+            assert!(matches!(
+                query.serve_compact_filters(&request, &|| true, &mut |_| Ok(())),
+                Err(PeerError::Io(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filter_backpressure_defers_unsent_responses_but_disconnects_a_partial_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+        use std::cell::Cell;
+
+        struct Filters;
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("range only")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                Ok(DerivedIndexInfo {
+                    synced: true,
+                    best_block_height: 2000,
+                })
+            }
+            fn for_each_filter(
+                &self,
+                _: u32,
+                stop: Hash256,
+                _: u32,
+                emit: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                for _ in 0..2 {
+                    if !emit(
+                        stop,
+                        BasicFilter {
+                            filter: vec![0],
+                            hash: [1; 32],
+                            header: [2; 32],
+                        },
+                    ) {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some([0; 32]))
+            }
+        }
+        let headers = seed_headers(2001);
+        let stop = wire_block_hash(headers[1].compute_hash());
+        let checkpoint_stop = wire_block_hash(headers[2000].compute_hash());
+        let query = query_with(headers)?.with_compact_filters(Some(Arc::new(Filters)));
+        for request in [
+            Message::GetCFilters(GetCFilters {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: stop,
+            }),
+            Message::GetCFHeaders(GetCFHeaders {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: stop,
+            }),
+            Message::GetCFCheckpt(GetCFCheckpt {
+                filter_type: 0,
+                stop_hash: checkpoint_stop,
+            }),
+        ] {
+            // Exhaust headroom at the entry gate, before the first item, or
+            // after one item. Header/checkpoint buffers have not reached wire.
+            for allowed in 0_u8..=2 {
+                let remaining = Cell::new(allowed);
+                let mut responses = Vec::new();
+                let result = query.serve_compact_filters(
+                    &request,
+                    &|| {
+                        let slots = remaining.get();
+                        remaining.set(slots.saturating_sub(1));
+                        slots > 0
+                    },
+                    &mut |message| {
+                        responses.push(message);
+                        Ok(())
+                    },
+                );
+                if allowed == 2 && matches!(request, Message::GetCFilters(_)) {
+                    assert!(matches!(result, Err(PeerError::Io(_))));
+                    assert_eq!(responses.len(), 1);
+                    continue;
+                }
+                assert!(!result?, "unsent request must remain pending");
+                assert_eq!(responses, Vec::<Message>::new());
+                assert!(
+                    query.serve_compact_filters(&request, &|| true, &mut |message| {
+                        responses.push(message);
+                        Ok(())
+                    })?
+                );
+                match (&request, &responses[..]) {
+                    (Message::GetCFilters(_), [Message::CFilter(_), Message::CFilter(_)]) => {}
+                    (Message::GetCFHeaders(_), [Message::CFHeaders(reply)]) => {
+                        assert_eq!(reply.filter_hashes.len(), 2);
+                    }
+                    (Message::GetCFCheckpt(_), [Message::CFCheckpt(reply)]) => {
+                        assert_eq!(reply.filter_headers.len(), 2);
+                    }
+                    _ => panic!("retry must deliver the complete response"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_filters_follow_applied_chain_when_competing_headers_lead()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+
+        struct Filters(Hash256);
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("range only")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                Ok(DerivedIndexInfo {
+                    synced: true,
+                    best_block_height: 1,
+                })
+            }
+            fn for_each_filter(
+                &self,
+                start: u32,
+                stop: Hash256,
+                step: u32,
+                emit: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                assert_eq!(stop, self.0, "only the applied branch has filters");
+                if step == 1 {
+                    assert_eq!(start, 1);
+                    assert!(emit(
+                        stop,
+                        BasicFilter {
+                            filter: vec![0],
+                            hash: [1; 32],
+                            header: [2; 32],
+                        }
+                    ));
+                }
+                Ok(Some([0; 32]))
+            }
+        }
+        let headers = seed_headers(2);
+        let applied_hash = headers[1].compute_hash();
+        let query = query_with(headers.clone())?
+            .with_compact_filters(Some(Arc::new(Filters(applied_hash.into()))));
+        let fork_tip = {
+            let mut tree = query.block_tree.write();
+            let genesis = tree
+                .lookup(headers[0].compute_hash().into())
+                .ok_or("genesis")?;
+            let fork = test_header(headers[0].compute_hash(), 100);
+            let fork_id = tree.insert_node(Some(genesis), fork, NodeStatus::HeaderValid)?;
+            let fork_tip = test_header(fork.compute_hash(), 101);
+            tree.insert_node(Some(fork_id), fork_tip, NodeStatus::HeaderValid)?;
+            fork_tip.compute_hash()
+        };
+        assert_eq!(query.active_height(fork_tip), Some(2));
+        assert!(query.compact_filters_ready());
+        for stop in [applied_hash, fork_tip] {
+            let stop_hash = wire_block_hash(stop);
+            for request in [
+                Message::GetCFilters(GetCFilters {
+                    filter_type: 0,
+                    start_height: 1,
+                    stop_hash,
+                }),
+                Message::GetCFHeaders(GetCFHeaders {
+                    filter_type: 0,
+                    start_height: 1,
+                    stop_hash,
+                }),
+                Message::GetCFCheckpt(GetCFCheckpt {
+                    filter_type: 0,
+                    stop_hash,
+                }),
+            ] {
+                let mut replies = Vec::new();
+                assert!(
+                    query.serve_compact_filters(&request, &|| true, &mut |message| {
+                        replies.push(message);
+                        Ok(())
+                    })?
+                );
+                if stop == fork_tip {
+                    assert!(replies.is_empty(), "unapplied headers have no filters");
+                    continue;
+                }
+                match (&request, &replies[..]) {
+                    (Message::GetCFilters(_), [Message::CFilter(reply)]) => {
+                        assert_eq!(reply.block_hash, stop_hash);
+                        assert_eq!(reply.filter, [0]);
+                    }
+                    (Message::GetCFHeaders(_), [Message::CFHeaders(reply)]) => {
+                        assert_eq!(reply.stop_hash, stop_hash);
+                        assert_eq!(reply.filter_hashes.len(), 1);
+                    }
+                    (Message::GetCFCheckpt(_), [Message::CFCheckpt(reply)]) => {
+                        assert_eq!(reply.stop_hash, stop_hash);
+                        assert_eq!(reply.filter_headers.len(), 0);
+                    }
+                    _ => panic!("the applied branch must remain servable"),
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

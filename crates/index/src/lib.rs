@@ -25,14 +25,16 @@ pub use capabilities::{
 };
 pub(crate) use index::NoSpentScripts;
 pub use index::{
-    BlockSource, ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError, IndexReader,
-    IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriteFence, IndexWriter, Indexer,
-    MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHistoryEntry,
-    ScriptLiveScan, SpentCoinScripts, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    BasicFilter, BlockSource, ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError,
+    IndexReader, IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriteFence, IndexWriter,
+    Indexer, MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, PreparedBlock,
+    ScriptHistoryEntry, ScriptLiveScan, SpentCoinScripts, TxIndexScan, TxIndexScanRow,
+    TxIndexSnapshot,
 };
 pub use query_api::{
-    DerivedIndexInfo, DerivedIndexQuery, RollbackWarningSource, ScriptHistoryRecord,
-    ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, SpendingRecord, TxQueryError,
+    CompactFilterQuery, DerivedIndexInfo, DerivedIndexQuery, RollbackWarningSource,
+    ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, SpendingRecord,
+    TxQueryError,
 };
 pub use types::{
     HASH_PREFIX_ROW_SIZE, HEADER_ROW_SIZE, HashPrefixRow, ScriptHash, ScriptHashRow, ScriptLiveRow,

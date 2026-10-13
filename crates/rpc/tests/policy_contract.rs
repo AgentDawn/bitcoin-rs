@@ -1635,6 +1635,7 @@ fn invalidation_handler(state: &NodeState) -> Handler {
         indexes: IndexHandles {
             derived_index: None,
             script_index: None,
+            compact_filters: None,
             esplora_tx_index: None,
             derived_index_status: None,
         },

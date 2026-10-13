@@ -17,6 +17,8 @@ pub enum IndexError {
     InvalidHeaderLength { len: usize },
     #[error("transaction byte range does not fit u32 at block offset {offset}")]
     UnaddressablePosition { offset: u64 },
+    #[error("compact filter or parent filter commitment is unavailable or corrupt")]
+    InvalidCompactFilter,
     #[error("invalid TxIndex watermark encoding")]
     InvalidWatermark,
     #[error("invalid TxIndex prefix row length {len}")]
@@ -44,7 +46,7 @@ pub enum IndexError {
         expected: Option<IndexWatermark>,
         actual: Option<IndexWatermark>,
     },
-    #[error("ScriptLive preparation requires a spent-coin script source")]
+    #[error("ScriptLive and CompactFilters preparation requires a spent-coin script source")]
     MissingSpentScripts,
     #[error("no spent-coin script for outpoint {txid:02x?}:{vout} in block at height {height}")]
     MissingSpentCoin {

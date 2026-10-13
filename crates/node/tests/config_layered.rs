@@ -98,6 +98,7 @@ fn script_index_is_valid_without_core_txindex() -> Result<()> {
         indexes: bitcoin_rs_node::IndexOverrides {
             script_index: Some(ScriptIndexMode::Full),
             txindex: Some(false),
+            ..Default::default()
         },
         ..Default::default()
     };

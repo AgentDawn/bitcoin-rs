@@ -57,7 +57,7 @@ impl ScriptIndexMode {
     ///
     /// PRE: none.
     /// POST: one of `NONE`, `TX_LOOKUP`, `SCRIPT_LIVE`, `TX_LOOKUP_SCRIPT_LIVE`,
-    /// `ALL`. Full always includes `TxLookup` regardless of txindex (Esplora
+    /// `TX_AND_SCRIPTS`. Full always includes `TxLookup` regardless of txindex (Esplora
     /// prevout and fee rendering needs exact historical transactions); the
     /// RPC-visible `derived_index_query` gate still requires an explicit
     /// `--txindex`.
@@ -70,7 +70,7 @@ impl ScriptIndexMode {
             (true, Self::Disabled) => IndexCapabilities::TX_LOOKUP,
             (false, Self::Utxo) => IndexCapabilities::SCRIPT_LIVE,
             (true, Self::Utxo) => IndexCapabilities::TX_LOOKUP_SCRIPT_LIVE,
-            (_, Self::Full) => IndexCapabilities::ALL,
+            (_, Self::Full) => IndexCapabilities::TX_AND_SCRIPTS,
         }
     }
 
@@ -167,6 +167,8 @@ pub struct RpcConfig {
 #[derive(Clone, Debug)]
 pub struct IndexConfig {
     pub txindex: bool,
+    /// Optional basic compact-filter index; disabled by default.
+    pub blockfilterindex: bool,
     pub script_index: ScriptIndexMode,
 }
 
@@ -273,6 +275,7 @@ impl NodeConfig {
             },
             indexes: IndexConfig {
                 txindex: settings.indexes.txindex.unwrap_or(false),
+                blockfilterindex: settings.indexes.blockfilterindex.unwrap_or(false),
                 script_index: settings
                     .indexes
                     .script_index

@@ -369,6 +369,7 @@ fn commit_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
                 spending: 0,
                 headers: 1,
                 live: 0,
+                filters: 0,
             },
         ),
         (
@@ -379,6 +380,7 @@ fn commit_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
                 spending: 1,
                 headers: 1,
                 live: 0,
+                filters: 0,
             },
         ),
         (
@@ -389,6 +391,7 @@ fn commit_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
                 spending: 5_192,
                 headers: 1,
                 live: 0,
+                filters: 0,
             },
         ),
     ];
@@ -856,6 +859,7 @@ fn capability_commits_own_only_their_rows_and_watermarks() -> Result<(), Box<dyn
     assert_eq!(
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
+            compact_filters: None,
             tx_lookup: Some(watermark),
             script_history: None,
             script_live: None,
@@ -879,6 +883,7 @@ fn capability_commits_own_only_their_rows_and_watermarks() -> Result<(), Box<dyn
     assert_eq!(
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
+            compact_filters: None,
             tx_lookup: Some(watermark),
             script_history: Some(watermark),
             script_live: None,
@@ -907,6 +912,7 @@ fn aligned_capabilities_share_one_atomic_commit() -> Result<(), Box<dyn std::err
     assert_eq!(
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
+            compact_filters: None,
             tx_lookup: Some(watermark),
             script_history: Some(watermark),
             script_live: None,
@@ -931,6 +937,7 @@ fn script_index_reset_preserves_tx_lookup_and_shared_identity()
     assert_eq!(
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
+            compact_filters: None,
             tx_lookup: Some(IndexWatermark { height: 0, hash }),
             script_history: None,
             script_live: None,
@@ -2271,7 +2278,7 @@ fn fenced_watermarks_prefers_reset_over_watermark_decode_error()
 }
 
 #[test]
-fn fenced_watermarks_captures_one_coherent_snapshot_across_five_reads()
+fn fenced_watermarks_captures_every_capability_in_one_coherent_snapshot()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = populated_idle_tracking_store()?;
     let mut writer = IndexWriter::open(Arc::clone(&store), 4)?;
@@ -2292,7 +2299,7 @@ fn fenced_watermarks_captures_one_coherent_snapshot_across_five_reads()
     let captures = store.snapshot_read_order.lock().clone();
     assert_eq!(
         captures.len(),
-        5,
+        6,
         "one capture reads each fenced key exactly once: {captures:?}"
     );
     let mut captured_keys: Vec<&[u8]> = captures.iter().map(|(_cf, key)| key.as_slice()).collect();
@@ -2303,6 +2310,7 @@ fn fenced_watermarks_captures_one_coherent_snapshot_across_five_reads()
         TX_WATERMARK_KEY,
         SCRIPT_WATERMARK_KEY,
         LIVE_WATERMARK_KEY,
+        &[0, b'F'],
     ];
     expected_keys.sort_unstable();
     assert_eq!(captured_keys, expected_keys);
@@ -2312,7 +2320,8 @@ fn fenced_watermarks_captures_one_coherent_snapshot_across_five_reads()
             !(*cf == ColumnFamily::UtxoMeta
                 && (key.as_slice() == TX_WATERMARK_KEY
                     || key.as_slice() == SCRIPT_WATERMARK_KEY
-                    || key.as_slice() == LIVE_WATERMARK_KEY))
+                    || key.as_slice() == LIVE_WATERMARK_KEY
+                    || key.as_slice() == [0, b'F']))
         }),
         "watermark state was read outside the capture snapshot: {live:?}"
     );
