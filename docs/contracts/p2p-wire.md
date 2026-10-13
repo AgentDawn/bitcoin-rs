@@ -241,6 +241,9 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
   header retry after that source disconnects, but exact-source checks prevent
   the retry from crediting or faulting a same-address replacement
   (`staged_body_retries_after_source_replacement_without_replacement_credit`).
+  The inbound body drain drops retired-source deliveries before staging;
+  queued bodies are not already-staged work
+  (`queued_body_from_replaced_source_cannot_enter_staging`).
 - A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
   `getblocktxn`, `Fallback`'s `getdata`) is marked
   (`InboundHeaders::body_fetch_owned`): once the tip admits, the window
@@ -525,6 +528,8 @@ answered pacing and selector ownership.
 `crates/p2p/src/sync/tests/head_sync.rs` test
 `staged_body_retries_after_source_replacement_without_replacement_credit`
 proves staged-body recovery without replacement credit after disconnect.
+`queued_body_from_replaced_source_cannot_enter_staging` in the same suite
+proves retired deliveries cannot enter staging through the inbound body drain.
 `crates/p2p/benches/headers_presync.rs` measures the hashing bound the first
 pass pays per page.
 

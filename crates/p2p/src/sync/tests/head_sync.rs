@@ -124,6 +124,68 @@ fn body_arriving_ahead_of_its_header_chain_requests_the_gap() -> TestResult {
 }
 
 #[test]
+fn queued_body_from_replaced_source_cannot_enter_staging() -> TestResult {
+    let (tree, blocks) = mined_chain(1, 0)?;
+    let SyncHarness {
+        sync,
+        peers,
+        applied_tip,
+        inbound_headers_tx,
+        inbound_blocks_tx,
+        ..
+    } = SyncHarness::new(tree);
+    inbound_blocks_tx.send(crate::InboundBlock::from_decoded(blocks[0].clone()))?;
+    sync.tick();
+    let original_tip = applied_tip.load_full().ok_or("missing applied tip")?.hash;
+
+    let peer = test_addr(9781, 0)?;
+    let _old_rx = connect_peer(&peers, synthetic_peer(peer, 2));
+    let old_source = current_source(&peers, peer);
+    let block = regtest_fixture::mined_block_with_prev_hash(
+        blocks[0].block_hash(),
+        2,
+        vec![regtest_fixture::coinbase(2)],
+    )
+    .or_fail("regtest fixture block");
+    let hash = Hash256::from(block.block_hash());
+    inbound_headers_tx.send(InboundHeaders {
+        headers: vec![block.header],
+        source: Some(old_source),
+        wire_response: false,
+        body_fetch_owned: false,
+    })?;
+    let mut inbound = crate::InboundBlock::from_decoded(block.clone());
+    inbound.source = Some(old_source);
+    inbound_blocks_tx.send(inbound)?;
+
+    assert!(peers.disconnect_source(old_source));
+    let _replacement_rx = connect_peer(&peers, synthetic_peer(peer, 2));
+    let replacement = current_source(&peers, peer);
+    assert_ne!(replacement, old_source);
+    sync.drain_inbound_headers();
+    sync.drain_inbound_blocks();
+
+    assert!(sync.chain.block_tree().lookup(hash).is_none());
+    assert!(!sync.scheduler.lock().stager.contains(&hash));
+    assert_eq!(
+        applied_tip.load_full().ok_or("missing applied tip")?.hash,
+        original_tip,
+        "a retired delivery must not enter through its body-carried header",
+    );
+
+    let mut current_inbound = crate::InboundBlock::from_decoded(block);
+    current_inbound.source = Some(replacement);
+    inbound_blocks_tx.send(current_inbound)?;
+    sync.tick();
+    assert_eq!(
+        applied_tip.load_full().ok_or("missing applied tip")?.hash,
+        hash,
+        "the same body from a current connection remains admissible",
+    );
+    Ok(())
+}
+
+#[test]
 fn staged_body_retries_after_source_replacement_without_replacement_credit() -> TestResult {
     let (tree, blocks) = mined_chain(1, 0)?;
     let SyncHarness {
