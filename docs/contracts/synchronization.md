@@ -208,10 +208,17 @@ Consumer views split by mechanism:
 - **Status RPC** (`getblockchaininfo`, mining info, wait responses) retain
   one applied publication and answer from it; a later commit behind the
   capture is not an error, and the response stays coherent at that snapshot.
-- **Generation-fenced reads** (wallet-facing/Esplora reads under `WF-02`,
-  mempool admission under `MPL-04`) return the declared unavailable response
-  when the chain generation moves between capture and read; a moved
-  generation never produces a mixed-tip page.
+- **Generation-fenced reads** (wallet-facing/Esplora reads under `WF-02`)
+  return the declared unavailable response when the chain generation moves
+  between capture and read; a moved generation never produces a mixed-tip
+  page.
+- **Generation-fenced admission** is not a read: `MPL-04` gives
+  `submit_transaction` four bounded attempts that retry with newly resolved
+  facts when the captured generation or sequence moved, and answers
+  `SubmitError::RetryExhausted` only once the attempts are spent
+  (`crates/mempool/src/admission.rs`); a moved generation never admits
+  against a stale tip. The two are distinct obligations and are proven
+  separately.
 - **Index queries** gate on watermark identity and runtime revision and
   refuse torn reads (`IDX-03`).
 
@@ -299,8 +306,8 @@ currently required synchronization/recovery operation still depends on them.
 | :--- | :--- | :--- | :--- | :--- |
 | Discovery | A lost/cancelled frontier request becomes requestable again | P2P `BlockSync` sweeps (`P2P-05`) | `crates/p2p/src/sync/tests/` frontier/handover regressions | None recorded |
 | Scheduling/execution | An eligible request is actually sent to a peer, or the tick records why not | Event-loop sync tick → `BlockSync::tick` | `tick_fetches_new_tip_headers_from_at_tip_peers` and the transitions suites | None recorded |
-| Recovery closure | A peer loss/timeout/failed delivery ends in retry, handover, or terminal outcome without restart | `P2P-05` strike/expiry + `RCV-08` reconnection | `crates/p2p/src/sync/tests/` expiry strikes; `bin/bitcoin-rs/tests/addrman_restart_e2e.rs` restart reconnection | Live reorg + expiry combined lane is main-only |
-| Non-starvation | A foreground commit lands while optional work runs | Apply fences (`EVT-02`) — bounded by construction | `EVT-02` fencing tests | **ScriptLive seeding holds the stable-view read lock for the full scan + persistence** (`crates/index/src/runtime/rollback.rs`); foreground commits contend. Recorded as an open gap above |
+| Recovery closure | A peer loss/timeout/failed delivery ends in retry, handover, or terminal outcome without restart | `P2P-05` strike/expiry and peer handover; startup dialing on persisted AddrMan recovery (not `RCV-08`, which covers chainstate reorg disconnect/reconnect) | `crates/p2p/src/sync/tests/` expiry strikes; `bin/bitcoin-rs/tests/addrman_restart_e2e.rs` restart reconnection | Live reorg + expiry combined lane is main-only |
+| Non-starvation | A foreground commit lands while optional work runs, on paths the fences bound | Apply fences (`EVT-02`) — bounded by construction | `EVT-02` fencing tests (fences held only around the mutation window) | **Not proven for seeding:** `EVT-02` fencing tests do not establish foreground isolation for ScriptLive seeding, which holds the stable UTXO view across its scan and batch writes (`crates/index/src/runtime/rollback.rs`), so commits needing that write lock contend. Recorded as an unresolved contention obligation above |
 | Index delay/failure | An index failure never blocks apply; queries refuse honestly | `IDX-07` supervision + `SYNC-01` authorities | `unusable_worker_makes_queries_unavailable` | None recorded |
 | Durable convergence | A successful apply survives restart at the published tip | Durable head + checkpoint (`RCV-01`–`RCV-04`) | `crates/node/tests/crash_recovery.rs` `RCV-04` matrix | Formal temporal runs are not completed proofs |
 
