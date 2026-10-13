@@ -3807,10 +3807,6 @@ mod getchaintips_tests {
         }
     }
 
-    fn hash_from_header(header: &Header) -> Hash256 {
-        header.compute_hash().0
-    }
-
     #[test]
     fn getchaintips_returns_empty_on_fresh_context() {
         let ctx = Arc::new(Context::new());
@@ -3826,7 +3822,7 @@ mod getchaintips_tests {
     fn getchaintips_emits_the_applied_tip_as_active() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = Arc::new(Context::new());
         let genesis = synthetic_header(BlockHash::default(), 1_000_000);
-        let hash = hash_from_header(&genesis);
+        let hash = genesis.compute_hash().0;
         let tip_id = {
             let mut tree = ctx.chain.block_tree.write();
             tree.insert_node(None, genesis, NodeStatus::Active)?

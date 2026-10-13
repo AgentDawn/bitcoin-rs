@@ -542,7 +542,7 @@ impl BlockTree {
         header: BlockHeader,
         status: NodeStatus,
     ) -> Result<NodeId, ChainError> {
-        let hash = hash_from_header(&header);
+        let hash = Hash256::from(header.compute_hash());
         self.insert_header_with_hash(header, hash, status)
     }
 
@@ -555,7 +555,7 @@ impl BlockTree {
         let parent = if self.nodes.is_empty() {
             None
         } else {
-            let prev_hash = prev_hash_from_header(&header);
+            let prev_hash = Hash256::from(header.prev_blockhash);
             Some(
                 self.lookup(prev_hash)
                     .ok_or(ChainError::MissingParent { prev_hash })?,
@@ -571,7 +571,7 @@ impl BlockTree {
         header: BlockHeader,
         status: NodeStatus,
     ) -> Result<NodeId, ChainError> {
-        let hash = hash_from_header(&header);
+        let hash = Hash256::from(header.compute_hash());
         self.insert_node_with_hash(parent, header, hash, status)
     }
 
@@ -591,7 +591,7 @@ impl BlockTree {
             Some(parent_id) => {
                 let parent_node = self.node(parent_id)?;
                 let expected_prev = parent_node.hash;
-                let actual_prev = prev_hash_from_header(&header);
+                let actual_prev = Hash256::from(header.prev_blockhash);
                 if actual_prev != expected_prev {
                     return Err(ChainError::NonContinuousHeader {
                         expected_prev,
@@ -840,14 +840,6 @@ impl Default for BlockTree {
     }
 }
 
-pub(crate) fn hash_from_header(header: &BlockHeader) -> Hash256 {
-    header.compute_hash().into()
-}
-
-pub(crate) fn prev_hash_from_header(header: &BlockHeader) -> Hash256 {
-    header.prev_blockhash.into()
-}
-
 pub(crate) fn hash_table_key(hash: Hash256) -> u64 {
     u64::from_le_bytes(hash.prefix8())
 }
@@ -862,7 +854,7 @@ fn node_hash_key(nodes: &Slab<BlockTreeNode>, id: NodeId) -> u64 {
 mod tests {
     use bitcoin_rs_primitives::{BlockHash, CompactTarget};
 
-    use super::{BlockTree, Hash256, hash_from_header};
+    use super::{BlockTree, Hash256};
     use crate::{
         ChainError, ChainTxCount,
         node::{BlockHeader, NodeId, NodeStatus},
@@ -1197,9 +1189,9 @@ mod tests {
         let mut tree = BlockTree::new();
         let genesis = test_header(BlockHash::default(), 0);
         let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
-        let mut variant_a = test_header(BlockHash(hash_from_header(&genesis)), 1);
+        let mut variant_a = test_header(genesis.compute_hash(), 1);
         variant_a.nonce = 1;
-        let mut variant_b = test_header(BlockHash(hash_from_header(&genesis)), 2);
+        let mut variant_b = test_header(genesis.compute_hash(), 2);
         variant_b.nonce = 2;
         let leaf_a = tree.insert_node(Some(genesis_id), variant_a, NodeStatus::HeaderValid)?;
         let leaf_b = tree.insert_node(Some(genesis_id), variant_b, NodeStatus::HeaderValid)?;
@@ -1342,7 +1334,7 @@ mod tests {
             .scan(BlockHash::default(), |prev, height| {
                 let header = test_header(*prev, height);
                 *prev = header.compute_hash();
-                Some(hash_from_header(&header))
+                Some(Hash256::from(header.compute_hash()))
             })
             .collect();
         short_expected.reverse();

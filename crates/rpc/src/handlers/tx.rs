@@ -2713,27 +2713,28 @@ mod acceptance_tests {
 }
 
 #[cfg(test)]
+fn empty_psbt() -> String {
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version(2),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx)
+        .unwrap_or_else(|err| panic!("from_unsigned_tx: {err}"));
+    crate::base64::encode(&psbt.serialize())
+}
+
+#[cfg(test)]
 mod combinepsbt_tests {
     use alloc::sync::Arc;
 
     use super::*;
 
-    fn empty_psbt_str() -> String {
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: Vec::new(),
-        };
-        let psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx)
-            .unwrap_or_else(|err| panic!("from_unsigned_tx: {err}"));
-        crate::base64::encode(&psbt.serialize())
-    }
-
     #[test]
     fn combinepsbt_single_input_returns_same_psbt() {
         let ctx = Arc::new(Context::new());
-        let psbt_str = empty_psbt_str();
+        let psbt_str = empty_psbt();
         let result = combinepsbt(&ctx, &json!([[psbt_str.as_str()]]))
             .unwrap_or_else(|err| panic!("combinepsbt: {err}"));
         let Some(out) = result.as_str() else {
@@ -2758,18 +2759,6 @@ mod finalizepsbt_tests {
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
     use super::*;
-
-    fn empty_psbt() -> String {
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: Vec::new(),
-        };
-        let psbt =
-            bitcoin::psbt::Psbt::from_unsigned_tx(tx).unwrap_or_else(|err| panic!("psbt: {err}"));
-        crate::base64::encode(&psbt.serialize())
-    }
 
     #[test]
     fn finalizepsbt_returns_incomplete_for_unfinalized_inputs() {
