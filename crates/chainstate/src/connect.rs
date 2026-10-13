@@ -18,7 +18,7 @@ use bitcoin_rs_chain::node::NodeId;
 use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, UtxoView};
 use bitcoin_rs_primitives::{Block, Hash256, Txid, consensus_bytes};
 use bitcoin_rs_storage::CommitRecords;
-use bitcoin_rs_utxo::contract::{BlockChangeError, build_block_changes, is_coinbase_tx};
+use bitcoin_rs_utxo::contract::{BlockChangeError, build_block_changes};
 use hashbrown::HashMap;
 use std::sync::Arc;
 
@@ -657,7 +657,7 @@ fn check_coinbase_maturity(
         return Ok(());
     }
     if !tx_plan.needs_local_utxo_overlay {
-        for tx in block.txs.iter().filter(|tx| !is_coinbase_tx(tx)) {
+        for tx in block.txs.iter().filter(|tx| !tx.is_coinbase()) {
             for input in &tx.inputs {
                 let Some(entry) = resolved.lookup_meta(&input.previous_output) else {
                     continue;
@@ -674,7 +674,7 @@ fn check_coinbase_maturity(
 
     let mut view = BlockLocalUtxoView::new(resolved, &block.txs, height, tx_plan.overlay_capacity);
     for (tx_index, (tx, txid)) in (0_u32..).zip(block.txs.iter().zip(txids)) {
-        if is_coinbase_tx(tx) {
+        if tx.is_coinbase() {
             view.add_outputs(tx_index, *txid, tx.outputs.len())?;
             continue;
         }
@@ -710,7 +710,7 @@ fn check_bip68_sequence_locks(
     let mut view = BlockLocalUtxoView::new(resolved, &block.txs, height, tx_plan.overlay_capacity);
     let mut prevout_mtp_by_height = HashMap::new();
     for (tx_index, (tx, txid)) in (0_u32..).zip(block.txs.iter().zip(txids)) {
-        if is_coinbase_tx(tx) {
+        if tx.is_coinbase() {
             view.add_outputs(tx_index, *txid, tx.outputs.len())?;
             continue;
         }

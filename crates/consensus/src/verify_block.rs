@@ -6,7 +6,6 @@ use crate::ConsensusError;
 use crate::bip9::SoftforkState;
 use crate::block_view::BlockFacts;
 use crate::sha256d64::{self, Avx2Sha256d64, detect_avx2};
-use crate::verify_tx::is_coinbase;
 
 /// BIP141 witness commitment output prefix: `OP_RETURN` `OP_PUSHBYTES_36`
 /// `commitment_header`.
@@ -91,11 +90,11 @@ pub fn verify_block_rules_precomputed(
     if facts.tx_count() != txdata.len() {
         return Err(ConsensusError::MerkleRoot);
     }
-    if !is_coinbase(&txdata[0]) {
+    if !txdata[0].is_coinbase() {
         return Err(ConsensusError::MissingCoinbase);
     }
     for (tx_index, tx) in txdata.iter().enumerate().skip(1) {
-        if is_coinbase(tx) {
+        if tx.is_coinbase() {
             return Err(ConsensusError::ExtraCoinbase { tx_index });
         }
     }
@@ -420,9 +419,9 @@ mod tests {
 
     use super::{
         BlockRuleContext, WITNESS_COMMITMENT_PREFIX, block_merkle_root_matches_txids,
-        compute_merkle_root, is_coinbase, merkle_root_and_mutation,
-        merkle_root_and_mutation_borrowed, merkle_root_spine, sha256d, verify_block_rules,
-        verify_block_rules_precomputed, verify_flags, verify_merkle_root_with_txids,
+        compute_merkle_root, merkle_root_and_mutation, merkle_root_and_mutation_borrowed,
+        merkle_root_spine, sha256d, verify_block_rules, verify_block_rules_precomputed,
+        verify_flags, verify_merkle_root_with_txids,
     };
     use crate::ConsensusError;
     use crate::bip9::SoftforkState;
@@ -874,8 +873,8 @@ mod tests {
 
     #[test]
     fn is_coinbase_detects_null_prevout() {
-        assert!(is_coinbase(&coinbase_tx()));
-        assert!(!is_coinbase(&witness_spend_tx()));
-        assert!(!is_coinbase(&spend_tx(1, Vec::new())));
+        assert!(coinbase_tx().is_coinbase());
+        assert!(!witness_spend_tx().is_coinbase());
+        assert!(!spend_tx(1, Vec::new()).is_coinbase());
     }
 }

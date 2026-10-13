@@ -17,7 +17,7 @@ use bitcoin_rs_storage::InMemoryUndoStore;
 pub use bitcoin_rs_storage::KvUndoStore;
 pub use bitcoin_rs_storage::UndoStore;
 use bitcoin_rs_storage::block_body::BlockBodyStore;
-use bitcoin_rs_utxo::contract::{SpentOutputLookup, is_coinbase_tx};
+use bitcoin_rs_utxo::contract::SpentOutputLookup;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_utxo::{UtxoCoin, UtxoSet};
 use connect::{apply_block_admitted, apply_committed_block_admitted};
@@ -1626,7 +1626,7 @@ impl ResolvedUtxoView {
         let candidates = block
             .txs
             .iter()
-            .filter(|tx| !is_coinbase_tx(tx))
+            .filter(|tx| !tx.is_coinbase())
             .flat_map(|tx| &tx.inputs)
             .filter(|input| same_block.is_none_or(|set| !set.contains(&input.previous_output)))
             .map(|input| input.previous_output);

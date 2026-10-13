@@ -313,7 +313,7 @@ pub(crate) fn evaluate_one(
 
     let reject = if pool.contains_txid(&txid) {
         Some(AcceptanceRejectReason::AlreadyInMempool)
-    } else if is_coinbase(tx) || context.missing_inputs {
+    } else if tx.is_coinbase() || context.missing_inputs {
         Some(AcceptanceRejectReason::MissingInputs)
     } else if let Err(err) = is_standard_tx(tx, policy) {
         Some(AcceptanceRejectReason::NonStandard(err))
@@ -350,12 +350,6 @@ pub(crate) fn evaluate_one(
             .and_then(|rate| u64::try_from(rate).ok()),
         reject_reason: reject,
     }
-}
-
-/// Returns true if `tx` is a coinbase transaction: exactly one input whose
-/// previous output is the null outpoint (zero txid, `vout == u32::MAX`).
-fn is_coinbase(tx: &Tx) -> bool {
-    tx.inputs.len() == 1 && tx.inputs[0].previous_output.is_null()
 }
 
 /// Minimum non-witness serialization Core relays, `tx-size-small`.
