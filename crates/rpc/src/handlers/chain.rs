@@ -44,13 +44,7 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
                 .node(tip.tip_id)
                 .map_or(CompactTarget::from_consensus(0), |node| node.header.bits)
         });
-    let chain = match progress.network {
-        Network::Mainnet => "main",
-        Network::Testnet3 => "test",
-        Network::Testnet4 => "testnet4",
-        Network::Signet => "signet",
-        Network::Regtest => "regtest",
-    };
+    let chain = crate::convert::chain_name(progress.network);
     let response = v31::GetBlockchainInfo {
         chain: chain.to_owned(),
         blocks: i64::from(progress.blocks),

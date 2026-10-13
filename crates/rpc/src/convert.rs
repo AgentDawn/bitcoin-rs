@@ -37,6 +37,18 @@ pub(crate) const fn bitcoin_network(network: Network) -> bitcoin::Network {
     }
 }
 
+/// Core RPC chain spelling, distinct from checkpoint and evidence identities.
+#[must_use]
+pub(crate) const fn chain_name(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "main",
+        Network::Testnet3 => "test",
+        Network::Testnet4 => "testnet4",
+        Network::Signet => "signet",
+        Network::Regtest => "regtest",
+    }
+}
+
 /// Saturating `u64 -> i64` for Core wire counters typed as `i64`.
 #[must_use]
 pub(crate) fn i64_saturated(value: u64) -> i64 {

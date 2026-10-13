@@ -697,13 +697,7 @@ fn render_block_template(template: &BlockTemplate) -> Result<Value, RpcError> {
 }
 
 fn render_mining_info(info: &MiningInfo) -> Result<Value, RpcError> {
-    let chain = match info.network {
-        bitcoin_rs_primitives::Network::Mainnet => "main",
-        bitcoin_rs_primitives::Network::Testnet3 => "test",
-        bitcoin_rs_primitives::Network::Testnet4 => "testnet4",
-        bitcoin_rs_primitives::Network::Signet => "signet",
-        bitcoin_rs_primitives::Network::Regtest => "regtest",
-    };
+    let chain = crate::convert::chain_name(info.network);
     let next_bits = format!("{:08x}", info.next_bits);
     let next_target = compact_target_hex(info.next_bits);
     let next_height = u64::from(info.blocks) + 1;
