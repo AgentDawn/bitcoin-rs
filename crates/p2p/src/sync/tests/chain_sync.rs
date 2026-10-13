@@ -406,6 +406,107 @@ fn chain_sync_probe_locator_anchors_at_the_header_tips_parent() {
 }
 
 #[test]
+fn frontier_and_eviction_probes_do_not_overwrite_live_requests() -> TestResult {
+    let (tree, blocks) = mined_chain(1, 2)?;
+    let harness = SyncHarness::new(tree);
+    let sync = harness.sync;
+    let peers = harness.peers;
+    let inbound_headers_tx = harness.inbound_headers_tx;
+    sync.chain.bootstrap_genesis();
+
+    let addr = test_addr(9_940, 0)?;
+    let rx = connect_peer(&peers, synthetic_peer(addr, i32::MAX));
+    let source = current_source(&peers, addr);
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), Instant::now());
+    let request_snapshot = || {
+        let scheduler = sync.scheduler.lock();
+        let request = scheduler.headers_sync.get(&source)?.request?;
+        Some((
+            request.locator_tip_hash,
+            request.target_height,
+            request.requested_at,
+            request.state,
+        ))
+    };
+    let header_tip = frontier
+        .chain
+        .chain_tip
+        .as_ref()
+        .ok_or("the fixture must have a header tip")?;
+    let chain_probe_locator = {
+        let tree = sync.chain.block_tree();
+        let parent = tree
+            .node(header_tip.tip_id)
+            .ok()
+            .and_then(|node| node.parent)
+            .ok_or("the header tip must have a parent")?;
+        tree.node(parent)
+            .ok()
+            .map(|node| node.hash)
+            .ok_or("the parent must be in the tree")?
+    };
+
+    assert_eq!(
+        sync.probe_frontier_peer(&frontier, source),
+        GetheadersOutcome::Sent,
+    );
+    assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
+    let frontier_request = request_snapshot().ok_or("the frontier request was not registered")?;
+    assert_ne!(
+        frontier_request.0, chain_probe_locator,
+        "the two probe classes ask from different locators",
+    );
+    assert_eq!(
+        frontier_request.3,
+        super::super::HeaderRequestState::AwaitingResponse,
+    );
+    assert!(
+        !sync.probe_chain_sync(source, &frontier),
+        "an eviction probe cannot borrow a frontier request's response",
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(request_snapshot(), Some(frontier_request));
+
+    inbound_headers_tx.send(crate::InboundHeaders {
+        headers: vec![blocks[0].header],
+        source: Some(source),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.drain_inbound_headers();
+    let _ = rx.try_iter().collect::<Vec<_>>();
+    assert!(
+        !sync.scheduler.lock().headers_sync.contains_key(&source),
+        "the real wire answer must consume the frontier request",
+    );
+
+    assert!(
+        sync.probe_chain_sync(source, &frontier),
+        "an unowned source can receive its eviction probe",
+    );
+    assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
+    let eviction_request = request_snapshot().ok_or("the eviction probe was not registered")?;
+    assert_eq!(eviction_request.0, chain_probe_locator);
+    assert_eq!(
+        eviction_request.3,
+        super::super::HeaderRequestState::AwaitingResponse,
+    );
+    assert_eq!(
+        sync.send_getheaders(
+            source,
+            0,
+            i32::try_from(frontier_request.1).unwrap_or(i32::MAX),
+            vec![frontier_request.0],
+        ),
+        GetheadersOutcome::Suppressed,
+        "a frontier request cannot overwrite the live eviction probe",
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(request_snapshot(), Some(eviction_request));
+    Ok(())
+}
+
+#[test]
 #[expect(clippy::expect_used)]
 fn a_failed_sweep_probe_restores_the_armed_record() {
     let t0 = Instant::now();

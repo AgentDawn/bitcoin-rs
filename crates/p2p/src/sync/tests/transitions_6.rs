@@ -228,5 +228,6 @@ fn reconcile_forgets_window_state_only_when_connection_identity_changes() -> Tes
     peers.publish_info(addr, &replacement, synthetic_peer(addr, 8));
     sync.reconcile_peer_sessions();
     assert!(sync.scheduler.lock().header_request().is_none());
+    assert!(sync.scheduler.lock().headers_sync.is_empty());
     Ok(())
 }

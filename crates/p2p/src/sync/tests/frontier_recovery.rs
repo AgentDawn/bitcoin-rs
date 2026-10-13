@@ -88,8 +88,9 @@ fn empty_header_probe_is_paced_then_rotates_to_another_peer() -> TestResult {
     assert!(second_rx.try_recv().is_err());
     sync.scheduler
         .lock()
-        .header_requests
+        .headers_sync
         .get_mut(&current_source(&peers, first))
+        .and_then(|owned| owned.request.as_mut())
         .ok_or("probe lost its deadline")?
         .requested_at -= super::super::HEADER_REQUEST_TIMEOUT;
     sync.tick();
@@ -361,8 +362,9 @@ fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick() -> TestResult 
 
     sync.scheduler
         .lock()
-        .header_requests
+        .headers_sync
         .get_mut(&current_source(&peers, live))
+        .and_then(|owned| owned.request.as_mut())
         .ok_or("fallback lost its deadline")?
         .requested_at -= super::super::HEADER_REQUEST_TIMEOUT;
 

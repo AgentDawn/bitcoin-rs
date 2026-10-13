@@ -748,15 +748,14 @@ fn body_carried_header_does_not_consume_a_pending_getheaders() -> TestResult {
     let source = current_source(&peers, peer);
     {
         let mut scheduler = sync.scheduler.lock();
-        scheduler.header_requests.insert(
-            source,
-            super::super::PendingHeaderRequest {
+        scheduler.headers_sync.entry(source).or_default().request =
+            Some(super::super::HeaderRequest {
                 source,
                 locator_tip_hash: Hash256::default(),
                 target_height: 1,
                 requested_at: Instant::now(),
-            },
-        );
+                state: super::super::HeaderRequestState::AwaitingResponse,
+            });
         scheduler.header_request_owner = Some(source);
     }
 

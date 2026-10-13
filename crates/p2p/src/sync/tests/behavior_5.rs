@@ -192,15 +192,14 @@ fn on_peer_ready_sweeps_dead_predecessor_header_request() -> TestResult {
     let source = crate::PeerSource::for_test(peer_addr);
     {
         let mut scheduler = sync.scheduler.lock();
-        scheduler.header_requests.insert(
-            source,
-            super::super::PendingHeaderRequest {
+        scheduler.headers_sync.entry(source).or_default().request =
+            Some(super::super::HeaderRequest {
                 source,
                 locator_tip_hash: Hash256::default(),
                 target_height: 1,
                 requested_at: Instant::now(),
-            },
-        );
+                state: super::super::HeaderRequestState::AwaitingResponse,
+            });
         scheduler.header_request_owner = Some(source);
     }
     register_info(&sync.peer_table, synthetic_peer(peer_addr, 1));
@@ -210,6 +209,7 @@ fn on_peer_ready_sweeps_dead_predecessor_header_request() -> TestResult {
         sync.scheduler.lock().header_request().is_none(),
         "replacement readiness must release the dead predecessor's request"
     );
+    assert!(sync.scheduler.lock().headers_sync.is_empty());
     Ok(())
 }
 
@@ -224,15 +224,17 @@ fn on_peer_ready_sweep_releases_dead_owned_requests_only() -> TestResult {
     let replacement = current_source(&sync.peer_table, peer_addr);
     {
         let mut scheduler = sync.scheduler.lock();
-        scheduler.header_requests.insert(
-            replacement,
-            super::super::PendingHeaderRequest {
-                source: replacement,
-                locator_tip_hash: Hash256::default(),
-                target_height: 1,
-                requested_at: Instant::now(),
-            },
-        );
+        scheduler
+            .headers_sync
+            .entry(replacement)
+            .or_default()
+            .request = Some(super::super::HeaderRequest {
+            source: replacement,
+            locator_tip_hash: Hash256::default(),
+            target_height: 1,
+            requested_at: Instant::now(),
+            state: super::super::HeaderRequestState::AwaitingResponse,
+        });
         scheduler.header_request_owner = Some(replacement);
     }
     sync.on_peer_ready(stale.source(peer_addr));

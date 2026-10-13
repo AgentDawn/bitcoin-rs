@@ -244,10 +244,8 @@ fn defer_owned_body_fetch(scheduler: &mut SchedulerState, source: PeerSource, ha
 struct SchedulerState {
     window: DownloadWindow,
     stager: BlockStager,
-    /// Requests are owned by exact connections, including presync
-    /// continuations and eviction probes outside frontier discovery.
-    header_requests: hashbrown::HashMap<PeerSource, PendingHeaderRequest>,
-    /// The request pacing frontier discovery; its data lives only in the map.
+    /// Selects the exact lifecycle entry whose request paces frontier
+    /// discovery; request data lives only in `headers_sync`.
     header_request_owner: Option<PeerSource>,
     /// Deferred body-fetch ownership: a compact `getblocktxn` or fallback
     /// `getdata` was issued for a tip hash whose header has not attached yet.
@@ -256,32 +254,29 @@ struct SchedulerState {
     /// it can bring us to the tip. Keyed by exact connection identity, so a
     /// replacement at the same address is judged on its own record.
     chain_sync: hashbrown::HashMap<PeerSource, peers::ChainSyncState>,
-    /// The download-twice header sync of every connection whose chain this
-    /// node has not yet seen reach the network's minimum work. Keyed by
-    /// exact connection identity, so a same-address replacement starts its
-    /// own sync and never inherits its predecessor's commitments.
-    headers_sync: hashbrown::HashMap<PeerSource, headers_presync::HeadersSyncState>,
+    /// The sole header lifecycle owner for each exact connection: its wire
+    /// request and download-twice validation cursor share one entry.
+    headers_sync: hashbrown::HashMap<PeerSource, PeerHeadersSync>,
     /// Whether this node's own tip is still moving, and what that buys.
     stale_tip: StaleTipState,
 }
 
 impl SchedulerState {
-    fn header_request(&self) -> Option<PendingHeaderRequest> {
+    fn header_request(&self) -> Option<HeaderRequest> {
         self.header_request_owner
-            .and_then(|source| self.header_requests.get(&source).copied())
+            .and_then(|source| self.headers_sync.get(&source)?.request)
     }
 
     /// Releases every scheduling fact owned by a connection not in `live`.
     ///
     /// PRE: `live` is the peer table's live-session snapshot.
-    /// POST: the window, header requests, header presync states, and the
-    ///   deferred body fetches hold only facts owned by a connection in `live`.
+    /// POST: the window, header lifecycles, and deferred body fetches hold
+    ///   only facts owned by a connection in `live`.
     /// INVARIANT: ownership is compared by connection identity, never by
     ///   address alone.
     fn release_unowned(&mut self, live: &[PeerSource]) {
         let owns = |source: &PeerSource| live.contains(source);
         self.window.retain_owned_by(owns);
-        self.header_requests.retain(|source, _| owns(source));
         if self
             .header_request_owner
             .is_some_and(|source| !owns(&source))
@@ -315,13 +310,26 @@ impl SchedulerState {
     }
 }
 
+#[derive(Default)]
+struct PeerHeadersSync {
+    request: Option<HeaderRequest>,
+    presync: Option<headers_presync::HeadersSyncState>,
+}
+
 #[derive(Clone, Copy, Debug)]
-pub(super) struct PendingHeaderRequest {
+pub(super) struct HeaderRequest {
     /// The exact connection the request was sent to.
     source: PeerSource,
     locator_tip_hash: Hash256,
     target_height: u32,
     requested_at: Instant,
+    state: HeaderRequestState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HeaderRequestState {
+    AwaitingResponse,
+    Answered,
 }
 
 /// Whether `send_getheaders` reached the wire this tick.
@@ -329,11 +337,8 @@ pub(super) struct PendingHeaderRequest {
 pub(super) enum GetheadersOutcome {
     /// The request was sent and registered.
     Sent,
-    /// An identical request is already pending on that connection; nothing
-    /// was sent.
+    /// Existing request pacing or a live presync cursor owns this connection.
     Suppressed,
-    /// Download-twice sync owns the connection; no eviction probe was sent.
-    SyncOwned,
     /// Nothing was sent because the frontier body is already owned: the
     /// capability question the probe exists to answer is resolved, and no
     /// request is outstanding on this connection.
@@ -396,7 +401,6 @@ impl BlockSync {
             scheduler: Mutex::new(SchedulerState {
                 window: DownloadWindow::new(budget),
                 stager: BlockStager::new(budget),
-                header_requests: hashbrown::HashMap::new(),
                 header_request_owner: None,
                 owned_body_fetches: Vec::new(),
                 chain_sync: hashbrown::HashMap::new(),
@@ -418,7 +422,6 @@ impl BlockSync {
         *self.scheduler.lock() = SchedulerState {
             window: DownloadWindow::new(budget),
             stager: BlockStager::new(budget),
-            header_requests: hashbrown::HashMap::new(),
             header_request_owner: None,
             owned_body_fetches: Vec::new(),
             chain_sync: hashbrown::HashMap::new(),
@@ -545,9 +548,7 @@ impl BlockSync {
                 GetheadersOutcome::Failed => {
                     self.request_headers_from_best_peer(&frontier, Some(source));
                 }
-                GetheadersOutcome::Suppressed
-                | GetheadersOutcome::FrontierOwned
-                | GetheadersOutcome::SyncOwned => {
+                GetheadersOutcome::Suppressed | GetheadersOutcome::FrontierOwned => {
                     self.request_headers_from_best_peer(&frontier, None);
                 }
                 GetheadersOutcome::Sent => {}

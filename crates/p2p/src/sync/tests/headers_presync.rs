@@ -127,18 +127,24 @@ fn with_sync_state<T>(
     source: PeerSource,
     read: impl FnOnce(&HeadersSyncState) -> T,
 ) -> Option<T> {
-    sync.scheduler.lock().headers_sync.get(&source).map(read)
+    sync.scheduler
+        .lock()
+        .headers_sync
+        .get(&source)
+        .and_then(|owned| owned.presync.as_ref())
+        .map(read)
 }
 
 fn sync_phase(sync: &BlockSync, source: PeerSource) -> Option<HeadersSyncPhase> {
     with_sync_state(sync, source, HeadersSyncState::phase)
 }
 
-fn pending_request(
-    sync: &BlockSync,
-    source: PeerSource,
-) -> Option<super::super::PendingHeaderRequest> {
-    sync.scheduler.lock().header_requests.get(&source).copied()
+fn pending_request(sync: &BlockSync, source: PeerSource) -> Option<super::super::HeaderRequest> {
+    sync.scheduler
+        .lock()
+        .headers_sync
+        .get(&source)
+        .and_then(|owned| owned.request)
 }
 
 fn expire_request(sync: &BlockSync, source: PeerSource) -> TestResult {
@@ -147,8 +153,9 @@ fn expire_request(sync: &BlockSync, source: PeerSource) -> TestResult {
         .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
     sync.scheduler
         .lock()
-        .header_requests
+        .headers_sync
         .get_mut(&source)
+        .and_then(|owned| owned.request.as_mut())
         .ok_or("the request must still be registered")?
         .requested_at = requested_at;
     Ok(())
@@ -165,7 +172,7 @@ fn assert_no_getheaders(rx: &crossbeam_channel::Receiver<Message>) {
 fn assert_request_unchanged(
     sync: &BlockSync,
     source: PeerSource,
-    expected: super::super::PendingHeaderRequest,
+    expected: super::super::HeaderRequest,
 ) {
     assert_eq!(
         pending_request(sync, source).map(|request| {
@@ -173,12 +180,14 @@ fn assert_request_unchanged(
                 request.locator_tip_hash,
                 request.target_height,
                 request.requested_at,
+                request.state,
             )
         }),
         Some((
             expected.locator_tip_hash,
             expected.target_height,
             expected.requested_at,
+            expected.state,
         )),
         "competing schedulers must not overwrite the owned request",
     );
@@ -199,10 +208,177 @@ fn assert_competing_requests_suppressed(
     );
     assert_eq!(
         sync.send_chain_sync_probe(&frontier, source),
-        super::super::GetheadersOutcome::SyncOwned,
+        super::super::GetheadersOutcome::Suppressed,
+    );
+    assert!(
+        !sync.probe_chain_sync(source, &frontier),
+        "an owned request or live presync must not arm an eviction window",
     );
     assert_no_getheaders(rx);
     assert_request_unchanged(sync, source, expected);
+    Ok(())
+}
+
+#[test]
+fn empty_below_floor_reply_preserves_pacing_and_rotates_without_retirement() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    sync.chain.bootstrap_genesis();
+    let fork = chain_on(&genesis, 0, 1);
+    assert!(matches!(
+        sync.chain.admit_headers(&fork),
+        super::super::chain::HeaderAdmission::Accepted { .. }
+    ));
+    let (first_addr, _first_lease, first_rx) = connect(&peers, 9710, 100_000);
+    let (second_addr, _second_lease, second_rx) = connect(&peers, 9711, 100_000);
+    let first = current_source(&peers, first_addr);
+    let second = current_source(&peers, second_addr);
+
+    sync.tick();
+    assert!(matches!(first_rx.try_recv()?, Message::GetHeaders(_)));
+    assert!(second_rx.try_recv().is_err());
+    let initial = pending_request(&sync, first).ok_or("the first request was not registered")?;
+    assert_eq!(
+        initial.state,
+        super::super::HeaderRequestState::AwaitingResponse
+    );
+
+    inbound_headers_tx.send(InboundHeaders {
+        headers: Vec::new(),
+        source: Some(first),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.tick();
+    let answered = pending_request(&sync, first).ok_or("the empty reply lost its request")?;
+    assert_eq!(answered.state, super::super::HeaderRequestState::Answered);
+    assert_eq!(answered.requested_at, initial.requested_at);
+    assert_eq!(answered.locator_tip_hash, initial.locator_tip_hash);
+    assert_eq!(answered.target_height, initial.target_height);
+    assert_no_getheaders(&first_rx);
+    assert_no_getheaders(&second_rx);
+
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), Instant::now());
+    assert_eq!(
+        sync.send_getheaders(first, 0, 1, vec![Hash256::from(genesis.compute_hash())],),
+        super::super::GetheadersOutcome::Suppressed,
+    );
+    assert!(
+        !sync.probe_chain_sync(first, &frontier),
+        "an answered pacing gate must not arm an eviction window",
+    );
+    assert_request_unchanged(&sync, first, answered);
+    assert_no_getheaders(&first_rx);
+
+    expire_request(&sync, first)?;
+    sync.tick();
+    assert!(
+        peers.is_current(first),
+        "an answered request cannot retire its peer"
+    );
+    assert_eq!(
+        pending_request(&sync, first).map(|request| request.state),
+        Some(super::super::HeaderRequestState::Answered),
+    );
+    assert!(first_rx.try_recv().is_err());
+    assert!(matches!(second_rx.try_recv()?, Message::GetHeaders(_)));
+    assert_eq!(sync.scheduler.lock().header_request_owner, Some(second));
+
+    let chain = chain_on(&genesis, 0, PAGE);
+    deliver_headers(&inbound_headers_tx, chain, second)?;
+    sync.tick();
+    let _ = next_locator(&second_rx).ok_or("the second peer's presync request was not sent")?;
+    let before_empty =
+        pending_request(&sync, second).ok_or("the second request was not tracked")?;
+    assert_eq!(sync_phase(&sync, second), Some(HeadersSyncPhase::Presync));
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get(&second)
+            .is_some_and(|owned| owned.presync.is_some()),
+        "a live presync cursor shares the request's lifecycle entry",
+    );
+
+    inbound_headers_tx.send(InboundHeaders {
+        headers: Vec::new(),
+        source: Some(second),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.drain_inbound_headers();
+    let answered = pending_request(&sync, second).ok_or("the empty answer lost its pacing gate")?;
+    assert_eq!(answered.state, super::super::HeaderRequestState::Answered);
+    assert_eq!(answered.requested_at, before_empty.requested_at);
+    assert_eq!(sync_phase(&sync, second), None);
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get(&second)
+            .is_some_and(|owned| owned.request.is_some() && owned.presync.is_none()),
+        "an empty answer clears only the nested presync state",
+    );
+    Ok(())
+}
+
+#[test]
+fn unowned_below_floor_peer_receives_one_tracked_chain_sync_probe() -> TestResult {
+    let floor = ChainWork::from(WORK_PER_HEADER * u64::try_from(4 * PAGE).unwrap_or(u64::MAX));
+    let (genesis, sync, inbound_headers_tx, peers) = presync_fixture(floor)?;
+    sync.chain.bootstrap_genesis();
+    let (addr, _lease, rx) = connect(&peers, 9712, 100_000);
+    let source = current_source(&peers, addr);
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), Instant::now());
+
+    assert!(
+        sync.probe_chain_sync(source, &frontier),
+        "an unowned source must receive its real below-floor probe",
+    );
+    assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
+    let request = pending_request(&sync, source).ok_or("the probe was not tracked")?;
+    assert_eq!(
+        request.state,
+        super::super::HeaderRequestState::AwaitingResponse
+    );
+    assert_eq!(
+        sync.send_getheaders(source, 0, 100, vec![Hash256::from(genesis.compute_hash())],),
+        super::super::GetheadersOutcome::Suppressed,
+        "an unanswered below-floor request owns this exact connection",
+    );
+    assert!(
+        !sync.probe_chain_sync(source, &frontier),
+        "a second probe must not borrow the first request's response window",
+    );
+    assert_no_getheaders(&rx);
+
+    inbound_headers_tx.send(InboundHeaders {
+        headers: chain_on(&genesis, 0, PAGE),
+        source: Some(source),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.tick();
+    assert_eq!(
+        sync_phase(&sync, source),
+        Some(HeadersSyncPhase::Presync),
+        "the real response must establish the download-twice owner",
+    );
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get(&source)
+            .is_some_and(|owned| owned.request.is_some() && owned.presync.is_some()),
+        "the presync continuation and request share one lifecycle entry",
+    );
+    let _ = rx.try_iter().collect::<Vec<_>>();
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), Instant::now());
+    assert!(
+        !sync.probe_chain_sync(source, &frontier),
+        "a live PRESYNC cursor must not arm a chain-sync eviction window",
+    );
+    assert_no_getheaders(&rx);
     Ok(())
 }
 
@@ -458,11 +634,20 @@ fn owned_header_requests_suppress_competing_frontier_and_chain_sync_requests() -
         Some(HeadersSyncPhase::Redownload),
         "the crossing page must enter redownload",
     );
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get(&source)
+            .is_some_and(|owned| owned.request.is_some() && owned.presync.is_some()),
+        "the redownload request and validation cursor share one lifecycle entry",
+    );
     assert_competing_requests_suppressed(&sync, source, &rx, competing_locator, 9)?;
     Ok(())
 }
 
 #[test]
+#[expect(clippy::too_many_lines)]
 fn expired_header_syncs_drop_delayed_pages_before_recovery() -> TestResult {
     let chain = chain_on(&genesis_header(), 0, PAGE + 500);
     let threshold = chain_work(&chain);
@@ -485,6 +670,7 @@ fn expired_header_syncs_drop_delayed_pages_before_recovery() -> TestResult {
     );
     assert_eq!(sync_phase(&sync, source_a), None);
     assert!(pending_request(&sync, source_a).is_none());
+    assert!(!sync.scheduler.lock().headers_sync.contains_key(&source_a));
     assert_eq!(
         tree_node_count(&sync),
         1,
@@ -508,6 +694,7 @@ fn expired_header_syncs_drop_delayed_pages_before_recovery() -> TestResult {
     );
     assert_eq!(sync_phase(&sync, source_b), None);
     assert!(pending_request(&sync, source_b).is_none());
+    assert!(!sync.scheduler.lock().headers_sync.contains_key(&source_b));
     assert_eq!(
         tree_node_count(&sync),
         1,
@@ -526,6 +713,13 @@ fn expired_header_syncs_drop_delayed_pages_before_recovery() -> TestResult {
         sync_phase(&sync, source_c),
         Some(HeadersSyncPhase::Redownload)
     );
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get(&source_c)
+            .is_some_and(|owned| owned.request.is_some() && owned.presync.is_some()),
+    );
     let (addr_d, _lease_d, rx_d) = connect(&peers, 9724, 100_000);
     let source_d = current_source(&peers, addr_d);
     deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), source_c)?;
@@ -538,6 +732,7 @@ fn expired_header_syncs_drop_delayed_pages_before_recovery() -> TestResult {
     );
     assert_eq!(sync_phase(&sync, source_c), None);
     assert!(pending_request(&sync, source_c).is_none());
+    assert!(!sync.scheduler.lock().headers_sync.contains_key(&source_c));
     assert_eq!(
         tree_node_count(&sync),
         1,
@@ -583,6 +778,21 @@ fn replaced_connection_cannot_admit_queued_predecessor_headers() -> TestResult {
     let old_source = current_source(&peers, addr);
     sync.tick();
     let _ = next_locator(&old_rx).ok_or("the predecessor request was not sent")?;
+    deliver_headers(&inbound_headers_tx, chain[..PAGE].to_vec(), old_source)?;
+    sync.tick();
+    let _ = next_locator(&old_rx).ok_or("the predecessor presync request was not sent")?;
+    assert_eq!(
+        sync_phase(&sync, old_source),
+        Some(HeadersSyncPhase::Presync)
+    );
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get(&old_source)
+            .is_some_and(|owned| owned.request.is_some() && owned.presync.is_some()),
+        "the predecessor has both lifecycle facts before replacement",
+    );
 
     let (replacement_tx, replacement_rx) = unbounded::<Message>();
     let replacement_lease = PeerLease::new(replacement_tx);
@@ -595,6 +805,7 @@ fn replaced_connection_cannot_admit_queued_predecessor_headers() -> TestResult {
     assert!(old_lease.is_cancelled());
     assert_eq!(sync_phase(&sync, old_source), None);
     assert!(pending_request(&sync, old_source).is_none());
+    assert!(!sync.scheduler.lock().headers_sync.contains_key(&old_source));
     assert_eq!(
         pending_request(&sync, replacement).map(|request| request.source),
         Some(replacement),
@@ -609,6 +820,14 @@ fn replaced_connection_cannot_admit_queued_predecessor_headers() -> TestResult {
         sync_phase(&sync, replacement),
         Some(HeadersSyncPhase::Presync),
         "the replacement must retain its own presync state",
+    );
+    assert!(
+        sync.scheduler
+            .lock()
+            .headers_sync
+            .get(&replacement)
+            .is_some_and(|owned| owned.request.is_some() && owned.presync.is_some()),
+        "the replacement owns its request and presync together",
     );
     let replacement_request =
         pending_request(&sync, replacement).ok_or("replacement request was not registered")?;

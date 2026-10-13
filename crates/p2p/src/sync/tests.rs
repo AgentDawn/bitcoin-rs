@@ -475,8 +475,9 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()
-            .header_requests
+            .headers_sync
             .get_mut(&a_source)
+            .and_then(|owned| owned.request.as_mut())
             .ok_or("the request must still be registered")?
             .requested_at = almost;
         sync.tick();
@@ -500,8 +501,9 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()
-            .header_requests
+            .headers_sync
             .get_mut(&a_source)
+            .and_then(|owned| owned.request.as_mut())
             .ok_or("the request must still be registered")?
             .requested_at = backdated;
         sync.tick();
