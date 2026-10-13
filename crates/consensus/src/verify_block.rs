@@ -410,14 +410,14 @@ pub fn compute_merkle_root(leaves: &mut Vec<[u8; 32]>) -> Option<[u8; 32]> {
 mod tests {
     use bitcoin_rs_primitives::{
         Amount, Block, BlockHash, Hash256, Header, LockTime, Network, OutPoint, Script, Sequence,
-        Tx, TxIn, TxOut, Txid, Witness,
+        Tx, TxIn, TxOut, Txid, Witness, encode::double_sha256,
     };
 
     use super::{
         BlockRuleContext, WITNESS_COMMITMENT_PREFIX, block_merkle_root_matches_txids,
         compute_merkle_root, merkle_root_and_mutation, merkle_root_and_mutation_borrowed,
-        merkle_root_spine, sha256d, verify_block_rules, verify_block_rules_precomputed,
-        verify_flags, verify_merkle_root_with_txids,
+        merkle_root_spine, verify_block_rules, verify_block_rules_precomputed, verify_flags,
+        verify_merkle_root_with_txids,
     };
     use crate::ConsensusError;
     use crate::bip9::SoftforkState;
