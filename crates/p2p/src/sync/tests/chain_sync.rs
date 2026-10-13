@@ -609,6 +609,207 @@ fn chain_sync_probe_holds_request_for_its_response_window() -> TestResult {
 }
 
 #[test]
+fn replacing_expired_frontier_with_chain_sync_probe_releases_owner() -> TestResult {
+    let (tree, _blocks) = mined_chain(1, 2)?;
+    let harness = SyncHarness::new(tree);
+    let sync = harness.sync;
+    let peers = harness.peers;
+    sync.chain.bootstrap_genesis();
+
+    let frontier_addr = test_addr(9_943, 0)?;
+    let other_addr = test_addr(9_944, 0)?;
+    let frontier_rx = connect_peer(&peers, synthetic_peer(frontier_addr, i32::MAX));
+    let other_rx = connect_peer(&peers, synthetic_peer(other_addr, i32::MAX));
+    let frontier_source = current_source(&peers, frontier_addr);
+    let other_source = current_source(&peers, other_addr);
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), Instant::now());
+
+    assert_eq!(
+        sync.probe_frontier_peer(&frontier, frontier_source),
+        GetheadersOutcome::Sent,
+    );
+    assert!(matches!(frontier_rx.try_recv()?, Message::GetHeaders(_)));
+    {
+        let mut scheduler = sync.scheduler.lock();
+        let request = scheduler
+            .headers_sync
+            .get_mut(&frontier_source)
+            .and_then(|owned| owned.request.as_mut())
+            .ok_or("the frontier request must be registered")?;
+        assert_eq!(request.kind, super::super::HeaderRequestKind::Frontier,);
+        request.requested_at = Instant::now()
+            .checked_sub(request.timeout())
+            .ok_or("the frontier request must be expired")?;
+    }
+
+    assert!(sync.probe_chain_sync(frontier_source, &frontier));
+    assert!(matches!(frontier_rx.try_recv()?, Message::GetHeaders(_)));
+    let probe_snapshot = {
+        let scheduler = sync.scheduler.lock();
+        assert_eq!(scheduler.header_request_owner, None);
+        assert!(scheduler.header_request().is_none());
+        let request = scheduler
+            .headers_sync
+            .get(&frontier_source)
+            .and_then(|owned| owned.request)
+            .ok_or("the unanswered chain-sync probe must remain registered")?;
+        assert_eq!(
+            (request.kind, request.state),
+            (
+                super::super::HeaderRequestKind::ChainSyncProbe,
+                super::super::HeaderRequestState::AwaitingResponse,
+            ),
+        );
+        (
+            request.locator_tip_hash,
+            request.target_height,
+            request.requested_at,
+            request.state,
+            request.kind,
+        )
+    };
+
+    assert_eq!(
+        sync.send_getheaders(other_source, 0, i32::MAX, vec![Hash256::default()]),
+        GetheadersOutcome::Sent,
+    );
+    assert!(matches!(other_rx.try_recv()?, Message::GetHeaders(_)));
+    let scheduler = sync.scheduler.lock();
+    assert_eq!(
+        scheduler.header_request_owner,
+        Some(other_source),
+        "frontier pacing must move off the connection now owned by the probe",
+    );
+    assert_eq!(
+        scheduler.header_request().map(|request| request.source),
+        Some(other_source),
+    );
+    let request = scheduler
+        .headers_sync
+        .get(&frontier_source)
+        .and_then(|owned| owned.request)
+        .ok_or("the probe must remain outstanding")?;
+    assert_eq!(
+        (
+            request.locator_tip_hash,
+            request.target_height,
+            request.requested_at,
+            request.state,
+            request.kind,
+        ),
+        probe_snapshot,
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_chain_sync_probe_keeps_original_five_second_pacing() -> TestResult {
+    let (tree, _blocks) = mined_chain(1, 2)?;
+    let harness = SyncHarness::new(tree);
+    let sync = harness.sync;
+    let peers = harness.peers;
+    let inbound_headers_tx = harness.inbound_headers_tx;
+    sync.chain.bootstrap_genesis();
+
+    let addr = test_addr(9_945, 0)?;
+    let rx = connect_peer(&peers, synthetic_peer(addr, i32::MAX));
+    let source = current_source(&peers, addr);
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), Instant::now());
+    assert!(sync.probe_chain_sync(source, &frontier));
+    assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
+
+    let original_request = sync
+        .scheduler
+        .lock()
+        .headers_sync
+        .get(&source)
+        .and_then(|owned| owned.request)
+        .ok_or("the chain-sync request must be registered")?;
+    assert_eq!(
+        (original_request.kind, original_request.state),
+        (
+            super::super::HeaderRequestKind::ChainSyncProbe,
+            super::super::HeaderRequestState::AwaitingResponse,
+        ),
+    );
+    assert_eq!(
+        original_request.timeout(),
+        HEADERS_RESPONSE_TIME,
+        "only an unanswered probe uses the eviction response window",
+    );
+
+    inbound_headers_tx.send(crate::InboundHeaders {
+        headers: Vec::new(),
+        source: Some(source),
+        wire_response: true,
+        body_fetch_owned: false,
+    })?;
+    sync.drain_inbound_headers();
+
+    let answered_request = sync
+        .scheduler
+        .lock()
+        .headers_sync
+        .get(&source)
+        .and_then(|owned| owned.request)
+        .ok_or("an empty answer retains the pacing request")?;
+    assert_eq!(
+        answered_request.state,
+        super::super::HeaderRequestState::Answered,
+    );
+    assert_eq!(answered_request.requested_at, original_request.requested_at);
+    assert_eq!(
+        answered_request.timeout(),
+        super::super::HEADER_REQUEST_TIMEOUT,
+        "an empty answer returns to ordinary frontier pacing",
+    );
+    let locator = vec![answered_request.locator_tip_hash];
+    let target = i32::try_from(answered_request.target_height).unwrap_or(i32::MAX);
+    assert_eq!(
+        sync.send_getheaders(source, 0, target, locator.clone()),
+        GetheadersOutcome::Suppressed,
+    );
+    assert!(rx.try_recv().is_err());
+
+    let request_age = answered_request
+        .timeout()
+        .checked_add(Duration::from_secs(1))
+        .ok_or("the test age must fit in a duration")?;
+    assert!(request_age < HEADERS_RESPONSE_TIME);
+    let expired_at = Instant::now()
+        .checked_sub(request_age)
+        .ok_or("the test instant must allow the answered age")?;
+    {
+        let mut scheduler = sync.scheduler.lock();
+        scheduler
+            .headers_sync
+            .get_mut(&source)
+            .and_then(|owned| owned.request.as_mut())
+            .ok_or("the answered request must remain registered")?
+            .requested_at = expired_at;
+    }
+    sync.retire_timed_out_header_syncs(Instant::now());
+    let retained_request = sync
+        .scheduler
+        .lock()
+        .headers_sync
+        .get(&source)
+        .and_then(|owned| owned.request)
+        .ok_or("an answered request is not a silence timeout")?;
+    assert_eq!(
+        retained_request.state,
+        super::super::HeaderRequestState::Answered
+    );
+    assert_eq!(retained_request.requested_at, expired_at);
+    assert_eq!(
+        sync.send_getheaders(source, 0, target, locator),
+        GetheadersOutcome::Sent,
+    );
+    assert!(matches!(rx.try_recv()?, Message::GetHeaders(_)));
+    Ok(())
+}
+
+#[test]
 fn expired_chain_sync_probe_does_not_suppress_frontier_request() -> TestResult {
     let (tree, _blocks) = mined_chain(1, 2)?;
     let harness = SyncHarness::new(tree);

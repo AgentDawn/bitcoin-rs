@@ -988,6 +988,8 @@ impl BlockSync {
                     if can_claim_owner {
                         scheduler.header_request_owner = Some(source);
                     }
+                } else if scheduler.header_request_owner == Some(source) {
+                    scheduler.header_request_owner = None;
                 }
             })
             .is_err()

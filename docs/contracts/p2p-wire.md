@@ -148,11 +148,12 @@ expiry.
   active-branch announcement grants body capability. Losing the last credited
   peer must not require restart or an unsolicited announcement from a
   surviving peer.
-- The existing header request and timeout pace discovery. Empty responses
-  mark a request answered but preserve its original deadline, pacing an
-  identical request without blaming that connection when the deadline passes.
-  Frontier requests use the five-second deadline; a chain-sync eviction
-  probe keeps its request gate for the existing two-minute
+- The existing header request and timeout pace discovery. Empty wire
+  responses mark a request answered without changing its original timestamp;
+  an identical retry is paced only until five seconds from that timestamp,
+  and answered requests are not blamed as silence. Frontier requests use the
+  same five-second deadline while unanswered. An unanswered chain-sync
+  eviction probe keeps its request gate for the existing two-minute
   `HEADERS_RESPONSE_TIME`, aligned with its eviction response window.
   A nonempty batch consumes its matching request only when it is a usable
   answer: admitted, or already known in full. A batch this node rejects keeps
@@ -195,6 +196,11 @@ expiry.
 Proof: `crates/p2p/src/sync/tests/frontier_recovery.rs` covers applied
 rollback, duplicate request suppression, empty-response pacing/rotation and
 cancelled readiness under contention.
+`crates/p2p/src/sync/tests/chain_sync.rs` tests
+`chain_sync_probe_holds_request_for_its_response_window`,
+`empty_chain_sync_probe_keeps_original_five_second_pacing`, and
+`replacing_expired_frontier_with_chain_sync_probe_releases_owner` cover probe
+exclusivity, answered-response pacing, and frontier selector ownership.
 `crates/p2p/src/sync/tests/witness_staging_gate.rs` covers bad delivery,
 peer replacement, relearned capability and eventual application. Existing
 branch-plan, attribution, timeout and bounded-staging suites remain required.
@@ -349,6 +355,8 @@ covers the delivery-path forward.
 Proof: `crates/p2p/src/dispatch.rs` test
 `inv_block_uses_headers_not_body_getdata`; `crates/p2p/src/sync/tests/head_sync.rs`
 test `announced_near_tip_is_direct_fetched_before_tick`;
+`crates/p2p/src/sync/tests/headers_presync.rs` test
+`owned_header_requests_suppress_competing_frontier_and_chain_sync_requests`;
 `crates/p2p/src/listener.rs` test
 `unsolicited_block_flood_is_bounded_per_source`; `crates/p2p/src/sync/tests.rs`
 tests `permanent_consensus_body_disconnects_delivering_source` and
@@ -471,12 +479,13 @@ prefilter exemption.
 - One per-connection lifecycle entry owns both the optional presync cursor
   and optional wire request. A nonempty wire answer clears only the request;
   an empty answer ends presync but retains an answered request with its
-  original kind-specific pacing deadline; exact-source teardown removes the
-  entry. A request excludes competing `getheaders` on that exact connection
-  while unanswered: ordinary frontier requests, including PRESYNC/REDOWNLOAD
+  original request timestamp; exact-source teardown removes the entry. A
+  request excludes competing `getheaders` on that exact connection while
+  unanswered: ordinary frontier requests, including PRESYNC/REDOWNLOAD
   continuations, use five seconds, while a chain-sync eviction probe uses its
   existing two-minute response window. An answered request paces only
-  identical locator/target requests until that same deadline. Only an
+  identical locator/target requests until five seconds from that same original
+  timestamp. Only an
   unanswered timeout below the work floor or during PRESYNC/REDOWNLOAD
   retires the connection and its sync state before queued headers are
   processed, even when it is the last usable peer. Recovery starts on another
@@ -491,6 +500,7 @@ prefilter exemption.
 Proof: `crates/p2p/src/sync/tests/headers_presync.rs` tests
 `empty_below_floor_reply_preserves_pacing_and_rotates_without_retirement`,
 `unowned_below_floor_peer_receives_one_tracked_chain_sync_probe`,
+`owned_header_requests_suppress_competing_frontier_and_chain_sync_requests`,
 `expired_header_syncs_drop_delayed_pages_before_recovery`, and
 `replaced_connection_cannot_admit_queued_predecessor_headers`, and pins the
 presync lifecycle end to end — first-pass commitment collection, the
@@ -501,7 +511,9 @@ the connection. `crates/p2p/src/sync/tests/chain_sync.rs` test
 `frontier_and_eviction_probes_do_not_overwrite_live_requests` covers
 above-floor request ownership; `chain_sync_probe_holds_request_for_its_response_window`
 and `expired_chain_sync_probe_does_not_suppress_frontier_request` prove its
-request gate shares the two-minute answer window.
+unanswered two-minute gate; `empty_chain_sync_probe_keeps_original_five_second_pacing`
+and `replacing_expired_frontier_with_chain_sync_probe_releases_owner` cover
+answered pacing and selector ownership.
 `crates/p2p/benches/headers_presync.rs` measures the hashing bound the first
 pass pays per page.
 

@@ -335,9 +335,11 @@ pub(super) enum HeaderRequestKind {
 
 impl HeaderRequest {
     fn timeout(self) -> Duration {
-        match self.kind {
-            HeaderRequestKind::Frontier => HEADER_REQUEST_TIMEOUT,
-            HeaderRequestKind::ChainSyncProbe => peers::HEADERS_RESPONSE_TIME,
+        match (self.kind, self.state) {
+            (HeaderRequestKind::ChainSyncProbe, HeaderRequestState::AwaitingResponse) => {
+                peers::HEADERS_RESPONSE_TIME
+            }
+            _ => HEADER_REQUEST_TIMEOUT,
         }
     }
 }
