@@ -2,7 +2,6 @@
 
 mod format;
 pub mod fs;
-mod io;
 mod load;
 mod publish;
 
