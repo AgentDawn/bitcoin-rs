@@ -165,8 +165,7 @@ impl Reconstruction {
         // Enforce the cheap connection-level bounds before walking the
         // mempool. Keep the post-fill check as matched bodies add bytes.
         if self.pending.len() >= MAX_PENDING_RECONSTRUCTIONS
-            || self.retained_bytes().saturating_add(retained_bytes)
-                > MAX_PENDING_RETAINED_BYTES
+            || self.retained_bytes().saturating_add(retained_bytes) > MAX_PENDING_RETAINED_BYTES
         {
             return Outcome::Fallback(hash);
         }
@@ -513,11 +512,7 @@ mod tests {
         let received_at = now();
 
         for seed in 1_u8..=4 {
-            let (_, cmpct) = sample_cmpct(
-                vec![test_tx(seed), test_tx(seed + 10)],
-                2,
-                u64::from(seed),
-            );
+            let (_, cmpct) = sample_cmpct(vec![test_tx(seed), test_tx(seed + 10)], 2, u64::from(seed));
             assert!(matches!(
                 reconstruction.receive_cmpctblock(&cmpct, 2, &hints, received_at),
                 Outcome::RequestMissing(_)
