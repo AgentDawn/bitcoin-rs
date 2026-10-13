@@ -1675,7 +1675,7 @@ pub(crate) fn synced_ibd_latch() -> Arc<InitialBlockDownload> {
     let genesis = Network::Regtest.genesis_block();
     let recent = Header {
         prev_blockhash: genesis.block_hash(),
-        time: u32::try_from(crate::counters::now_seconds()).unwrap_or(u32::MAX),
+        time: u32::try_from(bitcoin_rs_primitives::unix_time_secs()).unwrap_or(u32::MAX),
         ..genesis.header
     };
     {
@@ -2699,7 +2699,7 @@ fn binding_and_operational_failures_do_not_disconnect() -> TestResult {
 
 #[test]
 fn telemetry_ibd_bit_agrees_with_the_shared_latch() -> TestResult {
-    let now = crate::counters::now_seconds();
+    let now = bitcoin_rs_primitives::unix_time_secs();
 
     let syncing = SyncHarness::new(BlockTree::new());
     assert!(

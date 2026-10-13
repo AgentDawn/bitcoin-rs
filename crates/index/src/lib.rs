@@ -12,8 +12,6 @@ mod index;
 pub mod query_api;
 /// Derived-index reconciliation phase and exact capability watermark alignment.
 pub mod reconcile;
-/// Open-time recovery for disposable derived index storage.
-mod recovery;
 /// Asynchronous durable derived-index runtime.
 pub mod runtime;
 /// Stable electrs-shaped row types.
