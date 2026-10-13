@@ -510,12 +510,13 @@ Proof: `crates/p2p/src/sync/tests/headers_presync.rs` tests
 `unowned_below_floor_peer_receives_one_tracked_chain_sync_probe`,
 `owned_header_requests_suppress_competing_frontier_and_chain_sync_requests`,
 `expired_header_syncs_drop_delayed_pages_before_recovery`, and
-`replaced_connection_cannot_admit_queued_predecessor_headers`, and pins the
-presync lifecycle end to end — first-pass commitment collection, the
+`replaced_connection_cannot_admit_queued_predecessor_headers` and
+`staged_body_retries_after_source_replacement_without_replacement_credit`, and
+pins the presync lifecycle end to end — first-pass commitment collection, the
 work-floor crossing that restarts the sync at the fork point, commitment
 divergence on a substituted redownload header, salted-commitment spends, the
-benign lost-continuity break, and the disconnects every other failure costs
-the connection. `crates/p2p/src/sync/tests/chain_sync.rs` test
+benign lost-continuity break, and the disconnects every other failure costs the
+connection. `crates/p2p/src/sync/tests/chain_sync.rs` test
 `frontier_and_eviction_probes_do_not_overwrite_live_requests` covers
 above-floor request ownership; `chain_sync_probe_holds_request_for_its_response_window`
 and `expired_chain_sync_probe_does_not_suppress_frontier_request` prove its
