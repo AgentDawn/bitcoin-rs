@@ -50,6 +50,9 @@ const PENDING_DEADLINE: Duration = Duration::from_mins(1);
 const MAX_REQUESTED_MISSING: usize = 128;
 /// Sanity bound on the transaction count a `cmpctblock` may declare.
 const MAX_BLOCK_TX_COUNT: usize = 100_000;
+/// Recently admitted hashes remembered per connection to avoid rescanning
+/// the mempool for repeated compact announcements of one requested block.
+const MAX_RECENT_COMPACT_BLOCKS: usize = 64;
 
 /// Transaction identities the mempool can offer a compact-block
 /// reconstruction: an identity scan plus body lookup by either hash.
@@ -85,6 +88,8 @@ pub enum Outcome {
 #[derive(Debug, Default)]
 pub struct Reconstruction {
     pending: HashMap<BlockHash, Pending>,
+    /// At most one reconstruction attempt per hash within its deadline.
+    recent: Vec<(BlockHash, Instant)>,
 }
 
 /// One block being reconstructed.
@@ -107,6 +112,7 @@ impl Reconstruction {
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            recent: Vec::new(),
         }
     }
 
@@ -132,6 +138,15 @@ impl Reconstruction {
             return Outcome::Fallback(native_block_hash(compact.header.block_hash()));
         };
         let hash = header.compute_hash();
+        // Re-sending one in-flight or already completed block must never
+        // trigger another mempool-wide hint walk (or another fallback).
+        if self.recent.iter().any(|(seen, _)| *seen == hash) {
+            return Outcome::Idle;
+        }
+        if self.recent.len() == MAX_RECENT_COMPACT_BLOCKS {
+            self.recent.remove(0);
+        }
+        self.recent.push((hash, now));
         let total = compact.short_ids.len() + compact.prefilled_txs.len();
         if total > MAX_BLOCK_TX_COUNT {
             return Outcome::Fallback(hash);
@@ -146,6 +161,15 @@ impl Reconstruction {
                 .flatten()
                 .map(|tx: &Tx| tx.total_size())
                 .sum::<usize>();
+
+        // Enforce the cheap connection-level bounds before walking the
+        // mempool. Keep the post-fill check as matched bodies add bytes.
+        if self.pending.len() >= MAX_PENDING_RECONSTRUCTIONS
+            || self.retained_bytes().saturating_add(retained_bytes)
+                > MAX_PENDING_RETAINED_BYTES
+        {
+            return Outcome::Fallback(hash);
+        }
 
         let identity_is_wtxid = identity_version == 2;
         let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
@@ -245,6 +269,8 @@ impl Reconstruction {
     /// Drops pending entries whose deadline passed.
     pub fn prune(&mut self, now: Instant) {
         self.pending.retain(|_, entry| now < entry.deadline);
+        self.recent
+            .retain(|(_, received)| now.saturating_duration_since(*received) < PENDING_DEADLINE);
     }
 
     fn retained_bytes(&self) -> usize {
@@ -434,6 +460,79 @@ mod tests {
         fn get_tx_by_wtxid(&self, wtxid: Wtxid) -> Option<Tx> {
             self.txs.iter().find(|tx| tx.wtxid() == wtxid).cloned()
         }
+    }
+
+    struct CountingHints {
+        inner: SetHints,
+        scans: AtomicUsize,
+    }
+
+    impl CompactBlockHints for CountingHints {
+        fn for_each_identity(&self, f: &mut dyn FnMut(Txid, Wtxid)) {
+            self.scans.fetch_add(1, Ordering::Relaxed);
+            self.inner.for_each_identity(f);
+        }
+
+        fn get_tx_by_txid(&self, txid: Txid) -> Option<Tx> {
+            self.inner.get_tx_by_txid(txid)
+        }
+
+        fn get_tx_by_wtxid(&self, wtxid: Wtxid) -> Option<Tx> {
+            self.inner.get_tx_by_wtxid(wtxid)
+        }
+    }
+
+    #[test]
+    fn repeated_compact_block_does_not_repeat_mempool_scan() {
+        let (_, cmpct) = sample_cmpct(vec![test_tx(1), test_tx(2)], 2, 0x51);
+        let hints = CountingHints {
+            inner: SetHints { txs: Vec::new() },
+            scans: AtomicUsize::new(0),
+        };
+        let mut reconstruction = Reconstruction::new();
+        let received_at = now();
+
+        assert!(matches!(
+            reconstruction.receive_cmpctblock(&cmpct, 2, &hints, received_at),
+            Outcome::RequestMissing(_)
+        ));
+        assert!(matches!(
+            reconstruction.receive_cmpctblock(&cmpct, 2, &hints, received_at),
+            Outcome::Idle
+        ));
+        assert_eq!(hints.scans.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn saturated_pending_state_rejects_before_mempool_scan() {
+        let hints = CountingHints {
+            inner: SetHints { txs: Vec::new() },
+            scans: AtomicUsize::new(0),
+        };
+        let mut reconstruction = Reconstruction::new();
+        let received_at = now();
+
+        for seed in 1_u8..=4 {
+            let (_, cmpct) = sample_cmpct(
+                vec![test_tx(seed), test_tx(seed + 10)],
+                2,
+                u64::from(seed),
+            );
+            assert!(matches!(
+                reconstruction.receive_cmpctblock(&cmpct, 2, &hints, received_at),
+                Outcome::RequestMissing(_)
+            ));
+        }
+        let (_, extra) = sample_cmpct(vec![test_tx(5), test_tx(15)], 2, 5);
+        assert!(matches!(
+            reconstruction.receive_cmpctblock(&extra, 2, &hints, received_at),
+            Outcome::Fallback(_)
+        ));
+        assert_eq!(
+            hints.scans.load(Ordering::Relaxed),
+            MAX_PENDING_RECONSTRUCTIONS,
+            "no hint scan may run after the pending cap is reached"
+        );
     }
 
     fn test_tx(byte: u8) -> Tx {

@@ -1930,6 +1930,25 @@ fn process_compact_wire_message(
     peer_addr: SocketAddr,
     shared: &ConnectionShared,
 ) {
+    // The download scheduler already limits outstanding requests by peer
+    // and hash. Unsolicited compact blocks can announce headers, but must
+    // not enter reconstruction: doing so scans the entire mempool under its
+    // read lock before a peer has earned any download work.
+    if let crate::Message::CmpctBlock(cmpct) = message {
+        let source = lease.source(peer_addr);
+        let hash = crate::inv::native_block_hash(cmpct.compact_block.header.block_hash());
+        let requested = shared.block_sync.as_ref().is_some_and(|sync| {
+            sync.owns_body_fetch(source, bitcoin_rs_primitives::Hash256::from(hash))
+        });
+        if !requested {
+            if let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
+            {
+                shared.send_headers(source, vec![header], false, false);
+            }
+            return;
+        }
+    }
+
     let identity_version =
         local_compact_version.unwrap_or(crate::compact_blocks::COMPACT_BLOCK_VERSION);
     let outcome = process_compact_message(
@@ -4020,6 +4039,97 @@ mod block_forward_tests {
             1,
             "a forwarding slot returns once sync has taken the body"
         );
+        Ok(())
+    }
+    /// A compact block without an outstanding download is a header
+    /// announcement only. The same hash may reconstruct once its exact
+    /// connection owns the body, but repeating it cannot rescan the pool.
+    #[test]
+    fn compact_hints_require_owned_download() -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::bip152::HeaderAndShortIds;
+        use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+        use bitcoin_rs_primitives::{Tx, Txid, Wtxid};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Hints(AtomicUsize);
+
+        impl crate::compact_blocks::CompactBlockHints for Hints {
+            fn for_each_identity(&self, _f: &mut dyn FnMut(Txid, Wtxid)) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn get_tx_by_txid(&self, _txid: Txid) -> Option<Tx> {
+                None
+            }
+
+            fn get_tx_by_wtxid(&self, _wtxid: Wtxid) -> Option<Tx> {
+                None
+            }
+        }
+
+        let (tree, _) = mined_chain(1, 0)?;
+        let chain_tip = tree.tip_handle();
+        let block_tree = Arc::new(RwLock::new(tree));
+        let peers = Arc::new(crate::PeerTable::new());
+        let chain: Arc<dyn SyncChain> = Arc::new(TestChain::new(
+            chain_tip,
+            Arc::new(ArcSwapOption::empty()),
+            block_tree,
+        ));
+        let sync = Arc::new(BlockSync::new(
+            chain,
+            Arc::clone(&peers),
+            crossbeam_channel::unbounded().1,
+            crossbeam_channel::unbounded().1,
+            crate::sync::syncing_ibd_latch(),
+        ));
+        let addr = test_addr(9782, 0)?;
+        let _outbound = connect_peer(&peers, synthetic_peer(addr, 3));
+        let lease = peers.lease(addr).ok_or("peer must be registered")?;
+        let source = lease.source(addr);
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
+        let mut shared = test_shared(peers, headers_tx, blocks_tx);
+        shared.block_sync = Some(Arc::clone(&sync));
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let compact = HeaderAndShortIds::from_block(&genesis, 7, 2, &[])
+            .expect("genesis compact block");
+        let message = crate::Message::CmpctBlock(CmpctBlock {
+            compact_block: compact,
+        });
+        let hints = Hints(AtomicUsize::new(0));
+        let mut reconstruction = crate::compact_blocks::Reconstruction::new();
+
+        super::process_compact_wire_message(
+            &message, &mut reconstruction, Some(2), Some(&hints),
+            &lease, addr, &shared,
+        );
+        assert_eq!(hints.0.load(Ordering::Relaxed), 0);
+        let announced = headers_rx.try_recv()?;
+        assert_eq!(announced.headers.len(), 1);
+        assert!(!announced.body_fetch_owned);
+        assert!(blocks_rx.is_empty());
+
+        let hash = Hash256::from(
+            crate::compact_blocks::native_header(&genesis.header)
+                .expect("native genesis header")
+                .compute_hash(),
+        );
+        sync.record_owned_body_fetch(source, hash);
+        super::process_compact_wire_message(
+            &message, &mut reconstruction, Some(2), Some(&hints),
+            &lease, addr, &shared,
+        );
+        assert_eq!(hints.0.load(Ordering::Relaxed), 1);
+        assert_eq!(blocks_rx.len(), 1);
+
+        super::process_compact_wire_message(
+            &message, &mut reconstruction, Some(2), Some(&hints),
+            &lease, addr, &shared,
+        );
+        assert_eq!(hints.0.load(Ordering::Relaxed), 1);
+        assert_eq!(blocks_rx.len(), 1);
         Ok(())
     }
 }
