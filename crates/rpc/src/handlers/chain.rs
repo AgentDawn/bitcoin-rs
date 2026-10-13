@@ -2005,16 +2005,8 @@ mod tests {
             lock_time: LockTime::ZERO,
         };
         block.txs.push(spend);
-        let mut leaves = block
-            .txids()
-            .into_iter()
-            .map(|txid| txid.0.to_le_bytes())
-            .collect();
-        let Some(root) = bitcoin_rs_consensus::verify_block::compute_merkle_root(&mut leaves)
-        else {
-            panic!("merkle root over two transactions");
-        };
-        block.header.merkle_root = Hash256::from_le_bytes(&root);
+        block.header.merkle_root = bitcoin_rs_chain::regtest_fixture::merkle_root(&block.txs)
+            .expect("merkle root over two transactions");
         block
     }
 
@@ -2309,14 +2301,8 @@ mod tests {
         block.header.version = -1;
         block.txs[0].version = -1;
         block.txs[1].version = i32::MIN;
-        let mut leaves = block
-            .txids()
-            .into_iter()
-            .map(|txid| txid.0.to_le_bytes())
-            .collect();
-        let root = bitcoin_rs_consensus::verify_block::compute_merkle_root(&mut leaves)
+        block.header.merkle_root = bitcoin_rs_chain::regtest_fixture::merkle_root(&block.txs)
             .expect("fixture merkle root");
-        block.header.merkle_root = Hash256::from_le_bytes(&root);
         let record = BlockRecord::from_block(0, &block);
         let mut ctx = Context::new();
         ctx.chain.block_body_source = Some(Arc::new(SingleBlockSource {

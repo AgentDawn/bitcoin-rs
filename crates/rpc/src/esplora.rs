@@ -190,11 +190,6 @@ mod tests {
         }
     }
 
-    /// Core's null outpoint: zero txid, `u32::MAX` vout.
-    fn null_outpoint() -> OutPoint {
-        OutPoint::null()
-    }
-
     /// A native one-transaction block standing in for the network genesis.
     fn fixture_genesis() -> Block {
         let mut block = Block {
@@ -207,7 +202,7 @@ mod tests {
                 nonce: 1,
             },
             txs: vec![transaction(
-                Some(null_outpoint()),
+                Some(OutPoint::null()),
                 TxOut {
                     value: Amount::from_sat(5_000_000_000),
                     script_pubkey: vec![0x51].into(),
@@ -541,7 +536,7 @@ mod tests {
             },
         );
         transaction.inputs.push(TxIn {
-            previous_output: null_outpoint(),
+            previous_output: OutPoint::null(),
             script_sig: vec![1, 1].into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -1075,7 +1070,7 @@ mod tests {
             nonce,
         };
         let coinbase = transaction(
-            Some(null_outpoint()),
+            Some(OutPoint::null()),
             TxOut {
                 value: Amount::from_sat(5_000_000_000),
                 script_pubkey: vec![0x51].into(),
@@ -1929,7 +1924,7 @@ mod tests {
         let tx = Tx {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: null_outpoint(),
+                previous_output: OutPoint::null(),
                 script_sig: Script::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -2204,7 +2199,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            !outspend(&projection, null_outpoint())
+            !outspend(&projection, OutPoint::null())
                 .expect("outspend query")
                 .spent
         );
@@ -2253,7 +2248,7 @@ mod tests {
         // encoded into a decodable body (the 0x00 vin count reads as the
         // segwit marker, matching Core), so required_block would reject it.
         let transaction = transaction(
-            Some(null_outpoint()),
+            Some(OutPoint::null()),
             TxOut {
                 value: Amount::from_sat(125),
                 script_pubkey: vec![0x51].into(),

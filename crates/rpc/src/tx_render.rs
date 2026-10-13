@@ -506,11 +506,6 @@ mod tests {
 
     use sonic_rs::JsonValueTrait;
 
-    /// Core's null outpoint: zero txid, `u32::MAX` vout.
-    fn null_outpoint() -> OutPoint {
-        OutPoint::null()
-    }
-
     fn sample_tx() -> Tx {
         Tx {
             version: 2,
@@ -574,14 +569,14 @@ mod tests {
     fn one_input_null_prevout_is_coinbase() {
         let mut tx = sample_tx();
         tx.inputs.push(TxIn {
-            previous_output: null_outpoint(),
+            previous_output: OutPoint::null(),
             script_sig: vec![1, 2, 3].into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         });
         assert!(tx.is_coinbase());
         tx.inputs.push(TxIn {
-            previous_output: null_outpoint(),
+            previous_output: OutPoint::null(),
             script_sig: Script::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -593,7 +588,7 @@ mod tests {
     fn coinbase_input_renders_hex_coinbase_field() {
         let mut tx = sample_tx();
         tx.inputs.push(TxIn {
-            previous_output: null_outpoint(),
+            previous_output: OutPoint::null(),
             script_sig: vec![0x51].into(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
