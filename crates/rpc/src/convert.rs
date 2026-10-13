@@ -98,11 +98,7 @@ pub(crate) fn signed_sat_to_i64(sats: i128) -> i64 {
 #[must_use]
 pub(crate) fn signed_sat_to_btc(sats: i128) -> f64 {
     let clamped = signed_sat_to_i64(sats);
-    let magnitude = clamped.unsigned_abs();
-    let high = u32::try_from(magnitude >> 32).unwrap_or(u32::MAX);
-    let low = u32::try_from(magnitude & 0xffff_ffff).unwrap_or(u32::MAX);
-    let value = f64::from(high).mul_add(4_294_967_296.0, f64::from(low));
-    (if clamped.is_negative() { -value } else { value }) / 100_000_000.0
+    bitcoin_rs_primitives::i64_to_f64(clamped) / 100_000_000.0
 }
 
 /// Expands a compact `nBits` into its 64-character lowercase target hex, the

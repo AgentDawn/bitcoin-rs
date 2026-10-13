@@ -58,8 +58,6 @@ impl From<Arc<RwLock<BlockLog>>> for BlockLogReader {
     }
 }
 
-const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
-
 /// Block metadata made available to RPC handlers without forcing storage I/O.
 ///
 /// The serialized block body lives in durable storage behind
@@ -74,7 +72,7 @@ pub struct BlockRecord {
     /// The log never carries one: the `BlockTree` already holds the header of
     /// every applied block. Every constructor leaves this `None`. Boxed so an
     /// absent header costs 8 bytes rather than the full 80 in every record.
-    pub header: Option<Box<[u8; SERIALIZED_BLOCK_HEADER_LEN]>>,
+    pub header: Option<Box<[u8; bitcoin_rs_primitives::Header::LEN]>>,
     pub tx_count: usize,
     pub time: u32,
 }
@@ -326,7 +324,7 @@ impl BlockRecord {
     /// `Context::record_for_hash` does, because that fills it from the block
     /// tree.
     #[must_use]
-    pub fn header_bytes(&self) -> Option<&[u8; SERIALIZED_BLOCK_HEADER_LEN]> {
+    pub fn header_bytes(&self) -> Option<&[u8; bitcoin_rs_primitives::Header::LEN]> {
         self.header.as_deref()
     }
 

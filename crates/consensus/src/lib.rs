@@ -3,7 +3,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 /// Maximum consensus script size in bytes.
-pub const MAX_SCRIPT_SIZE: usize = 10_000;
+pub use bitcoin_rs_script::MAX_SCRIPT_SIZE;
 /// Maximum distance a BIP94 candidate timestamp may fall below its parent
 /// block's timestamp at a difficulty-adjustment boundary (`MAX_TIMEWARP`, Core
 /// `src/consensus/consensus.h:30-37`).
