@@ -145,6 +145,7 @@ transport I/O/timeouts, and local encoding failures never discourage an IP.
 | Condition | bitcoin-rs action for an ordinary automatic nonlocal peer | Core 31.1 reference |
 | :--- | :--- | :--- |
 | Unknown command after readiness | ignore | ignore |
+| Decoded compact-filter requests with a non-basic type, unknown/unapplied stop, inverted range or more than 1,000 filters / 2,000 hashes | ignore and keep the connection open, without discouragement | `PrepareBlockFilterRequest` disconnects without discouragement; this is a deliberate connection-policy deviation, tested by the compact-filter wire probe |
 | Invalid handshake ordering | disconnect and temporarily avoid the IP | Core ignores some cases, including redundant `version` and messages before `version`; bitcoin-rs retains its stricter FSM |
 | Invalid decoded payload or structural count | disconnect and temporarily avoid the IP | Core's payload exceptions and individual handlers have distinct rules; this is not blanket parsing-error parity |
 | Checksum failure | disconnect and temporarily avoid the IP | Core v1 rejects the message and resets its decoder; this remains a stricter bitcoin-rs policy |

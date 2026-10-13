@@ -38,6 +38,10 @@ OP_RETURN. The runner checks:
   of `NODE_NETWORK_LIMITED` and explicit rejection of pruning plus filters.
 - Exact Core P2P response payloads for valid ranges/checkpoints, request limits,
   unsupported types, unknown stops and inverted ranges.
+  Connection outcomes are recorded separately: Core 31.1 disconnects invalid
+  requests without discouragement; bitcoin-rs deliberately ignores them and
+  answers the subsequent ping. Payload equality alone does not establish
+  connection-policy parity.
 - Unmodified Kyoto syncing filters, matching the watched script and fetching its
   block against both implementations; a connected client following a reorg and
   a fresh client resynchronizing afterward.

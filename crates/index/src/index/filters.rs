@@ -81,7 +81,20 @@ pub(super) fn build(
     hash: &[u8; 32],
     spent: &dyn SpentCoinScripts,
 ) -> Result<BasicFilter, IndexError> {
-    let mut scripts = hashbrown::HashSet::<&[u8]>::new();
+    let k0 = u64::from_le_bytes(
+        hash[..8]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("SipHash keys are eight bytes")),
+    );
+    let k1 = u64::from_le_bytes(
+        hash[8..16]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("SipHash keys are eight bytes")),
+    );
+    let mut filter = Vec::new();
+    // The upstream encoder owns deduplication, range mapping and bit packing;
+    // the parsed image and authoritative undo still own script selection.
+    let mut writer = bitcoin::bip158::GcsFilterWriter::new(&mut filter, k0, k1, 784_931, 19);
     let mut created = hashbrown::HashMap::<([u8; 32], u32), &[u8]>::new();
     for tx in parsed.transactions() {
         for input in tx.inputs() {
@@ -103,9 +116,7 @@ pub(super) fn build(
                 .copied()
                 .or_else(|| spent.script_bytes(&txid, vout))
                 .ok_or(IndexError::MissingSpentCoin { txid, vout, height })?;
-            if !script.is_empty() {
-                scripts.insert(script);
-            }
+            writer.add_element(script);
         }
         let txid = *tx.txid().as_bytes();
         for (vout, output) in tx.outputs().iter().enumerate() {
@@ -117,59 +128,13 @@ pub(super) fn build(
             // BIP158 excludes empty and OP_RETURN outputs, but does not apply
             // the UTXO admission rule for oversized scripts or genesis.
             if !script.is_empty() && script[0] != 0x6a {
-                scripts.insert(script);
+                writer.add_element(script);
             }
         }
     }
-    let count =
-        u64::from(u32::try_from(scripts.len()).map_err(|_| IndexError::MutationSizeOverflow)?);
-    let range = count * 784_931;
-    let k0 = u64::from_le_bytes(
-        hash[..8]
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("SipHash keys are eight bytes")),
-    );
-    let k1 = u64::from_le_bytes(
-        hash[8..16]
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("SipHash keys are eight bytes")),
-    );
-    let mut mapped: Vec<u64> = scripts
-        .into_iter()
-        .map(|script| {
-            let value = bitcoin_hashes::siphash24::Hash::hash_to_u64_with_keys(k0, k1, script);
-            u64::try_from((u128::from(value) * u128::from(range)) >> 64)
-                .unwrap_or_else(|_| unreachable!("upper 64 bits fit u64"))
-        })
-        .collect();
-    mapped.sort_unstable();
-    let mut filter = bitcoin_rs_primitives::varint::encode(count).to_vec();
-    let mut byte = 0_u8;
-    let mut bits = 0_u8;
-    let mut push_bit = |bit: bool| {
-        byte = (byte << 1) | u8::from(bit);
-        bits += 1;
-        if bits == 8 {
-            filter.push(byte);
-            byte = 0;
-            bits = 0;
-        }
-    };
-    let mut previous = 0;
-    for value in mapped {
-        let delta = value - previous;
-        previous = value;
-        for _ in 0..(delta >> 19) {
-            push_bit(true);
-        }
-        push_bit(false);
-        for bit in (0..19).rev() {
-            push_bit((delta >> bit) & 1 != 0);
-        }
-    }
-    if bits != 0 {
-        filter.push(byte << (8 - bits));
-    }
+    writer
+        .finish()
+        .map_err(|_| IndexError::InvalidCompactFilter)?;
     let hash = encode::double_sha256(&filter).to_le_bytes();
     Ok(BasicFilter {
         filter,
@@ -229,6 +194,72 @@ mod tests {
             let expected: bitcoin::bip158::FilterHeader = expected_header.parse()?;
             assert_eq!(filter.header, expected.to_byte_array(), "{note}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn same_block_spends_resolve_locally_and_empty_filters_encode_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, consensus::serialize};
+
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let coinbase = &mut block.txdata[0];
+        coinbase.output = vec![
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+            },
+        ];
+        let no_spends = Scripts(hashbrown::HashMap::new());
+        let bytes = serialize(&block);
+        let filter = build(
+            &ParsedBlock::parse_exact(&bytes)?,
+            0,
+            &block.block_hash().to_byte_array(),
+            &no_spends,
+        )?;
+        assert_eq!(filter.filter, [0]);
+
+        block.txdata[0].output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51]);
+        let parent = block.txdata[0].compute_txid();
+        let mut child = block.txdata[0].clone();
+        child.input[0].previous_output = OutPoint {
+            txid: parent,
+            vout: 0,
+        };
+        child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x52]);
+        block.txdata.push(child);
+        let bytes = serialize(&block);
+        let hash = block.block_hash().to_byte_array();
+        // An empty undo source proves that the same-block parent is authoritative.
+        let filter = build(&ParsedBlock::parse_exact(&bytes)?, 1, &hash, &no_spends)?;
+        let expected = bitcoin::bip158::BlockFilter::new_script_filter(&block, |outpoint| {
+            assert_eq!(
+                *outpoint,
+                OutPoint {
+                    txid: parent,
+                    vout: 0
+                }
+            );
+            Ok(block.txdata[0].output[0].script_pubkey.clone())
+        })?;
+        assert_eq!(filter.filter, expected.content);
+        assert_eq!(filter.filter[0], 2);
+
+        block.txdata[1].input[0].previous_output.vout = 2;
+        let bytes = serialize(&block);
+        assert!(matches!(
+            build(&ParsedBlock::parse_exact(&bytes)?, 1, &hash, &no_spends),
+            Err(IndexError::MissingSpentCoin {
+                height: 1,
+                vout: 2,
+                ..
+            })
+        ));
         Ok(())
     }
 }

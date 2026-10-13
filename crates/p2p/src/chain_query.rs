@@ -699,6 +699,73 @@ mod tests {
         WireBlockHash::from_byte_array(*hash.as_bytes())
     }
 
+    /// Invalid decoded requests are ignored before invoking the query engine.
+    /// Core 31.1 disconnects them; retaining the connection is deliberate.
+    #[test]
+    fn invalid_compact_filter_requests_are_ignored_without_querying_the_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+
+        struct Filters;
+        impl CompactFilterQuery for Filters {
+            fn block_filter(&self, _: Hash256) -> Result<Option<BasicFilter>, TxQueryError> {
+                unreachable!("invalid request must not query the index")
+            }
+            fn filter_index_info(&self) -> Result<DerivedIndexInfo, TxQueryError> {
+                unreachable!("invalid request must not query the index")
+            }
+            fn for_each_filter(
+                &self,
+                _: u32,
+                _: Hash256,
+                _: u32,
+                _: &mut dyn FnMut(Hash256, BasicFilter) -> bool,
+            ) -> Result<Option<[u8; 32]>, TxQueryError> {
+                unreachable!("invalid request must not query the index")
+            }
+        }
+
+        let headers = seed_headers(2001);
+        let stop = wire_hash(headers[2000].compute_hash());
+        let query = query_with(headers)?.with_compact_filters(Some(Arc::new(Filters)));
+        for command in 0..3 {
+            for (kind, start, stop) in [
+                (1, 2000, stop),
+                (0, 2000, WireBlockHash::all_zeros()),
+                (0, 2001, stop),
+                (0, 0, stop),
+            ] {
+                // Checkpoints have no start/range limit; these two cases are valid.
+                if command == 2 && kind == 0 && stop != WireBlockHash::all_zeros() {
+                    continue;
+                }
+                let request = match command {
+                    0 => Message::GetCFilters(GetCFilters {
+                        filter_type: kind,
+                        start_height: start,
+                        stop_hash: stop,
+                    }),
+                    1 => Message::GetCFHeaders(GetCFHeaders {
+                        filter_type: kind,
+                        start_height: start,
+                        stop_hash: stop,
+                    }),
+                    _ => Message::GetCFCheckpt(GetCFCheckpt {
+                        filter_type: kind,
+                        stop_hash: stop,
+                    }),
+                };
+                assert!(query.serve_compact_filters(
+                    &request,
+                    &|| panic!("invalid request must not consume headroom"),
+                    &mut |_| panic!("invalid request must not emit a response"),
+                )?);
+            }
+        }
+        Ok(())
+    }
+
     /// Publication lag defers without blocking; completed responses are never
     /// replayed and an interrupted prefix terminates the connection.
     #[test]

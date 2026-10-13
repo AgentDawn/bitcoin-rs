@@ -256,8 +256,11 @@ unneeded funding record lists when callers only require history records.
 
 ### Compact-filter data and serving
 
-`index/filters.rs` owns BIP158 basic-filter encoding (P=19, M=784931) and BIP157
-hash/header commitments. Inputs are distinct nonempty output scripts excluding
+`index/filters.rs` selects BIP158 basic-filter scripts and owns BIP157 hash/header
+commitments. `bitcoin::bip158::GcsFilterWriter` owns deduplication and encoding
+(P=19, M=784931), without a second block decode. Proof: its pinned Core-vector
+and same-block-spend tests in `index/filters.rs`.
+Inputs are distinct nonempty output scripts excluding
 OP_RETURN, plus nonempty spent-prevout scripts. Same-block spends resolve from
 the parsed block before consulting the existing authoritative undo record.
 Genesis outputs and oversized scripts follow BIP158, not UTXO admission rules.
@@ -296,6 +299,13 @@ already-sent filters still belong to the captured stop chain. A completed range
 is not replayed; an interrupted prefix closes the connection instead of silently
 abandoning the tail. Disabled, unavailable, unknown, non-basic and oversized requests
 receive no filter answer.
+For decoded non-basic types, unknown/unapplied stops, inverted ranges and
+oversized ranges, bitcoin-rs deliberately keeps the connection open without
+discouragement; Core 31.1 disconnects these requests. Proof:
+`crates/p2p/src/chain_query.rs` test
+`invalid_compact_filter_requests_are_ignored_without_querying_the_index` and
+`tools/compact-filter-interop/run.py` wire checks (response bytes and connection
+outcome are recorded separately).
 To bridge a just-announced tip and asynchronous publication, a valid P2P request
 can be deferred for up to five seconds while publication or send headroom is
 pending. The existing socket poll retries one pending request per connection, so inbound traffic, ping

@@ -143,6 +143,7 @@ class Peer:
         version += struct.pack("<Q", 0x1502) + b"\x00" + struct.pack("<i?", 0, False)
         self.send("version", version)
         self.services = None
+        self.disconnected = False
         for _ in range(32):
             command, payload = self.receive()
             if command == "version":
@@ -184,6 +185,7 @@ class Peer:
             try:
                 name, response = self.receive()
             except EOFError:
+                self.disconnected = True
                 return result
             if name == "pong" and response == struct.pack("<Q", 0x1502):
                 return result
@@ -200,7 +202,8 @@ class Peer:
 def wire_query(node, command, payload):
     peer = Peer(node)
     try:
-        return peer.query(command, payload)
+        responses = peer.query(command, payload)
+        return responses, peer.disconnected
     finally:
         peer.close()
 
@@ -210,14 +213,18 @@ def wire_checks(core, node, tip, evidence):
     def request(command, start, stop, valid=True, kind=0):
         hash_ = bytes.fromhex(core.rpc("getblockhash", stop))[::-1] if stop is not None else bytes(32)
         payload = bytes([kind]) + (struct.pack("<I", start) if start is not None else b"") + hash_
-        actual = wire_query(node, command, payload)
-        expected = wire_query(core, command, payload)
+        actual, node_disconnected = wire_query(node, command, payload)
+        expected, core_disconnected = wire_query(core, command, payload)
         assert actual == expected, (command, start, stop, kind, len(actual), len(expected))
+        # Core disconnects invalid requests without discouragement. bitcoin-rs
+        # deliberately ignores them and remains responsive to the following ping.
+        assert not node_disconnected, (command, start, stop, kind)
+        assert core_disconnected == (not valid), (command, start, stop, kind)
         if valid:
             assert actual, (command, start, stop)
         else:
             assert not actual, (command, start, stop)
-        cases.append({"command": command, "start": start, "stop": stop, "type": kind, "responses": len(actual), "response_sha256": hashlib.sha256(b"".join(payload for _, payload in actual)).hexdigest()})
+        cases.append({"command": command, "start": start, "stop": stop, "type": kind, "responses": len(actual), "bitcoin_rs_disconnected": node_disconnected, "core_disconnected": core_disconnected, "response_sha256": hashlib.sha256(b"".join(payload for _, payload in actual)).hexdigest()})
     request("getcfilters", 0, min(999, tip))
     request("getcfheaders", 0, min(1999, tip))
     request("getcfheaders", tip, tip)
@@ -227,6 +234,7 @@ def wire_checks(core, node, tip, evidence):
         request(command, tip + 1, tip, valid=False)
         request(command, 0, tip, valid=False, kind=1)
     request("getcfcheckpt", None, tip, valid=False, kind=1)
+    request("getcfcheckpt", None, None, valid=False)
     if tip >= 2000:
         request("getcfilters", 0, 1000, valid=False)
         request("getcfheaders", 0, 2000, valid=False)
@@ -312,6 +320,7 @@ def main():
             peer = Peer(node)
             assert not (peer.services & 64)
             assert not peer.query("getcfheaders", b"\x00" + struct.pack("<I", 0) + bytes.fromhex(genesis)[::-1])
+            assert not peer.disconnected
             peer.close()
             bodies = core.batch("getblock", [[hash_, 0] for hash_ in blocks])
             started = time.monotonic()

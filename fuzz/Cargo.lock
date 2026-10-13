@@ -187,11 +187,11 @@ name = "bitcoin-rs-index"
 version = "0.14.0"
 dependencies = [
  "arc-swap",
+ "bitcoin",
  "bitcoin-rs-chain",
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
- "bitcoin_hashes",
  "compact_str",
  "crossbeam-channel",
  "hashbrown",

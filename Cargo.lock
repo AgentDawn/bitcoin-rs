@@ -337,7 +337,6 @@ dependencies = [
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
- "bitcoin_hashes",
  "compact_str",
  "criterion",
  "crossbeam-channel",

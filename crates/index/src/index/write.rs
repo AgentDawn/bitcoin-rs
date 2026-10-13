@@ -413,7 +413,9 @@ impl<S: KvStore> IndexWriter<S> {
         body: &[u8],
         cursor: ConsumerCursorUpdate<'_>,
     ) -> Result<(), IndexError> {
-        if capabilities.contains(IndexCapability::ScriptLive) {
+        if capabilities.contains(IndexCapability::ScriptLive)
+            || capabilities.contains(IndexCapability::CompactFilters)
+        {
             return Err(IndexError::MissingSpentScripts);
         }
         self.commit_rollback_one_for_with_cursor_with_spent_scripts(
@@ -427,7 +429,7 @@ impl<S: KvStore> IndexWriter<S> {
     }
 
     /// Atomically rolls back one block with the exact scripts of its spent
-    /// coins. This is the anchored variant used when `ScriptLive` is selected.
+    /// coins. Required when `ScriptLive` or `CompactFilters` is selected.
     ///
     /// The commit point is the successful return from the durable conditional
     /// write, so recovery sees either the prior state or the complete rollback.

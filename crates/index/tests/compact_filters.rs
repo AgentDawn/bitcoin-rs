@@ -100,6 +100,16 @@ fn filter_rows_and_cursor_publish_atomically_and_reset_preserves_txindex()
         IndexCapabilities::COMPACT_FILTERS,
     )?)?;
     let fence = writer.fenced_watermarks()?.0;
+    assert!(matches!(
+        writer.commit_rollback_one_for_with_cursor(
+            fence,
+            IndexCapabilities::COMPACT_FILTERS,
+            mark,
+            &serialize(&child),
+            ConsumerCursorUpdate::Keep,
+        ),
+        Err(IndexError::MissingSpentScripts)
+    ));
     writer.commit_rollback_one_for_with_cursor_with_spent_scripts(
         fence,
         IndexCapabilities::COMPACT_FILTERS,
