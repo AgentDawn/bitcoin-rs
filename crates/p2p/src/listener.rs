@@ -4041,6 +4041,7 @@ mod block_forward_tests {
         );
         Ok(())
     }
+
     /// A compact block without an outstanding download is a header
     /// announcement only. The same hash may reconstruct once its exact
     /// connection owns the body, but repeating it cannot rescan the pool.
@@ -4102,8 +4103,13 @@ mod block_forward_tests {
         let mut reconstruction = crate::compact_blocks::Reconstruction::new();
 
         super::process_compact_wire_message(
-            &message, &mut reconstruction, Some(2), Some(&hints),
-            &lease, addr, &shared,
+            &message,
+            &mut reconstruction,
+            Some(2),
+            Some(&hints),
+            &lease,
+            addr,
+            &shared,
         );
         assert_eq!(hints.0.load(Ordering::Relaxed), 0);
         let announced = headers_rx.try_recv()?;
@@ -4118,15 +4124,25 @@ mod block_forward_tests {
         );
         sync.record_owned_body_fetch(source, hash);
         super::process_compact_wire_message(
-            &message, &mut reconstruction, Some(2), Some(&hints),
-            &lease, addr, &shared,
+            &message,
+            &mut reconstruction,
+            Some(2),
+            Some(&hints),
+            &lease,
+            addr,
+            &shared,
         );
         assert_eq!(hints.0.load(Ordering::Relaxed), 1);
         assert_eq!(blocks_rx.len(), 1);
 
         super::process_compact_wire_message(
-            &message, &mut reconstruction, Some(2), Some(&hints),
-            &lease, addr, &shared,
+            &message,
+            &mut reconstruction,
+            Some(2),
+            Some(&hints),
+            &lease,
+            addr,
+            &shared,
         );
         assert_eq!(hints.0.load(Ordering::Relaxed), 1);
         assert_eq!(blocks_rx.len(), 1);
