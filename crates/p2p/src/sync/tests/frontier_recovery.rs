@@ -86,13 +86,15 @@ fn empty_header_probe_is_paced_then_rotates_to_another_peer() -> TestResult {
     sync.tick();
     assert!(first_rx.try_recv().is_err());
     assert!(second_rx.try_recv().is_err());
-    sync.scheduler
-        .lock()
-        .headers_sync
-        .get_mut(&current_source(&peers, first))
-        .and_then(|owned| owned.request.as_mut())
-        .ok_or("probe lost its deadline")?
-        .requested_at -= super::super::HEADER_REQUEST_TIMEOUT;
+    {
+        let mut scheduler = sync.scheduler.lock();
+        let request = scheduler
+            .headers_sync
+            .get_mut(&current_source(&peers, first))
+            .and_then(|owned| owned.request.as_mut())
+            .ok_or("probe lost its deadline")?;
+        request.requested_at -= request.timeout();
+    }
     sync.tick();
     assert!(matches!(second_rx.try_recv()?, Message::GetHeaders(_)));
     assert!(first_rx.try_recv().is_err());
@@ -360,13 +362,15 @@ fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick() -> TestResult 
         "the fallback request must start at the header tip"
     );
 
-    sync.scheduler
-        .lock()
-        .headers_sync
-        .get_mut(&current_source(&peers, live))
-        .and_then(|owned| owned.request.as_mut())
-        .ok_or("fallback lost its deadline")?
-        .requested_at -= super::super::HEADER_REQUEST_TIMEOUT;
+    {
+        let mut scheduler = sync.scheduler.lock();
+        let request = scheduler
+            .headers_sync
+            .get_mut(&current_source(&peers, live))
+            .and_then(|owned| owned.request.as_mut())
+            .ok_or("fallback lost its deadline")?;
+        request.requested_at -= request.timeout();
+    }
 
     sync.tick();
     assert!(

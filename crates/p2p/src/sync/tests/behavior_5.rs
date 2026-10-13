@@ -195,6 +195,7 @@ fn on_peer_ready_sweeps_dead_predecessor_header_request() -> TestResult {
         scheduler.headers_sync.entry(source).or_default().request =
             Some(super::super::HeaderRequest {
                 source,
+                kind: super::super::HeaderRequestKind::Frontier,
                 locator_tip_hash: Hash256::default(),
                 target_height: 1,
                 requested_at: Instant::now(),
@@ -230,6 +231,7 @@ fn on_peer_ready_sweep_releases_dead_owned_requests_only() -> TestResult {
             .or_default()
             .request = Some(super::super::HeaderRequest {
             source: replacement,
+            kind: super::super::HeaderRequestKind::Frontier,
             locator_tip_hash: Hash256::default(),
             target_height: 1,
             requested_at: Instant::now(),

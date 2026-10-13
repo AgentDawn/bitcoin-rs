@@ -84,7 +84,7 @@ const LOCATOR_MAX_ENTRIES: usize = 32;
 /// Wire protocol version we advertise on outbound `getheaders`.
 const PROTOCOL_VERSION: u32 = 70_016;
 
-/// Time after which an unanswered `getheaders` request may be retried.
+/// Time after which an unanswered frontier `getheaders` request may be retried.
 const HEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the node asks whether its own tip has gone stale: Core's
@@ -320,10 +320,26 @@ struct PeerHeadersSync {
 pub(super) struct HeaderRequest {
     /// The exact connection the request was sent to.
     source: PeerSource,
+    kind: HeaderRequestKind,
     locator_tip_hash: Hash256,
     target_height: u32,
     requested_at: Instant,
     state: HeaderRequestState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HeaderRequestKind {
+    Frontier,
+    ChainSyncProbe,
+}
+
+impl HeaderRequest {
+    fn timeout(self) -> Duration {
+        match self.kind {
+            HeaderRequestKind::Frontier => HEADER_REQUEST_TIMEOUT,
+            HeaderRequestKind::ChainSyncProbe => peers::HEADERS_RESPONSE_TIME,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

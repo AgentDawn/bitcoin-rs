@@ -268,6 +268,7 @@ fn live_pending_header_request_awaits_its_connection() {
     frontier.usable_peers[0].source = source;
     frontier.header_request = Some(super::super::HeaderRequest {
         source,
+        kind: super::super::HeaderRequestKind::Frontier,
         locator_tip_hash: hash(0x01),
         target_height: 6,
         requested_at: Instant::now(),
@@ -287,6 +288,7 @@ fn probe_rotates_past_the_dead_pending_owner() {
     );
     frontier.header_request = Some(super::super::HeaderRequest {
         source: dead_owner,
+        kind: super::super::HeaderRequestKind::Frontier,
         locator_tip_hash: hash(0x01),
         target_height: 6,
         requested_at: Instant::now(),
@@ -374,6 +376,7 @@ proptest::proptest! {
         let header_request = if let (true, Some(source)) = (pending_live, owner) {
             Some(super::super::HeaderRequest {
                 source,
+                kind: super::super::HeaderRequestKind::Frontier,
                 locator_tip_hash: hash(0x01),
                 target_height: 9,
                 requested_at: Instant::now(),

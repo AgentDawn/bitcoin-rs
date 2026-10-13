@@ -151,6 +151,9 @@ expiry.
 - The existing header request and timeout pace discovery. Empty responses
   mark a request answered but preserve its original deadline, pacing an
   identical request without blaming that connection when the deadline passes.
+  Frontier requests use the five-second deadline; a chain-sync eviction
+  probe keeps its request gate for the existing two-minute
+  `HEADERS_RESPONSE_TIME`, aligned with its eviction response window.
   A nonempty batch consumes its matching request only when it is a usable
   answer: admitted, or already known in full. A batch this node rejects keeps
   the gate and moves its deadline to the answer, because that connection did
@@ -468,11 +471,13 @@ prefilter exemption.
 - One per-connection lifecycle entry owns both the optional presync cursor
   and optional wire request. A nonempty wire answer clears only the request;
   an empty answer ends presync but retains an answered request with its
-  original pacing deadline; exact-source teardown removes the entry. A
-  request excludes competing `getheaders` on that exact connection while it
-  is unanswered, then paces only identical locator/target requests until its
-  deadline. Only an unanswered timeout below the work floor or during
-  PRESYNC/REDOWNLOAD
+  original kind-specific pacing deadline; exact-source teardown removes the
+  entry. A request excludes competing `getheaders` on that exact connection
+  while unanswered: ordinary frontier requests, including PRESYNC/REDOWNLOAD
+  continuations, use five seconds, while a chain-sync eviction probe uses its
+  existing two-minute response window. An answered request paces only
+  identical locator/target requests until that same deadline. Only an
+  unanswered timeout below the work floor or during PRESYNC/REDOWNLOAD
   retires the connection and its sync state before queued headers are
   processed, even when it is the last usable peer. Recovery starts on another
   connection. Deliveries from retired or replaced connections are ignored,
@@ -494,8 +499,11 @@ divergence on a substituted redownload header, salted-commitment spends, the
 benign lost-continuity break, and the disconnects every other failure costs
 the connection. `crates/p2p/src/sync/tests/chain_sync.rs` test
 `frontier_and_eviction_probes_do_not_overwrite_live_requests` covers
-above-floor request ownership. `crates/p2p/benches/headers_presync.rs`
-measures the hashing bound the first pass pays per page.
+above-floor request ownership; `chain_sync_probe_holds_request_for_its_response_window`
+and `expired_chain_sync_probe_does_not_suppress_frontier_request` prove its
+request gate shares the two-minute answer window.
+`crates/p2p/benches/headers_presync.rs` measures the hashing bound the first
+pass pays per page.
 
 ### `P2P-11`: BIP324 v2 transport negotiation
 

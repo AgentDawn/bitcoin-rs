@@ -22,7 +22,6 @@ use bitcoin_rs_primitives::Hash256;
 use crate::PeerInfo;
 use crate::connection::PeerSource;
 
-use super::HEADER_REQUEST_TIMEOUT;
 use super::HeaderRequest;
 
 /// The canonical next-required body: the block the apply frontier commits
@@ -339,7 +338,7 @@ pub(crate) fn header_request_live(
     now: Instant,
 ) -> bool {
     header_request.is_some_and(|request| {
-        now.saturating_duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT
+        now.saturating_duration_since(request.requested_at) < request.timeout()
             && usable_peers
                 .iter()
                 .any(|peer| peer.source == request.source)

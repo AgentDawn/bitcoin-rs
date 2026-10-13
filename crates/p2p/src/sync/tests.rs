@@ -470,8 +470,14 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
             "a body-forwarded batch is not an answer: the gate stays with `a`",
         );
 
+        let timeout = sync
+            .scheduler
+            .lock()
+            .header_request()
+            .map(super::HeaderRequest::timeout)
+            .ok_or("the request must still be registered")?;
         let almost = Instant::now()
-            .checked_sub(super::HEADER_REQUEST_TIMEOUT.saturating_sub(Duration::from_millis(1)))
+            .checked_sub(timeout.saturating_sub(Duration::from_millis(1)))
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()
@@ -497,7 +503,7 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
         );
 
         let backdated = Instant::now()
-            .checked_sub(super::HEADER_REQUEST_TIMEOUT)
+            .checked_sub(timeout)
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()

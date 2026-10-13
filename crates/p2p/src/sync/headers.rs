@@ -4,6 +4,7 @@ use super::GetdataRequestOutcome;
 use super::GetheadersOutcome;
 use super::HEADER_REQUEST_TIMEOUT;
 use super::HeaderRequest;
+use super::HeaderRequestKind;
 use super::HeaderRequestState;
 use super::LOCATOR_MAX_ENTRIES;
 use super::PROTOCOL_VERSION;
@@ -474,9 +475,8 @@ impl BlockSync {
                     let request = owned.request?;
                     (request.state == HeaderRequestState::AwaitingResponse
                         && (below_floor || owned.presync.is_some())
-                        && now.saturating_duration_since(request.requested_at)
-                            >= HEADER_REQUEST_TIMEOUT)
-                        .then_some(*source)
+                        && now.saturating_duration_since(request.requested_at) >= request.timeout())
+                    .then_some(*source)
                 })
                 .collect()
         };
@@ -872,8 +872,13 @@ impl BlockSync {
         };
         let our_height = headers.height.saturating_sub(1);
         let target_height = i32::try_from(headers.height).unwrap_or(i32::MAX);
-        let outcome =
-            self.send_getheaders_tracked(source, our_height, target_height, locator, false);
+        let outcome = self.send_getheaders_tracked(
+            source,
+            our_height,
+            target_height,
+            locator,
+            HeaderRequestKind::ChainSyncProbe,
+        );
         if outcome == GetheadersOutcome::Sent {
             tracing::debug!(
                 peer_addr = %source.addr,
@@ -909,21 +914,24 @@ impl BlockSync {
         target_height: i32,
         locator: Vec<Hash256>,
     ) -> GetheadersOutcome {
-        self.send_getheaders_tracked(source, our_height, target_height, locator, true)
+        self.send_getheaders_tracked(
+            source,
+            our_height,
+            target_height,
+            locator,
+            HeaderRequestKind::Frontier,
+        )
     }
 
-    /// Every request is registered under its exact connection. `track`
-    /// additionally claims the frontier request owner when that owner is free;
-    /// a probe that must not displace the frontier's pending request leaves
-    /// that owner unchanged, and its answer arrives as ordinary inbound
-    /// headers.
+    /// Every request is registered under its exact connection. Its kind
+    /// selects the response timeout and whether it claims the frontier owner.
     fn send_getheaders_tracked(
         &self,
         source: crate::PeerSource,
         our_height: u32,
         target_height: i32,
         locator: Vec<Hash256>,
-        track: bool,
+        kind: HeaderRequestKind,
     ) -> GetheadersOutcome {
         let Some(locator_tip_hash) = locator.first().copied() else {
             return GetheadersOutcome::Failed;
@@ -957,12 +965,13 @@ impl BlockSync {
                 let mut scheduler = self.scheduler.lock();
                 scheduler.headers_sync.entry(source).or_default().request = Some(HeaderRequest {
                     source,
+                    kind,
                     locator_tip_hash,
                     target_height,
                     requested_at: now,
                     state: HeaderRequestState::AwaitingResponse,
                 });
-                if track {
+                if kind == HeaderRequestKind::Frontier {
                     // A continuation from a different peer must not replace
                     // the frontier request its current owner still owes.
                     let can_claim_owner = scheduler.header_request_owner.is_none_or(|owner| {
@@ -973,7 +982,7 @@ impl BlockSync {
                                 .and_then(|owned| owned.request)
                                 .is_none_or(|request| {
                                     now.saturating_duration_since(request.requested_at)
-                                        >= HEADER_REQUEST_TIMEOUT
+                                        >= request.timeout()
                                 })
                     });
                     if can_claim_owner {
@@ -1025,8 +1034,7 @@ impl BlockSync {
         let Some(request) = owned.request else {
             return false;
         };
-        let unexpired =
-            now.saturating_duration_since(request.requested_at) < HEADER_REQUEST_TIMEOUT;
+        let unexpired = now.saturating_duration_since(request.requested_at) < request.timeout();
         match request.state {
             HeaderRequestState::AwaitingResponse
                 if below_floor || owned.presync.is_some() || unexpired =>

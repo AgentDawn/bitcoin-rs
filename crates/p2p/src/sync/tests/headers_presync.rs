@@ -148,16 +148,15 @@ fn pending_request(sync: &BlockSync, source: PeerSource) -> Option<super::super:
 }
 
 fn expire_request(sync: &BlockSync, source: PeerSource) -> TestResult {
-    let requested_at = Instant::now()
-        .checked_sub(super::super::HEADER_REQUEST_TIMEOUT)
-        .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
-    sync.scheduler
-        .lock()
+    let mut scheduler = sync.scheduler.lock();
+    let request = scheduler
         .headers_sync
         .get_mut(&source)
         .and_then(|owned| owned.request.as_mut())
-        .ok_or("the request must still be registered")?
-        .requested_at = requested_at;
+        .ok_or("the request must still be registered")?;
+    request.requested_at = Instant::now()
+        .checked_sub(request.timeout())
+        .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
     Ok(())
 }
 

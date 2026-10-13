@@ -144,7 +144,7 @@ const CHAIN_SYNC_TIMEOUT: Duration = Duration::from_mins(20);
 
 /// How long the answer to that probe is awaited: `HEADERS_RESPONSE_TIME` is
 /// 2 * 60 seconds, as Core sets it (`net_processing.cpp:103`).
-const HEADERS_RESPONSE_TIME: Duration = Duration::from_mins(2);
+pub(super) const HEADERS_RESPONSE_TIME: Duration = Duration::from_mins(2);
 
 /// How many tip-reaching outbound connections are never retired. Core's
 /// `MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT` (`net_processing.cpp:107`).
