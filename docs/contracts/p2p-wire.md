@@ -241,9 +241,13 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
   header retry after that source disconnects, but exact-source checks prevent
   the retry from crediting or faulting a same-address replacement
   (`staged_body_retries_after_source_replacement_without_replacement_credit`).
-  The inbound body drain drops retired-source deliveries before staging;
-  queued bodies are not already-staged work
+  The inbound body drain drops deliveries whose source is already retired
+  when checked at dequeue, before historical or foreground routing
   (`queued_body_from_replaced_source_cannot_enter_staging`).
+  This check does not hold peer-table authority through body validation or
+  staging: a body accepted while its source is current may finish staging
+  after concurrent retirement. Credit and fault attribution still require
+  the exact source to be current.
 - A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
   `getblocktxn`, `Fallback`'s `getdata`) is marked
   (`InboundHeaders::body_fetch_owned`): once the tip admits, the window
@@ -497,10 +501,11 @@ prefilter exemption.
   unanswered timeout below the work floor or during PRESYNC/REDOWNLOAD
   retires the connection and its sync state before queued headers are
   processed, even when it is the last usable peer. Recovery starts on another
-  connection. Queued wire deliveries from retired or replaced connections are
-  ignored, never admitted or attributed to the replacement; a body already
-  staged before retirement may retry its embedded header through the
-  body-carried path, retaining its source for work-floor validation while
+  connection. Wire deliveries whose source is retired or replaced at the
+  ingress identity check are ignored, never admitted or attributed to the
+  replacement. Foreground bodies accepted while their source is current may
+  finish staging and retry their embedded header after retirement through the
+  body-carried path, retaining their source for work-floor validation while
   exact-source credit and fault checks exclude the replacement. The wire has
   no request identifier with which to reconcile overlapping responses.
 - The serving side is the mirror rule: below the network's assumed work the
@@ -529,7 +534,8 @@ answered pacing and selector ownership.
 `staged_body_retries_after_source_replacement_without_replacement_credit`
 proves staged-body recovery without replacement credit after disconnect.
 `queued_body_from_replaced_source_cannot_enter_staging` in the same suite
-proves retired deliveries cannot enter staging through the inbound body drain.
+proves deliveries already stale at dequeue cannot enter staging through the
+inbound body drain.
 `crates/p2p/benches/headers_presync.rs` measures the hashing bound the first
 pass pays per page.
 
