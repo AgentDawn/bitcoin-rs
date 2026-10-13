@@ -268,8 +268,10 @@ pub enum PeerError {
         /// Actual magic bytes.
         actual: Magic,
     },
-    /// Peer advertised a payload larger than the configured bound.
-    #[error("payload length {0} exceeds 32 MiB bound")]
+    /// A payload, declared by a peer or about to be sent, exceeds its
+    /// transport's bound: [`MAX_MESSAGE_PAYLOAD`] for a v1 frame, 4,000,000
+    /// bytes for a BIP324 packet.
+    #[error("payload length {0} exceeds the transport's payload bound")]
     PayloadTooLarge(usize),
     /// Payload checksum did not match the header checksum.
     #[error("invalid payload checksum")]
