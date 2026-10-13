@@ -1184,12 +1184,14 @@ mod tests {
             header: Cursor::new(header),
         };
 
+        let v1_result = read_message(&mut reader, Magic::REGTEST);
         assert!(
-            matches!(read_message(&mut reader, Magic::REGTEST), Err(PeerError::PayloadTooLarge(len)) if len == oversize),
+            matches!(v1_result, Err(PeerError::PayloadTooLarge(len)) if len == oversize),
             "v1 rejects a block at the header before reading any payload bytes"
         );
+        let v2_result = super::decode_payload("block", &vec![0_u8; oversize]);
         assert!(
-            matches!(super::decode_payload("block", &vec![0_u8; oversize]), Err(PeerError::PayloadTooLarge(len)) if len == oversize),
+            matches!(v2_result, Err(PeerError::PayloadTooLarge(len)) if len == oversize),
             "shared typed decoding rejects oversized BIP324 block payloads"
         );
         Ok(())
@@ -1197,10 +1199,16 @@ mod tests {
 
     #[test]
     fn block_transaction_count_bound_precedes_layout_allocations() {
+        let count = super::MAX_BLOCK_TX_COUNT + 1;
         let mut payload = vec![0_u8; bitcoin_rs_primitives::Header::LEN];
-        payload.extend_from_slice(&bitcoin_rs_primitives::varint::encode(
-            super::MAX_BLOCK_TX_COUNT + 1,
-        ));
+        payload.extend_from_slice(&bitcoin_rs_primitives::varint::encode(count));
+        for _ in 0..count {
+            payload.extend_from_slice(&[0_u8; 10]);
+        }
+        assert!(
+            bitcoin_rs_primitives::layout::ParsedBlock::parse_exact(&payload).is_ok(),
+            "the adversarial block is wire-parseable despite invalid transactions"
+        );
         assert!(matches!(
             super::decode_payload("block", &payload),
             Err(PeerError::Misbehavior("block transaction count too large"))
