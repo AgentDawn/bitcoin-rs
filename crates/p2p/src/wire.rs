@@ -24,6 +24,13 @@ pub const PROTOCOL_VERSION: u32 = 70_016;
 
 /// Maximum accepted payload length for one v1 network message.
 pub const MAX_MESSAGE_PAYLOAD: usize = 32 * 1024 * 1024;
+// A consensus-valid transaction has at least one 41-byte input, one 9-byte
+// output, and 10 bytes of version, count prefixes, and lock time. Each base
+// byte costs four weight units; even a witness-heavy block cannot contain more.
+const MIN_VALID_TX_BASE_SIZE: u64 = 60;
+const MAX_BLOCK_TX_COUNT: u64 =
+    bitcoin_rs_consensus::MAX_BLOCK_WEIGHT / (4 * MIN_VALID_TX_BASE_SIZE);
+
 /// Maximum control messages coalesced into one vectored write.
 pub(crate) const MAX_WRITE_BURST: usize = 8;
 
@@ -270,7 +277,7 @@ pub enum PeerError {
     },
     /// A payload, declared by a peer or about to be sent, exceeds its
     /// transport's bound: [`MAX_MESSAGE_PAYLOAD`] for a v1 frame, 4,000,000
-    /// bytes for a BIP324 packet.
+    /// bytes for a BIP324 packet or a serialized block.
     #[error("payload length {0} exceeds the transport's payload bound")]
     PayloadTooLarge(usize),
     /// Payload checksum did not match the header checksum.
@@ -585,7 +592,9 @@ fn pending_body(
     let payload_len_u32 = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
     let payload_len =
         usize::try_from(payload_len_u32).map_err(|_| PeerError::PayloadTooLarge(usize::MAX))?;
-    if payload_len > MAX_MESSAGE_PAYLOAD {
+    if payload_len > MAX_MESSAGE_PAYLOAD
+        || (command == "block" && payload_len > crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE)
+    {
         return Err(PeerError::PayloadTooLarge(payload_len));
     }
 
@@ -678,7 +687,7 @@ pub(crate) fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, P
         "getheaders" => Message::GetHeaders(decode_getheaders(payload)?),
         "mempool" => empty_payload(payload, Message::MemPool)?,
         "tx" => Message::Tx(deserialize::<Tx>(payload)?),
-        "block" => Message::Block(deserialize::<Block>(payload)?),
+        "block" => Message::Block(decode_block(payload)?),
         "headers" => Message::Headers(decode_headers(payload)?),
         "sendheaders" => empty_payload(payload, Message::SendHeaders)?,
         "getaddr" => empty_payload(payload, Message::GetAddr)?,
@@ -718,6 +727,71 @@ pub(crate) fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, P
         }
     };
     Ok(message)
+}
+
+/// Admits a block's borrowed wire layout before creating owned transaction
+/// objects. Transport bytes, transaction count, structure, and weight are all
+/// bounded before materialization; the chainstate still owns contextual rules.
+fn decode_block(payload: &[u8]) -> Result<Block, PeerError> {
+    // BIP141 weight is never smaller than the serialized byte length.
+    // This guard also covers BIP324, which has no v1 message header.
+    if payload.len() > crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE {
+        return Err(PeerError::PayloadTooLarge(payload.len()));
+    }
+
+    // The count prefix is at a fixed offset. Check it before the layout
+    // parser grows one metadata record and span per declared transaction.
+    let count_bytes = payload
+        .get(Header::LEN..)
+        .ok_or(PeerError::Misbehavior("truncated block header"))?;
+    let (count, _) = bitcoin_rs_primitives::varint::decode(count_bytes)?;
+    if count > MAX_BLOCK_TX_COUNT {
+        return Err(PeerError::Misbehavior("block transaction count too large"));
+    }
+
+    let parsed = bitcoin_rs_primitives::layout::ParsedBlock::parse_exact(payload)?;
+    let Some(first) = parsed.transactions().first() else {
+        return Err(PeerError::Misbehavior("block has no transactions"));
+    };
+    if parsed
+        .transactions()
+        .iter()
+        .any(|tx| tx.inputs().is_empty() || tx.outputs().is_empty())
+    {
+        return Err(PeerError::Misbehavior(
+            "block transaction has no inputs or outputs",
+        ));
+    }
+
+    let [coinbase_input] = first.inputs() else {
+        return Err(PeerError::Misbehavior("block missing coinbase"));
+    };
+    let outpoint = first
+        .span_bytes(coinbase_input.outpoint())
+        .unwrap_or_else(|| unreachable!("parsed outpoint span is checked"));
+    if outpoint[..32].iter().any(|byte| *byte != 0) || outpoint[32..] != [0xff; 4] {
+        return Err(PeerError::Misbehavior("block missing coinbase"));
+    }
+
+    // Borrowed base sizes omit witness data. BIP141 weight is exactly
+    // three times the stripped size plus the serialized payload length.
+    let stripped_size = Header::LEN
+        + usize::try_from(parsed.tx_count_span().len())
+            .unwrap_or_else(|_| unreachable!("count-prefix span fits in usize"))
+        + parsed
+            .transactions()
+            .iter()
+            .map(bitcoin_rs_primitives::layout::ParsedTransaction::base_size)
+            .sum::<usize>();
+    let weight = u64::try_from(stripped_size)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(3)
+        .saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
+    if weight > bitcoin_rs_consensus::MAX_BLOCK_WEIGHT {
+        return Err(PeerError::Misbehavior("block exceeds maximum weight"));
+    }
+
+    Ok(parsed.materialize())
 }
 
 fn decode_addr(payload: &[u8]) -> Result<Vec<(u32, bitcoin::p2p::Address)>, PeerError> {
@@ -1099,6 +1173,76 @@ mod tests {
                 _ => "expected PayloadTooLarge for oversized payload length",
             })),
         }
+    }
+
+    #[test]
+    fn block_payload_cap_is_checked_before_body_read_and_v2_decode() -> Result<(), PeerError> {
+        let oversize = crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE + 1;
+        let mut header = header_declaring(oversize)?;
+        header[4..16].copy_from_slice(b"block\0\0\0\0\0\0\0");
+        let mut reader = HeaderOnlyReader {
+            header: Cursor::new(header),
+        };
+
+        assert!(
+            matches!(read_message(&mut reader, Magic::REGTEST), Err(PeerError::PayloadTooLarge(len)) if len == oversize),
+            "v1 rejects a block at the header before reading any payload bytes"
+        );
+        assert!(
+            matches!(super::decode_payload("block", &vec![0_u8; oversize]), Err(PeerError::PayloadTooLarge(len)) if len == oversize),
+            "shared typed decoding rejects oversized BIP324 block payloads"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn block_transaction_count_bound_precedes_layout_allocations() {
+        let mut payload = vec![0_u8; bitcoin_rs_primitives::Header::LEN];
+        payload.extend_from_slice(&bitcoin_rs_primitives::varint::encode(
+            super::MAX_BLOCK_TX_COUNT + 1,
+        ));
+        assert!(matches!(
+            super::decode_payload("block", &payload),
+            Err(PeerError::Misbehavior("block transaction count too large"))
+        ));
+    }
+
+    #[test]
+    fn block_rejects_parseable_empty_transaction_before_materialization() {
+        let mut payload = vec![0_u8; bitcoin_rs_primitives::Header::LEN];
+        payload.push(1); // One legacy transaction.
+        payload.extend_from_slice(&[0_u8; 10]); // Both input and output counts are zero.
+        assert!(bitcoin_rs_primitives::layout::ParsedBlock::parse_exact(&payload).is_ok());
+        assert!(matches!(
+            super::decode_payload("block", &payload),
+            Err(PeerError::Misbehavior(
+                "block transaction has no inputs or outputs"
+            ))
+        ));
+    }
+
+    #[test]
+    fn block_rejects_missing_coinbase_before_materialization() {
+        let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata[0].input[0].previous_output.vout = 0;
+        let payload = serialize(&block);
+        assert!(matches!(
+            super::decode_payload("block", &payload),
+            Err(PeerError::Misbehavior("block missing coinbase"))
+        ));
+    }
+
+    #[test]
+    fn block_weight_is_checked_before_materialization() {
+        let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        block.txdata[0].input[0].script_sig =
+            bitcoin::ScriptBuf::from_bytes(vec![0_u8; 1_000_000]);
+        let payload = serialize(&block);
+        assert!(payload.len() < crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE);
+        assert!(matches!(
+            super::decode_payload("block", &payload),
+            Err(PeerError::Misbehavior("block exceeds maximum weight"))
+        ));
     }
 
     #[test]
