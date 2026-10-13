@@ -1384,7 +1384,7 @@ mod tests {
                 &handler,
                 false,
                 core::time::Duration::from_secs(5),
-                    &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(0)),
             )
         });
 
@@ -1464,7 +1464,7 @@ mod tests {
                 &handler,
                 false,
                 core::time::Duration::from_secs(1),
-                    &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(0)),
             )
         });
 
