@@ -69,14 +69,24 @@ pub enum TweakError {
 /// Derives public material from a validated transaction and exact input-ordered
 /// prevout scripts. `None` means BIP352 v0 ineligibility, never incomplete history.
 ///
-/// Unknown witness versions (including nested ones) exclude the whole transaction.
-/// Unsupported scripts and uncompressed keys contribute no key. P2TR keys are
-/// lifted with even parity; NUMS script-path spends are excluded after removing
-/// an optional annex. No wallet key, address, label or subscription is accepted.
-/// This function does not validate consensus scripts or authenticate the prevouts.
+/// Native witness programs with version greater than one exclude the whole
+/// transaction. Unsupported scripts and uncompressed keys contribute no key.
+/// P2TR keys are lifted with even parity; NUMS script-path spends are excluded
+/// after removing an optional annex. No wallet key, address, label or
+/// subscription is accepted. This function does not validate consensus scripts
+/// or authenticate the prevouts.
 pub fn transaction_tweak(
     tx: &Tx,
     prevouts: &[Option<&Script>],
+) -> Result<Option<TransactionTweak>, TweakError> {
+    let secp = Secp256k1::verification_only();
+    transaction_tweak_with_ctx(tx, prevouts, &secp)
+}
+
+fn transaction_tweak_with_ctx<C: secp256k1::Verification>(
+    tx: &Tx,
+    prevouts: &[Option<&Script>],
+    secp: &Secp256k1<C>,
 ) -> Result<Option<TransactionTweak>, TweakError> {
     if tx.total_size() > MAX_BODY_BYTES {
         return Err(TweakError::ResourceLimit);
@@ -115,9 +125,7 @@ pub fn transaction_tweak(
     let mut keys = Vec::new();
     for (index, (input, script)) in tx.inputs.iter().zip(prevouts).enumerate() {
         let script = script.ok_or(TweakError::Unavailable { input: index })?;
-        if future_witness(script)
-            || (is_p2sh(script) && redeem_script(input).is_some_and(future_witness))
-        {
+        if future_witness(script) {
             return Ok(None);
         }
         if let Some(key) = input_key(input, script, index)? {
@@ -150,7 +158,7 @@ pub fn transaction_tweak(
         return Err(TweakError::InvalidInputHash);
     }
     let tweak = sum
-        .mul_tweak(&Secp256k1::verification_only(), &scalar)
+        .mul_tweak(secp, &scalar)
         .map_err(|_| TweakError::InvalidInputHash)?
         .serialize();
     Ok(Some(TransactionTweak {
@@ -188,6 +196,7 @@ pub fn block_tweaks(view: &BlockSpends) -> Result<BlockTweaks, BlockSpendsError>
     if bytes > MAX_PREVOUT_BYTES {
         return Err(BlockSpendsError::ResourceLimit);
     }
+    let secp = Secp256k1::verification_only();
     let mut transactions = Vec::new();
     for (tx, coins) in view.block.txs.iter().zip(spent) {
         if tx.inputs.len() == 1 && tx.inputs[0].previous_output.is_null() {
@@ -211,7 +220,7 @@ pub fn block_tweaks(view: &BlockSpends) -> Result<BlockTweaks, BlockSpendsError>
             .iter()
             .map(|coin| Some(&coin.txout.script_pubkey))
             .collect();
-        match transaction_tweak(tx, &scripts) {
+        match transaction_tweak_with_ctx(tx, &scripts, &secp) {
             Ok(Some(tweak)) => transactions.push(tweak),
             Ok(None) => {}
             Err(TweakError::ResourceLimit) => return Err(BlockSpendsError::ResourceLimit),

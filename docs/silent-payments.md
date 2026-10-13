@@ -16,8 +16,11 @@ Its JSON examples do not define BIP352 cryptography.
 
 Given a **consensus-validated** transaction and exact input-ordered prevout
 scripts, the codec requires a P2TR output and an eligible input. Spending a
-witness program with version greater than one excludes the whole transaction,
-including canonical P2SH-wrapped programs. It extracts compressed keys from
+native witness program with version greater than one excludes the whole
+transaction (`coin.out.scriptPubKey.IsWitnessProgram && version > 1`, matching
+Core `src/common/bip352.cpp`). Inputs spending non-v0 P2SH programs (including
+P2SH-wrapped future witness scripts) contribute no key to shared-secret derivation
+rather than disqualifying other eligible inputs. It extracts compressed keys from
 P2PKH (hash-matching even malleated scriptSigs), P2WPKH and P2SH-P2WPKH.
 Unsupported scripts and uncompressed keys contribute no key. Taproot uses the
 even lift of the output key; script-path spends with the BIP341 NUMS internal

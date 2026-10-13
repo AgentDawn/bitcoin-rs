@@ -169,23 +169,38 @@ fn missing_prevouts_never_become_empty_success() -> Result {
 
 #[test]
 fn future_witness_excludes_transaction_but_malformed_program_does_not() -> Result {
-    let (mut tx, mut scripts, _) = sample()?;
+    let (mut tx, mut scripts, initial) = sample()?;
     for len in [2_u8, 20, 32, 40] {
         for version in [0x52, 0x60] {
-            scripts[1] = [vec![version, len], vec![0x11; usize::from(len)]]
-                .concat()
-                .into();
+            let future_prog = [vec![version, len], vec![0x11; usize::from(len)]].concat();
+            // Native future witness program in prevout scriptPubKey excludes the transaction
+            // (matching BIP352 specification and Core GetSilentPaymentsPrevoutsSummary).
+            scripts[1] = future_prog.clone().into();
             assert!(derive(&tx, &scripts)?.is_none());
-            // Canonical P2SH-wrapped future witness programs also exclude v0.
-            tx.inputs[1].script_sig = [vec![len + 2], scripts[1].to_vec()].concat().into();
+
+            // P2SH-wrapped future witness: P2SH scriptPubKey is not a witness program,
+            // so the input contributes no key (per BIP352 input list and Core
+            // GetSilentPaymentsPrevoutsSummary), but does not disqualify other eligible inputs.
+            tx.inputs[1].script_sig = [vec![len + 2], future_prog].concat().into();
             scripts[1] = [vec![0xa9, 0x14], vec![0x11; 20], vec![0x87]]
                 .concat()
                 .into();
-            assert!(derive(&tx, &scripts)?.is_none());
+            let p2sh_derived = derive(&tx, &scripts)?.ok_or("eligible via input 0")?;
+            assert_eq!(p2sh_derived.outputs.len(), initial.outputs.len());
         }
     }
     scripts[1] = vec![0x52, 0x20, 0x11].into();
     assert!(derive(&tx, &scripts)?.is_some());
+
+    // When the only input is P2SH-wrapped future witness, the transaction has
+    // no eligible keys and produces None.
+    let single_input_tx = Tx {
+        version: 2,
+        inputs: vec![tx.inputs[1].clone()],
+        outputs: tx.outputs.clone(),
+        ..Tx::default()
+    };
+    assert!(derive(&single_input_tx, &[scripts[1].clone()])?.is_none());
     Ok(())
 }
 
