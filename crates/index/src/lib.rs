@@ -14,6 +14,9 @@ pub mod query_api;
 pub mod reconcile;
 /// Asynchronous durable derived-index runtime.
 pub mod runtime;
+/// Experimental, keyless BIP352 public scan material (no durable index or HTTP routes).
+#[cfg(feature = "silent-payments")]
+pub mod silent_payments;
 /// Stable electrs-shaped row types.
 pub mod types;
 /// Object-safe, fenced access to the durable index writer.
