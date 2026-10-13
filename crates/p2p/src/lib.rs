@@ -44,6 +44,8 @@ pub(crate) mod peer;
 pub(crate) mod peer_info;
 /// Single owner of live peer sessions: leases and their handshake metadata.
 pub(crate) mod peer_table;
+/// Buffered reads that survive a peer socket's poll interval.
+pub(crate) mod recv;
 /// Runtime owner for P2P control state and workers.
 pub(crate) mod service;
 /// Peer TCP socket options: `TCP_NODELAY`, blocking I/O, poll timeouts.
