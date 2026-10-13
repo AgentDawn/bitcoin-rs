@@ -672,7 +672,9 @@ impl BlockSync {
     pub(super) fn probe_chain_sync(&self, source: PeerSource, frontier: &SyncFrontier) -> bool {
         match self.send_chain_sync_probe(frontier, source) {
             GetheadersOutcome::Sent | GetheadersOutcome::Suppressed => true,
-            GetheadersOutcome::FrontierOwned | GetheadersOutcome::Failed => false,
+            GetheadersOutcome::FrontierOwned
+            | GetheadersOutcome::SyncOwned
+            | GetheadersOutcome::Failed => false,
         }
     }
 }

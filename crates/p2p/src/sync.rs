@@ -244,9 +244,11 @@ fn defer_owned_body_fetch(scheduler: &mut SchedulerState, source: PeerSource, ha
 struct SchedulerState {
     window: DownloadWindow,
     stager: BlockStager,
-    /// The one outstanding header request, owned by the exact connection it
-    /// was sent to. Same-address replacement never inherits it.
-    header_request: Option<PendingHeaderRequest>,
+    /// Requests are owned by exact connections, including presync
+    /// continuations and eviction probes outside frontier discovery.
+    header_requests: hashbrown::HashMap<PeerSource, PendingHeaderRequest>,
+    /// The request pacing frontier discovery; its data lives only in the map.
+    header_request_owner: Option<PeerSource>,
     /// Deferred body-fetch ownership: a compact `getblocktxn` or fallback
     /// `getdata` was issued for a tip hash whose header has not attached yet.
     owned_body_fetches: Vec<(PeerSource, Hash256)>,
@@ -264,22 +266,27 @@ struct SchedulerState {
 }
 
 impl SchedulerState {
+    fn header_request(&self) -> Option<PendingHeaderRequest> {
+        self.header_request_owner
+            .and_then(|source| self.header_requests.get(&source).copied())
+    }
+
     /// Releases every scheduling fact owned by a connection not in `live`.
     ///
     /// PRE: `live` is the peer table's live-session snapshot.
-    /// POST: the window, the header request, the header presync states, and
-    ///   the deferred body fetches hold only facts owned by a connection in
-    ///   `live`.
+    /// POST: the window, header requests, header presync states, and the
+    ///   deferred body fetches hold only facts owned by a connection in `live`.
     /// INVARIANT: ownership is compared by connection identity, never by
     ///   address alone.
     fn release_unowned(&mut self, live: &[PeerSource]) {
         let owns = |source: &PeerSource| live.contains(source);
         self.window.retain_owned_by(owns);
+        self.header_requests.retain(|source, _| owns(source));
         if self
-            .header_request
-            .is_some_and(|request| !owns(&request.source))
+            .header_request_owner
+            .is_some_and(|source| !owns(&source))
         {
-            self.header_request = None;
+            self.header_request_owner = None;
         }
         self.owned_body_fetches.retain(|(source, _)| owns(source));
         self.chain_sync.retain(|source, _| owns(source));
@@ -325,6 +332,8 @@ pub(super) enum GetheadersOutcome {
     /// An identical request is already pending on that connection; nothing
     /// was sent.
     Suppressed,
+    /// Download-twice sync owns the connection; no eviction probe was sent.
+    SyncOwned,
     /// Nothing was sent because the frontier body is already owned: the
     /// capability question the probe exists to answer is resolved, and no
     /// request is outstanding on this connection.
@@ -387,7 +396,8 @@ impl BlockSync {
             scheduler: Mutex::new(SchedulerState {
                 window: DownloadWindow::new(budget),
                 stager: BlockStager::new(budget),
-                header_request: None,
+                header_requests: hashbrown::HashMap::new(),
+                header_request_owner: None,
                 owned_body_fetches: Vec::new(),
                 chain_sync: hashbrown::HashMap::new(),
                 headers_sync: hashbrown::HashMap::new(),
@@ -408,7 +418,8 @@ impl BlockSync {
         *self.scheduler.lock() = SchedulerState {
             window: DownloadWindow::new(budget),
             stager: BlockStager::new(budget),
-            header_request: None,
+            header_requests: hashbrown::HashMap::new(),
+            header_request_owner: None,
             owned_body_fetches: Vec::new(),
             chain_sync: hashbrown::HashMap::new(),
             headers_sync: hashbrown::HashMap::new(),
@@ -478,6 +489,7 @@ impl BlockSync {
     /// reconciliation: observe, recover what is unowned, then schedule or
     /// name why progress is impossible.
     pub fn tick(&self) {
+        self.retire_timed_out_header_syncs(Instant::now());
         self.drain_inbound_headers();
         self.chain.bootstrap_genesis();
         // Remove dead racers before queued blocks can affect peer election.
@@ -533,7 +545,9 @@ impl BlockSync {
                 GetheadersOutcome::Failed => {
                     self.request_headers_from_best_peer(&frontier, Some(source));
                 }
-                GetheadersOutcome::Suppressed | GetheadersOutcome::FrontierOwned => {
+                GetheadersOutcome::Suppressed
+                | GetheadersOutcome::FrontierOwned
+                | GetheadersOutcome::SyncOwned => {
                     self.request_headers_from_best_peer(&frontier, None);
                 }
                 GetheadersOutcome::Sent => {}
@@ -707,7 +721,7 @@ impl BlockSync {
                 BodyState::Unowned
             }
         });
-        let header_request = scheduler.header_request;
+        let header_request = scheduler.header_request();
         SyncFrontier {
             chain,
             body_state,

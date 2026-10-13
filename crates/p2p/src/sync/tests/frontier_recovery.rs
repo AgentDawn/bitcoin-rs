@@ -88,8 +88,8 @@ fn empty_header_probe_is_paced_then_rotates_to_another_peer() -> TestResult {
     assert!(second_rx.try_recv().is_err());
     sync.scheduler
         .lock()
-        .header_request
-        .as_mut()
+        .header_requests
+        .get_mut(&current_source(&peers, first))
         .ok_or("probe lost its deadline")?
         .requested_at -= super::super::HEADER_REQUEST_TIMEOUT;
     sync.tick();
@@ -176,7 +176,7 @@ fn superseded_session_gets_no_probe_and_cannot_send_getheaders() -> TestResult {
         "lease_source must reject a superseded session identity"
     );
     assert!(
-        sync.scheduler.lock().header_request.is_none(),
+        sync.scheduler.lock().header_request().is_none(),
         "a rejected send must not leave scheduler state behind"
     );
     Ok(())
@@ -231,7 +231,7 @@ fn frontier_probe_preserves_another_live_header_request() -> TestResult {
     assert_eq!(
         sync.scheduler
             .lock()
-            .header_request
+            .header_request()
             .map(|request| request.source),
         Some(existing_source),
         "the frontier probe must not replace the other peer's live request"
@@ -278,8 +278,7 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick() -> TestResult {
     assert_eq!(
         sync.scheduler
             .lock()
-            .header_request
-            .as_ref()
+            .header_request()
             .map(|request| request.source.addr),
         Some(high),
         "the fallback owner must hold the pending request"
@@ -320,8 +319,7 @@ fn failed_probe_send_excludes_dead_highest_peer_from_header_fallback() -> TestRe
     assert_eq!(
         sync.scheduler
             .lock()
-            .header_request
-            .as_ref()
+            .header_request()
             .map(|request| request.source.addr),
         Some(live),
         "the lower live peer must own the fallback request"
@@ -363,8 +361,8 @@ fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick() -> TestResult 
 
     sync.scheduler
         .lock()
-        .header_request
-        .as_mut()
+        .header_requests
+        .get_mut(&current_source(&peers, live))
         .ok_or("fallback lost its deadline")?
         .requested_at -= super::super::HEADER_REQUEST_TIMEOUT;
 
@@ -376,8 +374,7 @@ fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick() -> TestResult 
     assert_ne!(
         sync.scheduler
             .lock()
-            .header_request
-            .as_ref()
+            .header_request()
             .map(|request| request.source.addr),
         Some(dead),
         "the pending request must not be keyed to the dead addr",

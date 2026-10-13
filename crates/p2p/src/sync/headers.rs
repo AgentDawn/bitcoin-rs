@@ -64,6 +64,9 @@ impl BlockSync {
             body_fetch_owned,
         }) = self.inbound_headers_rx.try_recv()
         {
+            if source.is_some_and(|source| !self.peer_table.is_current(source)) {
+                continue;
+            }
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
 
@@ -241,9 +244,9 @@ impl BlockSync {
             return;
         }
         let mut credit_refresh_needed = false;
-        // `header_request` is a singleton: asking a second peer before the
-        // first answers would orphan the earlier request untracked, so
-        // unknown announcements queue back for a later drain instead.
+        // The frontier request has one pacing owner: asking a second peer
+        // before the first answers would orphan that owner's request from
+        // discovery, so unknown announcements queue back for a later drain.
         let mut deferred: Vec<(PeerSource, Hash256)> = Vec::new();
         for (source, hash) in pending {
             if !self.peer_table.is_current(source) {
@@ -260,7 +263,7 @@ impl BlockSync {
                 (tree.lookup(hash).is_some(), height)
             };
             if !known {
-                if self.scheduler.lock().header_request.is_some() {
+                if self.scheduler.lock().header_request().is_some() {
                     deferred.push((source, hash));
                 } else {
                     self.request_headers_from(Some(source));
@@ -398,12 +401,42 @@ impl BlockSync {
     /// never frees its predecessor's pending request.
     pub(super) fn clear_header_request_for(&self, source: PeerSource) {
         let mut scheduler = self.scheduler.lock();
-        if scheduler
-            .header_request
-            .is_some_and(|request| request.source == source)
-        {
-            scheduler.header_request = None;
+        scheduler.header_requests.remove(&source);
+        if scheduler.header_request_owner == Some(source) {
+            scheduler.header_request_owner = None;
         }
+    }
+
+    /// A timed-out download-twice cursor cannot be retried on the same
+    /// connection: the wire has no request IDs to disambiguate late pages.
+    pub(super) fn retire_timed_out_header_syncs(&self, now: Instant) {
+        let below_floor = self.below_header_work_floor();
+        let expired: Vec<_> = {
+            let scheduler = self.scheduler.lock();
+            scheduler
+                .header_requests
+                .values()
+                .filter(|request| {
+                    (below_floor || scheduler.headers_sync.contains_key(&request.source))
+                        && now.saturating_duration_since(request.requested_at)
+                            >= HEADER_REQUEST_TIMEOUT
+                })
+                .map(|request| request.source)
+                .collect()
+        };
+        for source in expired {
+            self.peer_table.disconnect_source(source);
+            self.clear_header_request_for(source);
+            self.scheduler.lock().headers_sync.remove(&source);
+            tracing::debug!(peer_addr = %source.addr, "block sync: header sync request timed out");
+        }
+    }
+
+    fn below_header_work_floor(&self) -> bool {
+        let minimum_work = self.chain.minimum_chain_work();
+        self.chain
+            .chain_tip()
+            .is_none_or(|tip| tip.chainwork < minimum_work)
     }
 
     /// Records a body fetch the window does not own — the compact outcome
@@ -745,7 +778,7 @@ impl BlockSync {
     /// Sends one `getheaders` for the chain-sync eviction probe, without the
     /// frontier-ownership gate — a lagging peer owes an answer for its own
     /// silence regardless of who owns the next body — and without claiming
-    /// the singleton `header_request` slot.
+    /// the frontier request owner.
     ///
     /// PRE: `source` names a live subject connection.
     /// POST: return the wire outcome; `Suppressed` counts only when an
@@ -756,6 +789,11 @@ impl BlockSync {
         frontier: &SyncFrontier,
         source: PeerSource,
     ) -> GetheadersOutcome {
+        if self.below_header_work_floor()
+            || self.scheduler.lock().headers_sync.contains_key(&source)
+        {
+            return GetheadersOutcome::SyncOwned;
+        }
         // Core anchors this probe at the best header's parent
         // (`net_processing.cpp` ConsiderEviction) so the answer can carry
         // the header tip the eviction benchmark is measured against. The
@@ -816,9 +854,11 @@ impl BlockSync {
         self.send_getheaders_tracked(source, our_height, target_height, locator, true)
     }
 
-    /// `track` registers the request in the singleton `header_request` slot;
-    /// a probe that must not displace the frontier's pending request sends
-    /// untracked — its answer arrives as ordinary inbound headers.
+    /// Every request is registered under its exact connection. `track`
+    /// additionally claims the frontier request owner when that owner is free;
+    /// a probe that must not displace the frontier's pending request leaves
+    /// that owner unchanged, and its answer arrives as ordinary inbound
+    /// headers.
     fn send_getheaders_tracked(
         &self,
         source: crate::PeerSource,
@@ -856,20 +896,24 @@ impl BlockSync {
         if self
             .peer_table
             .send_then(source, msg, || {
+                let mut scheduler = self.scheduler.lock();
+                scheduler.header_requests.insert(
+                    source,
+                    PendingHeaderRequest {
+                        source,
+                        locator_tip_hash,
+                        target_height,
+                        requested_at: now,
+                    },
+                );
                 if track {
-                    let mut scheduler = self.scheduler.lock();
                     // A continuation from a different peer must not replace
-                    // the singleton request its current owner still owes.
+                    // the frontier request its current owner still owes.
                     if scheduler
-                        .header_request
-                        .is_none_or(|pending| pending.source == source)
+                        .header_request_owner
+                        .is_none_or(|owner| owner == source)
                     {
-                        scheduler.header_request = Some(PendingHeaderRequest {
-                            source,
-                            locator_tip_hash,
-                            target_height,
-                            requested_at: now,
-                        });
+                        scheduler.header_request_owner = Some(source);
                     }
                 }
             })
@@ -900,9 +944,9 @@ impl BlockSync {
         GetheadersOutcome::Sent
     }
 
-    /// Whether an unexpired request with these exact parameters is already
-    /// pending on this exact connection. Identity is the full `PeerSource`:
-    /// a same-address replacement is a different request.
+    /// A live download-twice state owns its connection's cursor regardless
+    /// of the locator or target a competing scheduler/probe wants to send.
+    /// Expiry retires that connection instead of permitting an overlap.
     fn has_pending_getheaders(
         &self,
         source: PeerSource,
@@ -910,14 +954,16 @@ impl BlockSync {
         target_height: u32,
         now: Instant,
     ) -> bool {
+        let below_floor = self.below_header_work_floor();
         let scheduler = self.scheduler.lock();
-        let Some(pending) = scheduler.header_request else {
+        let Some(pending) = scheduler.header_requests.get(&source) else {
             return false;
         };
-        pending.source == source
-            && pending.locator_tip_hash == locator_tip_hash
-            && pending.target_height == target_height
-            && now.duration_since(pending.requested_at) < HEADER_REQUEST_TIMEOUT
+        below_floor
+            || scheduler.headers_sync.contains_key(&source)
+            || (pending.locator_tip_hash == locator_tip_hash
+                && pending.target_height == target_height
+                && now.saturating_duration_since(pending.requested_at) < HEADER_REQUEST_TIMEOUT)
     }
 
     /// Routes one inbound batch to direct admission or to the delivering
@@ -954,6 +1000,9 @@ impl BlockSync {
         wire_response: bool,
         batch_len: usize,
     ) -> Option<HeaderAdmission> {
+        if source.is_some_and(|source| !self.peer_table.is_current(source)) {
+            return None;
+        }
         if headers.is_empty() {
             // An empty answer ends a live download-twice sync — the peer
             // has no more headers for this cursor — rather than leaving

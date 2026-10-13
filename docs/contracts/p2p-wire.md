@@ -289,9 +289,9 @@ covers the delivery-path forward.
 - The queue holds one entry per connection — the first unprocessed
   announcement wins — so a later vector cannot replace an unknown tip before
   the drain sees it, and a peer cannot grow scheduler state by announcing.
-  While one `getheaders` request is outstanding, further unknown
-  announcements stay queued for a later drain: the singleton
-  `header_request` never has its owner overwritten mid-flight.
+  While the frontier-owned `getheaders` request is outstanding, further
+  unknown announcements stay queued for a later drain: the frontier request
+  owner never changes mid-flight.
 - **Near-tip direct fetch**: `BlockSync::direct_fetch_announced_tip` asks the
   connection that just proved a header for its body, inside the same drain
   that admitted it, instead of waiting for the next scheduler tick (Core
@@ -460,6 +460,14 @@ prefilter exemption.
   connection, `headerssync.cpp:155-163`); every other failure — bad proof of
   work, an impermitted difficulty transition, a commitment divergence, or
   the commitment and buffer bounds — disconnects the connection.
+- Each connection owns its outstanding header request, including requests
+  outside frontier discovery. Before the work floor is reached and during
+  PRESYNC/REDOWNLOAD, scheduler retries and eviction probes cannot overlap
+  that request or overwrite its cursor. A timeout retires the connection
+  and its sync state before queued headers are processed; recovery starts
+  on another connection. Deliveries from retired or replaced connections
+  are ignored, never admitted or attributed to the replacement. The wire
+  has no request identifier with which to reconcile overlapping responses.
 - The serving side is the mirror rule: below the network's assumed work the
   node answers `getheaders` with the empty response
   (`ActiveChainQuery::headers_after`, `net_processing.cpp:3010-3018`), so a
@@ -600,4 +608,3 @@ misbehaviours of Core's `p2p_v2_misbehaving.py`, and the packet bounds.
   `a_timed_out_refill_does_not_replay_consumed_bytes`: one kernel delivery of
   two v1 frames decodes both without a second socket read, and a timed-out
   refill does not replay consumed bytes (`P2P-01`).
-

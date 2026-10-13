@@ -465,7 +465,7 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
         assert!(
             sync.scheduler
                 .lock()
-                .header_request
+                .header_request()
                 .is_some_and(|request| request.source == a_source),
             "a body-forwarded batch is not an answer: the gate stays with `a`",
         );
@@ -475,15 +475,15 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()
-            .header_request
-            .as_mut()
+            .header_requests
+            .get_mut(&a_source)
             .ok_or("the request must still be registered")?
             .requested_at = almost;
         sync.tick();
         assert!(
             sync.scheduler
                 .lock()
-                .header_request
+                .header_request()
                 .is_some_and(|request| request.source == a_source && request.requested_at == almost),
             "a request short of its deadline keeps its owner and stamp",
         );
@@ -500,8 +500,8 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
             .ok_or_else(|| std::io::Error::other("test instant underflow"))?;
         sync.scheduler
             .lock()
-            .header_request
-            .as_mut()
+            .header_requests
+            .get_mut(&a_source)
             .ok_or("the request must still be registered")?
             .requested_at = backdated;
         sync.tick();
@@ -519,7 +519,7 @@ fn body_forwarded_batch_does_not_consume_the_pending_header_gate() -> TestResult
         assert!(
             sync.scheduler
                 .lock()
-                .header_request
+                .header_request()
                 .is_some_and(|request| request.requested_at > backdated),
             "the re-issued request must carry a fresh deadline",
         );
