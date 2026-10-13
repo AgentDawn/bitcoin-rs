@@ -151,16 +151,14 @@ impl RpcServer {
             .name("rpc-connection".to_owned())
             .spawn(move || {
                 let _permit = permit;
-                if let Err(error) =
-                    serve_connection(
-                        stream,
-                        &auth,
-                        &handler,
-                        rest_enabled,
-                        idle_timeout,
-                        &body_bytes_in_flight,
-                    )
-                {
+                if let Err(error) = serve_connection(
+                    stream,
+                    &auth,
+                    &handler,
+                    rest_enabled,
+                    idle_timeout,
+                    &body_bytes_in_flight,
+                ) {
                     debug!(%error, "rpc connection closed with error");
                 }
             })?;
@@ -514,9 +512,7 @@ fn read_request(
         HttpRoute::RestPost { .. } if !rest_enabled => {
             return Err(RequestReadError::NotFound);
         }
-        HttpRoute::RestPost { .. }
-            if content_length > crate::rest::MAX_GETUTXOS_BODY_BYTES =>
-        {
+        HttpRoute::RestPost { .. } if content_length > crate::rest::MAX_GETUTXOS_BODY_BYTES => {
             return Err(RequestReadError::RestBodyTooLarge);
         }
         HttpRoute::NotFound if content_length != 0 => {
@@ -1138,12 +1134,14 @@ mod tests {
 
     #[test]
     fn authenticated_json_rpc_body_spanning_chunks_succeeds() -> io::Result<()> {
-        let mut body = br#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#.to_vec();
+        let mut body =
+            br#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#.to_vec();
         body.extend(vec![b' '; 2 * BODY_READ_CHUNK_BYTES]);
         let mut request = format!(
             "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dXNlcjpwYXNz\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len(),
-        ).into_bytes();
+        )
+        .into_bytes();
         request.extend_from_slice(&body);
         let response = rest_wire_request(&request, false)?;
         assert!(response.starts_with(b"HTTP/1.1 200 OK"));
@@ -1350,7 +1348,7 @@ mod tests {
                     &handler,
                     false,
                     core::time::Duration::from_secs(5),
-                &Arc::new(AtomicUsize::new(0)),
+                    &Arc::new(AtomicUsize::new(0)),
                 )
             });
 
@@ -1386,7 +1384,7 @@ mod tests {
                 &handler,
                 false,
                 core::time::Duration::from_secs(5),
-                &Arc::new(AtomicUsize::new(0)),
+                    &Arc::new(AtomicUsize::new(0)),
             )
         });
 
@@ -1466,7 +1464,7 @@ mod tests {
                 &handler,
                 false,
                 core::time::Duration::from_secs(1),
-                &Arc::new(AtomicUsize::new(0)),
+                    &Arc::new(AtomicUsize::new(0)),
             )
         });
 
