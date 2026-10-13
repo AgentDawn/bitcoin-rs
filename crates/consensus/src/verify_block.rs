@@ -386,11 +386,7 @@ fn witness_commitment_hash_matches(
     let mut buffer = [0_u8; 64];
     buffer[..32].copy_from_slice(&root);
     buffer[32..].copy_from_slice(reserved);
-    &sha256d(&buffer)[..] == commitment
-}
-
-fn sha256d(data: &[u8]) -> [u8; 32] {
-    double_sha256(data).to_le_bytes()
+    &double_sha256(&buffer).to_le_bytes()[..] == commitment
 }
 
 /// Bitcoin merkle root over raw 32-byte leaves.
@@ -513,7 +509,7 @@ mod tests {
         let mut buffer = [0u8; 64];
         buffer[..32].copy_from_slice(&root);
         buffer[32..].copy_from_slice(reserved);
-        sha256d(&buffer)
+        double_sha256(&buffer).to_le_bytes()
     }
 
     fn txid(seed: u8) -> Txid {

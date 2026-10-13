@@ -4,6 +4,7 @@ use bitcoin_rs_primitives::{
     Header, Tx, TxOut, Txid, Wtxid,
     encode::{double_sha256, finalize_double_sha256},
     layout::{ParsedBlock, ParsedTransaction},
+    varint,
 };
 use sha2::{Digest, Sha256};
 
@@ -220,7 +221,7 @@ impl<'b> BlockView<'b> {
 }
 
 fn decoded_block_weight(txs: &[Tx]) -> u64 {
-    let count_len = u64::from(compact_size_len(len_u64(txs.len())));
+    let count_len = len_u64(varint::encoded_len(len_u64(txs.len())));
     let mut stripped = HEADER_LEN.saturating_add(count_len);
     let mut total = HEADER_LEN.saturating_add(count_len);
     for tx in txs {
@@ -257,15 +258,6 @@ fn wtxid_from_span(tx: &ParsedTransaction<'_>) -> Wtxid {
         .span_bytes(tx.span())
         .unwrap_or_else(|| unreachable!("span belongs to the parsed image"));
     Wtxid(double_sha256(bytes))
-}
-
-const fn compact_size_len(value: u64) -> u32 {
-    match value {
-        0..=0xfc => 1,
-        0xfd..=0xffff => 3,
-        0x1_0000..=0xffff_ffff => 5,
-        _ => 9,
-    }
 }
 
 fn len_u64(len: usize) -> u64 {

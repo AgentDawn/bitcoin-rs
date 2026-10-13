@@ -2202,11 +2202,7 @@ mod acceptance_tests {
     use crate::context::Context;
     use crate::error::RpcError;
 
-    fn internal_outpoint(tag: u8) -> OutPoint {
-        OutPoint::new(Txid(Hash256::from_le_bytes(&[tag; 32])), 0)
-    }
-
-    fn spent_outpoint(tag: u8) -> OutPoint {
+    fn fixture_outpoint(tag: u8) -> OutPoint {
         OutPoint::new(Txid(Hash256::from_le_bytes(&[tag; 32])), 0)
     }
 
@@ -2214,7 +2210,7 @@ mod acceptance_tests {
     fn seed_utxo(ctx: &Context, tag: u8, value: u64) {
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
-            internal_outpoint(tag),
+            fixture_outpoint(tag),
             TxOut {
                 value: Amount::from_sat(value),
                 script_pubkey: Script::from_bytes(vec![0x51]),
@@ -2235,7 +2231,7 @@ mod acceptance_tests {
             version: 2,
             lock_time: LockTime::ZERO,
             inputs: vec![TxIn {
-                previous_output: spent_outpoint(tag),
+                previous_output: fixture_outpoint(tag),
                 script_sig: Script::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -2392,7 +2388,7 @@ mod acceptance_tests {
     fn sendrawtransaction_rejects_a_transaction_with_duplicate_inputs() {
         let ctx = Arc::new(Context::new());
         seed_utxo(&ctx, 1, 100_000);
-        let prev = spent_outpoint(1);
+        let prev = fixture_outpoint(1);
         let tx = Tx {
             version: 2,
             lock_time: LockTime::ZERO,
