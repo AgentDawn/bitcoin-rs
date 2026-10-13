@@ -1088,7 +1088,7 @@ impl BlockSync {
         wire_response: bool,
         batch_len: usize,
     ) -> Option<HeaderAdmission> {
-        if source.is_some_and(|source| !self.peer_table.is_current(source)) {
+        if wire_response && source.is_some_and(|source| !self.peer_table.is_current(source)) {
             return None;
         }
         if headers.is_empty() {

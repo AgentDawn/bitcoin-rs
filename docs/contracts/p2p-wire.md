@@ -237,6 +237,10 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
   rejection drops the staged body (`stager.discard`, never re-queued;
   its download-window record is only released when the delivery drains), disconnects the source, and marks
   it unresponsive — the same outcome a rejected `headers` batch produces.
+  A staged body's recorded source is retained for work-floor validation and
+  header retry after that source disconnects, but exact-source checks prevent
+  the retry from crediting or faulting a same-address replacement
+  (`staged_body_retries_after_source_replacement_without_replacement_credit`).
 - A `cmpctblock` outcome that fetches the body itself (`RequestMissing`'s
   `getblocktxn`, `Fallback`'s `getdata`) is marked
   (`InboundHeaders::body_fetch_owned`): once the tip admits, the window
@@ -263,9 +267,10 @@ Proof: `crates/p2p/src/sync/tests/head_sync.rs` covers body-carried header
 admission and apply, gap-fill requests for staged bodies ahead of their
 header chain, announcer-directed `getheaders` on unattached batches,
 non-response forwards preserving pending-request state, staged-retry
-credit, shared-ancestor capability, bounded fork evidence, credit for
-already-known tips, the compact-owned pending mark, and the retained
-mark resolving once its tip header attaches.
+credit, `staged_body_retries_after_source_replacement_without_replacement_credit`,
+shared-ancestor capability, bounded fork evidence, credit for already-known
+tips, the compact-owned pending mark, and the retained mark resolving once its
+tip header attaches.
 `crates/p2p/src/sync/tests/limited_peers.rs` pins the block-body service clause
 on both paths: the `statically_fanout_eligible` rows for the
 initial-block-download exclusion, the 287/288-block retained-window boundary,
@@ -489,9 +494,12 @@ prefilter exemption.
   unanswered timeout below the work floor or during PRESYNC/REDOWNLOAD
   retires the connection and its sync state before queued headers are
   processed, even when it is the last usable peer. Recovery starts on another
-  connection. Deliveries from retired or replaced connections are ignored,
-  never admitted or attributed to the replacement. The wire has no request
-  identifier with which to reconcile overlapping responses.
+  connection. Queued wire deliveries from retired or replaced connections are
+  ignored, never admitted or attributed to the replacement; a body already
+  staged before retirement may retry its embedded header through the
+  body-carried path, retaining its source for work-floor validation while
+  exact-source credit and fault checks exclude the replacement. The wire has
+  no request identifier with which to reconcile overlapping responses.
 - The serving side is the mirror rule: below the network's assumed work the
   node answers `getheaders` with the empty response
   (`ActiveChainQuery::headers_after`, `net_processing.cpp:3010-3018`), so a
