@@ -107,7 +107,7 @@ fn block_decode_failed() -> RpcError {
     RpcError::Deserialization("Block decode failed".to_owned())
 }
 
-const HEADER_BYTES: usize = 80;
+const HEADER_BYTES: usize = Header::LEN;
 
 fn decode_block_header(hex: &str) -> Result<Header, RpcError> {
     let bytes = Vec::<u8>::from_hex(hex)

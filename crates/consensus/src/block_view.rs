@@ -1,7 +1,7 @@
 //! Shared parse-once block facts for native validation.
 
 use bitcoin_rs_primitives::{
-    Tx, TxOut, Txid, Wtxid,
+    Header, Tx, TxOut, Txid, Wtxid,
     encode::{double_sha256, finalize_double_sha256},
     layout::{ParsedBlock, ParsedTransaction},
 };
@@ -9,7 +9,11 @@ use sha2::{Digest, Sha256};
 
 use crate::verify_block::merkle_root_and_mutation_borrowed;
 
-const HEADER_LEN: u64 = 80;
+#[expect(
+    clippy::as_conversions,
+    reason = "the fixed 80-byte header fits in u64"
+)]
+const HEADER_LEN: u64 = Header::LEN as u64;
 
 /// Facts derived once for a decoded block.
 #[derive(Clone, Debug, PartialEq, Eq)]
