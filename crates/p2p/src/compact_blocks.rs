@@ -51,8 +51,10 @@ const MAX_REQUESTED_MISSING: usize = 128;
 /// Sanity bound on the transaction count a `cmpctblock` may declare.
 const MAX_BLOCK_TX_COUNT: usize = 100_000;
 /// Recently admitted hashes remembered per connection to avoid rescanning
-/// the mempool for repeated compact announcements of one requested block.
-const MAX_RECENT_COMPACT_BLOCKS: usize = 64;
+/// the mempool for repeated compact announcements of one block. Sized to the
+/// most block downloads one connection can own, so a peer cannot evict a
+/// still-owned hash and replay it.
+const MAX_RECENT_COMPACT_BLOCKS: usize = crate::download_window::PEER_INFLIGHT_BUDGET;
 
 /// Transaction identities the mempool can offer a compact-block
 /// reconstruction: an identity scan plus body lookup by either hash.
@@ -512,7 +514,8 @@ mod tests {
         let received_at = now();
 
         for seed in 1_u8..=4 {
-            let (_, cmpct) = sample_cmpct(vec![test_tx(seed), test_tx(seed + 10)], 2, u64::from(seed));
+            let (_, cmpct) =
+                sample_cmpct(vec![test_tx(seed), test_tx(seed + 10)], 2, u64::from(seed));
             assert!(matches!(
                 reconstruction.receive_cmpctblock(&cmpct, 2, &hints, received_at),
                 Outcome::RequestMissing(_)
@@ -528,6 +531,40 @@ mod tests {
             MAX_PENDING_RECONSTRUCTIONS,
             "no hint scan may run after the pending cap is reached"
         );
+    }
+
+    /// A hash stays remembered across more distinct blocks than one
+    /// connection's 64 oldest, so a replay inside the deadline never rescans;
+    /// past the deadline the hash is forgotten and may scan again.
+    #[test]
+    fn replay_dedup_spans_more_than_sixty_four_blocks_until_the_deadline() {
+        let hints = CountingHints {
+            inner: SetHints { txs: Vec::new() },
+            scans: AtomicUsize::new(0),
+        };
+        let mut reconstruction = Reconstruction::new();
+        let received_at = now();
+        let (_, first) = sample_cmpct(vec![test_tx(0)], 2, 0);
+        assert!(matches!(
+            reconstruction.receive_cmpctblock(&first, 2, &hints, received_at),
+            Outcome::Complete(_)
+        ));
+        for seed in 1_u8..=100 {
+            let (_, cmpct) = sample_cmpct(vec![test_tx(seed)], 2, u64::from(seed));
+            reconstruction.receive_cmpctblock(&cmpct, 2, &hints, received_at);
+        }
+        let scanned = hints.scans.load(Ordering::Relaxed);
+        assert_eq!(scanned, 101);
+
+        assert!(matches!(
+            reconstruction.receive_cmpctblock(&first, 2, &hints, received_at),
+            Outcome::Idle
+        ));
+        assert_eq!(hints.scans.load(Ordering::Relaxed), scanned);
+
+        let expired = received_at + PENDING_DEADLINE + core::time::Duration::from_secs(1);
+        reconstruction.receive_cmpctblock(&first, 2, &hints, expired);
+        assert_eq!(hints.scans.load(Ordering::Relaxed), scanned + 1);
     }
 
     fn test_tx(byte: u8) -> Tx {

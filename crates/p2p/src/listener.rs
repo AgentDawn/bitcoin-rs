@@ -1930,21 +1930,15 @@ fn process_compact_wire_message(
     peer_addr: SocketAddr,
     shared: &ConnectionShared,
 ) {
-    // The download scheduler already limits outstanding requests by peer
-    // and hash. Unsolicited compact blocks can announce headers, but must
-    // not enter reconstruction: doing so scans the entire mempool under its
-    // read lock before a peer has earned any download work.
+    // Reconstruction scans the whole mempool, so a compact block must first
+    // earn it with its header; anything else is only a header announcement.
     if let crate::Message::CmpctBlock(cmpct) = message {
         let source = lease.source(peer_addr);
-        let hash = crate::inv::native_block_hash(cmpct.compact_block.header.block_hash());
-        let requested = shared.block_sync.as_ref().is_some_and(|sync| {
-            sync.owns_body_fetch(source, bitcoin_rs_primitives::Hash256::from(hash))
-        });
-        if !requested {
-            if let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
-            {
-                shared.send_headers(source, vec![header], false, false);
-            }
+        let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header) else {
+            return;
+        };
+        if !compact_reconstruction_admissible(&header, source, shared) {
+            shared.send_headers(source, vec![header], false, false);
             return;
         }
     }
@@ -1993,6 +1987,44 @@ fn process_compact_wire_message(
             );
         }
     }
+}
+
+/// Whether a `cmpctblock` header earns a mempool-wide reconstruction scan.
+///
+/// As in Core, the scan is kept for a header with valid proof of work whose
+/// parent is a known block not marked invalid, and that either carries more
+/// work than the applied chain or answers a body fetch this connection owns.
+/// Forging such a header costs a mined block, and replaying an old one fails
+/// the work test. Without a chain view nothing qualifies.
+fn compact_reconstruction_admissible(
+    header: &bitcoin_rs_primitives::Header,
+    source: crate::PeerSource,
+    shared: &ConnectionShared,
+) -> bool {
+    let Some(sync) = shared.block_sync.as_ref() else {
+        return false;
+    };
+    let hash = bitcoin_rs_primitives::Hash256::from(header.compute_hash());
+    if bitcoin_rs_chain::validate_pow(header, hash, sync.chain.network()).is_err() {
+        return false;
+    }
+    let candidate_work = {
+        let tree = sync.chain.block_tree();
+        let parent = tree
+            .lookup(bitcoin_rs_primitives::Hash256::from(header.prev_blockhash))
+            .and_then(|id| tree.node(id).ok());
+        match parent {
+            Some(parent) if parent.status != bitcoin_rs_chain::NodeStatus::Invalid => {
+                parent.chainwork + bitcoin_rs_chain::block_work(header)
+            }
+            _ => return false,
+        }
+    };
+    let extends_applied = sync
+        .chain
+        .applied_tip()
+        .is_none_or(|tip| candidate_work > tip.chainwork);
+    extends_applied || sync.owns_body_fetch(source, hash)
 }
 
 /// Applies one BIP152 receive-side outcome: a finished block enters the
@@ -4042,40 +4074,52 @@ mod block_forward_tests {
         Ok(())
     }
 
-    /// A compact block without an outstanding download is a header
-    /// announcement only. The same hash may reconstruct once its exact
-    /// connection owns the body, but repeating it cannot rescan the pool.
-    #[test]
-    fn compact_hints_require_owned_download() -> Result<(), Box<dyn std::error::Error>> {
-        use bitcoin::bip152::HeaderAndShortIds;
-        use bitcoin::p2p::message_compact_blocks::CmpctBlock;
-        use bitcoin_rs_primitives::{Tx, Txid, Wtxid};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    /// An empty mempool that counts its identity scans.
+    struct ScanCounter(std::sync::atomic::AtomicUsize);
 
-        struct Hints(AtomicUsize);
-
-        impl crate::compact_blocks::CompactBlockHints for Hints {
-            fn for_each_identity(&self, _f: &mut dyn FnMut(Txid, Wtxid)) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-
-            fn get_tx_by_txid(&self, _txid: Txid) -> Option<Tx> {
-                None
-            }
-
-            fn get_tx_by_wtxid(&self, _wtxid: Wtxid) -> Option<Tx> {
-                None
-            }
+    impl crate::compact_blocks::CompactBlockHints for ScanCounter {
+        fn for_each_identity(
+            &self,
+            _f: &mut dyn FnMut(bitcoin_rs_primitives::Txid, bitcoin_rs_primitives::Wtxid),
+        ) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        let (tree, _) = mined_chain(1, 0)?;
+        fn get_tx_by_txid(
+            &self,
+            _txid: bitcoin_rs_primitives::Txid,
+        ) -> Option<bitcoin_rs_primitives::Tx> {
+            None
+        }
+
+        fn get_tx_by_wtxid(
+            &self,
+            _wtxid: bitcoin_rs_primitives::Wtxid,
+        ) -> Option<bitcoin_rs_primitives::Tx> {
+            None
+        }
+    }
+
+    /// A compact block reconstructs only when its header earns the mempool
+    /// scan: valid proof of work, a known parent, and more work than the
+    /// applied chain or a body fetch this connection owns. Anything else is a
+    /// header announcement only, and repeating an admitted hash never rescans.
+    #[test]
+    fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use bitcoin::bip152::HeaderAndShortIds;
+        use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Genesis plus two blocks, all applied: the applied tip is block 2.
+        let (mut tree, blocks) = mined_chain(2, 0)?;
         let chain_tip = tree.tip_handle();
-        let block_tree = Arc::new(RwLock::new(tree));
+        let applied_tip = Arc::new(ArcSwapOption::new(chain_tip.load_full()));
         let peers = Arc::new(crate::PeerTable::new());
         let chain: Arc<dyn SyncChain> = Arc::new(TestChain::new(
             chain_tip,
-            Arc::new(ArcSwapOption::empty()),
-            block_tree,
+            applied_tip,
+            Arc::new(RwLock::new(tree)),
         ));
         let sync = Arc::new(BlockSync::new(
             chain,
@@ -4088,64 +4132,94 @@ mod block_forward_tests {
         let _outbound = connect_peer(&peers, synthetic_peer(addr, 3));
         let lease = peers.lease(addr).ok_or("peer must be registered")?;
         let source = lease.source(addr);
+        let other_addr = test_addr(9783, 0)?;
+        let _other = connect_peer(&peers, synthetic_peer(other_addr, 3));
+        let other_source = peers
+            .lease(other_addr)
+            .ok_or("second peer must be registered")?
+            .source(other_addr);
         let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
         let mut shared = test_shared(peers, headers_tx, blocks_tx);
         shared.block_sync = Some(Arc::clone(&sync));
 
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let compact = HeaderAndShortIds::from_block(&genesis, 7, 2, &[])
-            .expect("genesis compact block");
-        let message = crate::Message::CmpctBlock(CmpctBlock {
-            compact_block: compact,
-        });
-        let hints = Hints(AtomicUsize::new(0));
+        let hints = ScanCounter(AtomicUsize::new(0));
         let mut reconstruction = crate::compact_blocks::Reconstruction::new();
+        let mut deliver =
+            |block: &bitcoin_rs_primitives::Block| -> Result<(), Box<dyn std::error::Error>> {
+                let block: bitcoin::Block =
+                    bitcoin::consensus::encode::deserialize(&consensus_bytes(block))?;
+                let message = crate::Message::CmpctBlock(CmpctBlock {
+                    compact_block: HeaderAndShortIds::from_block(&block, 7, 2, &[])
+                        .expect("compact block"),
+                });
+                super::process_compact_wire_message(
+                    &message,
+                    &mut reconstruction,
+                    Some(2),
+                    Some(&hints),
+                    &lease,
+                    addr,
+                    &shared,
+                );
+                Ok(())
+            };
+        let scans = || hints.0.load(Ordering::Relaxed);
+        let tip = blocks.last().ok_or("chain has a tip")?;
+        let next = |height| {
+            regtest_fixture::mined_block_with_prev_hash(
+                tip.block_hash(),
+                height,
+                vec![regtest_fixture::coinbase(height)],
+            )
+        };
 
-        super::process_compact_wire_message(
-            &message,
-            &mut reconstruction,
-            Some(2),
-            Some(&hints),
-            &lease,
-            addr,
-            &shared,
-        );
-        assert_eq!(hints.0.load(Ordering::Relaxed), 0);
-        let announced = headers_rx.try_recv()?;
-        assert_eq!(announced.headers.len(), 1);
-        assert!(!announced.body_fetch_owned);
+        // No proof of work: the right parent, but a target the hash misses.
+        let mut no_work = next(3)?;
+        no_work.header.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x1d00_ffff);
+        deliver(&no_work)?;
+        // Unknown parent.
+        let orphan = regtest_fixture::mined_block_with_prev_hash(
+            no_work.header.compute_hash(),
+            4,
+            vec![regtest_fixture::coinbase(4)],
+        )?;
+        deliver(&orphan)?;
+        // A replayed applied block: known parent, but no more work than the
+        // applied tip.
+        let replayed = blocks.first().ok_or("chain has block 1")?;
+        deliver(replayed)?;
+        assert_eq!(scans(), 0, "no rejected header reaches the mempool");
         assert!(blocks_rx.is_empty());
+        for _ in 0..3 {
+            let announced = headers_rx.try_recv()?;
+            assert_eq!(announced.headers.len(), 1, "each header is still announced");
+            assert!(!announced.body_fetch_owned);
+        }
 
-        let hash = Hash256::from(
-            crate::compact_blocks::native_header(&genesis.header)
-                .expect("native genesis header")
-                .compute_hash(),
-        );
-        sync.record_owned_body_fetch(source, hash);
-        super::process_compact_wire_message(
-            &message,
-            &mut reconstruction,
-            Some(2),
-            Some(&hints),
-            &lease,
-            addr,
-            &shared,
-        );
-        assert_eq!(hints.0.load(Ordering::Relaxed), 1);
+        // Another connection owning its body fetch does not count for this one.
+        sync.record_owned_body_fetch(other_source, Hash256::from(replayed.block_hash()));
+        deliver(replayed)?;
+        assert_eq!(scans(), 0, "ownership is by exact connection");
+        assert!(blocks_rx.is_empty());
+        assert_eq!(headers_rx.try_recv()?.headers.len(), 1);
+
+        // The replayed block once this connection owns its body fetch.
+        sync.record_owned_body_fetch(source, Hash256::from(replayed.block_hash()));
+        deliver(replayed)?;
+        assert_eq!(scans(), 1);
         assert_eq!(blocks_rx.len(), 1);
 
-        super::process_compact_wire_message(
-            &message,
-            &mut reconstruction,
-            Some(2),
-            Some(&hints),
-            &lease,
-            addr,
-            &shared,
-        );
-        assert_eq!(hints.0.load(Ordering::Relaxed), 1);
-        assert_eq!(blocks_rx.len(), 1);
+        // A new block extending the applied tip needs no request.
+        let extending = next(3)?;
+        deliver(&extending)?;
+        assert_eq!(scans(), 2);
+        assert_eq!(blocks_rx.len(), 2);
+
+        // Repeating it never rescans the mempool.
+        deliver(&extending)?;
+        assert_eq!(scans(), 2);
+        assert_eq!(blocks_rx.len(), 2);
         Ok(())
     }
 }
