@@ -506,6 +506,57 @@ impl BlockSync {
                 .any(|(owner, owned)| *owner == source && *owned == hash)
     }
 
+    /// Whether a compact block with `header` from `source` earns a
+    /// mempool-wide reconstruction scan.
+    ///
+    /// PRE: `header` is the `cmpctblock`'s embedded header.
+    /// POST: `true` only when the header has valid proof of work for the
+    ///   network, the block is not marked invalid, its parent is a known
+    ///   block not marked invalid, and it either carries more work than the
+    ///   applied chain or answers a body fetch `source` owns, as Core gates
+    ///   compact reconstruction. Forging such a header costs a mined block,
+    ///   and replaying an old one fails the work test.
+    /// INVARIANT: the tree read is released before the scheduler lock is
+    ///   taken, keeping the `tree -> scheduler` order without nesting.
+    ///
+    /// This is the pre-scan gate on the compact header alone. A
+    /// reconstructed body still faces the staging gate
+    /// (`unrequested_body_admissible`) like any other delivered block.
+    #[must_use]
+    pub(crate) fn compact_reconstruction_admissible(
+        &self,
+        source: PeerSource,
+        header: &bitcoin_rs_primitives::Header,
+    ) -> bool {
+        let hash = Hash256::from(header.compute_hash());
+        if bitcoin_rs_chain::validate_pow(header, hash, self.chain.network()).is_err() {
+            return false;
+        }
+        let candidate_work = {
+            let tree = self.chain.block_tree();
+            let invalid = |id: NodeId| {
+                tree.node(id)
+                    .is_ok_and(|node| node.status == bitcoin_rs_chain::NodeStatus::Invalid)
+            };
+            if tree.lookup(hash).is_some_and(invalid) {
+                return false;
+            }
+            let parent = tree
+                .lookup(Hash256::from(header.prev_blockhash))
+                .filter(|&id| !invalid(id))
+                .and_then(|id| tree.node(id).ok());
+            let Some(parent) = parent else {
+                return false;
+            };
+            parent.chainwork + bitcoin_rs_chain::block_work(header)
+        };
+        let extends_applied = self
+            .chain
+            .applied_tip()
+            .is_none_or(|tip| candidate_work > tip.chainwork);
+        extends_applied || self.owns_body_fetch(source, hash)
+    }
+
     /// Runs one orchestrator tick as a single canonical frontier
     /// reconciliation: observe, recover what is unowned, then schedule or
     /// name why progress is impossible.

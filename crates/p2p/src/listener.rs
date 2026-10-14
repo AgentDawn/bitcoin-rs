@@ -1932,15 +1932,20 @@ fn process_compact_wire_message(
 ) {
     // Reconstruction scans the whole mempool, so a compact block must first
     // earn it with its header; anything else is only a header announcement.
-    if let crate::Message::CmpctBlock(cmpct) = message {
-        let source = lease.source(peer_addr);
-        let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header) else {
-            return;
-        };
-        if !compact_reconstruction_admissible(&header, source, shared) {
-            shared.send_headers(source, vec![header], false, false);
-            return;
-        }
+    // Without a chain view nothing qualifies.
+    if let crate::Message::CmpctBlock(cmpct) = message
+        && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
+        && !shared.block_sync.as_ref().is_some_and(|sync| {
+            sync.compact_reconstruction_admissible(lease.source(peer_addr), &header)
+        })
+    {
+        tracing::debug!(
+            peer_addr = %peer_addr,
+            hash = %header.compute_hash(),
+            "p2p compact block header does not earn reconstruction"
+        );
+        shared.send_headers(lease.source(peer_addr), vec![header], false, false);
+        return;
     }
 
     let identity_version =
@@ -1987,44 +1992,6 @@ fn process_compact_wire_message(
             );
         }
     }
-}
-
-/// Whether a `cmpctblock` header earns a mempool-wide reconstruction scan.
-///
-/// As in Core, the scan is kept for a header with valid proof of work whose
-/// parent is a known block not marked invalid, and that either carries more
-/// work than the applied chain or answers a body fetch this connection owns.
-/// Forging such a header costs a mined block, and replaying an old one fails
-/// the work test. Without a chain view nothing qualifies.
-fn compact_reconstruction_admissible(
-    header: &bitcoin_rs_primitives::Header,
-    source: crate::PeerSource,
-    shared: &ConnectionShared,
-) -> bool {
-    let Some(sync) = shared.block_sync.as_ref() else {
-        return false;
-    };
-    let hash = bitcoin_rs_primitives::Hash256::from(header.compute_hash());
-    if bitcoin_rs_chain::validate_pow(header, hash, sync.chain.network()).is_err() {
-        return false;
-    }
-    let candidate_work = {
-        let tree = sync.chain.block_tree();
-        let parent = tree
-            .lookup(bitcoin_rs_primitives::Hash256::from(header.prev_blockhash))
-            .and_then(|id| tree.node(id).ok());
-        match parent {
-            Some(parent) if parent.status != bitcoin_rs_chain::NodeStatus::Invalid => {
-                parent.chainwork + bitcoin_rs_chain::block_work(header)
-            }
-            _ => return false,
-        }
-    };
-    let extends_applied = sync
-        .chain
-        .applied_tip()
-        .is_none_or(|tip| candidate_work > tip.chainwork);
-    extends_applied || sync.owns_body_fetch(source, hash)
 }
 
 /// Applies one BIP152 receive-side outcome: a finished block enters the
