@@ -543,7 +543,8 @@ impl BlockSync {
                 tree.node(id)
                     .is_ok_and(|node| node.status == bitcoin_rs_chain::NodeStatus::Invalid)
             };
-            if tree.lookup(hash).is_some_and(invalid) {
+            let known = tree.lookup(hash);
+            if known.is_some_and(invalid) {
                 return false;
             }
             let Some(parent_id) = tree
@@ -554,16 +555,19 @@ impl BlockSync {
             };
             // A header that admission would refuse never earns the scan. In
             // particular its own valid proof of work must meet the target
-            // the chain requires after this parent.
-            if bitcoin_rs_chain::validate_contextual_header(
-                &tree,
-                parent_id,
-                header,
-                network,
-                bitcoin_rs_chain::current_unix_seconds(),
-                bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
-            )
-            .is_err()
+            // the chain requires after this parent. As in admission, a header
+            // already in the tree is not rechecked, so a clock that has since
+            // moved backwards cannot refuse it.
+            if known.is_none()
+                && bitcoin_rs_chain::validate_contextual_header(
+                    &tree,
+                    parent_id,
+                    header,
+                    network,
+                    bitcoin_rs_chain::current_unix_seconds(),
+                    bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+                )
+                .is_err()
             {
                 return false;
             }
