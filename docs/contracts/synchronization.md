@@ -158,8 +158,13 @@ therefore stall authoritative chain commits for the full seed duration, and
 the cited tick/fencing tests do **not** prove foreground progress during
 seeding. Follow-up: bound the hold at the existing owner (capture a bounded
 immutable view or hand the scan data off the lock), then add a
-process-level contention regression. This is the concrete case this clause
-records instead of claiming isolation is proven.
+process-level contention regression. This implementation fix and its
+foreground-progress proof are tracked outside this documentation contract by
+[#1512](https://github.com/gosuda/bitcoin-rs/issues/1512) (the executable
+AssumeUTXO + seed/backfill workflow that measures the contention) and
+[#1529](https://github.com/gosuda/bitcoin-rs/issues/1529); this clause only
+records the obligation. This is the concrete case this clause records
+instead of claiming isolation is proven.
 
 - Proof (bounded holds only): `EVT-02` step 1–7 fencing tests; the event-loop
   tick tests (`crates/node/src/event_loop.rs`, `EMB-10`). The seeding hold is
@@ -263,6 +268,16 @@ Progress is observable through `getchainstates`, `getindexinfo`, and
 `getblockchaininfo`; no new global sync manager, mirrored cursor, persistent
 verdict, or extra state machine is implied.
 
+- Cross-crate composition proof:
+  `crates/node/tests/sync_smoke.rs::tick_recovers_rejected_frontier_without_publishing_unapplied_blocks`
+  feeds admitted headers and a malformed frontier body through the real
+  delivery channels and asserts applied progress, the durable chain snapshot,
+  UTXO/CoinStats, the RPC block log and both tree nodes stay unchanged, then
+  that resending only the correct parent applies its already-staged
+  successor. It proves the channel-fed, in-memory composition across
+  `SYNC-01`/`SYNC-02`/`SYNC-05`; it does **not** prove live peer sockets,
+  durable crash recovery, or eventual progress under real index contention
+  (those keep their owning deep lanes).
 - Proof: `crates/p2p/src/sync/tests/transitions_*.rs` (tick fetch/handover
   regressions — the driver actually sends; `cold_start_stall_hedges_front_without_reassigning_owner`);
   `crates/index/src/runtime/reconciliation.rs` quiet-wait/timeout tests
@@ -299,6 +314,24 @@ currently required synchronization/recovery operation still depends on them.
   `crates/storage/src/` pruning retention tests and the `RCV-05`
   deep-rollback matrix; `crates/chainstate/src/reorg.rs` bounded disconnect
   streaming under a retention lease (`RCV-08`).
+
+## Review guidance by change class
+
+Use this to decide which obligations a feature PR can disturb and which
+existing evidence to run. It is review guidance, not a demand to add a test
+per hypothetical feature.
+
+- **Optional read/index BIP**: its own worker, failure, stale/readiness state
+  and backpressure must not block authoritative apply; a disabled or
+  unavailable index must not signal complete or require a sync-state
+  mutation. Relevant: `SYNC-01`, `SYNC-03`, `SYNC-05`, `SYNC-07`.
+- **Relay/transport BIP**: negotiation, malformed peers, timeouts and
+  fallback must not strand the body frontier or bypass header/body admission.
+  Relevant: `SYNC-02`, `SYNC-04`, `SYNC-06`.
+- **Performance change to download, validation, or storage**: same consensus
+  and durable applied outcome, plus recovery after failure, reorg and
+  restart; a benchmark delta is not proof of correctness. Relevant: the
+  affected `SYNC-*` clauses and their owner contracts.
 
 ## Convergence evidence map
 
