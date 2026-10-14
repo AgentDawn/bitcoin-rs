@@ -13,6 +13,9 @@ services:
       BITCOIN_RS_STORAGE_BACKEND: fjall
       BITCOIN_RS_RPC_USER: "${BITCOIN_RS_RPC_USER:-mempool}"
       BITCOIN_RS_RPC_PASSWORD: "${BITCOIN_RS_RPC_PASSWORD:-change-me}"
+      # The image keeps RPC on loopback; the api service reaches it over the
+      # compose network, and the host port is published to 127.0.0.1 only.
+      BITCOIN_RS_RPC_BIND: "0.0.0.0:8332"
       BITCOIN_RS_TXINDEX: "true"
       BITCOIN_RS_SCRIPTINDEX: "true"
       BITCOIN_RS_LOG_LEVEL: "${BITCOIN_RS_LOG_LEVEL:-info}"

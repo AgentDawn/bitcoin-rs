@@ -245,16 +245,14 @@ impl NodeConfig {
     /// set on any layer; it only fills the gaps (`ARCH-05`).
     fn materialize(settings: &UserConfig, selection: NetworkSelection) -> Self {
         let profile = NetworkProfile::for_selection(selection);
-        let data_dir = settings
-            .data_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(".bitcoin-rs"));
-        let auth = rpc_auth(settings, &data_dir);
         let mut chainstate_journal = ChainstateJournalConfig::default();
         apply_journal_overrides(&settings.chainstate_journal, &mut chainstate_journal);
         Self {
             network: selection.consensus_network(),
-            data_dir,
+            data_dir: settings
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".bitcoin-rs")),
             storage: StorageConfig {
                 backend: settings.storage.backend.unwrap_or(DEFAULT_STORAGE_BACKEND),
                 dbcache_mb: settings.storage.dbcache_mb.unwrap_or(DEFAULT_DBCACHE_MB),
@@ -273,7 +271,7 @@ impl NodeConfig {
             rpc: RpcConfig {
                 bind: settings.rpc.bind.unwrap_or(profile.rpc_bind),
                 rest: settings.rpc.rest.unwrap_or(false),
-                auth,
+                auth: rpc_auth(settings),
             },
             indexes: IndexConfig {
                 txindex: settings.indexes.txindex.unwrap_or(false),
@@ -328,8 +326,7 @@ impl NodeConfig {
             );
         }
         anyhow::ensure!(
-            self.rpc.bind.ip().is_loopback()
-                || !matches!(&self.rpc.auth, Auth::GeneratedCookie { .. }),
+            self.rpc.bind.ip().is_loopback() || self.rpc.auth != Auth::GeneratedCookie,
             "non-loopback RPC bind requires explicit credentials (--rpc-password or --rpc-cookie)"
         );
         anyhow::ensure!(
@@ -412,18 +409,16 @@ pub fn resolve(layers: &[&UserConfig]) -> Result<NodeConfig> {
 /// basic credentials are never both set.
 /// POST: an explicit cookie wins; absent credentials select a fresh per-start
 /// cookie; Basic auth never receives a fixed password fallback.
-fn rpc_auth(settings: &UserConfig, data_dir: &Path) -> Auth {
+fn rpc_auth(settings: &UserConfig) -> Auth {
     if let Some(path) = &settings.rpc.cookie {
         return Auth::Cookie { path: path.clone() };
     }
-    match (settings.rpc.user.as_deref(), settings.rpc.password.as_deref()) {
-        (None, None) => Auth::GeneratedCookie {
-            path: data_dir.join(".cookie"),
-        },
-        (user, password) => Auth::basic(
-            user.unwrap_or(DEFAULT_RPC_USER),
-            password.unwrap_or(""),
-        ),
+    match (
+        settings.rpc.user.as_deref(),
+        settings.rpc.password.as_deref(),
+    ) {
+        (None, None) => Auth::GeneratedCookie,
+        (user, password) => Auth::basic(user.unwrap_or(DEFAULT_RPC_USER), password.unwrap_or("")),
     }
 }
 
@@ -507,10 +502,9 @@ pub enum Auth {
         /// Operator-provided cookie file path.
         path: PathBuf,
     },
-    /// New private cookie at a fixed path in the node data directory.
-    GeneratedCookie {
-        path: PathBuf,
-    },
+    /// New private cookie at `<data_dir>/.cookie`, written when the RPC
+    /// listener starts so it always follows the final data directory.
+    GeneratedCookie,
 }
 
 impl Auth {
@@ -524,13 +518,14 @@ impl Auth {
     }
 
     /// Converts this configuration into the RPC crate's runtime auth policy.
-    pub(crate) fn to_rpc_auth(&self) -> Result<bitcoin_rs_rpc::Auth> {
+    /// A generated cookie is written into `data_dir`.
+    pub(crate) fn to_rpc_auth(&self, data_dir: &Path) -> Result<bitcoin_rs_rpc::Auth> {
         match self {
             Self::Basic { user, password } => {
                 Ok(bitcoin_rs_rpc::Auth::basic(user.clone(), password))
             }
             Self::Cookie { path } => Ok(bitcoin_rs_rpc::Auth::cookie(path)?),
-            Self::GeneratedCookie { path } => generate_rpc_cookie(path),
+            Self::GeneratedCookie => generate_rpc_cookie(&data_dir.join(".cookie")),
         }
     }
 }
@@ -543,17 +538,19 @@ impl fmt::Debug for Auth {
                 .field("user", user)
                 .field("password", &"<redacted>")
                 .finish(),
-            Self::Cookie { .. } | Self::GeneratedCookie { .. } => f
+            Self::Cookie { .. } => f
                 .debug_struct("Auth::Cookie")
                 .field("path", &"<redacted>")
                 .finish(),
+            Self::GeneratedCookie => f.write_str("Auth::GeneratedCookie"),
         }
     }
 }
 
 /// Replaces the previous run's cookie with a new 256-bit OS-random secret
-/// before the RPC socket is bound. A same-directory temporary file avoids
-/// following a stale .cookie symlink and is atomically renamed on Unix.
+/// before the RPC socket is bound. A same-directory temporary file, named
+/// independently of the secret and created fresh, avoids following a stale
+/// symlink and is atomically renamed on Unix.
 fn generate_rpc_cookie(path: &Path) -> Result<bitcoin_rs_rpc::Auth> {
     use bitcoin::secp256k1::rand::{RngCore as _, rngs::OsRng};
     use std::fmt::Write as _;
@@ -571,13 +568,20 @@ fn generate_rpc_cookie(path: &Path) -> Result<bitcoin_rs_rpc::Auth> {
         write!(&mut password, "{byte:02x}")?;
     }
 
-    let temporary = path.with_extension(format!("cookie-{}.tmp", &password[..16]));
+    let temporary = path.with_extension("tmp");
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
 
     let written = (|| -> std::io::Result<()> {
+        // A temporary file left by an interrupted start is discarded, so
+        // `create_new` never opens an existing file or symlink.
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         let mut file = options.open(&temporary)?;
         writeln!(file, "__cookie__:{password}")?;
         file.sync_all()?;

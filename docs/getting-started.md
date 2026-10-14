@@ -81,7 +81,9 @@ explicit nonempty password (`--rpc-password` or `BITCOIN_RS_RPC_PASSWORD`)
 or an operator-supplied `--rpc-cookie` file. The generated cookie is
 rotated before each listener starts and cannot be used for a non-loopback
 bind without an explicit cookie-file configuration. The legacy public
-password `bitcoin-rs` is rejected on every bind.
+password `bitcoin-rs` is rejected as a Basic-auth password on every bind;
+an operator-supplied cookie file is used as written, so choose its secret
+yourself.
 
 The Docker image also keeps RPC on loopback. To serve RPC outside the
 container, explicitly set `BITCOIN_RS_RPC_BIND=0.0.0.0:8332` together

@@ -60,6 +60,8 @@ SV1 miner connects — see [Optional SV1 leg](#optional-sv1-leg-unpinned).
 
 - Docker with Compose v2 (`docker compose version`).
 - ~4 GB disk for images + regtest chainstate (trivial: regtest stays near-empty).
+- `openssl` to generate the RPC password below, or any other source of a
+  random secret.
 
 ## Run
 
@@ -70,6 +72,10 @@ $ docker compose build            # bitcoin-rs node, bridge, two devices
 $ docker compose up -d
 $ docker compose logs -f template-provider pool device-direct-1
 ```
+
+Compose reads `BITCOIN_RS_RPC_PASSWORD` whenever it loads this project, so
+export it in the shell before every `docker compose` command here, including
+`logs` and `down`.
 
 Bootstrap order is `bitcoin-rs` (healthcheck: JSON-RPC `getblockchaininfo`)
 → `template-provider` → `pool` → devices. With the default example key
@@ -147,7 +153,7 @@ The bridge is env-configured (regtest defaults shown):
 | `TP_LISTEN`            | `0.0.0.0:8442`               | TDP listener the pool connects to    |
 | `BITCOINRS_RPC_URL`    | `http://127.0.0.1:18443`     | bitcoin-rs JSON-RPC endpoint         |
 | `BITCOINRS_RPC_USER`   | `bitcoin-rs`                 | RPC basic-auth user                  |
-| `BITCOINRS_RPC_PASS`   | supplied `BITCOIN_RS_RPC_PASSWORD` | RPC basic-auth password |
+| `BITCOINRS_RPC_PASS`   | required (Compose passes `BITCOIN_RS_RPC_PASSWORD`) | RPC basic-auth password |
 | `TP_PRIVATE_KEY_HEX`   | fixed example key            | Noise secret key (64 hex chars)      |
 | `TP_CERT_VALIDITY_SECS`| `3600`                       | Noise certificate lifetime           |
 

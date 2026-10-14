@@ -21,45 +21,41 @@ fn auth_debug_redacts_secrets() {
     let rendered = format!("{auth:?}");
     assert!(!rendered.contains("/secret/.cookie"));
     assert!(rendered.contains("<redacted>"));
-
-    let auth = Auth::GeneratedCookie {
-        path: PathBuf::from("/secret/default/.cookie"),
-    };
-    assert!(!format!("{auth:?}").contains("/secret/default/.cookie"));
 }
 
 #[test]
-fn default_rpc_auth_uses_a_per_data_directory_cookie() {
+fn default_rpc_auth_uses_a_generated_cookie() {
     let layer = UserConfig {
         data_dir: Some(PathBuf::from("test-node")),
         ..UserConfig::default()
     };
     let config = resolved(&[&layer]);
-    assert_eq!(
-        config.rpc.auth,
-        Auth::GeneratedCookie {
-            path: PathBuf::from("test-node/.cookie")
-        }
-    );
+    assert_eq!(config.rpc.auth, Auth::GeneratedCookie);
 }
 
 #[test]
 fn generated_rpc_cookie_is_private_and_rotates() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join(".cookie");
-    let auth = Auth::GeneratedCookie { path: path.clone() };
+    // A temporary file left by an interrupted start must not block the next.
+    std::fs::write(dir.path().join(".cookie.tmp"), "stale")?;
+    let auth = Auth::GeneratedCookie;
 
-    auth.to_rpc_auth()?;
+    auth.to_rpc_auth(dir.path())?;
     let first = std::fs::read_to_string(&path)?;
+    assert!(!dir.path().join(".cookie.tmp").exists());
     assert!(first.starts_with("__cookie__:"));
     assert_eq!(first.trim_end().len(), "__cookie__:".len() + 64);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
     }
 
-    auth.to_rpc_auth()?;
+    auth.to_rpc_auth(dir.path())?;
     let second = std::fs::read_to_string(&path)?;
     assert_ne!(first, second, "each startup must rotate the cookie");
     Ok(())
@@ -75,8 +71,13 @@ fn rpc_rejects_missing_or_public_credentials() {
         },
         ..UserConfig::default()
     };
-    let error = super::resolve(&[&exposed]).unwrap_err();
-    assert!(error.to_string().contains("non-loopback RPC bind"), "{error}");
+    let Err(error) = super::resolve(&[&exposed]) else {
+        panic!("a non-loopback bind without credentials must fail validation");
+    };
+    assert!(
+        error.to_string().contains("non-loopback RPC bind"),
+        "{error}"
+    );
 
     let user_without_password = UserConfig {
         rpc: RpcOverrides {
@@ -85,8 +86,13 @@ fn rpc_rejects_missing_or_public_credentials() {
         },
         ..UserConfig::default()
     };
-    let error = super::resolve(&[&user_without_password]).unwrap_err();
-    assert!(error.to_string().contains("nonempty username and password"), "{error}");
+    let Err(error) = super::resolve(&[&user_without_password]) else {
+        panic!("a user without a password must fail validation");
+    };
+    assert!(
+        error.to_string().contains("nonempty username and password"),
+        "{error}"
+    );
 
     let legacy_password = UserConfig {
         rpc: RpcOverrides {
@@ -96,8 +102,13 @@ fn rpc_rejects_missing_or_public_credentials() {
         },
         ..UserConfig::default()
     };
-    let error = super::resolve(&[&legacy_password]).unwrap_err();
-    assert!(error.to_string().contains("publicly known legacy default"), "{error}");
+    let Err(error) = super::resolve(&[&legacy_password]) else {
+        panic!("the legacy public password must fail validation");
+    };
+    assert!(
+        error.to_string().contains("publicly known legacy default"),
+        "{error}"
+    );
 
     let explicit_password = UserConfig {
         rpc: RpcOverrides {
@@ -121,7 +132,10 @@ fn rpc_rejects_missing_or_public_credentials() {
         },
         ..UserConfig::default()
     };
-    assert!(matches!(resolved(&[&explicit_cookie]).rpc.auth, Auth::Cookie { .. }));
+    assert!(matches!(
+        resolved(&[&explicit_cookie]).rpc.auth,
+        Auth::Cookie { .. }
+    ));
 }
 
 // ---- Named config-option coverage -------------------------------------
@@ -138,7 +152,7 @@ fn resolved(layers: &[&UserConfig]) -> NodeConfig {
 fn basic_auth(auth: &Auth) -> (String, String) {
     match auth {
         Auth::Basic { user, password } => (user.clone(), password.clone()),
-        Auth::Cookie { .. } | Auth::GeneratedCookie { .. } => panic!("expected basic auth"),
+        Auth::Cookie { .. } | Auth::GeneratedCookie => panic!("expected basic auth"),
     }
 }
 
