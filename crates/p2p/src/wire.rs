@@ -1243,8 +1243,7 @@ mod tests {
     #[test]
     fn block_weight_is_checked_before_materialization() {
         let mut block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        block.txdata[0].input[0].script_sig =
-            bitcoin::ScriptBuf::from_bytes(vec![0_u8; 1_000_000]);
+        block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0_u8; 1_000_000]);
         let payload = serialize(&block);
         assert!(payload.len() < crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE);
         assert!(matches!(
