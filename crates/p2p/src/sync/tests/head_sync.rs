@@ -1245,6 +1245,87 @@ fn compact_owned_body_fetch_marks_the_tip_pending() -> TestResult {
 }
 
 #[test]
+fn compact_reconstruction_admission_follows_cores_header_gate() -> TestResult {
+    // Genesis plus two blocks, applied: the applied tip is block 2.
+    let (tree, blocks) = mined_chain(2, 0)?;
+    let SyncHarness {
+        sync,
+        peers,
+        block_tree,
+        applied_tip,
+        ..
+    } = SyncHarness::new(tree);
+    applied_tip.store(block_tree.read().tip());
+    let peer = test_addr(9707, 0)?;
+    let _rx = connect_peer(&peers, synthetic_peer(peer, 0));
+    let other = test_addr(9708, 0)?;
+    let _other_rx = connect_peer(&peers, synthetic_peer(other, 0));
+    let source = current_source(&peers, peer);
+    let tip = blocks.last().ok_or("chain has a tip")?;
+    let child = |coinbase_height| {
+        regtest_fixture::mined_block_with_prev_hash(
+            tip.block_hash(),
+            3,
+            vec![regtest_fixture::coinbase(coinbase_height)],
+        )
+        .map(|block| block.header)
+    };
+
+    let extending = child(3)?;
+    assert!(
+        sync.compact_reconstruction_admissible(source, &extending),
+        "a mined child of the applied tip"
+    );
+    let mut no_work = extending;
+    no_work.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x1d00_ffff);
+    assert!(
+        !sync.compact_reconstruction_admissible(source, &no_work),
+        "no proof of work"
+    );
+    let orphan = regtest_fixture::mined_regtest_header(no_work.compute_hash(), 4)?;
+    assert!(
+        !sync.compact_reconstruction_admissible(source, &orphan),
+        "unknown parent"
+    );
+
+    let replayed = blocks.first().ok_or("chain has block 1")?.header;
+    let replayed_hash = Hash256::from(replayed.compute_hash());
+    assert!(
+        !sync.compact_reconstruction_admissible(source, &replayed),
+        "no more work than the applied tip"
+    );
+    sync.record_owned_body_fetch(current_source(&peers, other), replayed_hash);
+    assert!(
+        !sync.compact_reconstruction_admissible(source, &replayed),
+        "another connection's fetch"
+    );
+    sync.record_owned_body_fetch(source, replayed_hash);
+    assert!(
+        sync.compact_reconstruction_admissible(source, &replayed),
+        "this connection's fetch"
+    );
+
+    let invalid = child(33)?;
+    {
+        let mut tree = block_tree.write();
+        let parent = tree
+            .lookup(Hash256::from(tip.block_hash()))
+            .ok_or("tip is in the tree")?;
+        tree.insert_node(Some(parent), invalid, NodeStatus::Invalid)?;
+    }
+    assert!(
+        !sync.compact_reconstruction_admissible(source, &invalid),
+        "a block marked invalid"
+    );
+    let invalid_child = regtest_fixture::mined_regtest_header(invalid.compute_hash(), 4)?;
+    assert!(
+        !sync.compact_reconstruction_admissible(source, &invalid_child),
+        "a child of an invalid block"
+    );
+    Ok(())
+}
+
+#[test]
 fn owned_fetch_mark_survives_until_its_tip_header_attaches() -> TestResult {
     // A compact-owned tip announced ahead of its ancestry cannot be marked
     // at delivery: the tree has no height for it yet. Dropping the mark
