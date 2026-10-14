@@ -510,12 +510,16 @@ impl BlockSync {
     /// mempool-wide reconstruction scan.
     ///
     /// PRE: `header` is the `cmpctblock`'s embedded header.
-    /// POST: `true` only when the header has valid proof of work for the
-    ///   network, the block is not marked invalid, its parent is a known
-    ///   block not marked invalid, and it either carries more work than the
-    ///   applied chain or answers a body fetch `source` owns, as Core gates
-    ///   compact reconstruction. Forging such a header costs a mined block,
-    ///   and replaying an old one fails the work test.
+    /// POST: `true` only when the header has valid proof of work, the block
+    ///   is not marked invalid, its parent is a known block not marked
+    ///   invalid, the header passes the contextual rules header admission
+    ///   applies against that parent (required nBits, median time past,
+    ///   timewarp, future time, version), and it either carries more work
+    ///   than the applied chain or answers a body fetch `source` owns. This
+    ///   matches Core, which runs its contextual header checks before
+    ///   reconstruction. With the required nBits enforced, forging such a
+    ///   header costs a block at the chain's difficulty, and replaying an
+    ///   old one fails the work test.
     /// INVARIANT: the tree read is released before the scheduler lock is
     ///   taken, keeping the `tree -> scheduler` order without nesting.
     ///
@@ -529,7 +533,8 @@ impl BlockSync {
         header: &bitcoin_rs_primitives::Header,
     ) -> bool {
         let hash = Hash256::from(header.compute_hash());
-        if bitcoin_rs_chain::validate_pow(header, hash, self.chain.network()).is_err() {
+        let network = self.chain.network();
+        if bitcoin_rs_chain::validate_pow(header, hash, network).is_err() {
             return false;
         }
         let candidate_work = {
@@ -541,11 +546,28 @@ impl BlockSync {
             if tree.lookup(hash).is_some_and(invalid) {
                 return false;
             }
-            let parent = tree
+            let Some(parent_id) = tree
                 .lookup(Hash256::from(header.prev_blockhash))
                 .filter(|&id| !invalid(id))
-                .and_then(|id| tree.node(id).ok());
-            let Some(parent) = parent else {
+            else {
+                return false;
+            };
+            // A header that admission would refuse never earns the scan. In
+            // particular its own valid proof of work must meet the target
+            // the chain requires after this parent.
+            if bitcoin_rs_chain::validate_contextual_header(
+                &tree,
+                parent_id,
+                header,
+                network,
+                bitcoin_rs_chain::current_unix_seconds(),
+                bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let Ok(parent) = tree.node(parent_id) else {
                 return false;
             };
             parent.chainwork + bitcoin_rs_chain::block_work(header)

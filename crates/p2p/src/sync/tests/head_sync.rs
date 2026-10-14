@@ -1255,7 +1255,6 @@ fn compact_reconstruction_admission_follows_cores_header_gate() -> TestResult {
         applied_tip,
         ..
     } = SyncHarness::new(tree);
-    applied_tip.store(block_tree.read().tip());
     let peer = test_addr(9707, 0)?;
     let _rx = connect_peer(&peers, synthetic_peer(peer, 0));
     let other = test_addr(9708, 0)?;
@@ -1272,9 +1271,24 @@ fn compact_reconstruction_admission_follows_cores_header_gate() -> TestResult {
     };
 
     let extending = child(3)?;
+    let replayed = blocks.first().ok_or("chain has block 1")?.header;
+    assert!(
+        sync.compact_reconstruction_admissible(source, &replayed),
+        "with nothing applied yet, any valid connected header carries more work"
+    );
+    applied_tip.store(block_tree.read().tip());
     assert!(
         sync.compact_reconstruction_admissible(source, &extending),
         "a mined child of the applied tip"
+    );
+    // Valid proof of work for its own declared target, but not the target
+    // the chain requires after this parent.
+    let mut wrong_target = extending;
+    wrong_target.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x2000_ffff);
+    regtest_fixture::mine_header_to_declared_target(&mut wrong_target)?;
+    assert!(
+        !sync.compact_reconstruction_admissible(source, &wrong_target),
+        "a target other than the required one"
     );
     let mut no_work = extending;
     no_work.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x1d00_ffff);
@@ -1288,7 +1302,6 @@ fn compact_reconstruction_admission_follows_cores_header_gate() -> TestResult {
         "unknown parent"
     );
 
-    let replayed = blocks.first().ok_or("chain has block 1")?.header;
     let replayed_hash = Hash256::from(replayed.compute_hash());
     assert!(
         !sync.compact_reconstruction_admissible(source, &replayed),
