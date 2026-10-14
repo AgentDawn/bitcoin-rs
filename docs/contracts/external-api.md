@@ -818,8 +818,10 @@ evidence does not establish mainnet memory or throughput qualifications.
   callers, batch entries and notifications, acquires its dispatcher's
   bounded blocking quota. A bound listener permits one fewer such call than
   one source address may hold (`max_connections - max_connections / 4 - 1`,
-  95 of the node's 128; zero with one worker), so the source holding them can
-  still reach an ordinary call. The total connection bound is unchanged.
+  95 of the node's 128; zero with one worker). Blocking calls therefore never
+  take a source's last connection or the whole pool. The total connection
+  bound is unchanged: once the pool is full, every source is refused, as
+  before; reserving ordinary capacity per source is not provided.
   A standalone dispatcher defaults to 16 blocking calls. Admission never
   waits for capacity. Scan status/abort remain ordinary calls.
 - Connection admission: a listener holds at most `max_connections` live

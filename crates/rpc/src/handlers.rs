@@ -50,7 +50,8 @@ impl Handler {
     }
 
     /// Admits blocking calls on all but one of the connections a single
-    /// source may hold, so that source can always reach an ordinary call.
+    /// source may hold, so its own blocking calls never take its last
+    /// connection. A full pool still refuses every source.
     pub(crate) fn configure_blocking_admission(&self, source_connections: usize) {
         self.blocking_requests.lock().1 = source_connections.saturating_sub(1);
     }

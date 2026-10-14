@@ -1122,8 +1122,8 @@ mod tests {
         Ok(())
     }
 
-    /// One source filling the blocking quota still has a connection left for
-    /// an ordinary call such as status or abort.
+    /// One source filling the blocking quota still has a connection left in
+    /// its own share for an ordinary call such as status or abort.
     #[test]
     fn blocking_quota_leaves_the_busiest_source_an_ordinary_slot() {
         for max_connections in [1, 2, 4, 5, 128] {
