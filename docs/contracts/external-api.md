@@ -820,6 +820,19 @@ evidence does not establish mainnet memory or throughput qualifications.
   such calls (zero with one worker); the total connection bound is unchanged.
   A standalone dispatcher defaults to 16 blocking calls. Admission never
   waits for capacity. Scan status/abort remain ordinary calls.
+- Connection admission: a listener holds at most `max_connections` live
+  connections. One source address holds at most `max_connections -
+  max_connections / 4` of them (96 of the node's 128), so a quarter stays open
+  to other sources. A refused connection gets HTTP 503 `busy`. A source is an
+  address, so clients behind loopback, a Docker gateway or a reverse proxy
+  share one. Pools below four workers keep no per-source share.
+  - A request's head must complete within 10 s of its first byte and its body
+    within 60 s, however slowly the bytes arrive.
+  - Waiting for the next keep-alive request keeps the listener's idle timeout
+    (30 s in the node, Core's `-rpcservertimeout` default).
+  - Proof: `rpc::server::tests` `connection_admission_reserves_slots_for_other_peers`,
+    `slow_drip_request_line_headers_and_body_expire` and
+    `keep_alive_wait_is_not_bounded_by_the_head_budget`.
 - Admission exhaustion is the intentional `-1` error
   `RPC blocking request limit reached`. HTTP requests containing a classified
   blocking call close keep-alive after their response, including refusals, so

@@ -14,7 +14,10 @@ use crate::error::RpcError;
 use crate::handlers::Handler;
 
 const MAX_HEADER_BYTES: usize = 16 * 1_024;
-const MAX_CONNECTIONS_PER_IP: usize = 16;
+/// Share of the connection pool kept open to sources other than the busiest
+/// one: a quarter, rounded down, so one source holds at most 96 of the
+/// default 128.
+const RESERVED_POOL_DIVISOR: usize = 4;
 const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -162,16 +165,19 @@ struct ActiveConnections {
 
 impl ActiveConnections {
     fn admit(&mut self, peer: IpAddr, max_connections: usize) -> bool {
-        // Leave at least one slot for another peer, including with small
-        // configured pools. One IP cannot claim the entire production pool.
-        let per_ip_limit = max_connections
-            .saturating_sub(1)
-            .clamp(1, MAX_CONNECTIONS_PER_IP);
+        // One source cannot claim the whole pool: a quarter of it stays open
+        // to other sources. A source is an address, so every client behind
+        // loopback, a Docker gateway or a reverse proxy shares one source and
+        // can still use most of the pool. Pools below four workers keep no
+        // share, so one client keeps the ordinary slot the blocking quota
+        // leaves it.
+        let reserved = max_connections / RESERVED_POOL_DIVISOR;
+        let per_source_limit = max_connections - reserved;
         if self.total >= max_connections
             || self
                 .per_ip
                 .get(&peer)
-                .is_some_and(|&count| count >= per_ip_limit)
+                .is_some_and(|&count| count >= per_source_limit)
         {
             return false;
         }
@@ -212,11 +218,14 @@ impl Drop for RpcStop {
 }
 
 /// Applies a single wall-clock budget across all socket reads for a request
-/// phase. A trickle of bytes cannot restart this deadline as with SO_RCVTIMEO.
+/// phase. A trickle of bytes cannot restart this deadline as with `SO_RCVTIMEO`.
 struct RequestDeadlineStream {
     stream: TcpStream,
     idle_timeout: Duration,
     deadline: Instant,
+    /// The socket read timeout last set, so an unchanged value costs no
+    /// extra syscall per read.
+    applied_timeout: Option<Duration>,
 }
 
 impl RequestDeadlineStream {
@@ -224,7 +233,8 @@ impl RequestDeadlineStream {
         Self {
             stream,
             idle_timeout,
-            deadline: Instant::now() + REQUEST_HEAD_TIMEOUT,
+            deadline: Instant::now() + idle_timeout,
+            applied_timeout: None,
         }
     }
 
@@ -249,8 +259,11 @@ impl Read for RequestDeadlineStream {
                 "HTTP request deadline exceeded",
             ));
         }
-        self.stream
-            .set_read_timeout(Some(self.idle_timeout.min(remaining)))?;
+        let timeout = self.idle_timeout.min(remaining);
+        if self.applied_timeout != Some(timeout) {
+            self.stream.set_read_timeout(Some(timeout))?;
+            self.applied_timeout = Some(timeout);
+        }
         self.stream.read(buffer)
     }
 }
@@ -268,8 +281,10 @@ fn serve_connection(
         if handler.is_stopping() {
             return Ok(());
         }
-        reader.get_mut().reset_deadline(REQUEST_HEAD_TIMEOUT);
-        let request = match read_request(&mut reader, REQUEST_BODY_TIMEOUT) {
+        // Waiting for the next request keeps the configured idle timeout;
+        // `read_request` starts the head budget at the request's first byte.
+        reader.get_mut().reset_deadline(idle_timeout);
+        let request = match read_request(&mut reader, REQUEST_HEAD_TIMEOUT, REQUEST_BODY_TIMEOUT) {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(RequestReadError::RestBodyTooLarge) => {
@@ -278,14 +293,25 @@ fn serve_connection(
                 } else {
                     crate::rest::not_found()
                 };
-                write_response(reader.get_mut().socket_mut(), &response, false, CorsPolicy::Disabled)?;
+                write_response(
+                    reader.get_mut().socket_mut(),
+                    &response,
+                    false,
+                    CorsPolicy::Disabled,
+                )?;
                 return Ok(());
             }
             Err(RequestReadError::Io(error)) => {
                 let rpc_error = RpcError::InvalidRequest("malformed http request");
                 let response =
                     JsonRpcVersion::Legacy.error_response(&rpc_error, &Value::new_null());
-                write_json(reader.get_mut().socket_mut(), 400, "Bad Request", &response, false)?;
+                write_json(
+                    reader.get_mut().socket_mut(),
+                    400,
+                    "Bad Request",
+                    &response,
+                    false,
+                )?;
                 return Err(error);
             }
         };
@@ -463,8 +489,13 @@ impl From<io::Error> for RequestReadError {
 
 fn read_request(
     reader: &mut BufReader<RequestDeadlineStream>,
+    head_timeout: Duration,
     body_timeout: Duration,
 ) -> Result<Option<HttpRequest>, RequestReadError> {
+    if reader.fill_buf()?.is_empty() {
+        return Ok(None);
+    }
+    reader.get_mut().reset_deadline(head_timeout);
     let (request_line, bytes) = read_head_line(reader, MAX_HEADER_BYTES)?;
     if bytes == 0 {
         return Ok(None);
@@ -1022,11 +1053,14 @@ mod tests {
             let _ = client.shutdown(Shutdown::Write);
         });
 
-        let mut reader =
-            BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(3)));
+        let mut reader = BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(3)));
         reader.get_mut().reset_deadline(Duration::from_millis(200));
         let start = Instant::now();
-        let result = read_request(&mut reader, Duration::from_millis(200));
+        let result = read_request(
+            &mut reader,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
         stop.store(true, Ordering::Release);
         writer.join().expect("writer thread");
         assert!(
@@ -1035,7 +1069,10 @@ mod tests {
         );
         match result {
             Err(RequestReadError::Io(error)) => assert!(
-                matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock),
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ),
                 "unexpected read error: {error}"
             ),
             Err(RequestReadError::RestBodyTooLarge) => panic!("unexpected size rejection"),
@@ -1056,16 +1093,50 @@ mod tests {
         Ok(())
     }
 
+    /// Waiting for the next keep-alive request runs under the idle deadline;
+    /// the shorter head budget starts only when the request begins.
+    #[test]
+    fn keep_alive_wait_is_not_bounded_by_the_head_budget() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept()?;
+        let writer = thread::spawn(move || -> io::Result<()> {
+            thread::sleep(Duration::from_millis(300));
+            client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        });
+
+        let mut reader = BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(3)));
+        reader.get_mut().reset_deadline(Duration::from_secs(3));
+        let result = read_request(
+            &mut reader,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        writer.join().expect("writer thread")?;
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "a request arriving after the head budget but within the idle timeout is served"
+        );
+        Ok(())
+    }
+
     #[test]
     fn connection_admission_reserves_slots_for_other_peers() {
+        // Loopback gets no special treatment: it is one source like any other.
         let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let other = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let mut active = ActiveConnections::default();
-        for _ in 0..MAX_CONNECTIONS_PER_IP {
+        for _ in 0..96 {
             assert!(active.admit(source, 128));
         }
-        assert!(!active.admit(source, 128));
-        assert!(active.admit(other, 128));
+        assert!(
+            !active.admit(source, 128),
+            "a quarter of the pool stays open to other sources"
+        );
+        for _ in 0..32 {
+            assert!(active.admit(other, 128));
+        }
+        assert!(!active.admit(other, 128), "the pool is full");
         active.release(source);
         assert!(active.admit(source, 128));
 
@@ -1075,6 +1146,13 @@ mod tests {
         }
         assert!(!small_pool.admit(source, 4));
         assert!(small_pool.admit(other, 4));
+
+        // Below four workers no share is kept: one client can hold a blocking
+        // call and still reach the ordinary slot the quota leaves it.
+        let mut two_slots = ActiveConnections::default();
+        assert!(two_slots.admit(source, 2));
+        assert!(two_slots.admit(source, 2));
+        assert!(!two_slots.admit(other, 2), "the pool is full");
     }
 
     #[test]
