@@ -64,7 +64,7 @@ impl RpcServer {
         drop(handler);
         let handler = Arc::new(Handler::new(context));
         handler.context().mark_server_bound();
-        handler.configure_blocking_admission(max_connections);
+        handler.configure_blocking_admission(per_source_limit(max_connections));
         Ok(Self {
             listener,
             auth,
@@ -93,7 +93,7 @@ impl RpcServer {
         let shutdown = shutdown.into();
         let _stop = RpcStop(Arc::clone(&self.handler));
         self.handler
-            .configure_blocking_admission(self.max_connections);
+            .configure_blocking_admission(per_source_limit(self.max_connections));
         self.listener.set_nonblocking(true)?;
         let active = Arc::new(Mutex::new(ActiveConnections::default()));
         while !shutdown.is_triggered() {
@@ -157,6 +157,15 @@ impl RpcServer {
     }
 }
 
+/// The most connections one source address may hold: all but a quarter of
+/// the pool, rounded down, so the rest stays open to other sources. A source
+/// is an address, so every client behind loopback, a Docker gateway or a
+/// reverse proxy shares one and can still use most of the pool. Pools below
+/// four workers keep no share.
+fn per_source_limit(max_connections: usize) -> usize {
+    max_connections - max_connections / RESERVED_POOL_DIVISOR
+}
+
 #[derive(Default)]
 struct ActiveConnections {
     total: usize,
@@ -165,14 +174,7 @@ struct ActiveConnections {
 
 impl ActiveConnections {
     fn admit(&mut self, peer: IpAddr, max_connections: usize) -> bool {
-        // One source cannot claim the whole pool: a quarter of it stays open
-        // to other sources. A source is an address, so every client behind
-        // loopback, a Docker gateway or a reverse proxy shares one source and
-        // can still use most of the pool. Pools below four workers keep no
-        // share, so one client keeps the ordinary slot the blocking quota
-        // leaves it.
-        let reserved = max_connections / RESERVED_POOL_DIVISOR;
-        let per_source_limit = max_connections - reserved;
+        let per_source_limit = per_source_limit(max_connections);
         if self.total >= max_connections
             || self
                 .per_ip
@@ -1118,6 +1120,24 @@ mod tests {
             "a request arriving after the head budget but within the idle timeout is served"
         );
         Ok(())
+    }
+
+    /// One source filling the blocking quota still has a connection left for
+    /// an ordinary call such as status or abort.
+    #[test]
+    fn blocking_quota_leaves_the_busiest_source_an_ordinary_slot() {
+        for max_connections in [1, 2, 4, 5, 128] {
+            let handler = Handler::new(Arc::new(Context::new()));
+            handler.configure_blocking_admission(per_source_limit(max_connections));
+            let held: Vec<_> = core::iter::from_fn(|| handler.reserve_blocking_request().ok())
+                .take(max_connections)
+                .collect();
+            assert_eq!(
+                held.len() + 1,
+                per_source_limit(max_connections),
+                "pool {max_connections}"
+            );
+        }
     }
 
     #[test]

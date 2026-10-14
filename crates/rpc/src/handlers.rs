@@ -49,8 +49,10 @@ impl Handler {
         }
     }
 
-    pub(crate) fn configure_blocking_admission(&self, max_connections: usize) {
-        self.blocking_requests.lock().1 = max_connections.saturating_sub(1);
+    /// Admits blocking calls on all but one of the connections a single
+    /// source may hold, so that source can always reach an ordinary call.
+    pub(crate) fn configure_blocking_admission(&self, source_connections: usize) {
+        self.blocking_requests.lock().1 = source_connections.saturating_sub(1);
     }
 
     pub(crate) fn reserve_blocking_request(&self) -> Result<BlockingRequest<'_>, RpcError> {
