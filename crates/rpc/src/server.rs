@@ -558,8 +558,16 @@ fn read_request(
         return Err(RequestReadError::RestBodyTooLarge);
     }
     reader.get_mut().reset_deadline(body_timeout);
-    let mut body = vec![0_u8; content_length];
-    reader.read_exact(&mut body)?;
+    // The body grows with the bytes received, as Bitcoin Core's does, so a
+    // declared but unsent body allocates nothing.
+    let mut body = Vec::new();
+    let limit = u64::try_from(content_length).unwrap_or(u64::MAX);
+    (&mut *reader).take(limit).read_to_end(&mut body)?;
+    if body.len() != content_length {
+        return Err(
+            io::Error::new(io::ErrorKind::UnexpectedEof, "request body ended early").into(),
+        );
+    }
     Ok(Some(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
@@ -1202,7 +1210,7 @@ mod tests {
         }
         for (enabled, expected) in [(true, 400), (false, 404)] {
             // Deliberately send no body: receiving an answer proves the cap
-            // was enforced before read_exact or body allocation.
+            // was enforced before the body read.
             let response = rest_wire_request(b"POST /rest/getutxos.hex?cache=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2049\r\nConnection: keep-alive\r\n\r\n", enabled)?;
             assert!(response.starts_with(format!("HTTP/1.1 {expected} ").as_bytes()));
             let text = String::from_utf8_lossy(&response);
@@ -1389,6 +1397,60 @@ mod tests {
 
         shutdown.store(true, Ordering::SeqCst);
         drop(handle.join().expect("server thread"));
+        Ok(())
+    }
+
+    /// Runs `read_request` over a loopback socket fed `request` in writes of
+    /// at most `chunk` bytes, after which the client closes its write half.
+    fn read_fed_request(
+        request: Vec<u8>,
+        chunk: usize,
+    ) -> io::Result<Result<Option<HttpRequest>, RequestReadError>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept()?;
+        let writer = thread::spawn(move || -> io::Result<()> {
+            for piece in request.chunks(chunk) {
+                client.write_all(piece)?;
+            }
+            client.shutdown(Shutdown::Write)
+        });
+        let mut reader = BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(3)));
+        let result = read_request(&mut reader, Duration::from_secs(3), Duration::from_secs(3));
+        writer.join().expect("writer thread")?;
+        Ok(result)
+    }
+
+    #[test]
+    fn body_arriving_across_reads_is_received_whole() -> io::Result<()> {
+        let body = b"0123456789abcdef".repeat(4_096);
+        let mut request = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        let Ok(Some(received)) = read_fed_request(request, 1_000)? else {
+            panic!("a complete request must decode");
+        };
+        assert_eq!(received.body, body);
+        Ok(())
+    }
+
+    /// A body declared at the size cap but cut short is a framing error, as
+    /// before; the read holds only the bytes that arrived.
+    #[test]
+    fn declared_but_unsent_body_is_a_framing_error() -> io::Result<()> {
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {MAX_BODY_BYTES}\r\n\r\npartial"
+        );
+        match read_fed_request(request.into_bytes(), usize::MAX)? {
+            Err(RequestReadError::Io(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            Err(RequestReadError::RestBodyTooLarge) => panic!("unexpected size rejection"),
+            Ok(_) => panic!("a truncated body was accepted"),
+        }
         Ok(())
     }
 
