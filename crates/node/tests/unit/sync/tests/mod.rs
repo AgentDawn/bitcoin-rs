@@ -201,10 +201,10 @@ fn matured_chain(depth: u32) -> Result<MaturedChain, Box<dyn std::error::Error>>
 }
 
 #[cfg(test)]
-mod transitions_2;
+mod staged_branch_switch;
 
 #[cfg(test)]
-mod transitions_3;
+mod reorg_invalidation;
 
 #[cfg(test)]
-mod transitions_7;
+mod branch_connect_mempool;
