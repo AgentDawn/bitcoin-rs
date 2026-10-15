@@ -673,7 +673,13 @@ mod registry_tests {
 
     fn await_waiter(handler: &Handler) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while handler.reserve_blocking_request().is_ok() {
+        loop {
+            // Observe the owner without competing for the waiter's permit.
+            // Release the mutex before checking the deadline or sleeping.
+            let active = handler.blocking_requests.lock().0;
+            if active != 0 {
+                return;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
                 "request must enter the bounded wait quota"

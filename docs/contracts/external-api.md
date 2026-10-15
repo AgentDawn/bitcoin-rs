@@ -831,6 +831,11 @@ evidence does not establish mainnet memory or throughput qualifications.
   before; reserving ordinary capacity per source is not provided.
   A standalone dispatcher defaults to 16 blocking calls. Admission never
   waits for capacity. Scan status/abort remain ordinary calls.
+  Proof: `rpc::registry::tests::scan_start_is_blocking_but_status_abort_and_gbt_are_outside_this_budget`,
+  `rpc::registry::tests::tip_waits_are_blocking_requests`, and
+  `rpc::handlers::registry_tests::one_worker_rejects_waits_and_direct_dispatch_cannot_bypass_budget`
+  pin classification and direct-dispatch quota enforcement. The dispatcher
+  test observes the existing active count without reserving a permit itself.
 - Connection admission: a listener holds at most `max_connections` live
   connections. One source address holds at most `max_connections -
   max_connections / 4` of them (96 of the node's 128), so a quarter, rounded
