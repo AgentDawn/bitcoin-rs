@@ -182,16 +182,16 @@ fn populated_utxo() -> Result<UtxoSet, bitcoin_rs_utxo::UtxoError> {
 }
 
 #[cfg(test)]
-mod behavior_1;
+mod headers_artifact;
 
 #[cfg(test)]
-mod behavior_2;
+mod artifact_consistency;
 
 #[cfg(test)]
-mod persistence_1;
+mod storage_roundtrip;
 
 #[cfg(test)]
-mod validation_1;
+mod tip_transitions;
 
 #[cfg(test)]
-mod transitions_1;
+mod headers_validation;
