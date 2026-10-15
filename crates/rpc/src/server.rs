@@ -1441,9 +1441,13 @@ mod tests {
         let mut reader = BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(3)));
         let result = read_request(&mut reader, Duration::from_secs(3), Duration::from_secs(3));
         // Close the server end first: after a failed read, a writer blocked on
-        // a full socket buffer would otherwise never return.
+        // a full socket buffer would otherwise never return. The writer's
+        // resulting error must not hide the read's.
         drop(reader);
-        writer.join().expect("writer thread")?;
+        let written = writer.join().expect("writer thread");
+        if result.is_ok() {
+            written?;
+        }
         Ok(result)
     }
 
