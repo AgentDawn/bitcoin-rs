@@ -264,6 +264,9 @@ owns script-engine selection and its promotion criteria.
 Keep implementation guidance with its owner rather than introducing another
 architecture or validation specification in this guide.
 
+Follow the [source and test organization policy](docs/policies/source-organization.md)
+when adding or reorganizing modules, tests, and fixtures.
+
 ## Proposing and implementing BIPs
 
 External BIP authors and implementers are welcome to propose, prototype, and

@@ -11,6 +11,7 @@
 | Understand project vocabulary | [Concepts](../CONCEPTS.md) |
 | Read repository-wide invariants | [Project invariants](../CONSTRAINTS.md) |
 | Change the repository | [Agent guidelines](../AGENTS.md) and [contributing](../CONTRIBUTING.md) |
+| Organize source modules, tests, and fixtures | [Source and test organization policy](policies/source-organization.md) |
 | Operate recovery or REST | [Recovery contract](contracts/recovery.md) and [REST guide](rest-interface.md) |
 | Evaluate the experimental keyless BIP352 codec | [Silent Payments feasibility](silent-payments.md) |
 | Place instrumentation in the right layer | [Observability boundary](observability.md), [tracing/USDT](tracing.md) |

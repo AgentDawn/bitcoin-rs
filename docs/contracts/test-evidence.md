@@ -5,6 +5,10 @@ A test that only restates a constructor, field layout, historical task plan,
 lookup count, or private call order is not a permanent compatibility rule.
 Performance claims require measured evidence, not a source-shape assertion.
 
+The [source and test organization policy](../policies/source-organization.md)
+owns placement, naming, fixture scope, and exceptions. This contract owns the
+proof boundary and retained guarantees; moving a test does not change them.
+
 ## Retained proof owners
 
 The current suite is classified by owner family below. Every surviving test
