@@ -835,16 +835,17 @@ evidence does not establish mainnet memory or throughput qualifications.
     10 s and its body within 60 s, however slowly the bytes arrive.
   - Waiting for the next keep-alive request keeps the listener's idle timeout
     (30 s in the node, Core's `-rpcservertimeout` default).
-  - A request body grows with the bytes received, up to its declared
-    `Content-Length` (at most 16 MiB), as in Core's HTTP server; a declared
-    but unsent body reserves only the bytes that arrived, and a body cut
-    short is a framing error.
+  - A request body's buffer grows with the bytes received, as in Core's HTTP
+    server: to at most twice those bytes or 8 KiB past them, and never beyond
+    the declared `Content-Length` (at most 16 MiB). A body cut short is a
+    framing error.
   - Proof: `rpc::server::tests` `connection_admission_reserves_slots_for_other_peers`,
     `blocking_quota_leaves_the_busiest_source_an_ordinary_slot`,
     `slow_drip_request_line_headers_and_body_expire`,
     `keep_alive_wait_is_not_bounded_by_the_head_budget`,
     `body_arriving_across_reads_is_received_whole`,
-    `declared_but_unsent_body_allocates_only_received_bytes` and
+    `declared_but_unsent_body_allocates_only_received_bytes`,
+    `full_body_capacity_stays_within_the_declared_length` and
     `declared_but_unsent_body_is_a_framing_error`.
 - Admission exhaustion is the intentional `-1` error
   `RPC blocking request limit reached`. HTTP requests containing a classified
