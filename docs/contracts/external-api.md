@@ -857,7 +857,8 @@ evidence does not establish mainnet memory or throughput qualifications.
   its generated help body. These cancellation, overload, transport and help
   differences are declared `Deviation`; no full compatibility promotion is made.
 - Evidence: `chainstate::tip_wait::tests`,
-  `rpc::server::tip_wait_tests`, and the live pinned-Core process comparisons
+  `crates/rpc/tests/tip_wait_admission.rs`, `rpc::registry::tests`,
+  `rpc::handlers::registry_tests`, and the live pinned-Core process comparisons
   in `e2e/tests/rpc_tip_waits.rs` exercise reorgs, deadlines, shutdown responses,
   parameter errors and restored startup. Header-only process checks complete
   finite waits after admission and compare the applied tip; deterministic

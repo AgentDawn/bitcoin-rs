@@ -383,10 +383,12 @@ pub(crate) fn parse_txid(value: &str, label: &str) -> Result<Txid, RpcError> {
 }
 #[cfg(test)]
 mod registry_tests {
+    #![expect(clippy::expect_used)]
+
     use alloc::collections::BTreeSet;
     use alloc::sync::Arc;
 
-    use sonic_rs::json;
+    use sonic_rs::{JsonValueTrait as _, json};
 
     use super::{Handler, live_registry, optional_bool, parse_txid, required_str, required_u64};
     use crate::context::Context;
@@ -644,4 +646,73 @@ mod registry_tests {
             assert_eq!(error.to_string(), format!("Unknown named parameter {name}"));
         }
     }
+
+    fn test_context() -> (Arc<Context>, Arc<bitcoin_rs_chainstate::Chainstate>) {
+        let chainstate = Arc::new(bitcoin_rs_chainstate::Chainstate::new(
+            bitcoin_rs_primitives::Network::Regtest,
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
+            Arc::new(bitcoin_rs_utxo::UtxoSet::new()),
+            Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+                bitcoin_rs_utxo::stats::CoinStats::default(),
+            )),
+            Arc::new(bitcoin_rs_chainstate::events::ChainEventPublisher::detached(0)),
+        ));
+        chainstate
+            .apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block(), None)
+            .expect("genesis");
+        let mut ctx = Context::new();
+        ctx.chain.applied_tip = chainstate.applied_tip_reader();
+        ctx.chain.active_tip_wait = Some(chainstate.clone());
+        (Arc::new(ctx), chainstate)
+    }
+
+    fn await_waiter(handler: &Handler) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while handler.reserve_blocking_request().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "request must enter the bounded wait quota"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn one_worker_rejects_waits_and_direct_dispatch_cannot_bypass_budget() {
+        let (ctx, _) = test_context();
+        let handler = Arc::new(Handler::new(Arc::clone(&ctx)));
+        handler.configure_blocking_admission(1);
+        assert!(
+            handler
+                .dispatch("waitforblockheight", &json!([-1]))
+                .is_err()
+        );
+        assert_eq!(
+            handler
+                .dispatch("getblockcount", &json!([]))
+                .expect("ordinary")
+                .as_u64(),
+            Some(0)
+        );
+        handler.configure_blocking_admission(2);
+        let waiter = Arc::clone(&handler);
+        let task = std::thread::spawn(move || waiter.dispatch("waitforblockheight", &json!([1])));
+        await_waiter(&handler);
+        assert!(handler.dispatch("waitfornewblock", &json!([1])).is_err());
+        assert_eq!(
+            handler
+                .dispatch("getblockcount", &json!([]))
+                .expect("ordinary")
+                .as_u64(),
+            Some(0)
+        );
+        handler.stop();
+        assert_eq!(
+            task.join().expect("waiter").expect("cancel returns tip")["height"].as_u64(),
+            Some(0)
+        );
+    }
 }
+
