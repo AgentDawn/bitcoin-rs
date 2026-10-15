@@ -589,9 +589,10 @@ owned by [wallet-facing.md](wallet-facing.md).
 - Projection uses `typed_to_sonic_omitting_nulls`.
 
 
-### `API-26`: `estimatesmartfee` Core `conf_target` and `estimate_mode`
+### `API-26`: `estimatesmartfee` parameters and Esplora fee estimates
 
-- **Owner**: `estimatesmartfee` in `crates/rpc/src/handlers/util.rs`.
+- **Owners**: `estimatesmartfee` in `crates/rpc/src/handlers/util.rs`;
+  Esplora `/fee-estimates` in `crates/rpc/src/esplora/public.rs`.
 - `conf_target` must be in `1..=1008` (Core `MAX_CONFIRM_TARGET`). Otherwise
   `-8` `Invalid conf_target, must be between 1 and 1008`.
 - `estimate_mode` is optional, case-insensitive `UNSET` / `ECONOMICAL` /
@@ -604,6 +605,12 @@ owned by [wallet-facing.md](wallet-facing.md).
 - Insufficient data for the requested target omits `fee_rate` and returns an
   `errors` array containing `Insufficient data or no feerate found`.
 - Trailing parameters are refused.
+- Esplora `/fee-estimates` in `crates/rpc/src/esplora/public.rs` captures
+  targets `1..=25`, `144`, `504`, and `1008` from one mempool read view, so
+  concurrent pool updates cannot mix estimator states within a response.
+  The guard is released before response formatting. It uses the same estimator
+  and `sat_to_btc` projection as RPC, then multiplies BTC/kvB by `100_000` for
+  sat/vB; targets with insufficient history are omitted.
 
 
 ### `API-27`: `generateblock` txid and raw-tx parse errors
@@ -1097,6 +1104,9 @@ evidence does not establish mainnet memory or throughput qualifications.
     `getmininginfo_projects_control_state`
 
 - `API-26`:
+  - `crates/rpc/tests/esplora_fee_estimates.rs`: RPC projection equality for
+    empty, partial and fully qualified history, plus
+    `fee_estimates_is_coherent_during_concurrent_pool_changes`
   - `crates/rpc/src/handlers/util.rs` tests
     `estimatesmartfee_rejects_conf_target_outside_core_range`,
     `estimatesmartfee_rejects_unknown_estimate_mode`,
