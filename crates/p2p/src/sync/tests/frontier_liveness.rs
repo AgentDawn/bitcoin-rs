@@ -1,3 +1,4 @@
+//! Regression coverage for issue #1153:
 //! Frontier liveness after serving peers miss the block-request timeout:
 //! the peers this node holds must carry the frontier.
 

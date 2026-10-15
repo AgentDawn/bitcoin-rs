@@ -1,11 +1,11 @@
 use super::*;
 
-const QUOTA_MAP: &[u8] = include_bytes!("../../tests/data/asmap-source-quota-core-v31.1.raw");
-const V2: &[u8] = include_bytes!("../../tests/data/addrman-historical-v2.dat");
-const V3: &[u8] = include_bytes!("../../tests/data/addrman-historical-v3.dat");
-const V2_ASMAP: &[u8] = include_bytes!("../../tests/data/addrman-historical-v2-asmap.dat");
-const V3_ASMAP: &[u8] = include_bytes!("../../tests/data/addrman-historical-v3-asmap.dat");
-const V5: &[u8] = include_bytes!("../../tests/data/addrman-core-v5-eight-refs.dat");
+const QUOTA_MAP: &[u8] = include_bytes!("../../../tests/data/asmap-source-quota-core-v31.1.raw");
+const V2: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v2.dat");
+const V3: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v3.dat");
+const V2_ASMAP: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v2-asmap.dat");
+const V3_ASMAP: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v3-asmap.dat");
+const V5: &[u8] = include_bytes!("../../../tests/data/addrman-core-v5-eight-refs.dat");
 
 fn map_file(directory: &Path, bytes: &[u8]) -> PathBuf {
     let path = directory.join("asmap.raw");
@@ -23,7 +23,7 @@ fn backups(directory: &Path) -> Vec<PathBuf> {
 #[test]
 fn asmap_placement_matches_224_actual_core_vectors() {
     let data: serde_json::Value = serde_json::from_str(include_str!(
-        "../../tests/data/core-addrman-asmap-v31.1.json"
+        "../../../tests/data/core-addrman-asmap-v31.1.json"
     ))
     .expect("Core reference");
     let directory = tempfile::tempdir().expect("directory");
