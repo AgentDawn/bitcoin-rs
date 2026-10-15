@@ -645,11 +645,12 @@ misbehaviours of Core's `p2p_v2_misbehaving.py`, and the packet bounds.
   pin the identity-checked, monotonic credit mutation and retained tip
   evidence (P2P-03).
 - `crates/p2p/src/sync/tests/header_progress.rs` tests `tick_fetches_new_tip_headers_from_at_tip_peers`
-  (at-tip request eligibility after catch-up, P2P-03/#617) and
+  (at-tip request eligibility after catch-up, P2P-03/#617),
   `tick_fetches_reorg_fork_announced_by_at_tip_peer` (reorg announcements
   earn credit on the reselected best chain),
-  `losing_fork_credit_survives_winner_disconnect` (retained branch evidence),
-  and `cold_start_stall_hedges_front_without_reassigning_owner` (active-chain
+  and `losing_fork_credit_survives_winner_disconnect` (retained branch evidence).
+- `crates/p2p/src/sync/tests/headroom_throttling.rs` tests
+  `cold_start_stall_hedges_front_without_reassigning_owner` (active-chain
   hedge eligibility).
 - `crates/p2p/src/counters.rs` tests `a_vectored_write_counts_every_slice`,
   `from_connected_disables_nagle`: the counting wrapper forwards one
