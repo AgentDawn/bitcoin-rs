@@ -1,9 +1,8 @@
 use alloc::sync::Arc;
 use std::io::{self, BufRead, BufReader, IoSlice, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
@@ -14,9 +13,6 @@ use crate::error::RpcError;
 use crate::handlers::Handler;
 
 const MAX_HEADER_BYTES: usize = 16 * 1_024;
-const BODY_READ_CHUNK_BYTES: usize = 16 * 1_024;
-const MAX_IN_FLIGHT_BODY_BYTES: usize = 32 * 1_024 * 1_024;
-const BODY_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 
@@ -93,12 +89,11 @@ impl RpcServer {
             .configure_blocking_admission(self.max_connections);
         self.listener.set_nonblocking(true)?;
         let active = Arc::new(Mutex::new(0_usize));
-        let body_bytes_in_flight = Arc::new(AtomicUsize::new(0));
         while !shutdown.is_triggered() {
             match self.listener.accept() {
                 Ok((stream, _addr)) => {
                     stream.set_nonblocking(false)?;
-                    if let Err(error) = self.handle_accept(&active, &body_bytes_in_flight, stream) {
+                    if let Err(error) = self.handle_accept(&active, stream) {
                         debug!(%error, "rpc connection setup failed");
                     }
                 }
@@ -113,12 +108,7 @@ impl RpcServer {
         Ok(())
     }
 
-    fn handle_accept(
-        &self,
-        active: &Arc<Mutex<usize>>,
-        body_bytes_in_flight: &Arc<AtomicUsize>,
-        stream: TcpStream,
-    ) -> io::Result<()> {
+    fn handle_accept(&self, active: &Arc<Mutex<usize>>, stream: TcpStream) -> io::Result<()> {
         // Connection-local: a nodelay failure must not stop the accept loop.
         let mut stream = match prepare_http_socket(stream) {
             Ok(stream) => stream,
@@ -146,19 +136,13 @@ impl RpcServer {
         let handler = Arc::clone(&self.handler);
         let rest_enabled = self.rest_enabled;
         let idle_timeout = self.idle_timeout;
-        let body_bytes_in_flight = Arc::clone(body_bytes_in_flight);
         thread::Builder::new()
             .name("rpc-connection".to_owned())
             .spawn(move || {
                 let _permit = permit;
-                if let Err(error) = serve_connection(
-                    stream,
-                    &auth,
-                    &handler,
-                    rest_enabled,
-                    idle_timeout,
-                    &body_bytes_in_flight,
-                ) {
+                if let Err(error) =
+                    serve_connection(stream, &auth, &handler, rest_enabled, idle_timeout)
+                {
                     debug!(%error, "rpc connection closed with error");
                 }
             })?;
@@ -188,7 +172,6 @@ fn serve_connection(
     handler: &Handler,
     rest_enabled: bool,
     idle_timeout: Duration,
-    body_bytes_in_flight: &Arc<AtomicUsize>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(idle_timeout))?;
@@ -197,13 +180,7 @@ fn serve_connection(
         if handler.is_stopping() {
             return Ok(());
         }
-        let request = match read_request(
-            &mut reader,
-            auth,
-            rest_enabled,
-            idle_timeout,
-            body_bytes_in_flight,
-        ) {
+        let request = match read_request(&mut reader) {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(RequestReadError::RestBodyTooLarge) => {
@@ -213,18 +190,6 @@ fn serve_connection(
                     crate::rest::not_found()
                 };
                 write_response(reader.get_mut(), &response, false, CorsPolicy::Disabled)?;
-                return Ok(());
-            }
-            Err(RequestReadError::Unauthorized) => {
-                write_status(reader.get_mut(), 401, "Unauthorized", b"unauthorized", false)?;
-                return Ok(());
-            }
-            Err(RequestReadError::NotFound) => {
-                write_not_found(reader.get_mut(), false)?;
-                return Ok(());
-            }
-            Err(RequestReadError::Unavailable) => {
-                write_status(reader.get_mut(), 503, "Service Unavailable", b"busy", false)?;
                 return Ok(());
             }
             Err(RequestReadError::Io(error)) => {
@@ -319,45 +284,6 @@ struct HttpRequest {
     authorization: Option<String>,
     keep_alive: bool,
     body: Vec<u8>,
-    _body_budget: BodyBudget,
-}
-
-/// Holds the global charge until the HTTP handler has finished using the body.
-struct BodyBudget {
-    in_flight: Arc<AtomicUsize>,
-    held: usize,
-}
-
-impl BodyBudget {
-    fn new(in_flight: &Arc<AtomicUsize>) -> Self {
-        Self {
-            in_flight: Arc::clone(in_flight),
-            held: 0,
-        }
-    }
-
-    fn charge(&mut self, bytes: usize) -> Result<(), RequestReadError> {
-        self.in_flight
-            .fetch_update(
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-                |used| {
-                    used.checked_add(bytes)
-                        .filter(|total| *total <= MAX_IN_FLIGHT_BODY_BYTES)
-                },
-            )
-            .map_err(|_| RequestReadError::Unavailable)?;
-        self.held += bytes;
-        Ok(())
-    }
-}
-
-impl Drop for BodyBudget {
-    fn drop(&mut self) {
-        if self.held != 0 {
-            self.in_flight.fetch_sub(self.held, AtomicOrdering::AcqRel);
-        }
-    }
 }
 
 /// Reads one request-head line with the remaining aggregate budget. The
@@ -432,9 +358,6 @@ fn read_headers(
 enum RequestReadError {
     Io(io::Error),
     RestBodyTooLarge,
-    Unauthorized,
-    NotFound,
-    Unavailable,
 }
 
 impl From<io::Error> for RequestReadError {
@@ -445,10 +368,6 @@ impl From<io::Error> for RequestReadError {
 
 fn read_request(
     reader: &mut BufReader<TcpStream>,
-    auth: &Auth,
-    rest_enabled: bool,
-    idle_timeout: Duration,
-    body_bytes_in_flight: &Arc<AtomicUsize>,
 ) -> Result<Option<HttpRequest>, RequestReadError> {
     let (request_line, bytes) = read_head_line(reader, MAX_HEADER_BYTES)?;
     if bytes == 0 {
@@ -503,88 +422,21 @@ fn read_request(
         (_, Some(len)) => len,
         (_, None) => 0,
     };
-    // Decide authorization and route admission from the headers, before
-    // receiving or allocating any request-body bytes.
-    match classify(method, path) {
-        HttpRoute::JsonRpc if !auth.validate_header(authorization.as_deref()) => {
-            return Err(RequestReadError::Unauthorized);
-        }
-        HttpRoute::RestPost { .. } if !rest_enabled => {
-            return Err(RequestReadError::NotFound);
-        }
-        HttpRoute::RestPost { .. } if content_length > crate::rest::MAX_GETUTXOS_BODY_BYTES => {
-            return Err(RequestReadError::RestBodyTooLarge);
-        }
-        HttpRoute::NotFound if content_length != 0 => {
-            return Err(RequestReadError::NotFound);
-        }
-        HttpRoute::Rest { .. } if !rest_enabled && content_length != 0 => {
-            return Err(RequestReadError::NotFound);
-        }
-        HttpRoute::Rest { .. } | HttpRoute::EsploraGet { .. } | HttpRoute::Preflight { .. }
-            if content_length != 0 =>
-        {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "unexpected request body").into(),
-            );
-        }
-        _ => {}
+    if method == "POST"
+        && crate::rest::getutxos_suffix(split_path_query(path).0).is_some()
+        && content_length > crate::rest::MAX_GETUTXOS_BODY_BYTES
+    {
+        return Err(RequestReadError::RestBodyTooLarge);
     }
-    let (body, budget) =
-        read_body(reader, content_length, idle_timeout, body_bytes_in_flight)?;
+    let mut body = vec![0_u8; content_length];
+    reader.read_exact(&mut body)?;
     Ok(Some(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
         authorization,
         keep_alive,
         body,
-        _body_budget: budget,
     }))
-}
-
-/// Reads only bytes received from the network, with a shared in-flight limit.
-/// A peer that trickles data cannot extend the absolute completion deadline.
-fn read_body(
-    reader: &mut BufReader<TcpStream>,
-    content_length: usize,
-    idle_timeout: Duration,
-    body_bytes_in_flight: &Arc<AtomicUsize>,
-) -> Result<(Vec<u8>, BodyBudget), RequestReadError> {
-    let mut body = Vec::new();
-    let mut budget = BodyBudget::new(body_bytes_in_flight);
-    if content_length == 0 {
-        return Ok((body, budget));
-    }
-
-    let deadline = Instant::now() + idle_timeout.min(BODY_COMPLETION_TIMEOUT);
-    let mut chunk = [0_u8; BODY_READ_CHUNK_BYTES];
-    while body.len() < content_length {
-        let time_left = deadline.saturating_duration_since(Instant::now());
-        if time_left.is_zero() {
-            return Err(
-                io::Error::new(io::ErrorKind::TimedOut, "request body deadline exceeded").into(),
-            );
-        }
-        reader.get_mut().set_read_timeout(Some(time_left))?;
-        let next = (content_length - body.len()).min(chunk.len());
-        let read = match reader.read(&mut chunk[..next]) {
-            Ok(0) => {
-                return Err(
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "request body ended early")
-                        .into(),
-                );
-            }
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        };
-        budget.charge(read)?;
-        body.try_reserve(read)
-            .map_err(|_| RequestReadError::Unavailable)?;
-        body.extend_from_slice(&chunk[..read]);
-    }
-    reader.get_mut().set_read_timeout(Some(idle_timeout))?;
-    Ok((body, budget))
 }
 
 struct JsonResponse {
@@ -1044,7 +896,6 @@ mod tests {
                 &handler,
                 enabled,
                 Duration::from_secs(2),
-                &Arc::new(AtomicUsize::new(0)),
             )
         });
         client.write_all(request)?;
@@ -1088,63 +939,6 @@ mod tests {
             assert!(text.contains("Connection: close"));
             assert!(text.contains("Content-Type: text/plain"));
         }
-        Ok(())
-    }
-
-    #[test]
-    fn unauthenticated_large_json_rpc_body_is_rejected_from_headers() -> io::Result<()> {
-        for path in ["/", "/getblockcount"] {
-            let request = format!(
-                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {MAX_BODY_BYTES}\r\nConnection: keep-alive\r\n\r\n"
-            );
-            // There is deliberately no body: the response must not wait for it.
-            let response = rest_wire_request(request.as_bytes(), false)?;
-            assert!(response.starts_with(b"HTTP/1.1 401 Unauthorized"));
-            assert!(String::from_utf8_lossy(&response).contains("Connection: close"));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_post_does_not_read_declared_body() -> io::Result<()> {
-        let request = format!(
-            "POST /rest/not-a-route HTTP/1.1\r\nHost: localhost\r\nContent-Length: {MAX_BODY_BYTES}\r\n\r\n"
-        );
-        let response = rest_wire_request(request.as_bytes(), true)?;
-        assert!(response.starts_with(b"HTTP/1.1 404 Not Found"));
-        Ok(())
-    }
-
-    #[test]
-    fn in_flight_budget_is_shared_and_released() {
-        let total = Arc::new(AtomicUsize::new(0));
-        let mut first = BodyBudget::new(&total);
-        first.charge(MAX_IN_FLIGHT_BODY_BYTES).expect("charge shared budget");
-        let mut second = BodyBudget::new(&total);
-        assert!(matches!(
-            second.charge(1),
-            Err(RequestReadError::Unavailable)
-        ));
-        drop(first);
-        second.charge(1).expect("budget returned on drop");
-        assert_eq!(total.load(AtomicOrdering::Acquire), 1);
-        drop(second);
-        assert_eq!(total.load(AtomicOrdering::Acquire), 0);
-    }
-
-    #[test]
-    fn authenticated_json_rpc_body_spanning_chunks_succeeds() -> io::Result<()> {
-        let mut body =
-            br#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#.to_vec();
-        body.extend(vec![b' '; 2 * BODY_READ_CHUNK_BYTES]);
-        let mut request = format!(
-            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic dXNlcjpwYXNz\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len(),
-        )
-        .into_bytes();
-        request.extend_from_slice(&body);
-        let response = rest_wire_request(&request, false)?;
-        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
         Ok(())
     }
 
@@ -1348,7 +1142,6 @@ mod tests {
                     &handler,
                     false,
                     core::time::Duration::from_secs(5),
-                    &Arc::new(AtomicUsize::new(0)),
                 )
             });
 
@@ -1384,7 +1177,6 @@ mod tests {
                 &handler,
                 false,
                 core::time::Duration::from_secs(5),
-                &Arc::new(AtomicUsize::new(0)),
             )
         });
 
@@ -1464,7 +1256,6 @@ mod tests {
                 &handler,
                 false,
                 core::time::Duration::from_secs(1),
-                &Arc::new(AtomicUsize::new(0)),
             )
         });
 
