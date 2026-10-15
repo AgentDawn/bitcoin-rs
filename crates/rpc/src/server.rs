@@ -558,16 +558,8 @@ fn read_request(
         return Err(RequestReadError::RestBodyTooLarge);
     }
     reader.get_mut().reset_deadline(body_timeout);
-    // The body grows with the bytes received, as Bitcoin Core's does, so a
-    // declared but unsent body allocates nothing.
     let mut body = Vec::new();
-    let limit = u64::try_from(content_length).unwrap_or(u64::MAX);
-    (&mut *reader).take(limit).read_to_end(&mut body)?;
-    if body.len() != content_length {
-        return Err(
-            io::Error::new(io::ErrorKind::UnexpectedEof, "request body ended early").into(),
-        );
-    }
+    read_body(reader, content_length, &mut body)?;
     Ok(Some(HttpRequest {
         method: method.to_owned(),
         path: path.to_owned(),
@@ -575,6 +567,21 @@ fn read_request(
         keep_alive,
         body,
     }))
+}
+
+/// Reads exactly `content_length` bytes into the empty `body`, which grows
+/// with the bytes received, as Bitcoin Core's HTTP server does: a declared but
+/// unsent body allocates nothing. A body that ends early is `UnexpectedEof`.
+fn read_body(reader: &mut impl Read, content_length: usize, body: &mut Vec<u8>) -> io::Result<()> {
+    let limit = u64::try_from(content_length).unwrap_or(u64::MAX);
+    reader.take(limit).read_to_end(body)?;
+    if body.len() != content_length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "request body ended early",
+        ));
+    }
+    Ok(())
 }
 
 struct JsonResponse {
@@ -1438,7 +1445,7 @@ mod tests {
     }
 
     /// A body declared at the size cap but cut short is a framing error, as
-    /// before; the read holds only the bytes that arrived.
+    /// before.
     #[test]
     fn declared_but_unsent_body_is_a_framing_error() -> io::Result<()> {
         let request = format!(
@@ -1452,6 +1459,27 @@ mod tests {
             Ok(_) => panic!("a truncated body was accepted"),
         }
         Ok(())
+    }
+
+    /// The body buffer tracks the bytes that arrived, not the declared length.
+    #[test]
+    fn declared_but_unsent_body_allocates_only_received_bytes() {
+        let mut body = Vec::new();
+        let result = read_body(
+            &mut std::io::Cursor::new(b"partial"),
+            MAX_BODY_BYTES,
+            &mut body,
+        );
+        assert!(
+            matches!(&result, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof),
+            "{result:?}"
+        );
+        assert_eq!(body, b"partial");
+        assert!(
+            body.capacity() < 64 * 1_024,
+            "a {MAX_BODY_BYTES}-byte declaration reserved {} bytes",
+            body.capacity()
+        );
     }
 
     /// The request-head budget must be enforced while bytes arrive, even if
