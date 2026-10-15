@@ -371,7 +371,7 @@ tests.
   protocol; it is evidence publication, not chainstate authority. It
   publishes a recovery fact only after the restored authoritative position is
   known; neither the warning store nor the marker may move chainstate. The
-  node crate keeps `RecoveryReporter` (`crates/node/src/state_storage.rs`) as
+  node crate keeps `RecoveryReporter` (`crates/node/src/state/storage.rs`) as
   the composition adapter implementing `IndexAheadSink` and
   `RollbackWarningSource` alongside the storage capabilities it adapts.
 - For checkpoint fallback and index-watermark-ahead evidence, the publisher
@@ -512,7 +512,7 @@ durable.
   cumulative transaction count, preserves the full-revalidation marker, and
   restarts at the retention limit before genesis without an applied tip
   (`RCV-02`).
-- `crates/storage/src/chainstate_journal/writer/tests/behavior_1.rs`:
+- `crates/storage/src/chainstate_journal/writer/tests/segment_lifecycle.rs`:
   - `recovery_progress_compaction_preserves_full_revalidation_marker` proves
     progress compaction leaves the sticky marker armed (`RCV-02`, `JW-MARK-2`);
   - `recovery_compaction_cannot_clear_an_append_gap` proves compaction cannot
@@ -544,7 +544,7 @@ durable.
   the legacy migration (`legacy_datadir_reconstructs_from_surviving_rows_not_the_requested_line`,
   `legacy_datadir_with_no_rows_falls_back_to_the_requested_line`).
 - Checkpoint publication and recovery:
-  `crates/chainstate/tests/unit/checkpoint/tests/` covers consensus-valid active-chain
+  `crates/chainstate/src/checkpoint/tests/` covers consensus-valid active-chain
   replay, applied-ancestry selection, competing-fork rejection, and
   immutable-generation resume, including
   `failed_publication_preserves_current`;

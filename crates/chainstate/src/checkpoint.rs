@@ -705,5 +705,4 @@ fn manifest_tip(tip: headers::HeaderCheckpointTip, chain_tx_count: u64) -> Check
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/checkpoint/tests/mod.rs"]
 mod tests;

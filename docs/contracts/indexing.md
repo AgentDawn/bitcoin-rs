@@ -339,7 +339,7 @@ Core/Kyoto runner are described in
   - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
   - `pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`
 - `crates/index/src/runtime/startup.rs` and
-  `crates/index/src/runtime/integration_tests.rs`: lifecycle
+  `crates/index/src/runtime/supervisor_tests.rs`: lifecycle
   publication, open failure/timeout, and shutdown abandonment.
 - `crates/index/src/runtime/query_tests.rs`: query gating, snapshot
   consistency, revision ABA detection, and

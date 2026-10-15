@@ -2589,10 +2589,10 @@ mod headers_presync;
 mod frontier_recovery;
 
 mod chain_sync;
+mod frontier_liveness;
 #[cfg(test)]
 mod frontier_model;
 mod head_sync;
-mod frontier_liveness;
 mod limited_peers;
 mod stale_tip;
 
