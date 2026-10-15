@@ -890,7 +890,4 @@ fn signet_info(network: Network) -> Option<SignetMiningInfo> {
 }
 
 #[cfg(test)]
-mod candidate_template_tests;
-
-#[cfg(test)]
-mod generation_key_tests;
+mod tests;

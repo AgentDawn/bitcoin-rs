@@ -4,7 +4,7 @@
 //! `CompactSize` transaction count. POL-05 keeps fee chunks indivisible and
 //! configured capacity inclusive.
 
-#[path = "common/fixtures.rs"]
+#[path = "support/fixtures.rs"]
 mod common;
 
 use std::error::Error;
