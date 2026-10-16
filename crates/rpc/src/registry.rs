@@ -83,6 +83,13 @@ const ZMQ_NOTIFS_HANDLER: Option<HandlerFn> = Some(util::getzmqnotifications);
 #[cfg(not(feature = "zmq"))]
 const ZMQ_NOTIFS_HANDLER: Option<HandlerFn> = None;
 
+#[cfg(feature = "silent-payments")]
+const BLOCK_TWEAKS_HANDLER: Option<HandlerFn> =
+    Some(crate::handlers::silent_payments::getblocktweaks);
+
+#[cfg(not(feature = "silent-payments"))]
+const BLOCK_TWEAKS_HANDLER: Option<HandlerFn> = None;
+
 /// Declares both `REGISTRY` and [`MANIFEST`] from one set of row literals
 /// so a method is declared and bound in a single source location.
 macro_rules! declare_rows {
@@ -143,6 +150,7 @@ macro_rules! declare_rows {
 }
 
 declare_rows! {
+    "getblocktweaks", SurfaceKind::Rpc, Status::Extension, "silent-payments", "", "Experimental keyless BIP352 extension; requires --silent-payments. One applied-chain height or hash per call, certified retained inputs, final publication check, one in-flight projection, and shared block-render permits. Source read budgets can refuse valid blocks; use another complete source for those blocks. No draft HTTP/gRPC compatibility or wallet discovery claim. See docs/silent-payments.md.", "0.14.0", BLOCK_TWEAKS_HANDLER;
     // -- JSON-RPC: shipped methods (registration order) --------------
     "getblockchaininfo", SurfaceKind::Rpc, Status::Deviation, "", CORE_VERSION, "Unavailable optional fields are omitted. Pruning mode/target and signet challenge are not reported (automatic_pruning, prune_target_size, signet_challenge); pruneheight reflects the backing prune service (crates/rpc/src/handlers/chain.rs).", "0.4.0", Some(chain::getblockchaininfo);
     "getdifficulty", SurfaceKind::Rpc, Status::ImplementedUnverified, "", CORE_VERSION, "", "0.4.0", Some(chain::getdifficulty);

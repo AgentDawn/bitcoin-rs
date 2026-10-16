@@ -56,6 +56,8 @@ no backend cargo feature (`g17_dependency_direction` proves both from
 
 ## Features
 
+- `silent-payments`: experimental `getblocktweaks` extension, separately enabled
+  at runtime with `--silent-payments`. See [usage and limits](../../docs/silent-payments.md).
 - `zmq`: gates ZMQ notification methods in the JSON-RPC registry. The crate
   defines and forwards no storage-backend features (`ARCH-04`).
 

@@ -105,6 +105,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
+| `getblocktweaks` | 0.14.0 | Experimental keyless BIP352 extension; requires --silent-payments. One applied-chain height or hash per call, certified retained inputs, final publication check, one in-flight projection, and shared block-render permits. Source read budgets can refuse valid blocks; use another complete source for those blocks. No draft HTTP/gRPC compatibility or wallet discovery claim. See docs/silent-payments.md. |
 | `getcapabilities` | 0.4.0 | bitcoin-rs reporting of compiled/enabled concrete service capabilities and index lifecycle state (crates/rpc/src/handlers/chain.rs, crates/index/src/capabilities.rs). |
 
 ### Unimplemented
@@ -239,4 +240,4 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `rawtx` | 0.4.0 | Requires the zmq feature and a --zmqpubrawtx endpoint. |
 | `sequence` | 0.4.0 | Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/rpc/src/zmq.rs). |
 
-Row counts: Supported 0, Deviation 31, Implemented (unverified) 57, Extension 2, Disabled 0, Unimplemented 85 - total 175.
+Row counts: Supported 0, Deviation 31, Implemented (unverified) 57, Extension 3, Disabled 0, Unimplemented 85 - total 176.

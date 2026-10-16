@@ -275,6 +275,8 @@ pub use bitcoin_rs_index::{
 /// storage backend or backend engine type, and production wiring attaches
 /// nothing to a constructed `Context` afterwards.
 pub struct ContextHandles {
+    /// Enable the compiled experimental keyless tweak service. No wallet state.
+    pub silent_payments: bool,
     /// Chain capability: tips, block log, UTXO set, block tree, transition
     /// barrier, and the chain-owned control surfaces.
     pub chain: ChainHandles,
@@ -482,6 +484,8 @@ pub struct MiningHandles {
 /// and the listener bind epoch). Handlers read capabilities through the
 /// groups; production wiring attaches nothing after construction.
 pub struct Context {
+    #[cfg(feature = "silent-payments")]
+    pub(crate) silent_payments: Option<Mutex<()>>,
     /// Chain capability: tips, block log, UTXO set, block tree, transition
     /// barrier, and the chain-owned control surfaces.
     pub chain: ChainHandles,
@@ -613,6 +617,7 @@ impl Default for ContextHandles {
     /// wiring supplies every capability it owns.
     fn default() -> Self {
         Self {
+            silent_payments: false,
             chain: ChainHandles::default(),
             mempool: MempoolHandles::default(),
             indexes: IndexHandles::default(),
@@ -674,6 +679,7 @@ impl Context {
     #[must_use]
     pub fn from_handles(handles: ContextHandles) -> Self {
         let ContextHandles {
+            silent_payments,
             chain,
             mempool,
             indexes,
@@ -682,7 +688,11 @@ impl Context {
             zmq_publisher,
             debug_log_path,
         } = handles;
+        #[cfg(not(feature = "silent-payments"))]
+        let _ = silent_payments;
         Self {
+            #[cfg(feature = "silent-payments")]
+            silent_payments: silent_payments.then(|| Mutex::new(())),
             chain,
             mempool,
             indexes,
@@ -756,6 +766,8 @@ impl Context {
     }
 
     /// Acquires a bounded full-block render slot, if one is available.
+    /// Full-body responses retain it through rendering. The tweak adapter drops
+    /// its source first; its single-work slot still bounds derived JSON rendering.
     pub(crate) fn try_acquire_block_render(&self) -> Option<BlockRenderPermit> {
         self.block_render_budget.try_acquire()
     }
