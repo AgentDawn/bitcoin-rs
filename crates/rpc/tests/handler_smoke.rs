@@ -275,7 +275,7 @@ fn network_and_wallet_expectations(
             json!({"complete": false, "psbt": psbt, "hex": null}),
         ),
         ("combinepsbt", json!([[psbt]]), json!(psbt)),
-        // No block verifier is wired, so the chain cannot be declared verified.
+        // This synthetic block does not satisfy its declared proof of work.
         ("verifychain", json!([]), json!(false)),
         ("getmininginfo", json!([]), json!({"chain": "regtest"})),
         (
@@ -961,8 +961,12 @@ struct SingleBlockSource {
 }
 
 impl BlockBodySource for SingleBlockSource {
-    fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
-        (height == self.height && hash == self.hash).then(|| self.body.clone())
+    fn block_body(
+        &self,
+        height: u32,
+        hash: BlockHash,
+    ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+        Ok((height == self.height && hash == self.hash).then(|| self.body.clone()))
     }
 }
 

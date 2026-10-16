@@ -54,7 +54,11 @@ impl IndexBlockSource {
     /// Returns the stored body bytes for the block identified by height and
     /// hash, or `None` when no body store is attached or the body is absent.
     pub fn block_body_bytes_for(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
-        self.block_body_source.as_ref()?.block_body(height, hash)
+        self.block_body_source
+            .as_ref()?
+            .block_body(height, hash)
+            .ok()
+            .flatten()
     }
 
     pub(super) fn resolve_block_by_hash(&self, height: u32, active_hash: Hash256) -> Option<Block> {

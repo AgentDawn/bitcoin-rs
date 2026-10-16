@@ -1056,6 +1056,8 @@ impl ChainHandles {
         self.block_body_source
             .as_ref()?
             .block_body(record.height, record.hash)
+            .ok()
+            .flatten()
     }
 
     /// Bytes the node's block storage occupies on disk, when it can say.
@@ -2462,12 +2464,17 @@ pub(crate) struct BlockBodies {
 
 #[cfg(test)]
 impl BlockBodySource for BlockBodies {
-    fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
-        self.bodies
+    fn block_body(
+        &self,
+        height: u32,
+        hash: BlockHash,
+    ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+        Ok(self
+            .bodies
             .iter()
             .find(|(candidate_height, candidate_hash, _)| {
                 *candidate_height == height && *candidate_hash == hash
             })
-            .map(|(_, _, body)| body.clone())
+            .map(|(_, _, body)| body.clone()))
     }
 }

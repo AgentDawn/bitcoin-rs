@@ -162,6 +162,40 @@ scanning and wallet interoperability remain unverified.
   allocation. Unsupported custom stores must implement the bounded reads
   before serving this capability.
 
+#### Block database verification
+
+- `verifychain` captures one applied publication, excluding genesis from the
+  window. Defaults remain level 3 and six blocks; a nonpositive depth means
+  all applied descendants and a larger depth is clipped to the applied height.
+  Signed 32-bit parameters are required; levels are clamped to 0–4.
+- Every requested body is read and decoded, including level 0. Its header must
+  match the captured ancestry and satisfy the chain owner's proof-of-work check.
+  Levels 1–4 additionally check the Merkle root and mutation rule. Corrupt bytes,
+  mismatched headers, invalid work or failed Merkle checks return `false`.
+- `chain::BlockBodySource` preserves read errors separately from unavailable
+  bodies. An absent body may be pruned, absent from snapshot history, or missing
+  unexpectedly; absence alone does not establish corruption. Unavailable bodies
+  or ancestry, absent readers, and read errors return RPC `-1` with an incomplete
+  verification reason, even if an available suffix already passed. No requested
+  block is silently skipped. Snapshot history is checked only when available.
+- The scan holds no tree or chain-transition guard during body reads. The existing
+  transition boundary fences publication checks; a replaced publication, recovery
+  closure or shutdown returns `-1`. Shutdown is checked between reads and while
+  waiting for tree/transition guards. A storage read already in progress must return
+  before cancellation can be observed. The existing blocking-call budget applies.
+- This is a read-only integrity check: it never changes the UTXO set, rewrites
+  bodies, repairs storage, or advances a durable root. Full transaction validity,
+  level-2 undo checks and level-3/4 disconnect/reconnect verification remain
+  unimplemented. `Deviation` stays in the registry: Core returns `false` for
+  incomplete verification where this implementation reports a reason via `-1`;
+  excess arguments retain the local `-32602` shape error.
+- Evidence: `handlers::chain::verifychain_tests` covers corruption, depth, read
+  failure, unavailable/snapshot history, shutdown and changed publications.
+  `overhaul_process_harness::verifychain_reads_the_requested_window_and_preserves_state`
+  compares the pinned Core daemon and bitcoin-rs on common blocks, parameter
+  errors and deliberately corrupted isolated block files. This is not proof of
+  the omitted higher-level checks or full AssumeUTXO/pruning lifecycle parity.
+
 #### Native deployment reporting
 
 - `getdeploymentinfo` and `/rest/deploymentinfo` share one typed projection

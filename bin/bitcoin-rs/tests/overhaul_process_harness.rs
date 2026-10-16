@@ -109,6 +109,150 @@ fn start(binary: Kind) -> ProcessNode {
     .expect("public process must start")
 }
 
+/// API-02: verification must inspect its requested bodies without repairing them.
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one common-chain fixture owns parameter parity, corruption injection and state preservation"
+)]
+fn verifychain_reads_the_requested_window_and_preserves_state() {
+    use std::io::{Seek as _, SeekFrom};
+
+    let mut core = ProcessNode::spawn_with(
+        Kind::Core,
+        &SpawnOptions {
+            extra_args: &["-blocksxor=0"],
+            ..Default::default()
+        },
+    )
+    .expect("pinned Core with readable isolated block files");
+    let mut node = start(Kind::BitcoinRs);
+    assert_eq!(
+        compare_rpc(&mut core, &mut node, "verifychain", &json!([0, 0])).expect("genesis"),
+        json!(true)
+    );
+    let funds = mine_common_chain(&mut core, &mut node, 8).expect("common verification window");
+    for params in [
+        json!([]),
+        json!([0, 0]),
+        json!([1, 1]),
+        json!([2, 0]),
+        json!([4, -1]),
+        json!([-1, 100]),
+        json!([5, 0]),
+        json!([null, null]),
+    ] {
+        assert_eq!(
+            compare_rpc(&mut core, &mut node, "verifychain", &params)
+                .expect("valid parameter parity"),
+            json!(true)
+        );
+    }
+    for params in [
+        json!(["0"]),
+        json!([0, false]),
+        json!([2_147_483_648_i64]),
+        json!([0, -2_147_483_649_i64]),
+        json!([0, 0.5]),
+    ] {
+        let reference = core
+            .rpc("verifychain", &params)
+            .expect_err("Core rejects invalid parameter");
+        let candidate = node
+            .rpc("verifychain", &params)
+            .expect_err("candidate rejects invalid parameter");
+        let (Error::Rpc { code: expected, .. }, Error::Rpc { code: actual, .. }) =
+            (reference, candidate)
+        else {
+            panic!("expected RPC errors for {params}");
+        };
+        assert_eq!(actual, expected, "error code for {params}");
+    }
+
+    let original = &funds.common_block_bytes[0];
+    let mut changed: bitcoin::Block = bitcoin::consensus::deserialize(original).expect("block one");
+    changed.txdata[0].output[0].value = bitcoin::Amount::from_sat(1);
+    let changed = bitcoin::consensus::serialize(&changed);
+    assert_eq!(changed.len(), original.len());
+    let value_offset = changed
+        .iter()
+        .zip(original)
+        .position(|(a, b)| a != b)
+        .expect("changed amount");
+    for (mut process, relative) in [
+        (core, "regtest/blocks/blk00000.dat"),
+        (node, "node/blocks/blk00000.dat"),
+    ] {
+        let datadir = process.take_datadir().expect("isolated datadir custody");
+        let path = datadir.path().join(relative);
+        let bytes = std::fs::read(&path).expect("isolated block file");
+        let position = bytes
+            .windows(original.len())
+            .position(|body| body == original)
+            .expect("common block in file");
+        let tip = process
+            .rpc("getbestblockhash", &json!([]))
+            .expect("applied tip before verification");
+        let coins = process
+            .rpc("gettxoutsetinfo", &json!(["hash_serialized_3"]))
+            .expect("coins before verification");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("test fault injection");
+        // Corrupt an older transaction, then its stored header. The one-block
+        // suffix stays healthy, but a full-window verification must find both.
+        for (offset, level) in [(value_offset, 2), (0, 0)] {
+            let location = u64::try_from(position + offset).expect("file offset");
+            file.seek(SeekFrom::Start(location)).expect("seek fault");
+            file.write_all(&[original[offset] ^ 1])
+                .expect("write fault");
+            file.sync_all().expect("persist test fault");
+            assert_eq!(
+                process
+                    .rpc("verifychain", &json!([level, 1]))
+                    .expect("healthy suffix"),
+                json!(true)
+            );
+            assert_eq!(
+                process
+                    .rpc("verifychain", &json!([level, 0]))
+                    .expect("corrupt full window"),
+                json!(false)
+            );
+            assert_eq!(
+                process
+                    .rpc("getbestblockhash", &json!([]))
+                    .expect("unchanged tip"),
+                tip
+            );
+            let after = process
+                .rpc("gettxoutsetinfo", &json!(["hash_serialized_3"]))
+                .expect("unchanged coins");
+            assert_eq!(after["hash_serialized_3"], coins["hash_serialized_3"]);
+            assert_eq!(
+                std::fs::read(&path).expect("unrepaired bytes")[position + offset],
+                original[offset] ^ 1
+            );
+            file.seek(SeekFrom::Start(location)).expect("seek restore");
+            file.write_all(&[original[offset]])
+                .expect("restore fixture byte");
+            file.sync_all().expect("persist fixture restoration");
+        }
+        assert_eq!(
+            process
+                .rpc("verifychain", &json!([2, 0]))
+                .expect("restored fixture"),
+            json!(true)
+        );
+        drop(file);
+        process
+            .stop()
+            .expect("stop before removing isolated datadir");
+        drop(datadir);
+    }
+}
+
 /// API-01/API-02: Core 31.1 omits inapplicable pruning and signet fields.
 /// The optional compact-filter RPC must remain unavailable until enabled.
 #[test]

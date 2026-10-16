@@ -988,59 +988,142 @@ pub(crate) fn invalidateblock(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     }
 }
 
-pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the read-only walk and its cancellation/publication fence in one owner"
+)]
+pub(crate) fn verifychain(
+    ctx: &Arc<Context>,
+    params: &Value,
+    cancellation: &bitcoin_rs_chain::LatchReader,
+) -> Result<Value, RpcError> {
+    super::ensure_at_most_params(params, 2)?;
     let array = params_array(params)?;
-    let checklevel = array.first().and_then(JsonValueTrait::as_u64).unwrap_or(3);
-    let nblocks_param = array.get(1).and_then(JsonValueTrait::as_u64).unwrap_or(6);
-    let Ok(nblocks) = u32::try_from(nblocks_param) else {
-        return Err(RpcError::InvalidParams("nblocks exceeds u32"));
-    };
-    if checklevel == 0 {
-        // Bitcoin Core: checklevel 0 reads blocks from disk without per-block verification.
-        // bitcoin-rs reports pass since this v1 doesn't surface block-read failures here.
-        return typed_to_sonic(&v31::VerifyChain(true));
-    }
-    let tree = ctx.chain.block_tree.read();
-    let Some(applied) = ctx.chain.applied_tip.load_full() else {
-        return typed_to_sonic(&v31::VerifyChain(true));
-    };
-    let mut cursor = applied.tip_id;
-    let mut checked: u32 = 0;
-    loop {
-        if checked >= nblocks {
-            break;
-        }
-        let Ok(node) = tree.node(cursor) else {
-            return typed_to_sonic(&v31::VerifyChain(false));
+    let parameter = |index: usize, name, default: i32| {
+        let Some(value) = array.get(index).filter(|value| !value.is_null()) else {
+            return Ok(default);
         };
-        // L1+: PoW self-consistency check.
-        if !compact_target_met_by(node.header.bits, node.header.compute_hash().0) {
-            return typed_to_sonic(&v31::VerifyChain(false));
+        if !value.is_number() {
+            return Err(super::wrong_type(index + 1, name, value, "number"));
         }
-        // L2+: Merkle-root sanity when block body is available. Absent blocks
-        // (header-only / pruned) skip the merkle check.
-        if checklevel >= 2 {
-            if let Some(record) = ctx.chain.block_by_hash(node.hash) {
-                if let Some(bytes) = ctx.chain.block_body_bytes(&record) {
-                    if let Ok(block) = deserialize::<Block>(&bytes) {
-                        let txids = block.txids();
-                        if !bitcoin_rs_consensus::verify_block::block_merkle_root_matches_txids(
-                            &block, &txids,
-                        ) {
-                            return typed_to_sonic(&v31::VerifyChain(false));
-                        }
-                    }
+        value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| RpcError::Misc("JSON integer out of range".to_owned()))
+    };
+    let checklevel = parameter(0, "checklevel", 3)?.clamp(0, 4);
+    let requested = parameter(1, "nblocks", 6)?;
+    let stable_read = || loop {
+        if cancellation.is_triggered() {
+            return Err(RpcError::Misc("Block verification interrupted".to_owned()));
+        }
+        if let Some(guard) = ctx
+            .chain
+            .chain_transition
+            .try_lock_for(std::time::Duration::from_millis(50))
+        {
+            return Ok(guard);
+        }
+    };
+    let applied = {
+        let _guard = stable_read()?;
+        ctx.chain.applied_tip.load_full()
+    };
+    let applied_height = applied.as_ref().map_or(0, |tip| tip.height);
+    // The window excludes genesis. A nonpositive depth selects every applied
+    // descendant, never the header-only best chain.
+    let depth = if requested <= 0 {
+        applied_height
+    } else {
+        applied_height.min(requested.unsigned_abs())
+    };
+    // Storage I/O holds neither the tree nor transition lock. Recheck under
+    // the existing transition boundary before work and before reporting success.
+    let check_current = || {
+        let _guard = stable_read()?;
+        if cancellation.is_triggered() {
+            return Err(RpcError::Misc("Block verification interrupted".to_owned()));
+        }
+        if ctx.chain.closed_for_recovery.is_triggered() {
+            return Err(RpcError::Misc(
+                "Chainstate is unavailable for verification".to_owned(),
+            ));
+        }
+        let current = ctx.chain.applied_tip.load_full();
+        let unchanged = match (&applied, &current) {
+            (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            return Err(RpcError::Misc(
+                "Active chain changed during block verification; retry".to_owned(),
+            ));
+        }
+        Ok(())
+    };
+    let mut cursor = applied.as_ref().map(|tip| tip.tip_id);
+    let mut expected_hash = applied.as_ref().map_or_else(
+        || ctx.chain.chain_network.genesis_block_hash(),
+        |tip| tip.hash,
+    );
+    for offset in 0..depth {
+        check_current()?;
+        let height = applied_height - offset;
+        let (header, parent) = {
+            let tree = loop {
+                if let Some(tree) = ctx
+                    .chain
+                    .block_tree
+                    .try_read_for(std::time::Duration::from_millis(50))
+                {
+                    break tree;
                 }
-            }
-        }
-        // L3+: behaves as L2 in this v1 — a future strand wires per-tx structural
-        // checks (e.g., max-size, witness sanity). L4 (full UTXO replay) is deferred.
-        checked = checked.saturating_add(1);
-        let Some(parent_id) = node.parent else {
-            break;
+                check_current()?;
+            };
+            let node = cursor
+                .and_then(|id| tree.node(id).ok())
+                .filter(|node| node.height == height && node.hash == expected_hash)
+                .ok_or_else(|| {
+                    RpcError::Misc(
+                        "Applied block ancestry unavailable; verification incomplete".to_owned(),
+                    )
+                })?;
+            (node.header, node.parent)
         };
-        cursor = parent_id;
+        let source = ctx.chain.block_body_source.as_ref().ok_or_else(|| {
+            RpcError::Misc("Block body reader unavailable; verification incomplete".to_owned())
+        })?;
+        let body = source.block_body(height, expected_hash.into());
+        check_current()?;
+        let bytes = body.map_err(|error| {
+            RpcError::Misc(format!("Unable to read block at height {height}: {error}"))
+        })?.ok_or_else(|| RpcError::Misc(format!(
+            "Block data unavailable at height {height}; verification incomplete (history may be pruned or absent after snapshot import)"
+        )))?;
+        let Ok(block) = deserialize::<Block>(&bytes) else {
+            tracing::warn!(height, "verifychain: stored block body is corrupt");
+            return typed_to_sonic(&v31::VerifyChain(false));
+        };
+        // Core's level-zero disk reader also authenticates the header and PoW.
+        if block.header != header
+            || block.block_hash().0 != expected_hash
+            || bitcoin_rs_chain::validate_pow(&header, expected_hash, ctx.chain.chain_network)
+                .is_err()
+            || (checklevel >= 1
+                && bitcoin_rs_consensus::verify_block::verify_merkle_root_with_txids(
+                    &block,
+                    &block.txids(),
+                )
+                .is_err())
+        {
+            tracing::warn!(height, "verifychain: stored block validation failed");
+            return typed_to_sonic(&v31::VerifyChain(false));
+        }
+        expected_hash = header.prev_blockhash.into();
+        cursor = parent;
     }
+    check_current()?;
     typed_to_sonic(&v31::VerifyChain(true))
 }
 
@@ -1848,35 +1931,6 @@ fn next_applied_block_hash(ctx: &Context, view: &AppliedView, height: u32) -> Op
     Some(BlockHash::from(node.hash))
 }
 
-/// WHY-local: the chain crate's compact-target helpers are `pub(crate)`, and
-/// this crate must not grow a dependency to reach them. `verifychain` only
-/// needs the `PoW` self-consistency verdict the old `validate_pow` call made:
-/// decode `bits` into a 256-bit target and compare the header hash against it
-/// (both read as little-endian integers, as consensus does).
-fn compact_target_met_by(bits: CompactTarget, hash: Hash256) -> bool {
-    let bits = bits.to_consensus();
-    let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
-    let mantissa = u64::from(bits & 0x007f_ffff);
-    // A zero mantissa or a negative sign bit decodes to a zero target, and an
-    // exponent past 32 bytes overflows the 256-bit range; none are meetable.
-    if mantissa == 0 || bits & 0x0080_0000 != 0 || exponent > 32 {
-        return false;
-    }
-    let mut target = [0_u8; 32];
-    let mantissa_bytes = mantissa.to_le_bytes();
-    let start = exponent - 3;
-    target[start..start + 3].copy_from_slice(&mantissa_bytes[..3]);
-    let hash_bytes = hash.to_le_bytes();
-    hash_bytes
-        .iter()
-        .rev()
-        .zip(target.iter().rev())
-        .map(|(hash_byte, target_byte)| hash_byte.cmp(target_byte))
-        .find(|ordering| *ordering != core::cmp::Ordering::Equal)
-        .unwrap_or(core::cmp::Ordering::Equal)
-        != core::cmp::Ordering::Greater
-}
-
 fn decode_header(record: &BlockRecord) -> Result<Header, RpcError> {
     let Some(bytes) = record.header_bytes() else {
         return Err(RpcError::Internal(
@@ -1931,10 +1985,14 @@ mod tests {
     use crate::context::BlockBodies;
 
     impl bitcoin_rs_chain::BlockBodySource for SingleBlockSource {
-        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
+        fn block_body(
+            &self,
+            height: u32,
+            hash: BlockHash,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
             self.calls
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            (height == self.height && hash == self.hash).then(|| self.body.clone())
+            Ok((height == self.height && hash == self.hash).then(|| self.body.clone()))
         }
     }
 
@@ -2237,9 +2295,13 @@ mod tests {
         }
 
         impl bitcoin_rs_chain::BlockBodySource for SingleBlockSource {
-            fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
+            fn block_body(
+                &self,
+                height: u32,
+                hash: BlockHash,
+            ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
-                (height == self.height && hash == self.hash).then(|| self.body.clone())
+                Ok((height == self.height && hash == self.hash).then(|| self.body.clone()))
             }
         }
 
@@ -3192,8 +3254,12 @@ mod tests {
         struct SizedStore(u64);
 
         impl bitcoin_rs_chain::BlockBodySource for SizedStore {
-            fn block_body(&self, _height: u32, _hash: BlockHash) -> Option<Vec<u8>> {
-                None
+            fn block_body(
+                &self,
+                _height: u32,
+                _hash: BlockHash,
+            ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+                Ok(None)
             }
             fn disk_usage(&self) -> Option<u64> {
                 Some(self.0)
@@ -4433,26 +4499,7 @@ mod getchaintips_tests {
 }
 
 #[cfg(test)]
-mod verifychain_tests {
-    use alloc::sync::Arc;
-
-    use super::*;
-
-    #[test]
-    fn verifychain_accepts_core_parameters_and_refuses_oversized_nblocks() {
-        let ctx = Arc::new(Context::new());
-        for params in [json!([]), json!([3, 6]), json!([0, 6]), json!([4, 0])] {
-            let result = verifychain(&ctx, &params)
-                .unwrap_or_else(|err| panic!("verifychain{params:?} failed: {err}"));
-            assert_eq!(result.as_bool(), Some(true), "{params:?}");
-        }
-
-        match verifychain(&ctx, &json!([3, u64::from(u32::MAX) + 1])) {
-            Ok(value) => panic!("oversized nblocks succeeded: {value:?}"),
-            Err(err) => assert_eq!(err.to_string(), "invalid params: nblocks exceeds u32"),
-        }
-    }
-}
+mod verifychain_tests;
 
 fn compute_branchlen(
     tree: &bitcoin_rs_chain::BlockTree,
