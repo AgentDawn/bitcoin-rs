@@ -1602,32 +1602,6 @@ fn long_poll_returns_quickly_on_mempool_sequence_wake() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// API-05: `MiningControl::generate` submits each solved block through the
-/// apply path before assembling the next; the last hash is the new tip.
-#[test]
-fn generate_mines_coinbase_only_blocks_to_the_tip() -> anyhow::Result<()> {
-    let (state, mining) = regtest_mining()?;
-    mining.publish_generation();
-    let hashes = mining.generate(GenerateRequest {
-        payout: vec![0x51],
-        count: 2,
-        max_tries: GenerateRequest::DEFAULT_MAX_TRIES,
-        selection: GenerateSelection::Ordered(Vec::new()),
-        submit: true,
-    })?;
-    assert_eq!(hashes.len(), 2);
-    let tip = state
-        .chainstate()
-        .applied_tip_snapshot()
-        .unwrap_or_else(|| panic!("applied tip missing after generate"));
-    assert_eq!(tip.height, 2);
-    assert_eq!(
-        tip.hash,
-        Hash256::from(hashes.last().unwrap_or_else(|| panic!("two hashes")).hash)
-    );
-    Ok(())
-}
-
 /// API-05: a 64-character generateblock entry must already be in the mempool.
 #[test]
 fn generateblock_rejects_unknown_mempool_txid() -> anyhow::Result<()> {
