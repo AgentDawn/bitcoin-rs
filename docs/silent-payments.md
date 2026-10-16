@@ -91,32 +91,36 @@ The receiver performs ECDH and discovery locally.
 The codec's 29 receiving-vector projections and pinned Python reference run are
 recorded in [vector provenance](../crates/index/tests/data/bip352-PROVENANCE.md).
 The adapter's owner-local tests cover unavailable history, read failures,
-publication/recovery races, activation, selection, IBD and backpressure. The
+publication/recovery races, IBD and backpressure. The
 `bin/bitcoin-rs/tests/silent_payments.rs` ProcessNode case applies a signed mature
-P2PKH spend with 11,000 P2TR candidates and checks the exact tweak and every
-candidate through authenticated HTTP, reorg and restart. The shared signed-spend
-fixture lives in `tests/support/silent_payment_spend.rs`. Source commit/recovery
-and lease tests remain with `crates/chainstate/tests/unit/block_spends_tests.rs`.
+P2PKH spend with three P2TR candidates and checks the exact tweak and each
+candidate through authenticated HTTP, reorg and restart. The 100 funding blocks
+are required for coinbase maturity. Source commit/recovery and lease tests remain
+with `crates/chainstate/tests/unit/block_spends_tests.rs`. A recorded run at
+`12116e7390fc88d3f3dcbe570f051152c864716b` passed with 11,000 candidates
+(1,893,440 WU); that large-output case is outside the default CI scenario.
 
-The separate `silent_payments_interop` target runs unmodified
+A recorded standalone REST probe ran unmodified
 [BlindBit Oracle](https://github.com/setavenger/blindbit-oracle/blob/f9ab7fd8bc35467c492324f743ba1b69049a2bb6/internal/server/README.md),
 pinned to `f9ab7fd8bc35467c492324f743ba1b69049a2bb6`, through existing REST.
-It needs no native tweak feature or runtime option. Oracle consumes
+It used no native tweak feature or runtime option. Oracle consumed
 `/rest/chaininfo.json`, `/rest/blockhashbyheight/101.bin`,
 `/rest/block/<hash>.bin` and `/rest/spenttxouts/<hash>.bin`. Its `/tweaks/101`
-must publish the confirmed block hash and independently expected nonempty tweak.
-Configuration, logs and response land in `target/process-harness/e2e/run-*/blindbit*`.
+published the confirmed block hash and independently expected nonempty tweak.
+The recorded configuration, logs and response were stored in `target/process-harness/e2e/run-*/blindbit*`.
 The pinned binary passed the REST probe on 2026-10-16 under WSL/Linux
 (Go 1.25.0, Rust 1.99.0); its SHA256 was
 `0d386c6920ed3582c38b9f541cf9e57c761e3c9979c63f07193ad42af6bde4f4`.
 
-Run this external evidence target explicitly (Go and a C compiler required):
+The Oracle runner is not part of this PR's active tests. Reproduce the recorded
+probe from its immutable historical checkout (Go and a C compiler required):
 
 ```sh
 git clone https://github.com/setavenger/blindbit-oracle target/consumer-evidence/blindbit-oracle
 git -C target/consumer-evidence/blindbit-oracle checkout --detach f9ab7fd8bc35467c492324f743ba1b69049a2bb6
 go -C target/consumer-evidence/blindbit-oracle build -o ../blindbit-oracle-bin ./cmd/blindbit-oracle
-BLINDBIT_ORACLE="$PWD/target/consumer-evidence/blindbit-oracle-bin" cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test silent_payments_interop -- --ignored
+git worktree add --detach target/consumer-evidence/l1-rest 12116e7390fc88d3f3dcbe570f051152c864716b
+BLINDBIT_ORACLE="$PWD/target/consumer-evidence/blindbit-oracle-bin" cargo test --manifest-path target/consumer-evidence/l1-rest/Cargo.toml --locked -p bitcoin-rs --no-default-features --features fjall --test silent_payments_interop -- --ignored
 ```
 
 This proves the L1 REST-to-sidecar path. The probe pays a P2TR candidate, not a

@@ -40,7 +40,7 @@ surface = "BIP352 public scan codec and getblocktweaks RPC extension"
 core_reference = "BIP352 v0; not a Bitcoin Core RPC"
 status = "experimental"
 representative_consumer = "REST sidecar verified: BlindBit Oracle f9ab7fd8bc35467c492324f743ba1b69049a2bb6; native RPC consumer and funded wallet discovery unverified"
-evidence = "Pinned BIP352 vectors, adapter failure/publication tests and signed-spend HTTP reorg/restart coverage. Separate silent_payments_interop verifies the unmodified Oracle's exact block/tweak result through existing REST without the native tweak feature. Source budgets can refuse valid blocks; wallet discovery and native RPC benefit remain unverified. See docs/silent-payments.md for provenance, reproducer and coverage limits."
+evidence = "Pinned BIP352 vectors, adapter failure/publication tests and signed-spend HTTP reorg/restart coverage. A recorded unmodified Oracle run verified the exact block/tweak result through existing REST without the native tweak feature; its historical reproducer is documented separately. Source budgets can refuse valid blocks; wallet discovery and native RPC benefit remain unverified. See docs/silent-payments.md for provenance, reproducer and coverage limits."
 
 [[row]]
 surface = "P2P v1 wire protocol"

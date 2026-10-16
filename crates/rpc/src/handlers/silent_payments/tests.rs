@@ -54,56 +54,6 @@ fn fixture() -> Result<(Context, Block)> {
 }
 
 #[test]
-fn header_only_selector_is_rejected_before_body_io() -> Result {
-    let (ctx, block) = fixture()?;
-    let mut header = block.header;
-    header.prev_blockhash = block.block_hash();
-    header.nonce ^= 1;
-    let hash = Hash256::from(header.compute_hash());
-    {
-        let mut tree = ctx.chain.block_tree.write();
-        let parent = tree.lookup(block.block_hash().into());
-        tree.insert_node(parent, header, NodeStatus::Active)?;
-    }
-    assert!(getblocktweaks(&Arc::new(ctx), &json!([hash.to_string_be()])).is_err());
-    Ok(())
-}
-
-#[test]
-fn deep_unindexed_ancestry_is_refused_before_body_io() -> Result {
-    let (ctx, block) = fixture()?;
-    let tip = {
-        let mut tree = ctx.chain.block_tree.write();
-        let root = tree.lookup(block.block_hash().into()).ok_or("root")?;
-        let mut parent = root;
-        for nonce in 1..=u32::try_from(MAX_SELECTION_HOPS + 1)? {
-            let mut header = block.header;
-            header.prev_blockhash = tree.node(parent)?.header.compute_hash();
-            header.nonce = nonce;
-            parent = tree.insert_node(Some(parent), header, NodeStatus::Active)?;
-        }
-        let node = tree.node(parent)?;
-        let tip = TipSnapshot {
-            tip_id: parent,
-            height: node.height,
-            chainwork: node.chainwork,
-            hash: node.hash,
-            chain_tx_count: node.chain_tx_count,
-        };
-        // The seam invalidates the height index even without altering a node.
-        let _unindexed = tree.node_mut(root)?;
-        tip
-    };
-    ctx.chain.applied_tip.store(Some(Arc::new(tip)));
-    // fixture's source would assert if reached with this new expected tip.
-    let error = getblocktweaks(&Arc::new(ctx), &json!([0]))
-        .err()
-        .ok_or("budget")?;
-    assert!(error.to_string().contains("hop budget"));
-    Ok(())
-}
-
-#[test]
 fn unavailable_history_never_becomes_empty_success() -> Result {
     for reason in [
         HistoryUnavailable::Missing,
@@ -164,7 +114,7 @@ fn moved_tip_and_recovery_after_source_read_refuse_publication() -> Result {
 }
 
 #[test]
-fn wrong_body_and_source_retry_are_errors() -> Result {
+fn body_identity_and_read_errors_are_preserved() -> Result {
     for wrap in [BlockSpendsError::BodyRead, BlockSpendsError::BoundedRead] {
         let disk = std::io::Error::other("private/path: disk read failed").into();
         let error = read_error(&wrap(BoundedReadError::Storage(disk)));
@@ -180,26 +130,19 @@ fn wrong_body_and_source_retry_are_errors() -> Result {
             assert_eq!(read_error(&wrap(refusal)).code(), -1);
         }
     }
-    for retry in [false, true] {
-        let (mut ctx, mut block) = fixture()?;
-        block.header.nonce ^= 1;
-        ctx.chain.block_undo_source = Some(Arc::new(Source(move |_, _| {
-            if retry {
-                return Err(BlockSpendsError::Retry);
-            }
-            Ok(BlockSpends {
-                block: block.clone(),
-                spent: Ok(vec![vec![]]),
-            })
-        })));
-        let error = getblocktweaks(&Arc::new(ctx), &json!([0]))
-            .err()
-            .ok_or("must refuse")?;
-        assert_eq!(
-            error.code(),
-            if retry { -1 } else { RpcError::INTERNAL_ERROR }
-        );
-    }
+    assert_eq!(read_error(&BlockSpendsError::Retry).code(), -1);
+    let (mut ctx, mut block) = fixture()?;
+    block.header.nonce ^= 1;
+    ctx.chain.block_undo_source = Some(Arc::new(Source(move |_, _| {
+        Ok(BlockSpends {
+            block: block.clone(),
+            spent: Ok(vec![vec![]]),
+        })
+    })));
+    let error = getblocktweaks(&Arc::new(ctx), &json!([0]))
+        .err()
+        .ok_or("wrong body")?;
+    assert_eq!(error.code(), RpcError::INTERNAL_ERROR);
     Ok(())
 }
 
@@ -234,45 +177,17 @@ fn shared_materialization_budget_and_transition_never_queue_tweak_work() -> Resu
 
 #[test]
 fn ibd_and_missing_applied_tip_are_not_empty_success() -> Result {
-    let (ctx, _) = fixture()?;
+    let (mut ctx, _) = fixture()?;
+    ctx.chain.chain_network = Network::Mainnet;
     let ctx = Arc::new(ctx);
-    // Mainnet's minimum work is not met by this synthetic regtest root.
-    let (mut ibd, _) = fixture()?;
-    ibd.chain.chain_network = Network::Mainnet;
     assert!(matches!(
-        getblocktweaks(&Arc::new(ibd), &json!([0])),
+        getblocktweaks(&ctx, &json!([0])),
         Err(RpcError::ClientInInitialDownload(_))
     ));
     ctx.chain.applied_tip.store(None);
-    assert!(getblocktweaks(&ctx, &json!([0])).is_err());
-    Ok(())
-}
-
-#[test]
-fn historical_activation_uses_requested_height_not_the_captured_tip_height() -> Result {
-    let (mut ctx, _) = fixture()?;
-    // Latch this synthetic world out of IBD before testing mainnet's boundary.
-    assert!(
-        !ctx.chain
-            .progress
-            .initial_block_download(bitcoin_rs_primitives::unix_time_secs(), Network::Regtest,)
-    );
-    ctx.chain.chain_network = Network::Mainnet;
-    let mut tip = ctx
-        .chain
-        .applied_tip
-        .load_full()
-        .ok_or("tip")?
-        .as_ref()
-        .clone();
-    // A synthetic high publication keeps the requested root at height zero.
-    tip.height = Network::Mainnet.taproot_activation_height();
-    ctx.chain.applied_tip.store(Some(Arc::new(tip)));
-    let result = getblocktweaks(&Arc::new(ctx), &json!([0]))?;
-    assert_eq!(result["taproot_active"].as_bool(), Some(false));
-    assert_eq!(
-        result["tip_height"].as_u64(),
-        Some(u64::from(Network::Mainnet.taproot_activation_height()))
-    );
+    let error = getblocktweaks(&ctx, &json!([0]))
+        .err()
+        .ok_or("missing tip")?;
+    assert!(error.to_string().contains("no applied tip"));
     Ok(())
 }

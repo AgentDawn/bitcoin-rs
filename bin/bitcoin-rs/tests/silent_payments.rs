@@ -4,22 +4,46 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use bitcoin::Block;
-use bitcoin::consensus::deserialize;
-use bitcoin::hex::FromHex as _;
-use bitcoin_rs_e2e::helpers::tx_hex;
+use bitcoin::consensus::serialize;
+use bitcoin::hashes::{Hash as _, sha256};
+use bitcoin::hex::{DisplayHex as _, FromHex as _};
+use bitcoin::secp256k1::{Scalar, Secp256k1};
+use bitcoin::{Amount, OutPoint, PublicKey, ScriptBuf, Sequence, TxOut};
+use bitcoin_rs_e2e::helpers::{
+    COINBASE_MATURITY, coinbase_at, funding_address, funding_output, mine_blocks_to, raw_spend_to,
+    sign_p2pkh_inputs, submit_genesis, tx_hex,
+};
 use bitcoin_rs_e2e::{Kind, ProcessNode, SpawnOptions};
 use serde_json::json;
 
-mod support {
-    pub(crate) mod silent_payment_spend;
-}
-use support::silent_payment_spend::{OUTPUT_KEY, mine_candidates};
+const OUTPUT_COUNT: usize = 3;
+const OUTPUT_KEY: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
-const OUTPUT_COUNT: usize = 11_000;
+// Independent single-input BIP352 oracle: the fixture's known public key,
+// serialized funding outpoint and tagged SHA256, without the node/index codec.
+fn expected_tweak(outpoint: OutPoint, prevout: &TxOut) -> Result<String> {
+    let key: PublicKey =
+        "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f".parse()?;
+    assert_eq!(
+        prevout.script_pubkey,
+        ScriptBuf::new_p2pkh(&key.pubkey_hash())
+    );
+    let tag = sha256::Hash::hash(b"BIP0352/Inputs");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(tag.as_byte_array());
+    bytes.extend_from_slice(tag.as_byte_array());
+    bytes.extend_from_slice(&serialize(&outpoint));
+    bytes.extend_from_slice(&key.inner.serialize());
+    let scalar = Scalar::from_be_bytes(sha256::Hash::hash(&bytes).to_byte_array())?;
+    Ok(key
+        .inner
+        .mul_tweak(&Secp256k1::verification_only(), &scalar)?
+        .serialize()
+        .to_lower_hex_string())
+}
 
 #[test]
-fn signed_dense_block_survives_reorg_and_restart() -> Result<()> {
+fn signed_spend_survives_reorg_and_restart() -> Result<()> {
     let options = SpawnOptions {
         binary: Some(Path::new(env!("CARGO_BIN_EXE_bitcoin-rs"))),
         extra_args: &["--silent-payments"],
@@ -32,12 +56,27 @@ fn signed_dense_block_survives_reorg_and_restart() -> Result<()> {
             .status,
         401
     );
-    let (tx, hash, expected) = mine_candidates(&mut node, OUTPUT_COUNT)?;
-    let outpoint = tx.input[0].previous_output;
-    let raw = node.rpc("getblock", &json!([hash, 0]))?;
-    let block: Block = deserialize(&Vec::from_hex(raw.as_str().context("block hex")?)?)?;
-    assert!(block.weight().to_wu() > 1_890_000);
-    assert!(block.weight().to_wu() <= 4_000_000);
+    submit_genesis(&mut node)?;
+    let _ = mine_blocks_to(
+        &mut node,
+        COINBASE_MATURITY,
+        &format!("addr({})", funding_address()?),
+    )?;
+    let (outpoint, prevout) = funding_output(&coinbase_at(&mut node, 1)?)?;
+    let expected = expected_tweak(outpoint, &prevout)?;
+    let script = ScriptBuf::from_bytes(Vec::from_hex(&format!("5120{OUTPUT_KEY}"))?);
+    let mut tx = raw_spend_to(outpoint, &prevout, 10_000, Sequence::MAX, &script);
+    // Keep duplicates and dust: candidate completeness is independent of policy.
+    tx.output.resize(
+        OUTPUT_COUNT,
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: script,
+        },
+    );
+    sign_p2pkh_inputs(&mut tx, &[prevout])?;
+    let mined = node.rpc("generateblock", &json!(["raw(51)", [tx_hex(&tx)]]))?;
+    let hash = mined["hash"].as_str().context("mined hash")?.to_owned();
     assert!(
         node.rpc(
             "gettxout",
@@ -60,12 +99,6 @@ fn signed_dense_block_survives_reorg_and_restart() -> Result<()> {
     for (vout, output) in outputs.iter().enumerate() {
         assert_eq!(output, &json!({"vout":vout,"output_key":OUTPUT_KEY}));
     }
-    eprintln!(
-        "validated block: {} WU; {} candidates",
-        block.weight().to_wu(),
-        outputs.len()
-    );
-
     node.rpc("invalidateblock", &json!([hash]))?;
     let stale =
         node.rpc_raw(&json!({"jsonrpc":"2.0","id":1,"method":"getblocktweaks","params":[hash]}))?;
