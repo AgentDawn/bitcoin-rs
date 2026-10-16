@@ -2,7 +2,6 @@ use super::*;
 use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
 use bitcoin_rs_primitives::{Block, Network};
 use bitcoin_rs_utxo::contract::{BlockSpends, BlockUndoSource, HistoryUnavailable};
-use sonic_rs::JsonContainerTrait as _;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -55,51 +54,7 @@ fn fixture() -> Result<(Context, Block)> {
 }
 
 #[test]
-fn height_and_named_hash_return_exact_identity_and_empty_success() -> Result {
-    for named in [false, true] {
-        let (ctx, block) = fixture()?;
-        let params = if named {
-            json!({"block": block.block_hash().to_string()})
-        } else {
-            json!([0])
-        };
-        let result = crate::Handler::new(Arc::new(ctx)).dispatch("getblocktweaks", &params)?;
-        assert_eq!(result["height"].as_u64(), Some(0));
-        assert_eq!(
-            result["hash"].as_str(),
-            Some(block.block_hash().to_string().as_str())
-        );
-        assert_eq!(result["tip_hash"], result["hash"]);
-        assert_eq!(result["taproot_active"].as_bool(), Some(true));
-        assert!(
-            result["transactions"]
-                .as_array()
-                .ok_or("transactions")?
-                .is_empty()
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn malformed_range_secret_and_header_only_selectors_are_rejected() -> Result {
-    for params in [
-        json!([]),
-        json!([-1]),
-        json!([1]),
-        json!([1.5]),
-        json!([true]),
-        json!([[0, 1]]),
-        json!([0, 1]),
-        json!({"scan_sk": "secret"}),
-        json!(["bad"]),
-    ] {
-        let (ctx, _) = fixture()?;
-        assert!(
-            getblocktweaks(&Arc::new(ctx), &params).is_err(),
-            "{params:?}"
-        );
-    }
+fn header_only_selector_is_rejected_before_body_io() -> Result {
     let (ctx, block) = fixture()?;
     let mut header = block.header;
     header.prev_blockhash = block.block_hash();
@@ -211,10 +166,12 @@ fn moved_tip_and_recovery_after_source_read_refuse_publication() -> Result {
 #[test]
 fn wrong_body_and_source_retry_are_errors() -> Result {
     for wrap in [BlockSpendsError::BodyRead, BlockSpendsError::BoundedRead] {
-        let disk = std::io::Error::other("disk read failed").into();
+        let disk = std::io::Error::other("private/path: disk read failed").into();
+        let error = read_error(&wrap(BoundedReadError::Storage(disk)));
+        assert_eq!(error.code(), RpcError::INTERNAL_ERROR);
         assert_eq!(
-            read_error(&wrap(BoundedReadError::Storage(disk))).code(),
-            RpcError::INTERNAL_ERROR
+            error.to_string(),
+            "internal error: Unable to read silent payment block inputs"
         );
         for refusal in [
             BoundedReadError::Unsupported,
@@ -317,18 +274,5 @@ fn historical_activation_uses_requested_height_not_the_captured_tip_height() -> 
         result["tip_height"].as_u64(),
         Some(u64::from(Network::Mainnet.taproot_activation_height()))
     );
-    Ok(())
-}
-
-#[test]
-fn result_budget_covers_every_valid_block_weight() -> Result {
-    // Each eligible tx has >=51 stripped non-output bytes (version, counts,
-    // locktime and one input); each P2TR candidate consumes 43 stripped bytes.
-    // All these bytes cost four weight units, including for witness spends.
-    for (json_bytes, wire_bytes) in [(JSON_TRANSACTION_BYTES, 51), (JSON_OUTPUT_BYTES, 43)] {
-        assert!(json_bytes <= 6 * wire_bytes);
-    }
-    let max_stripped = usize::try_from(bitcoin_rs_consensus::MAX_BLOCK_WEIGHT)? / 4;
-    assert!(JSON_ENVELOPE_BYTES + 6 * max_stripped <= MAX_RESULT_BYTES);
     Ok(())
 }

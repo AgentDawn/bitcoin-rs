@@ -14,9 +14,8 @@ complete historical prevouts. The adapter verifies the returned body identity,
 uses the requested height's native Taproot activation, and after projection
 tries transition exclusion without waiting to recheck recovery and applied hash
 before publication. No history/read failure becomes empty success. There is one
-nonqueued work slot, the shared block-render permit, an 8 MiB conservative result
-bound covering consensus-valid block weight (see the linked derivation), bounded
-selection (at most 4,096 fallback parent hops), and no history I/O during IBD.
+nonqueued work slot, the shared block-render permit, bounded selection (at most
+4,096 fallback parent hops), and no history I/O during IBD.
 The source's separate read/projection budgets can refuse consensus-valid blocks;
 clients need another complete source for those blocks rather than unchanged
 retries. This extension does not guarantee complete scanning of every valid block.

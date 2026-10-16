@@ -5,6 +5,7 @@ use core::str::FromStr as _;
 use std::time::Duration;
 
 use bitcoin::hex::DisplayHex as _;
+use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::silent_payments::{BlockTweaks, block_tweaks};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_utxo::contract::{BlockSpendsError, BoundedReadError};
@@ -13,10 +14,6 @@ use sonic_rs::{JsonValueTrait as _, Value, json};
 use crate::context::{AppliedView, Context};
 use crate::error::RpcError;
 
-const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
-const JSON_ENVELOPE_BYTES: usize = 512;
-const JSON_TRANSACTION_BYTES: usize = 256;
-const JSON_OUTPUT_BYTES: usize = 128;
 const MAX_SELECTION_HOPS: usize = 4_096;
 
 fn unavailable(message: &str) -> RpcError {
@@ -69,7 +66,7 @@ pub(crate) fn getblocktweaks(ctx: &Arc<Context>, params: &Value) -> Result<Value
     // Use the same activation owner as consensus::verify_flags; never the tip's height.
     let taproot_active = ctx.chain.chain_network.is_taproot_active(height);
     let material = block_tweaks(&inputs, taproot_active).map_err(|error| read_error(&error))?;
-    let result = render(&material, height, &view, taproot_active)?;
+    let result = render(&material, height, tip, taproot_active);
     // Source rechecks certify its read, not the subsequent CPU/JSON projection.
     // Never wait behind validation, and never hold transition exclusion over work.
     let _stable = ctx
@@ -141,42 +138,14 @@ fn read_error(error: &BlockSpendsError) -> RpcError {
         | BlockSpendsError::Undo(_)
         | BlockSpendsError::BodyRead(BoundedReadError::Storage(_))
         | BlockSpendsError::BoundedRead(BoundedReadError::Storage(_)) => {
-            RpcError::Internal(error.to_string())
+            tracing::warn!(%error, "silent payment block input read failed");
+            RpcError::Internal("Unable to read silent payment block inputs".to_owned())
         }
         _ => unavailable(&error.to_string()),
     }
 }
 
-/// Conservative JSON bound before allocating hex strings or a JSON tree:
-/// envelope <512 bytes, txid/tweak/field framing <256 per transaction,
-/// u32 index/key/field framing <128 per candidate. No filtering or truncation.
-/// A valid block has at most 1,000,000 stripped bytes. Each eligible transaction
-/// needs at least 51 non-output bytes and each candidate 43 output bytes, so
-/// this bound is <=512 + 6 * 1,000,000, safely below 8 MiB. The limit cannot
-/// exclude a consensus-valid block; see the weight-bound test and process case.
-fn check_result_budget(material: &BlockTweaks) -> Result<(), RpcError> {
-    let bound = material
-        .transactions
-        .iter()
-        .fold(JSON_ENVELOPE_BYTES, |bytes, tx| {
-            bytes
-                .saturating_add(JSON_TRANSACTION_BYTES)
-                .saturating_add(tx.outputs.len().saturating_mul(JSON_OUTPUT_BYTES))
-        });
-    if bound > MAX_RESULT_BYTES {
-        return Err(unavailable("result exceeds 8 MiB budget"));
-    }
-    Ok(())
-}
-
-fn render(
-    material: &BlockTweaks,
-    height: u32,
-    view: &AppliedView,
-    active: bool,
-) -> Result<Value, RpcError> {
-    check_result_budget(material)?;
-    let tip = view.tip().ok_or_else(|| unavailable("no applied tip"))?;
+fn render(material: &BlockTweaks, height: u32, tip: &TipSnapshot, active: bool) -> Value {
     let transactions = material
         .transactions
         .iter()
@@ -198,14 +167,14 @@ fn render(
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
+    json!({
         "height": height,
         "hash": material.hash.to_string(),
         "tip_height": tip.height,
         "tip_hash": tip.hash.to_string_be(),
         "taproot_active": active,
         "transactions": transactions,
-    }))
+    })
 }
 
 #[cfg(test)]

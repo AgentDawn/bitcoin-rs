@@ -36,9 +36,10 @@ parameters are rejected. Unknown hashes return `-5`; stale/header-only hashes
 and heights above the applied tip return `-8`. Incomplete ancestry, absent or
 pruned/certification-limited history, recovery closure, a changed chain and
 resource/admission refusals return `-1` with the reason, never empty success.
-Corrupt/inconsistent retained material or storage/undo failures return
-`-32603`; disabled runtime configuration also returns `-32603` with an explicit
-disabled message. A build without this feature returns method-not-found
+Corrupt/inconsistent retained material returns `-32603`. Storage/undo read
+failures use a fixed public `-32603` message; details go to the node log.
+Disabled runtime configuration returns `-32603` with an explicit disabled message.
+A build without this feature returns method-not-found
 (`-32601`). Initial block download returns `-10` before history I/O.
 
 The service resolves ancestry against one captured applied publication and
@@ -52,26 +53,16 @@ cache to recover. No full-history readiness watermark is invented: each
 requested block must establish its own coverage through the retained owner.
 
 All callers share one nonqueued work slot. Each request also acquires an existing
-full-block materialization permit. A conservative JSON bound rejects results
-over 8 MiB before allocating their JSON tree; this bounds the result payload,
-not an arbitrary caller's JSON-RPC id/envelope. Busy responses ask callers to
-retry; sequential requests have no timer-based admission delay. CPU projection
+full-block materialization permit. Busy responses ask callers to retry;
+sequential requests have no timer-based admission delay. CPU projection
 and body I/O hold no transition/tree guard. The final transition check uses
 `try_lock_for(Duration::ZERO)`, so it never queues behind validation. These bounds and refusal
 during IBD protect serving capacity; they are not a measured latency or
 mainnet throughput guarantee. The global limit is shared across credentials,
 not an anonymous per-IP quota.
 
-The result budget accommodates every consensus-valid block. Its conservative
-bound is `512 + 256*T + 128*O` bytes for eligible transactions `T` and P2TR
-candidates `O`. Each eligible transaction consumes at least 51 stripped bytes
-outside its outputs; each P2TR candidate consumes 43 stripped output bytes.
-Since these cost four weight units per byte, the 4,000,000-weight limit gives
-`51*T + 43*O <= 1,000,000`. Both JSON coefficients are at most six times their
-wire costs, so the bound is at most 6,000,512 bytes, below 8 MiB. No pagination
-or candidate truncation is needed for this result limit. This does not establish
-historical-input availability. Missing/pruned/certification-limited history
-requires restoring/replaying the required data or using another complete source.
+Missing/pruned/certification-limited history requires restoring/replaying the
+required data or using another complete source.
 The retained-input owner's separate 64 MiB verbose-projection budget can reject
 a consensus-valid block with many outputs before BIP352 computation. This
 extension therefore does not guarantee scanning every valid block. An unchanged
@@ -172,9 +163,7 @@ The process test in `bin/bitcoin-rs/tests/silent_payments.rs` uses the existing
 After confirming the funding output is spent, it checks the HTTP tweak against
 an independent single-input tagged-hash/public-key calculation and every output
 index/key. The block exceeds 1,890,000 weight units and its complete result fits
-both source and result budgets. It also exercises invalidation, replacement and
-clean restart. The separate arithmetic test establishes the JSON bound at the
-consensus weight limit; it does not establish source availability at that limit.
+the source budgets. It also exercises invalidation, replacement and clean restart.
 
 ## Resources and consumer assessment
 
@@ -190,30 +179,48 @@ framing/txids/candidates. Full history also retains native bodies/undo. No
 mainnet disk-cost estimate follows from this arithmetic. A durable cache needs
 measured benefit and the existing writer/fence/reconciliation/replay owners.
 
-The evaluated target is [BlindBit Oracle](https://github.com/setavenger/blindbit-oracle/blob/f9ab7fd8bc35467c492324f743ba1b69049a2bb6/internal/server/README.md),
-pinned to `f9ab7fd8bc35467c492324f743ba1b69049a2bb6`. It deprecates HTTP
-block-data APIs and directs clients to gRPC `OracleService`; HTTP `/info`
-remains supported. Its legacy tweak response has `block_identifier`/`index`,
-whereas the draft describes `/getinfo` and `/tweaks/:height` with
-`height`/`hash`/`tweaks`. Implementing only the draft examples would not
-establish unmodified-client interoperability. This is a documented WIP
-protocol incompatibility, not a successful wallet run.
+The integration target is [BlindBit Oracle](https://github.com/setavenger/blindbit-oracle/blob/f9ab7fd8bc35467c492324f743ba1b69049a2bb6/internal/server/README.md),
+pinned to `f9ab7fd8bc35467c492324f743ba1b69049a2bb6`. Its node backend
+uses existing REST data; its wallet-facing API prefers gRPC `OracleService`.
+The legacy HTTP tweak response has `block_identifier`/`index`, unlike the WIP
+specification's `/getinfo` and `height`/`hash`/`tweaks` shapes. The native RPC
+prototype implements neither wallet-facing protocol.
 
-An external sidecar speaking the pinned consumer protocol is the deployment
-alternative: existing `getblock` verbosity 3 or `/rest/spenttxouts` supply
-certified inputs, existing APIs supply complete blocks, and PR #1554's optional
-filters can reduce downloads. It must reject missing prevouts and verify
-identity/coverage; wallet scanning stays local. No full duplicate coin database
-or wallet fork is justified by this stage. Funded regtest wallet discovery and
-confirmation has **not** been run.
+The ignored `blindbit_indexes_existing_rest_without_the_tweak_service` process
+case runs this **unmodified upstream binary**, with `--rest=true` on bitcoin-rs
+and the native tweak RPC disabled. It confirms a signed mature P2PKH spend into
+P2TR, then Oracle fetches `/rest/chaininfo.json`,
+`/rest/blockhashbyheight/101.bin`, `/rest/block/<hash>.bin` and
+`/rest/spenttxouts/<hash>.bin`. Oracle's `/tweaks/101` must return the exact
+confirmed block hash and independently expected nonempty tweak. Configuration,
+Oracle logs and the response are saved beside the existing process transcript
+in `target/process-harness/e2e/run-*/blindbit*`.
+Recorded on 2026-10-16 with Go 1.25.0 and Rust 1.99.0 under WSL/Linux: the case
+passed, with one exact tweak and block identity match. The upstream tree was
+unmodified; the Oracle binary's SHA256 was
+`0d386c6920ed3582c38b9f541cf9e57c761e3c9979c63f07193ad42af6bde4f4`.
 
-The draft `/getinfo` and `/tweaks/:height` shapes were evaluated. This adapter
-instead provides an explicitly bitcoin-rs-specific, authenticated JSON-RPC
-extension with transaction mapping and complete output keys, over the existing
-listener. It does not implement the draft's anonymous HTTP role or BlindBit's
-gRPC service. A consumer/sidecar must speak this documented extension; no
-unmodified wallet interoperability or funded discovery is claimed. The pinned
-WIP protocol incompatibility remains the recorded external integration limit.
+Reproduce outside the ordinary PR test lane (Go and a C compiler required):
+
+```sh
+git clone https://github.com/setavenger/blindbit-oracle target/consumer-evidence/blindbit-oracle
+git -C target/consumer-evidence/blindbit-oracle checkout --detach f9ab7fd8bc35467c492324f743ba1b69049a2bb6
+go -C target/consumer-evidence/blindbit-oracle build -o ../blindbit-oracle-bin ./cmd/blindbit-oracle
+BLINDBIT_ORACLE="$PWD/target/consumer-evidence/blindbit-oracle-bin" cargo test --locked -p bitcoin-rs --no-default-features --features fjall,silent-payments --test silent_payments -- --ignored blindbit_indexes_existing_rest_without_the_tweak_service
+```
+
+This demonstrates the existing L1-to-sidecar path. It does **not** establish a
+consumer for `getblocktweaks`, a receiver wallet discovering a funded Silent
+Payment, complete-history coverage, or network/CPU savings over existing APIs.
+The payment output in this probe is a P2TR candidate, not a wallet-derived
+Silent Payment. Oracle's own disposable index remains outside the node.
+
+**Merge remains deferred:** before promoting the native RPC, establish a real
+wallet's required protocol and funded discovery/confirmation, measure its
+benefit over the working REST/sidecar path, and resolve the source projection
+limit for that workload. Adding a second storage reader or a wallet-specific
+fork is not justified by this evidence. Existing REST shares the source limit;
+the sidecar result does not make the unscannable-block limitation disappear.
 
 ## Evidence, privacy and API status
 
@@ -224,7 +231,7 @@ reference passed the full vectors locally (WSL, Python 3.12.3). Additional
 tests cover future witness versions, missing material/history, empty blocks,
 output indices, limits and deterministic hash-scoped replay. Adapter tests
 cover exact selection, unavailable history, publication races, recovery,
-IBD, nonqueued admission and the weight-based result bound. The production
+IBD and nonqueued admission. The production
 process HTTP test covers the positive chain/undo/crypto path, dense-block result
 completeness, authentication, runtime gating, invalidation/replacement and restart.
 Extraction is
