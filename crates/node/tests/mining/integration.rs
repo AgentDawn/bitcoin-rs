@@ -5,22 +5,24 @@ use bitcoin::hex::DisplayHex;
 use bitcoin_rs_mempool::{MempoolObserver, MutationEnvelope, MutationOutcome};
 use bitcoin_rs_primitives::{
     Amount, Hash256, LockTime, OutPoint, Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
+    encode::double_sha256,
 };
 use parking_lot::Mutex;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 use super::support::{
-    MEMPOOL_TX_FEE_SATS, REGTEST_SUBSIDY_SATS, SEED_BLOCKS, admit_to_mempool, apply_genesis,
-    assemble_from_template, assemble_regtest_block, current_tip, mine_regtest_block,
-    mining_handler, open_regtest, p2sh_true_output, p2sh_true_spend_script_sig, required_str,
-    required_u64, seed_chain, seed_coinbase_spend, seed_coinbase_spend_with_fee,
+    MEMPOOL_TX_FEE_SATS, REGTEST_SUBSIDY_SATS, SEED_BLOCKS, WITNESS_RESERVED, admit_to_mempool,
+    apply_genesis, assemble_from_template, assemble_regtest_block, compute_witness_merkle_root,
+    current_tip, mine_regtest_block, mining_handler, open_regtest, p2sh_true_output,
+    p2sh_true_spend_script_sig, required_str, required_u64, seed_chain, seed_coinbase_spend,
+    seed_coinbase_spend_with_fee,
 };
 
 #[test]
 fn template_renders_coinbase_subsidy_plus_fees_and_bip22_fields() -> Result<()> {
     let (state, _guard) = open_regtest()?;
     apply_genesis(&state)?;
-    let _seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
+    let seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
 
     // A spend of the height-1 seed coinbase matures exactly at height 101.
     let mempool_tx = seed_coinbase_spend();
@@ -52,31 +54,81 @@ fn template_renders_coinbase_subsidy_plus_fees_and_bip22_fields() -> Result<()> 
     // 3. Essential BIP22 mutable and capability sets for external miner interop.
     let mutable = template
         .get("mutable")
-        .and_then(|value| value.as_array())
-        .map_or(&[][..], |entries| entries.as_slice());
-    let mutables: Vec<&str> = mutable.iter().filter_map(|value| value.as_str()).collect();
+        .and_then(|v| v.as_array())
+        .map_or(&[][..], |a| a.as_slice());
     for expected in ["time", "transactions", "prevblock"] {
         assert!(
-            mutables.contains(&expected),
+            mutable.iter().any(|v| v.as_str() == Some(expected)),
             "mutable must contain {expected}"
         );
     }
-
     let capabilities = template
         .get("capabilities")
-        .and_then(|value| value.as_array())
-        .map_or(&[][..], |entries| entries.as_slice());
-    let capability_set: Vec<&str> = capabilities
-        .iter()
-        .filter_map(|value| value.as_str())
-        .collect();
+        .and_then(|v| v.as_array())
+        .map_or(&[][..], |a| a.as_slice());
     for expected in ["proposal", "longpoll"] {
         assert!(
-            capability_set.contains(&expected),
+            capabilities.iter().any(|v| v.as_str() == Some(expected)),
             "capabilities must contain {expected}"
         );
     }
 
+    // 4. BIP22 header & constraint fields (preserves coverage from deleted e2e::block_template_shape).
+    assert_eq!(
+        required_str(&template, "previousblockhash")?,
+        seed_tip_hash.to_string_be()
+    );
+    assert_eq!(
+        required_u64(&template, "height")?,
+        u64::from(SEED_BLOCKS + 1)
+    );
+    assert_eq!(required_str(&template, "bits")?, "207fffff");
+    assert_eq!(
+        required_str(&template, "target")?,
+        "7fffff0000000000000000000000000000000000000000000000000000000000"
+    );
+    assert_eq!(required_str(&template, "noncerange")?, "00000000ffffffff");
+    assert_eq!(required_u64(&template, "sigoplimit")?, 80_000);
+    assert_eq!(required_u64(&template, "sizelimit")?, 4_000_000);
+    assert_eq!(required_u64(&template, "weightlimit")?, 4_000_000);
+    assert!(required_u64(&template, "mintime")? <= required_u64(&template, "curtime")?);
+    let rules = template
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .map_or(&[][..], |a| a.as_slice());
+    assert!(
+        rules.iter().any(|x| x.as_str() == Some("!segwit")),
+        "segwit is mandatory"
+    );
+
+    // 5. BIP141 witness commitment derivation and longpollid.
+    assert_template_witness_commitment(&template, &mempool_tx)?;
+    let long_poll_id = required_str(&template, "longpollid")?;
+    assert!(long_poll_id.len() > 64 && long_poll_id.starts_with(&seed_tip_hash.to_string_be()));
+    long_poll_id[64..]
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("invalid longpollid sequence"))?;
+
+    Ok(())
+}
+
+fn assert_template_witness_commitment(template: &sonic_rs::Value, mempool_tx: &Tx) -> Result<()> {
+    let commitment = required_str(template, "default_witness_commitment")?;
+    assert!(
+        commitment.starts_with("6a24aa21a9ed"),
+        "default witness commitment carries BIP141 prefix"
+    );
+    let expected_root = compute_witness_merkle_root(std::slice::from_ref(mempool_tx))
+        .ok_or_else(|| anyhow::anyhow!("single-tx witness merkle root must exist"))?;
+    let mut commitment_input = [0_u8; 64];
+    commitment_input[..32].copy_from_slice(&expected_root.to_le_bytes());
+    commitment_input[32..].copy_from_slice(&WITNESS_RESERVED);
+    let expected_commitment = double_sha256(&commitment_input).to_le_bytes();
+    assert_eq!(
+        &commitment[12..],
+        expected_commitment.to_lower_hex_string(),
+        "rendered commitment must be SHA256D(witness merkle root || witness reserved value)"
+    );
     Ok(())
 }
 

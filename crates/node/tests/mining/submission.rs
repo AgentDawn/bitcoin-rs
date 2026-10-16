@@ -520,23 +520,6 @@ fn rejection_mapping_for_bad_prev_hash() -> Result<()> {
 }
 
 #[test]
-fn duplicate_submit_returns_duplicate() -> Result<()> {
-    let (_state, mining) = regtest_mining()?;
-    mining.publish_generation();
-    let genesis = Network::Regtest.genesis_block();
-    let child = mined_child(genesis.block_hash())?;
-    assert_eq!(
-        mining.submit_block(child.clone())?,
-        BlockValidationResult::Accepted
-    );
-    assert_eq!(
-        mining.submit_block(child)?,
-        BlockValidationResult::Duplicate
-    );
-    Ok(())
-}
-
-#[test]
 fn concurrent_duplicate_submissions_leave_admission_open() -> Result<()> {
     let (state, mining) = regtest_mining()?;
     let child = mined_child(Network::Regtest.genesis_block().block_hash())?;

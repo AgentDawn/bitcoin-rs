@@ -12,7 +12,7 @@ use bitcoin_rs_mining::{
 use bitcoin_rs_node::{MiningCoordinator, Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence,
-    Tx, TxIn, TxOut, Txid, Witness, deserialize as native_deserialize,
+    Tx, TxIn, TxOut, Txid, Witness, deserialize as native_deserialize, encode::double_sha256,
 };
 use bitcoin_rs_rpc::{
     Handler,
@@ -34,27 +34,39 @@ pub(crate) const MEMPOOL_TX_FEE_SATS: u64 = 10_000;
 pub(crate) const WITNESS_RESERVED: [u8; 32] = [0_u8; 32];
 pub(crate) const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
-pub(crate) fn open_network(network: Network) -> Result<NodeState> {
+pub(crate) struct NodeFixture {
+    pub(crate) state: NodeState,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for NodeFixture {
+    type Target = NodeState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+pub(crate) fn open_network(network: Network) -> Result<NodeFixture> {
     let dir = tempfile::tempdir()?;
     let mut config = NodeConfig::default_for_network(network);
     config.data_dir = dir.path().join("node");
     config.p2p.listen.clear();
-    // NodeState retains open files under data_dir for the test duration.
-    std::mem::forget(dir);
-    NodeState::open(config, None)
+    let state = NodeState::open(config, None)?;
+    Ok(NodeFixture { state, _dir: dir })
 }
 
-pub(crate) fn open_at_genesis(network: Network) -> Result<NodeState> {
-    let state = open_network(network)?;
-    let _ = state.apply_block(&network.genesis_block())?;
-    Ok(state)
+pub(crate) fn open_at_genesis(network: Network) -> Result<NodeFixture> {
+    let fixture = open_network(network)?;
+    let _ = fixture.state.apply_block(&network.genesis_block())?;
+    Ok(fixture)
 }
 
 /// Regtest node at its applied genesis tip plus the coordinator over it.
-pub(crate) fn regtest_mining() -> Result<(NodeState, MiningCoordinator)> {
-    let state = open_at_genesis(Network::Regtest)?;
-    let mining = coordinator(&state);
-    Ok((state, mining))
+pub(crate) fn regtest_mining() -> Result<(NodeFixture, MiningCoordinator)> {
+    let fixture = open_at_genesis(Network::Regtest)?;
+    let mining = coordinator(&fixture.state);
+    Ok((fixture, mining))
 }
 
 pub(crate) fn coordinator(state: &NodeState) -> MiningCoordinator {
@@ -585,4 +597,30 @@ pub(crate) fn required_u64(value: &sonic_rs::Value, key: &str) -> Result<u64> {
         .and_then(sonic_rs::JsonValueTrait::as_i64)
         .and_then(|number| u64::try_from(number).ok())
         .ok_or_else(|| anyhow::anyhow!("template field {key} missing or not a number"))
+}
+
+/// Native BIP141 witness merkle fold with the odd-leaf duplication rule.
+/// The coinbase wtxid is replaced by all-zeroes before folding.
+pub(crate) fn compute_witness_merkle_root(txs: &[Tx]) -> Option<Hash256> {
+    if txs.is_empty() {
+        return None;
+    }
+    let mut level: Vec<[u8; 32]> = Vec::with_capacity(txs.len().saturating_add(1));
+    level.push([0_u8; 32]);
+    for tx in txs {
+        level.push(*tx.wtxid().as_bytes());
+    }
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pos in 0..level.len().div_ceil(2) {
+            let left = level[2 * pos];
+            let right = level[(2 * pos + 1).min(level.len() - 1)];
+            let mut pair = [0_u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next.push(*double_sha256(&pair).as_byte_array());
+        }
+        level = next;
+    }
+    Some(Hash256::from_le_bytes(&level[0]))
 }

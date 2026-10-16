@@ -6,7 +6,7 @@ use super::support::{
     coordinator, expect_template, open_at_genesis, regtest_mining, template_request,
 };
 
-// CONTRACT: API-07
+// CONTRACT: API-11
 #[test]
 fn template_does_not_echo_client_capabilities() -> Result<()> {
     let (_state, mining) = regtest_mining()?;
@@ -36,7 +36,7 @@ fn template_does_not_echo_client_capabilities() -> Result<()> {
     Ok(())
 }
 
-// CONTRACT: API-07
+// CONTRACT: API-11
 #[test]
 fn signet_template_includes_challenge_and_signet_rule() -> Result<()> {
     let state = open_at_genesis(Network::Signet)?;

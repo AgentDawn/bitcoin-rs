@@ -386,14 +386,17 @@ fn concurrent_publish_generation_paths_do_not_deadlock() -> Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
 
+    let (tip_done_tx, tip_done_rx) = bounded::<()>(1);
     let mining_tip = Arc::clone(&mining);
     let stop_tip = Arc::clone(&stop);
     let tip_thread = thread::spawn(move || {
         while !stop_tip.load(Ordering::Relaxed) {
             mining_tip.publish_generation();
         }
+        let _ = tip_done_tx.send(());
     });
 
+    let (seq_done_tx, seq_done_rx) = bounded::<()>(1);
     let mining_seq = Arc::clone(&mining);
     let stop_seq = Arc::clone(&stop);
     let seq_thread = thread::spawn(move || {
@@ -402,18 +405,26 @@ fn concurrent_publish_generation_paths_do_not_deadlock() -> Result<()> {
             mining_seq.publish_generation_from(seq);
             seq = seq.wrapping_add(1);
         }
+        let _ = seq_done_tx.send(());
     });
 
     // 200 ms watchdog — if either thread is stuck, the joins below time out.
     thread::sleep(Duration::from_millis(200));
     stop.store(true, Ordering::Relaxed);
 
+    tip_done_rx
+        .recv_timeout(Duration::from_millis(500))
+        .map_err(|_| anyhow::anyhow!("tip publish_generation thread deadlocked"))?;
+    seq_done_rx
+        .recv_timeout(Duration::from_millis(500))
+        .map_err(|_| anyhow::anyhow!("sequence publish_generation_from thread deadlocked"))?;
+
     tip_thread
         .join()
-        .unwrap_or_else(|_| panic!("tip publish_generation thread deadlocked"));
+        .unwrap_or_else(|_| panic!("tip publish_generation thread panicked"));
     seq_thread
         .join()
-        .unwrap_or_else(|_| panic!("sequence publish_generation_from thread deadlocked"));
+        .unwrap_or_else(|_| panic!("sequence publish_generation_from thread panicked"));
     Ok(())
 }
 
