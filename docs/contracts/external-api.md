@@ -987,7 +987,6 @@ evidence does not establish mainnet memory or throughput qualifications.
   `generateblock_rejects_invalid_supplied_checksums`,
   `getnetworkhashps_projects_control_invalid_request_as_invalid_parameter`;
   `crates/node/tests/mining.rs` tests
-  `generate_mines_coinbase_only_blocks_to_the_tip`,
   `generateblock_rejects_unknown_mempool_txid`,
   `generateblock_raw_tx_does_not_require_mempool_admission`,
   `generate_without_submit_does_not_advance_the_tip`,
@@ -1077,11 +1076,11 @@ evidence does not establish mainnet memory or throughput qualifications.
     `proposal_of_a_disconnected_scripts_valid_block_is_duplicate`,
     `submit_of_a_disconnected_scripts_valid_block_is_duplicate`,
     `applied_ancestor_with_unset_chain_tx_count_is_duplicate`,
-    `duplicate_submit_returns_duplicate`
+    `duplicate_solved_submission_is_idempotent`
 - `API-19`:
   - `crates/mining/src/bip22/tests.rs` tests
     `consensus_failures_use_core_bip22_reasons`, `header_failures_use_core_bip22_reasons`;
-    `crates/node/tests/unit/mining/apply_error_tests.rs` test
+    `crates/node/src/mining/tests.rs` test
     `apply_errors_delegate_consensus_and_chain_reasons`
   - `crates/node/tests/mining.rs` tests `proposal_without_coinbase_is_bad_cb_missing`,
     `proposal_merkle_mismatch_is_bad_txnmrklroot`,
@@ -1156,7 +1155,7 @@ evidence does not establish mainnet memory or throughput qualifications.
     `generateblock_rejects_invalid_supplied_checksums`
 
 - `API-30`:
-  - `crates/node/tests/unit/mining/apply_error_tests.rs` tests
+  - `crates/node/src/mining/tests.rs` tests
     `generateblock_validity_wraps_bip22_reason`,
     `generateblock_validity_keeps_shutdown_operational`
   - `crates/node/tests/mining.rs` test

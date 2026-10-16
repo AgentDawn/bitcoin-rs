@@ -632,5 +632,4 @@ fn bip22_reject_reason(error: &ApplyError) -> Result<CompactString, MiningContro
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/mining/apply_error_tests.rs"]
-mod apply_error_tests;
+mod tests;
