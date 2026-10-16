@@ -79,6 +79,20 @@ impl Node {
         self.state.chainstate().chain_snapshot()
     }
 
+    /// Borrows the existing node-owned mining control used by RPC.
+    ///
+    /// Calls are synchronous, including long polls and block validation;
+    /// embedders must place them on their blocking workers. The borrow cannot
+    /// outlive this node. Node shutdown cancels outstanding long polls through
+    /// the existing shutdown latch; no additional coordinator is constructed.
+    pub fn mining_control(&self) -> Result<&dyn bitcoin_rs_mining::MiningControl, NodeError> {
+        self.context
+            .mining
+            .mining_control
+            .as_deref()
+            .ok_or_else(|| NodeError::Unavailable("mining control is not attached".to_owned()))
+    }
+
     /// Returns active and historical validation progress from the chainstate owner.
     pub fn chainstates_summary(
         &self,
