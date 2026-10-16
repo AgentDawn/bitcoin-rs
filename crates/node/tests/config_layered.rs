@@ -12,6 +12,11 @@ use bitcoin_rs_rpc::zmq::ZmqTopic;
 
 #[test]
 fn silent_payments_toml_overlay_preserves_explicit_disable() -> Result<()> {
+    assert!(
+        !NodeConfig::default_for_network(Network::Regtest)
+            .rpc
+            .silent_payments
+    );
     let enabled: UserConfig = toml::from_str("silent_payments = true")?;
     let disabled: UserConfig = toml::from_str("silent_payments = false")?;
     assert!(!resolve(&[&enabled, &disabled])?.rpc.silent_payments);

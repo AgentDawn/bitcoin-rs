@@ -58,7 +58,7 @@ over 8 MiB before allocating their JSON tree; this bounds the result payload,
 not an arbitrary caller's JSON-RPC id/envelope. Busy/rate-limit responses ask
 callers to retry; rate-limit retries should wait at least 100 ms. CPU projection
 and body I/O hold no transition/tree guard. The final transition check uses
-`try_lock`, so it never queues behind validation. These bounds and refusal
+`try_lock_for(Duration::ZERO)`, so it never queues behind validation. These bounds and refusal
 during IBD protect serving capacity; they are not a measured latency or
 mainnet throughput guarantee. The global limit is shared across credentials,
 not an anonymous per-IP quota.

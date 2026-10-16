@@ -72,6 +72,11 @@ clippy_profiles() {
   profile "clippy: bitcoin-rs-node (fjall,zmq,silent-payments)" \
     cargo clippy --locked -p bitcoin-rs-node \
       --no-default-features --features fjall,zmq,silent-payments --all-targets -- -D warnings
+  # All-target builds unify test-seam features through dev-dependencies. Check
+  # the operator build separately so test-only capabilities cannot hide here.
+  profile "check: bitcoin-rs (production silent-payments)" \
+    cargo check --locked -p bitcoin-rs \
+      --no-default-features --features fjall,silent-payments
 }
 
 test_crates_profiles() {

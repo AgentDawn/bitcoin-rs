@@ -94,7 +94,7 @@ pub(crate) fn getblocktweaks(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let _stable = ctx
         .chain
         .chain_transition
-        .try_lock()
+        .try_lock_for(Duration::ZERO)
         .ok_or_else(|| unavailable("chain transition in progress; retry"))?;
     if ctx.chain.closed_for_recovery.is_triggered() {
         return Err(unavailable("closed for recovery"));
