@@ -3,18 +3,15 @@
 use super::{
     capability::{IndexCapabilities, IndexCapability},
     error::IndexError,
-    prepared::PreparedBlock,
     rows::LiveOp,
     rows::PendingRows,
     rows::PositionedRow,
-    write::IndexWriter,
 };
 use crate::{
-    types::HashPrefixRow, types::HeaderRow, types::ScriptHash, types::SpendingPrefixRow,
-    types::TxidRow, types::U24_MAX, types::encode_height,
+    types::HashPrefixRow, types::ScriptHash, types::SpendingPrefixRow, types::TxidRow,
+    types::U24_MAX, types::encode_height,
 };
 use bitcoin_rs_primitives::{Hash256, OutPoint, Txid, encode, layout::ParsedBlock};
-use bitcoin_rs_storage::KvStore;
 
 /// Source of exact scripts for coins an incoming block spends.
 ///
@@ -60,7 +57,7 @@ pub const MAX_LIVE_SCRIPT_SIZE: usize = 10_000;
 /// row the capabilities select, and the returned header is the body's exact
 /// 80-byte prefix.
 /// INVARIANT: A rejected parse contributes no rows.
-fn pending_rows_for_block_with_header(
+pub(super) fn pending_rows_for_block_with_header(
     block: &[u8],
     height: u32,
     capabilities: IndexCapabilities,
@@ -70,11 +67,11 @@ fn pending_rows_for_block_with_header(
     let header_bytes = parsed
         .span_bytes(parsed.header_span())
         .unwrap_or_else(|| unreachable!("header span belongs to the parsed image"));
-    let header = HeaderRow::from_header_bytes(header_bytes)
-        .unwrap_or_else(|| unreachable!("the layout parser fixes the header at 80 bytes"));
+    let header_row: [u8; crate::types::HEADER_ROW_SIZE] = header_bytes
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("the layout parser fixes the header at 80 bytes"));
 
     let height_bytes = encode_height(height);
-    let header_row = header.to_db_row();
     let mut rows = PendingRows::default();
     rows.header_rows.push(header_row);
     let mut live_created: Vec<([u8; 32], u32, Option<ScriptHash>)> = Vec::new();
@@ -255,73 +252,4 @@ pub(super) fn is_op_return_script(script: &[u8]) -> bool {
 fn live_admission(script: &[u8]) -> Option<ScriptHash> {
     let admitted = !is_op_return_script(script) && script.len() <= MAX_LIVE_SCRIPT_SIZE;
     admitted.then(|| ScriptHash::from_script_bytes(script))
-}
-
-impl<S: KvStore> IndexWriter<S> {
-    /// Derives a `PreparedBlock` from a serialized body without allocating a decoded block.
-    pub fn prepare_block(
-        &self,
-        height: u32,
-        hash: [u8; 32],
-        body: &[u8],
-    ) -> Result<PreparedBlock, IndexError> {
-        self.prepare_block_for(IndexCapabilities::HISTORICAL, height, hash, body)
-    }
-
-    /// Derives capability-selected row mutations from one serialized block scan.
-    pub fn prepare_block_for(
-        &self,
-        capabilities: IndexCapabilities,
-        height: u32,
-        hash: [u8; 32],
-        body: &[u8],
-    ) -> Result<PreparedBlock, IndexError> {
-        if capabilities.contains(IndexCapability::ScriptLive)
-            || capabilities.contains(IndexCapability::CompactFilters)
-        {
-            return Err(IndexError::MissingSpentScripts);
-        }
-        self.prepare_block_with_spent_scripts(capabilities, height, hash, body, &NoSpentScripts)
-    }
-
-    /// [`Self::prepare_block_for`] with the spent-coin script source
-    /// `ScriptLive` and `CompactFilters` preparation require.
-    pub fn prepare_block_with_spent_scripts(
-        &self,
-        capabilities: IndexCapabilities,
-        height: u32,
-        hash: [u8; 32],
-        body: &[u8],
-        spent_scripts: &dyn SpentCoinScripts,
-    ) -> Result<PreparedBlock, IndexError> {
-        if capabilities.is_empty() {
-            return Err(IndexError::NonContiguousPrepared {
-                watermark: self.watermark()?,
-            });
-        }
-        let (mut rows, header) =
-            pending_rows_for_block_with_header(body, height, capabilities, spent_scripts)?;
-        let actual_hash = encode::double_sha256(header.as_slice()).to_le_bytes();
-        if actual_hash != hash {
-            return Err(IndexError::BlockIdentityMismatch {
-                height,
-                expected: hash,
-                actual: actual_hash,
-            });
-        }
-        let mut parent_hash = [0_u8; 32];
-        parent_hash.copy_from_slice(&header[4..36]);
-        rows.sort();
-        let row_count = rows.total();
-        let encoded_bytes = rows.encoded_bytes()?;
-        Ok(PreparedBlock {
-            height,
-            hash,
-            parent_hash,
-            row_count,
-            encoded_bytes,
-            capabilities,
-            rows,
-        })
-    }
 }

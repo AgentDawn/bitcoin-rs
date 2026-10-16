@@ -1,12 +1,12 @@
 //! The sole concrete owner of durable index mutations.
 
 use super::{
-    block::NoSpentScripts, block::SpentCoinScripts, capability::IndexCapabilities,
-    capability::IndexCapability, capability::IndexWatermark, capability::IndexWatermarks,
-    capability::SCRIPT_LIVE_WATERMARK_KEY, capability::put_selected_watermarks,
-    capability::selected_watermark, error::IndexError, prepared::PreparedBatch,
-    prepared::PreparedBatchLimits, reader::Indexer, rows::PendingRows, rows::delete_rows,
-    rows::put_rows, state::CONSUMER_CURSOR_KEY, state::ConsumerCursorUpdate,
+    block::NoSpentScripts, block::SpentCoinScripts, block::pending_rows_for_block_with_header,
+    capability::IndexCapabilities, capability::IndexCapability, capability::IndexWatermark,
+    capability::IndexWatermarks, capability::SCRIPT_LIVE_WATERMARK_KEY,
+    capability::put_selected_watermarks, error::IndexError, prepared::PreparedBatch,
+    prepared::PreparedBatchLimits, prepared::PreparedBlock, reader::Indexer, rows::PendingRows,
+    rows::delete_rows, rows::put_rows, state::CONSUMER_CURSOR_KEY, state::ConsumerCursorUpdate,
     state::FORMAT_VERSION_KEY, state::FORMAT_VERSION_VALUE, state::IndexWriteFence,
     state::capture_write_fence, state::commit_ordinary, state::ensure_fence_live,
     state::resume_capability_reset,
@@ -262,6 +262,73 @@ impl<S: KvStore> IndexWriter<S> {
         commit_ordinary(self.indexer.store.as_ref(), self.generation, &fence, batch)
     }
 
+    /// Derives a `PreparedBlock` from a serialized body without allocating a decoded block.
+    pub fn prepare_block(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        self.prepare_block_for(IndexCapabilities::HISTORICAL, height, hash, body)
+    }
+
+    /// Derives capability-selected row mutations from one serialized block scan.
+    pub fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        if capabilities.contains(IndexCapability::ScriptLive)
+            || capabilities.contains(IndexCapability::CompactFilters)
+        {
+            return Err(IndexError::MissingSpentScripts);
+        }
+        self.prepare_block_with_spent_scripts(capabilities, height, hash, body, &NoSpentScripts)
+    }
+
+    /// [`Self::prepare_block_for`] with the spent-coin script source
+    /// `ScriptLive` and `CompactFilters` preparation require.
+    pub fn prepare_block_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+        spent_scripts: &dyn SpentCoinScripts,
+    ) -> Result<PreparedBlock, IndexError> {
+        if capabilities.is_empty() {
+            return Err(IndexError::NonContiguousPrepared {
+                watermark: self.watermark()?,
+            });
+        }
+        let (mut rows, header) =
+            pending_rows_for_block_with_header(body, height, capabilities, spent_scripts)?;
+        let actual_hash = encode::double_sha256(header.as_slice()).to_le_bytes();
+        if actual_hash != hash {
+            return Err(IndexError::BlockIdentityMismatch {
+                height,
+                expected: hash,
+                actual: actual_hash,
+            });
+        }
+        let mut parent_hash = [0_u8; 32];
+        parent_hash.copy_from_slice(&header[4..36]);
+        rows.sort();
+        let row_count = rows.total();
+        let encoded_bytes = rows.encoded_bytes()?;
+        Ok(PreparedBlock {
+            height,
+            hash,
+            parent_hash,
+            row_count,
+            encoded_bytes,
+            capabilities,
+            rows,
+        })
+    }
+
     /// Commits one serialized block through the prepared-write owner.
     ///
     /// The successful return is the commit point: prepared rows and the
@@ -321,7 +388,7 @@ impl<S: KvStore> IndexWriter<S> {
             .ok_or(IndexError::NonContiguousPrepared {
                 watermark: fence.watermarks.tx_lookup,
             })?;
-        let current = selected_watermark(fence.watermarks, capabilities)?;
+        let current = fence.watermarks.selected(capabilities)?;
         let mut expected_height = match current {
             None => 0,
             Some(w) => w
@@ -446,7 +513,9 @@ impl<S: KvStore> IndexWriter<S> {
         cursor: ConsumerCursorUpdate<'_>,
         spent_scripts: &dyn SpentCoinScripts,
     ) -> Result<(), IndexError> {
-        let current = selected_watermark(fence.watermarks, capabilities)?
+        let current = fence
+            .watermarks
+            .selected(capabilities)?
             .ok_or(IndexError::NonContiguousPrepared { watermark: None })?;
         let prepared = self.prepare_block_with_spent_scripts(
             capabilities,
