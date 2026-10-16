@@ -516,8 +516,10 @@ pub struct SnapshotEntry {
 pub struct MempoolMiningSnapshot {
     /// Pool mempool sequence at capture. Every admission and removal change
     /// moves it; in-pool prioritisation does not (it emits no mutation
-    /// change). Template caches key on it.
+    /// change). Template caches also need the fee-delta revision.
     pub sequence: u64,
+    /// Fee-priority revision captured under the same pool guard as `sequence`.
+    pub fee_delta_sequence: u64,
     /// Entries in modified-priority order. `ancestors` positions and the
     /// order itself both refer to this vector.
     pub entries: Vec<SnapshotEntry>,
@@ -654,6 +656,12 @@ impl Mempool {
     #[must_use]
     pub const fn sequence_number(&self) -> u64 {
         self.mempool_sequence
+    }
+
+    /// Existing fee-overlay revision; prioritisation does not move membership.
+    #[must_use]
+    pub const fn fee_delta_sequence_number(&self) -> u64 {
+        self.fee_delta_sequence
     }
 
     /// Returns the configured min-relay-fee rate in sat/kvB.
@@ -1341,6 +1349,7 @@ impl Mempool {
             .collect();
         MempoolMiningSnapshot {
             sequence: self.sequence_number(),
+            fee_delta_sequence: self.fee_delta_sequence,
             entries,
         }
     }

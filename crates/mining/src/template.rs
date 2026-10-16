@@ -43,10 +43,10 @@ pub struct CandidateContext {
     pub max_sigops: u64,
 }
 
-/// Deterministic generation identity for a captured tip and mempool sequence.
+/// Deterministic generation identity for a tip, membership and fee revision.
 ///
-/// Matches Bitcoin Core's `longpollid` encoding: tip hash as big-endian hex
-/// concatenated with the decimal mempool sequence.
+/// At fee revision zero, retains Core's hash + decimal membership sequence.
+/// Later fee revisions append `:<revision>` to keep both tokens unambiguous.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct TemplateId(String);
 
@@ -54,10 +54,22 @@ impl TemplateId {
     /// Builds the identity for `previous_block_hash` and `mempool_sequence`.
     #[must_use]
     pub fn new(previous_block_hash: &Hash256, mempool_sequence: u64) -> Self {
-        Self(format!(
-            "{}{mempool_sequence}",
-            previous_block_hash.to_string_be()
-        ))
+        Self::with_fee_revision(previous_block_hash, mempool_sequence, 0)
+    }
+
+    /// Builds an identity including the pool-owned fee-priority revision.
+    #[must_use]
+    pub fn with_fee_revision(
+        previous_block_hash: &Hash256,
+        mempool_sequence: u64,
+        fee_delta_sequence: u64,
+    ) -> Self {
+        let mut id = format!("{}{mempool_sequence}", previous_block_hash.to_string_be());
+        if fee_delta_sequence != 0 {
+            use std::fmt::Write as _;
+            let _ = write!(id, ":{fee_delta_sequence}");
+        }
+        Self(id)
     }
 
     /// Returns the opaque identity string.
@@ -362,7 +374,11 @@ fn finish_candidate(
         .ok_or(MiningError::CandidateScalarOverflow { field: "weight" })?;
 
     Ok(Candidate {
-        template_id: TemplateId::new(&context.previous_block_hash, snapshot.sequence),
+        template_id: TemplateId::with_fee_revision(
+            &context.previous_block_hash,
+            snapshot.sequence,
+            snapshot.fee_delta_sequence,
+        ),
         previous_block_hash: context.previous_block_hash,
         height: context.height,
         version: context.version,

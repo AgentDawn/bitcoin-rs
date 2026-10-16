@@ -1,6 +1,6 @@
 //! Candidate lifecycle state and pure mining-domain projections.
 //!
-//! Generation is keyed by `(applied_tip_hash, mempool_sequence)`. Template
+//! Generation is keyed by `(applied_tip_hash, mempool_sequence, fee_revision)`. Template
 //! assembly is single-flight per key, cached by [`TemplateId`], and woken by
 //! explicit generation publication. [`MiningService`] drives this state
 //! through capability sources implemented by the node; proposal validation
@@ -55,20 +55,25 @@ const GENERATION_RACE: &str = "generation key changed during candidate assembly"
 /// Upper bound for a single long-poll wait slice while rechecking predicates.
 const LONG_POLL_SLICE: Duration = Duration::from_secs(1);
 
-/// Applied-tip hash plus mempool sequence that identify one candidate generation.
+/// Applied-tip hash plus pool-owned revisions identifying one candidate generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GenerationKey {
     /// Applied tip hash in consensus little-endian storage order.
     tip_hash: Hash256,
     /// Mempool sequence captured with the tip.
     mempool_sequence: u64,
+    fee_delta_sequence: u64,
 }
 
 impl GenerationKey {
     /// Opaque BIP22/BIP23 long-poll identity for this generation.
     #[must_use]
     fn template_id(self) -> TemplateId {
-        TemplateId::new(&self.tip_hash, self.mempool_sequence)
+        TemplateId::with_fee_revision(
+            &self.tip_hash,
+            self.mempool_sequence,
+            self.fee_delta_sequence,
+        )
     }
 }
 
@@ -132,13 +137,12 @@ impl CoordinatorState {
 
 /// Mempool-sequence wake that avoids the mempool read lock.
 ///
-/// The mempool observer fires under the gateway's publish mutex; taking the
-/// pool read lock from that path can deadlock or contend with an in-flight
-/// writer. Implementations build the generation key from `applied_tip` plus
-/// the caller-supplied sequence instead.
+/// Membership notifications carry no fee revision. Avoid a second pool view
+/// or contention with an in-flight writer on that path. Implementations invalidate
+/// membership generations using the supplied sequence; the next template read
+/// captures both live pool revisions.
 pub trait MempoolSequenceWake: Send + Sync {
-    /// Publishes a generation key built from `applied_tip` and `sequence`
-    /// without taking the mempool read lock, then wakes all waiters.
+    /// Invalidates an older membership generation without a pool read, then wakes waiters.
     fn publish_generation_from(&self, sequence: u64);
 }
 
@@ -150,14 +154,18 @@ pub trait AppliedTipSource: Send + Sync {
 
 /// Read-only mempool facts for candidate assembly and long-poll waits.
 pub trait MempoolSnapshotSource: Send + Sync {
-    /// Monotonic mutation sequence of the pool.
-    fn current_sequence(&self) -> u64;
-    /// Captures the mining snapshot if the pool is still at `expected_sequence`.
+    /// Membership and fee-priority revisions captured under one pool read lock.
+    fn current_revisions(&self) -> (u64, u64);
+    /// Captures a snapshot only if both pool revisions still match.
     ///
     /// The comparison and the capture share one pool read lock: a snapshot is
     /// only valid for the sequence it was taken at, so generation-key
     /// coherence is checked and captured atomically.
-    fn mining_snapshot_at(&self, expected_sequence: u64) -> Option<MempoolMiningSnapshot>;
+    fn mining_snapshot_at(
+        &self,
+        expected_sequence: u64,
+        expected_fee_revision: u64,
+    ) -> Option<MempoolMiningSnapshot>;
     /// Captures the mining snapshot an explicit generate selection assembles from.
     ///
     /// Pool facts are captured under one read lock; `Ordered` selections
@@ -264,20 +272,23 @@ impl MiningService {
         self.publish_key(key);
     }
 
-    /// Publishes a generation key built from `applied_tip` and `sequence`
-    /// without taking the mempool read lock, then wakes all waiters.
+    /// Invalidates an older membership generation and wakes waiters without a pool read.
     ///
-    /// The mempool observer calls this with the sequence the mutation already
-    /// produced, avoiding a reentrant pool read that can deadlock under the
-    /// gateway's publish mutex. Tip-move callers should use
+    /// The mempool observer supplies only the sequence the mutation produced.
+    /// Do not read the pool here or invent its fee revision. Tip/fee callers use
     /// [`Self::publish_generation`] instead, which captures the live sequence
     /// safely (no write lock is held on that path).
     pub fn publish_generation_from(&self, sequence: u64) {
-        let key = GenerationKey {
-            tip_hash: self.live_tip_hash(),
-            mempool_sequence: sequence,
-        };
-        self.publish_key(key);
+        let mut state = self.state.lock();
+        if let Some(key) = state.published
+            && key.mempool_sequence != sequence
+        {
+            state.invalidate_key(key);
+            state.published = None;
+        }
+        // Use the same mutex as the wait predicate so a wake cannot be lost.
+        // Do not invent a fee revision from a membership-only notification.
+        self.wake.notify_all();
     }
 
     fn live_tip_hash(&self) -> Hash256 {
@@ -287,9 +298,12 @@ impl MiningService {
     }
 
     fn live_generation_key(&self) -> GenerationKey {
+        let tip_hash = self.live_tip_hash();
+        let (mempool_sequence, fee_delta_sequence) = self.mempool.current_revisions();
         GenerationKey {
-            tip_hash: self.live_tip_hash(),
-            mempool_sequence: self.mempool.current_sequence(),
+            tip_hash,
+            mempool_sequence,
+            fee_delta_sequence,
         }
     }
 
@@ -576,7 +590,10 @@ impl MiningService {
         if tip.hash != key.tip_hash {
             return Err(generation_race());
         }
-        let Some(snapshot) = self.mempool.mining_snapshot_at(key.mempool_sequence) else {
+        let Some(snapshot) = self
+            .mempool
+            .mining_snapshot_at(key.mempool_sequence, key.fee_delta_sequence)
+        else {
             return Err(generation_race());
         };
         let context = self.candidate_context(&tip)?;
@@ -815,6 +832,7 @@ pub fn snapshot_for_selection(
             }
             Ok(MempoolMiningSnapshot {
                 sequence: full.sequence,
+                fee_delta_sequence: full.fee_delta_sequence,
                 entries: selected,
             })
         }
@@ -865,10 +883,13 @@ fn parse_long_poll_id(id: &str) -> Option<GenerationKey> {
         return None;
     }
     let tip_hash = Hash256::from_str_be(hash_hex).ok()?;
+    let (sequence, fee_revision) = sequence.split_once(':').unwrap_or((sequence, "0"));
     let mempool_sequence = sequence.parse().ok()?;
+    let fee_delta_sequence = fee_revision.parse().ok()?;
     Some(GenerationKey {
         tip_hash,
         mempool_sequence,
+        fee_delta_sequence,
     })
 }
 
