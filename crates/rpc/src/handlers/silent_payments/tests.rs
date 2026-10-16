@@ -102,7 +102,10 @@ fn eligible_transactions_keep_complete_candidate_indices() -> Result {
     });
     let coin = UtxoCoin {
         outpoint,
-        txout: TxOut { script_pubkey: script.clone(), ..TxOut::default() },
+        txout: TxOut {
+            script_pubkey: script.clone(),
+            ..TxOut::default()
+        },
         height: 1,
         coinbase: false,
     };
