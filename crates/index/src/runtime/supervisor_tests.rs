@@ -1,6 +1,11 @@
+//! Worker lifecycle, supervisor shutdown, and open abandonment unit tests.
+//!
+//! This is an owner-local unit-test module exercising supervised worker
+//! lifecycle in `crate::runtime`, not a Cargo integration test target.
+
 #![expect(
     clippy::expect_used,
-    reason = "test: integration tests use expect for clarity"
+    reason = "test: supervisor tests use expect for clarity"
 )]
 
 use super::namespace::NAMESPACE_REGISTRY;

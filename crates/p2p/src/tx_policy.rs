@@ -1547,6 +1547,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "tx_policy/preferred_tests.rs"]
 #[expect(clippy::expect_used, reason = "bounded admission contract assertions")]
 mod preferred_tests;

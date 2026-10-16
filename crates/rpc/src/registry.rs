@@ -332,3 +332,48 @@ declare_rows! {
     "rawtx", SurfaceKind::Zmq, Status::ImplementedUnverified, "zmq", CORE_VERSION, "Requires the zmq feature and a --zmqpubrawtx endpoint.", "0.4.0", None;
     "sequence", SurfaceKind::Zmq, Status::ImplementedUnverified, "zmq", CORE_VERSION, "Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/rpc/src/zmq.rs).", "0.4.0", None;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sonic_rs::json;
+
+    #[test]
+    fn scan_start_is_blocking_but_status_abort_and_gbt_are_outside_this_budget() {
+        for params in [
+            json!(["start", []]),
+            json!({"action":"start","scanobjects":[]}),
+            json!({"args":["start",[]]}),
+        ] {
+            assert!(blocking_request(
+                &json!({"method":"scantxoutset","params":params})
+            ));
+        }
+        for params in [
+            json!(["status"]),
+            json!(["abort"]),
+            json!({"action":"status"}),
+        ] {
+            assert!(!blocking_request(
+                &json!({"method":"scantxoutset","params":params})
+            ));
+        }
+        assert!(!blocking_request(
+            &json!({"method":"getblocktemplate","params":[{"longpollid":"x"}]})
+        ));
+    }
+
+    #[test]
+    fn tip_waits_are_blocking_requests() {
+        for (method, params) in [
+            ("waitfornewblock", json!([])),
+            ("waitforblock", json!(["00".repeat(32)])),
+            ("waitforblockheight", json!([1])),
+        ] {
+            assert!(
+                blocking_request(&json!({"method": method, "params": params})),
+                "{method} must be classified as a blocking request"
+            );
+        }
+    }
+}

@@ -1,15 +1,74 @@
-//! Worker admission and RPC-only cancellation use the real chain wait owner.
+//! Worker admission and RPC-only cancellation HTTP integration tests.
+//!
+//! CONTRACT: docs/contracts/external-api.md#API-34 — Active-tip waits
 
 #![expect(clippy::expect_used)]
 
-use super::*;
-use crate::context::Context;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use bitcoin_rs_chain::{ActiveTipWait, LatchReader, TipSnapshot, TipWaitCondition};
 use bitcoin_rs_chainstate::Chainstate;
 use bitcoin_rs_primitives::Network;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use bitcoin_rs_rpc::{Auth, Handler, RpcServer, context::Context};
+use parking_lot::{Condvar, Mutex};
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
 
-fn context() -> (Arc<Context>, Arc<Chainstate>) {
+struct ObservableTipWait {
+    inner: Arc<Chainstate>,
+    waiting: AtomicUsize,
+    gate: Mutex<()>,
+    entered: Condvar,
+}
+
+impl ObservableTipWait {
+    fn new(inner: Arc<Chainstate>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            waiting: AtomicUsize::new(0),
+            gate: Mutex::new(()),
+            entered: Condvar::new(),
+        })
+    }
+
+    fn wait_for_waiters(&self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut guard = self.gate.lock();
+        while self.waiting.load(Ordering::Acquire) < count {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} active tip waiter(s)"
+            );
+            self.entered.wait_for(&mut guard, Duration::from_millis(5));
+        }
+    }
+}
+
+impl ActiveTipWait for ObservableTipWait {
+    fn wait_for_tip(
+        &self,
+        condition: TipWaitCondition,
+        deadline: Option<Instant>,
+        cancellation: &LatchReader,
+    ) -> Option<Arc<TipSnapshot>> {
+        let guard = self.gate.lock();
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_all();
+        drop(guard);
+        let result = self.inner.wait_for_tip(condition, deadline, cancellation);
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    fn wake_waiters(&self) {
+        self.inner.wake_waiters();
+    }
+}
+
+fn context() -> (Arc<Context>, Arc<Chainstate>, Arc<ObservableTipWait>) {
     let chainstate = Arc::new(Chainstate::new(
         Network::Regtest,
         Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -24,10 +83,11 @@ fn context() -> (Arc<Context>, Arc<Chainstate>) {
     chainstate
         .apply_block(&Network::Regtest.genesis_block(), None)
         .expect("genesis");
+    let observable = ObservableTipWait::new(chainstate.clone());
     let mut ctx = Context::new();
     ctx.chain.applied_tip = chainstate.applied_tip_reader();
-    ctx.chain.active_tip_wait = Some(chainstate.clone());
-    (Arc::new(ctx), chainstate)
+    ctx.chain.active_tip_wait = Some(observable.clone());
+    (Arc::new(ctx), chainstate, observable)
 }
 
 fn send(address: SocketAddr, body: &Value) -> TcpStream {
@@ -36,7 +96,12 @@ fn send(address: SocketAddr, body: &Value) -> TcpStream {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("deadline");
-    write!(stream, "POST / HTTP/1.1\r\nHost: {address}\r\nAuthorization: Basic cGFyaXR5OnBhcml0eQ==\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}", body.len()).expect("send");
+    write!(
+        stream,
+        "POST / HTTP/1.1\r\nHost: {address}\r\nAuthorization: Basic cGFyaXR5OnBhcml0eQ==\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("send");
     stream
 }
 
@@ -55,18 +120,8 @@ fn read(mut stream: TcpStream) -> (String, Value) {
     (head.to_owned(), value)
 }
 
-fn await_waiter(handler: &Handler) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while handler.reserve_blocking_request().is_ok() {
-        assert!(
-            Instant::now() < deadline,
-            "request must enter the bounded wait quota"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
 // EOF can precede ConnectionPermit::drop. Retry only the observable 503
+
 // admission refusal; an RPC/JSON/transport error is never treated as busy.
 fn ordinary_rpc(address: SocketAddr) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -93,7 +148,7 @@ fn ordinary_rpc(address: SocketAddr) -> serde_json::Value {
 
 #[test]
 fn wait_quota_preserves_ordinary_http_and_server_only_shutdown_returns_tip() {
-    let (ctx, chainstate) = context();
+    let (ctx, chainstate, observable) = context();
     let handler = Arc::new(Handler::new(Arc::clone(&ctx)));
     let server = RpcServer::bind(
         "127.0.0.1:0",
@@ -104,7 +159,6 @@ fn wait_quota_preserves_ordinary_http_and_server_only_shutdown_returns_tip() {
         false,
     )
     .expect("bind");
-    let handler = Arc::clone(&server.handler);
     let address = server.local_addr().expect("address");
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&shutdown);
@@ -113,7 +167,7 @@ fn wait_quota_preserves_ordinary_http_and_server_only_shutdown_returns_tip() {
         address,
         &json!({"id":1,"method":"waitforblockheight","params":[1]}),
     );
-    await_waiter(&handler);
+    observable.wait_for_waiters(1);
     let (head, denied) = read(send(
         address,
         &json!({"id":3,"method":"waitfornewblock","params":[]}),
@@ -138,7 +192,7 @@ fn wait_quota_preserves_ordinary_http_and_server_only_shutdown_returns_tip() {
 #[test]
 fn mixed_batch_and_notification_waits_share_admission_and_cancellation() {
     for notification_only in [false, true] {
-        let (ctx, _) = context();
+        let (ctx, _, observable) = context();
         let handler = Arc::new(Handler::new(Arc::clone(&ctx)));
         let server = RpcServer::bind(
             "127.0.0.1:0",
@@ -149,7 +203,6 @@ fn mixed_batch_and_notification_waits_share_admission_and_cancellation() {
             false,
         )
         .expect("bind");
-        let handler = Arc::clone(&server.handler);
         let address = server.local_addr().expect("address");
         let shutdown = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&shutdown);
@@ -165,7 +218,7 @@ fn mixed_batch_and_notification_waits_share_admission_and_cancellation() {
             ])
         };
         let waiting = send(address, &body);
-        await_waiter(&handler);
+        observable.wait_for_waiters(1);
         let ordinary = bitcoin_rs_e2e::rpc::Connection::new(address)
             .rpc(
                 &serde_json::json!({"id":3,"method":"getblockcount","params":[]}),
@@ -189,69 +242,8 @@ fn mixed_batch_and_notification_waits_share_admission_and_cancellation() {
 }
 
 #[test]
-fn one_worker_rejects_waits_and_direct_dispatch_cannot_bypass_budget() {
-    let (ctx, _) = context();
-    let handler = Arc::new(Handler::new(Arc::clone(&ctx)));
-    handler.configure_blocking_admission(1);
-    assert!(
-        handler
-            .dispatch("waitforblockheight", &json!([-1]))
-            .is_err()
-    );
-    assert_eq!(
-        handler
-            .dispatch("getblockcount", &json!([]))
-            .expect("ordinary")
-            .as_u64(),
-        Some(0)
-    );
-    handler.configure_blocking_admission(2);
-    let waiter = Arc::clone(&handler);
-    let task = std::thread::spawn(move || waiter.dispatch("waitforblockheight", &json!([1])));
-    await_waiter(&handler);
-    assert!(handler.dispatch("waitfornewblock", &json!([1])).is_err());
-    assert_eq!(
-        handler
-            .dispatch("getblockcount", &json!([]))
-            .expect("ordinary")
-            .as_u64(),
-        Some(0)
-    );
-    handler.stop();
-    assert_eq!(
-        task.join().expect("waiter").expect("cancel returns tip")["height"].as_u64(),
-        Some(0)
-    );
-}
-
-#[test]
-fn scan_start_is_blocking_but_status_abort_and_gbt_are_outside_this_budget() {
-    for params in [
-        json!(["start", []]),
-        json!({"action":"start","scanobjects":[]}),
-        json!({"args":["start",[]]}),
-    ] {
-        assert!(crate::registry::blocking_request(
-            &json!({"method":"scantxoutset","params":params})
-        ));
-    }
-    for params in [
-        json!(["status"]),
-        json!(["abort"]),
-        json!({"action":"status"}),
-    ] {
-        assert!(!crate::registry::blocking_request(
-            &json!({"method":"scantxoutset","params":params})
-        ));
-    }
-    assert!(!crate::registry::blocking_request(
-        &json!({"method":"getblocktemplate","params":[{"longpollid":"x"}]})
-    ));
-}
-
-#[test]
 fn rebinding_context_keeps_old_and_new_cancellation_and_budgets_separate() {
-    let (ctx, _) = context();
+    let (ctx, _, observable) = context();
     let supplied = Arc::new(Handler::new(ctx));
     let old = RpcServer::bind(
         "127.0.0.1:0",
@@ -262,7 +254,6 @@ fn rebinding_context_keeps_old_and_new_cancellation_and_budgets_separate() {
         false,
     )
     .expect("old bind");
-    let old_handler = Arc::clone(&old.handler);
     let old_addr = old.local_addr().expect("old address");
     let old_shutdown = Arc::new(AtomicBool::new(false));
     let old_signal = Arc::clone(&old_shutdown);
@@ -271,7 +262,7 @@ fn rebinding_context_keeps_old_and_new_cancellation_and_budgets_separate() {
         old_addr,
         &json!({"id":1,"method":"waitforblockheight","params":[1]}),
     );
-    await_waiter(&old_handler);
+    observable.wait_for_waiters(1);
 
     // Bind/start the replacement BEFORE the old server's stop guard runs.
     let new = RpcServer::bind(
@@ -283,7 +274,6 @@ fn rebinding_context_keeps_old_and_new_cancellation_and_budgets_separate() {
         false,
     )
     .expect("new bind over same context");
-    let new_handler = Arc::clone(&new.handler);
     let new_addr = new.local_addr().expect("new address");
     let new_shutdown = Arc::new(AtomicBool::new(false));
     let new_signal = Arc::clone(&new_shutdown);
@@ -292,7 +282,7 @@ fn rebinding_context_keeps_old_and_new_cancellation_and_budgets_separate() {
         new_addr,
         &json!({"id":2,"method":"waitforblockheight","params":[1]}),
     );
-    await_waiter(&new_handler);
+    observable.wait_for_waiters(2);
     old_shutdown.store(true, Ordering::Release);
     old_thread.join().expect("old server").expect("old exit");
     assert_eq!(read(old_wait).1["result"]["height"].as_u64(), Some(0));
@@ -321,7 +311,7 @@ fn rebinding_context_keeps_old_and_new_cancellation_and_budgets_separate() {
 
 #[test]
 fn one_connection_server_rejects_waits_before_they_can_occupy_the_only_worker() {
-    let (ctx, _) = context();
+    let (ctx, _, _) = context();
     let mut server = RpcServer::bind(
         "127.0.0.1:0",
         Arc::new(Auth::basic("parity", "parity")),

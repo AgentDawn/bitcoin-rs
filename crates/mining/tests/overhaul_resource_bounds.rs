@@ -27,7 +27,7 @@ use bitcoin_rs_script::VerifyFlags;
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 
-#[path = "common/fixtures.rs"]
+#[path = "support/fixtures.rs"]
 mod common;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;

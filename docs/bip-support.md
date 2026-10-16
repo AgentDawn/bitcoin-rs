@@ -46,7 +46,7 @@ Linked capability names lead to code or tests; notes link scope and evidence own
 | 152 | [Compact blocks](../crates/p2p/src/compact_blocks.rs) | ✅ | ✓ | Announcements are implemented (see policy §7); only the CORE-05 live-reorg qualification is pending; [Core 31.1 request/response scope](api/ecosystem-compat.toml); reconstruction counts diagnostic |
 | 155 | [Address v2](../crates/p2p/src/wire.rs) | ◐ | — | Negotiation and IP receive path; getaddr sends legacy addr |
 | 157/158 | [Compact filters](../crates/index/src/index/filters.rs) | ✅ | ✓ | Optional blockfilterindex; basic active-chain filters; [Kyoto regtest scope](api/ecosystem-compat.toml) |
-| 159 | [Limited-network service](../crates/node/src/state_open.rs) | ✅ | — | Pruned nodes advertise NETWORK_LIMITED + WITNESS |
+| 159 | [Limited-network service](../crates/node/src/state/open.rs) | ✅ | — | Pruned nodes advertise NETWORK_LIMITED + WITNESS |
 | 324 | [v2 transport](../crates/p2p/src/transport.rs) | 🧪 | — | Opt-in; [vectors](../crates/p2p/tests/data/bip324/) and [negotiation tests](../crates/p2p/src/listener/v2_transport_tests.rs); bidirectional Core interop pending |
 | 330 | [Erlay](https://github.com/gosuda/bitcoin-rs/issues/1501) | ❌ | — | Explicitly deferred backlog (#1501 tracks the deferral, so the policy keeps it `Unsupported` rather than `Planned`); sendtxrcncl ignored |
 | 339 | [Wtxid relay](../crates/p2p/src/peer.rs) | ✅ | — | Negotiation, announcements and getdata |

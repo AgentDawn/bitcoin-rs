@@ -2542,43 +2542,43 @@ fn service_and_range_gate_both_request_paths() -> TestResult {
 }
 
 #[cfg(test)]
-mod behavior_1;
+mod download_frontier;
 
 #[cfg(test)]
-mod behavior_2;
+mod download_batches;
 
 #[cfg(test)]
-mod behavior_3;
+mod headroom_throttling;
 
 #[cfg(test)]
-mod behavior_4;
+mod pending_retries;
 
 #[cfg(test)]
-mod behavior_5;
+mod settlement_faults;
 
 #[cfg(test)]
-mod behavior_6;
+mod peer_fanout;
 
 #[cfg(test)]
-mod transitions_1;
+mod header_progress;
 
 #[cfg(test)]
-mod transitions_2;
+mod fork_retargeting;
 
 #[cfg(test)]
-mod transitions_3;
+mod tip_alignment;
 
 #[cfg(test)]
-mod transitions_4;
+mod header_rotation;
 
 #[cfg(test)]
-mod transitions_5;
+mod trickle_peers;
 
 #[cfg(test)]
-mod transitions_6;
+mod window_recovery;
 
 #[cfg(test)]
-mod validation_1;
+mod peer_qualification;
 
 #[cfg(test)]
 mod witness_staging_gate;
@@ -2589,10 +2589,10 @@ mod headers_presync;
 mod frontier_recovery;
 
 mod chain_sync;
+mod frontier_liveness;
 #[cfg(test)]
 mod frontier_model;
 mod head_sync;
-mod issue_1153;
 mod limited_peers;
 mod stale_tip;
 

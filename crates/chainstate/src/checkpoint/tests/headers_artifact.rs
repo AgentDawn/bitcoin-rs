@@ -67,7 +67,7 @@ fn reader_rejects_wrong_network_and_genesis() -> Result<(), Box<dyn std::error::
 }
 
 /// Regression coverage for the headers-v1 wire contract in
-/// `crates/chainstate/src/checkpoint_headers.rs`: `prefix`/`parse_prefix` define the
+/// `crates/chainstate/src/checkpoint/headers.rs`: `prefix`/`parse_prefix` define the
 /// magic at bytes 0..8, version at 8..12, and count at 48..56; `checkpoint_size`
 /// and `read_headers` require the encoded length to contain exactly the prefix
 /// plus 80-byte headers. Keep these offsets tied to that authoritative codec

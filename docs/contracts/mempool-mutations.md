@@ -322,8 +322,8 @@ state (`crates/mempool/src/orphan.rs`).
   `sequence_base_matches_per_change_assignment`,
   `stable_generation_reads_even_values`,
   `admit_write_gate_retries_when_the_stamp_moved_after_prepare`.
-- `crates/node/tests/unit/sync/tests/transitions_3.rs` and
-  `transitions_7.rs`: permanent and mutated-body reorg outcomes preserve the
+- `crates/node/src/sync/tests/reorg_invalidation.rs` and
+  `branch_connect_mempool.rs`: permanent and mutated-body reorg outcomes preserve the
   committed-prefix and invalidation semantics while the node owns
   mempool/follower coordination.
 - `crates/chainstate/src/reorg.rs` owns body preflight, bounded mid-rollback

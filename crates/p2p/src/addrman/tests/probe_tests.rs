@@ -165,9 +165,9 @@ fn connected_collision_good_uses_ip_not_port_but_not_linked_ipv6_group() {
     assert_eq!(state(&book, target()).last_success, EPOCH - 20_000);
 }
 
-const V3_ANCHORS: &[u8] = include_bytes!("../../tests/data/addrman-historical-v3-anchors.dat");
-const V4_ANCHORS: &[u8] = include_bytes!("../../tests/data/addrman-historical-v4-anchors.dat");
-const V6_REFS: &[u8] = include_bytes!("../../tests/data/addrman-core-v6-eight-refs.dat");
+const V3_ANCHORS: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v3-anchors.dat");
+const V4_ANCHORS: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v4-anchors.dat");
+const V6_REFS: &[u8] = include_bytes!("../../../tests/data/addrman-core-v6-eight-refs.dat");
 
 #[test]
 fn actual_historical_anchor_and_v6_files_migrate_with_exact_backup() {
@@ -304,7 +304,7 @@ fn failed_anchor_consumption_exposes_no_claims_and_newer_confirmation_wins_retur
 
 fn collision_oracle() -> serde_json::Value {
     serde_json::from_str(include_str!(
-        "../../tests/data/core-addrman-collisions-v31.1.json"
+        "../../../tests/data/core-addrman-collisions-v31.1.json"
     ))
     .expect("independent Core output")
 }
@@ -595,7 +595,7 @@ fn historical_anchor_migration_obeys_configured_map_and_unknown_shape_barriers()
         );
         fs::write(
             &map,
-            include_bytes!("../../tests/data/asmap-linked-ipv4-core-v31.1.raw"),
+            include_bytes!("../../../tests/data/asmap-linked-ipv4-core-v31.1.raw"),
         )
         .expect("restore map");
         let restored = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
@@ -747,7 +747,7 @@ fn returned_anchor_releases_same_as_group_and_rejection_preserves_other_purposes
     let map = directory.path().join("asmap.raw");
     fs::write(
         &map,
-        include_bytes!("../../tests/data/asmap-source-quota-core-v31.1.raw"),
+        include_bytes!("../../../tests/data/asmap-source-quota-core-v31.1.raw"),
     )
     .expect("Core map");
     let book = AddressBook::open(None, [1; 4], false, Some(&map));

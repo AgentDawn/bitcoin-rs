@@ -831,6 +831,11 @@ evidence does not establish mainnet memory or throughput qualifications.
   before; reserving ordinary capacity per source is not provided.
   A standalone dispatcher defaults to 16 blocking calls. Admission never
   waits for capacity. Scan status/abort remain ordinary calls.
+  Proof: `rpc::registry::tests::scan_start_is_blocking_but_status_abort_and_gbt_are_outside_this_budget`,
+  `rpc::registry::tests::tip_waits_are_blocking_requests`, and
+  `rpc::handlers::registry_tests::one_worker_rejects_waits_and_direct_dispatch_cannot_bypass_budget`
+  pin classification and direct-dispatch quota enforcement. The dispatcher
+  test observes the existing active count without reserving a permit itself.
 - Connection admission: a listener holds at most `max_connections` live
   connections. One source address holds at most `max_connections -
   max_connections / 4` of them (96 of the node's 128), so a quarter, rounded
@@ -865,7 +870,8 @@ evidence does not establish mainnet memory or throughput qualifications.
   its generated help body. These cancellation, overload, transport and help
   differences are declared `Deviation`; no full compatibility promotion is made.
 - Evidence: `chainstate::tip_wait::tests`,
-  `rpc::server::tip_wait_tests`, and the live pinned-Core process comparisons
+  `crates/rpc/tests/tip_wait_admission.rs`, `rpc::registry::tests`,
+  `rpc::handlers::registry_tests`, and the live pinned-Core process comparisons
   in `e2e/tests/rpc_tip_waits.rs` exercise reorgs, deadlines, shutdown responses,
   parameter errors and restored startup. Header-only process checks complete
   finite waits after admission and compare the applied tip; deterministic
@@ -980,7 +986,7 @@ evidence does not establish mainnet memory or throughput qualifications.
   `generateblock_raw_tx_does_not_require_mempool_admission`,
   `generate_without_submit_does_not_advance_the_tip`,
   `network_hash_ps_rejects_core_invalid_windows`;
-  `crates/mining/src/network_hashps/oracle_tests.rs` tests
+  `crates/mining/src/network_hashps/tests.rs` tests
   `network_hash_ps_rejects_a_height_the_tip_cannot_resolve`;
   `crates/mining/tests/template_shape.rs` tests
   `candidate_solves_an_unsolved_regtest_header`,
@@ -1005,9 +1011,10 @@ evidence does not establish mainnet memory or throughput qualifications.
 - `API-11`:
   - `crates/rpc/src/handlers/mining.rs` tests `getblocktemplate_forwards_longpollid`,
     `getblocktemplate_requires_signet_rule_on_signet`
-  - `crates/mining/src/coordinator/candidate_template_tests.rs` tests
-    `template_facts_follow_mutated_candidate_generation`,
-    `signet_template_carries_challenge_and_mandatory_rule`
+  - `crates/mining/src/coordinator/tests.rs` tests
+    `template_projects_candidate_generation_and_deployment_flags`,
+    `long_poll_round_trips_template_id`,
+    `long_poll_rejects_non_ascii_split_boundary_without_panicking`
   - `crates/node/tests/mining.rs` tests `template_does_not_echo_client_capabilities`,
     `signet_template_includes_challenge_and_signet_rule`
 

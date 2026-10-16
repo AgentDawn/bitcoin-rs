@@ -1754,7 +1754,3 @@ mod tests {
         assert!(rows[1].get("error").is_some());
     }
 }
-
-#[cfg(test)]
-#[path = "server_tip_wait_tests.rs"]
-mod tip_wait_tests;

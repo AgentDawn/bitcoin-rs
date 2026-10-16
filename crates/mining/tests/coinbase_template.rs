@@ -1,6 +1,6 @@
 //! Coinbase and witness-commitment candidate tests.
 
-#[path = "common/fixtures.rs"]
+#[path = "support/fixtures.rs"]
 mod common;
 
 use std::error::Error;

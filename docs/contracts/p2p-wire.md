@@ -292,7 +292,7 @@ the slot, and a same-address replacement that keeps its own identity.
 Capacity and frontier gates
 on the owned-fetch mark are covered in
 `crates/p2p/src/download_window.rs` tests; fault-path gate cleanup is
-covered in `crates/p2p/src/sync/tests/transitions_4.rs`.
+covered in `crates/p2p/src/sync/tests/header_rotation.rs`.
 `crates/p2p/src/listener.rs` test `send_block_forwards_the_blocks_header`
 covers the delivery-path forward.
 
@@ -373,7 +373,7 @@ test `announced_near_tip_is_direct_fetched_before_tick`;
 `unsolicited_block_flood_is_bounded_per_source`; `crates/p2p/src/sync/tests.rs`
 tests `permanent_consensus_body_disconnects_delivering_source` and
 `binding_and_operational_failures_do_not_disconnect`; and
-`crates/p2p/src/sync/tests/transitions_6.rs` test
+`crates/p2p/src/sync/tests/window_recovery.rs` test
 `reconcile_forgets_window_state_only_when_connection_identity_changes`.
 
 ### `P2P-08`: Inbound admission and the outbound service gate
@@ -668,12 +668,13 @@ misbehaviours of Core's `p2p_v2_misbehaving.py`, and the packet bounds.
   `note_announced_height_raises_monotonically_and_reports_actual_updates`
   pin the identity-checked, monotonic credit mutation and retained tip
   evidence (P2P-03).
-- `crates/p2p/src/sync/tests/transitions_1.rs` tests `tick_fetches_new_tip_headers_from_at_tip_peers`
-  (at-tip request eligibility after catch-up, P2P-03/#617) and
+- `crates/p2p/src/sync/tests/header_progress.rs` tests `tick_fetches_new_tip_headers_from_at_tip_peers`
+  (at-tip request eligibility after catch-up, P2P-03/#617),
   `tick_fetches_reorg_fork_announced_by_at_tip_peer` (reorg announcements
   earn credit on the reselected best chain),
-  `losing_fork_credit_survives_winner_disconnect` (retained branch evidence),
-  and `cold_start_stall_hedges_front_without_reassigning_owner` (active-chain
+  and `losing_fork_credit_survives_winner_disconnect` (retained branch evidence).
+- `crates/p2p/src/sync/tests/headroom_throttling.rs` tests
+  `cold_start_stall_hedges_front_without_reassigning_owner` (active-chain
   hedge eligibility).
 - `crates/p2p/src/counters.rs` tests `a_vectored_write_counts_every_slice`,
   `from_connected_disables_nagle`: the counting wrapper forwards one

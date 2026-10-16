@@ -767,7 +767,7 @@ impl DerivedIndexWorkerError {
 mod query_tests;
 
 #[cfg(all(test, feature = "fjall"))]
-mod integration_tests;
+mod supervisor_tests;
 
 #[cfg(all(test, feature = "fjall"))]
 #[expect(clippy::expect_used, clippy::panic)]

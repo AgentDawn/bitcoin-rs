@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used)]
 //! Package selection, limits, and adversarial candidate tests.
 
-#[path = "common/fixtures.rs"]
+#[path = "support/fixtures.rs"]
 mod common;
 
 use std::error::Error;

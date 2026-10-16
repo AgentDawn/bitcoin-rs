@@ -180,21 +180,21 @@ fn assert_preserved_invalid(base: &Path, path: &Path, bytes: &[u8]) {
     assert_eq!(fs::read(path).expect("untouched"), bytes);
 }
 
-const V1_SERVICES: &[u8] = include_bytes!("../../tests/data/addrman-historical-v1-services.dat");
-const V7_SERVICES: &[u8] = include_bytes!("../../tests/data/addrman-historical-v7-services.dat");
+const V1_SERVICES: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v1-services.dat");
+const V7_SERVICES: &[u8] = include_bytes!("../../../tests/data/addrman-historical-v7-services.dat");
 const V7_SERVICES_ASMAP: &[u8] =
-    include_bytes!("../../tests/data/addrman-historical-v7-services-asmap.dat");
-const SERVICE_MAP: &[u8] = include_bytes!("../../tests/data/asmap-linked-ipv4-core-v31.1.raw");
+    include_bytes!("../../../tests/data/addrman-historical-v7-services-asmap.dat");
+const SERVICE_MAP: &[u8] = include_bytes!("../../../tests/data/asmap-linked-ipv4-core-v31.1.raw");
 
 #[test]
 fn every_historical_schema_requires_numeric_services_before_conversion() {
     let fixtures: [&[u8]; 7] = [
         V1_SERVICES,
-        include_bytes!("../../tests/data/addrman-historical-v2.dat"),
-        include_bytes!("../../tests/data/addrman-historical-v3.dat"),
-        include_bytes!("../../tests/data/addrman-historical-v4-anchors.dat"),
-        include_bytes!("../../tests/data/addrman-core-v5-eight-refs.dat"),
-        include_bytes!("../../tests/data/addrman-core-v6-eight-refs.dat"),
+        include_bytes!("../../../tests/data/addrman-historical-v2.dat"),
+        include_bytes!("../../../tests/data/addrman-historical-v3.dat"),
+        include_bytes!("../../../tests/data/addrman-historical-v4-anchors.dat"),
+        include_bytes!("../../../tests/data/addrman-core-v5-eight-refs.dat"),
+        include_bytes!("../../../tests/data/addrman-core-v6-eight-refs.dat"),
         V7_SERVICES,
     ];
     for bytes in fixtures {

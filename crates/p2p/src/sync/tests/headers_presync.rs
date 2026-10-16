@@ -5,8 +5,8 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use super::behavior_5::deliver_headers;
-use super::behavior_5::next_locator;
+use super::settlement_faults::deliver_headers;
+use super::settlement_faults::next_locator;
 use bitcoin_rs_primitives::Hash256;
 
 use super::super::SyncBudget;
