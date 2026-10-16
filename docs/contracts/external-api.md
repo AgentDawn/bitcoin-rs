@@ -141,11 +141,16 @@ scanning and wallet interoperability remain unverified.
   `/rest/block` retains its separate projection without undo fields.
 - Full block REST rendering, spent outputs, and detailed getblock responses
   share two materialization permits. The owner bounds body copies to
-  4,000,000 bytes, undo copies to 64 MiB, decoded inverse counts by the
-  authenticated block, and conservative projected response expansion to
-  64 MiB. Certification shares a 4,096-parent-hop budget, reusing the tree's
-  trusted height index after joining its prefix. Retained-body witness checks
-  use the existing bounded deployment query: an off-header-chain BIP9 read
+  4,000,000 bytes and undo copies to 64 MiB. Undo counts are bounded by the
+  authenticated block and remaining record bytes; script lengths must fit the
+  record before allocation. Spent-input rows derive from that block, and each
+  spent script is copied once from the bounded body or undo. These bounds cover
+  input materialization, not a 64 MiB heap or JSON limit: decoded metadata and
+  script copies add allocations, and verbose JSON can expand further. Any
+  format-specific response budget belongs to its renderer, not the reusable
+  `BlockUndoSource`. Certification shares a 4,096-parent-hop budget, reusing
+  the tree's trusted height index after joining its prefix. Retained-body witness
+  checks use the existing bounded deployment query: an off-header-chain BIP9 read
   captures at most 2,000,000 ancestor IDs (at most 8 MB); missing bodies do not
   trigger deployment work. Both budget failures are explicit resource limits;
   these bounds are not throughput or global-RSS claims.
