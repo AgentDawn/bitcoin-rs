@@ -766,6 +766,8 @@ impl Context {
     }
 
     /// Acquires a bounded full-block render slot, if one is available.
+    /// Full-body responses retain it through rendering. The tweak adapter drops
+    /// its source first; its single-work slot still bounds derived JSON rendering.
     pub(crate) fn try_acquire_block_render(&self) -> Option<BlockRenderPermit> {
         self.block_render_budget.try_acquire()
     }

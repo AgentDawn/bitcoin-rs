@@ -47,7 +47,7 @@ pub(crate) fn getblocktweaks(ctx: &Arc<Context>, params: &Value) -> Result<Value
         .try_lock()
         .ok_or_else(|| unavailable("busy; retry"))?;
     let (height, hash) = select_block(ctx, &view, selector)?;
-    let _render = ctx
+    let materialization = ctx
         .try_acquire_block_render()
         .ok_or_else(|| unavailable("full-block read limit; retry"))?;
     let source = ctx
@@ -66,6 +66,9 @@ pub(crate) fn getblocktweaks(ctx: &Arc<Context>, params: &Value) -> Result<Value
     // Use the same activation owner as consensus::verify_flags; never the tip's height.
     let taproot_active = ctx.chain.chain_network.is_taproot_active(height);
     let material = block_tweaks(&inputs, taproot_active).map_err(|error| read_error(&error))?;
+    drop(inputs);
+    drop(materialization);
+    // The single-work slot still bounds derived JSON projection and publication.
     let result = render(&material, height, tip, taproot_active);
     // Source rechecks certify its read, not the subsequent CPU/JSON projection.
     // Never wait behind validation, and never hold transition exclusion over work.

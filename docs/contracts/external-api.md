@@ -6,24 +6,12 @@
 
 ## Clauses
 
-The optional BIP352 `getblocktweaks` RPC is an experimental `Extension`, described
-in [silent-payments.md](../silent-payments.md). It requires the `silent-payments`
-build feature and runtime opt-in, uses ordinary RPC authentication, and accepts
-only one applied-chain height or hash. The retained-input owner below supplies
-complete historical prevouts. The adapter verifies the returned body identity,
-uses the requested height's native Taproot activation, and after projection
-tries transition exclusion without waiting to recheck recovery and applied hash
-before publication. No history/read failure becomes empty success. There is one
-nonqueued work slot, the shared block-render permit, bounded selection (at most
-4,096 fallback parent hops), and no history I/O during IBD.
-The source's separate read/projection budgets can refuse consensus-valid blocks;
-clients need another complete source for those blocks rather than unchanged
-retries. This extension does not guarantee complete scanning of every valid block.
-No new chain/index state or durable representation exists. Draft `/getinfo` and
-`/tweaks/:blockheight` are not served; no Core or finalized index-server protocol
-compatibility is claimed. Executable proof: RPC `handlers::silent_payments`
-tests, `manifest_coverage`, binary `silent_payments` signed-spend/dense-block
-HTTP/reorg/restart process test, and configuration tests.
+The opt-in BIP352 `getblocktweaks` extension uses the retained-input owner
+below. Its [service documentation](../silent-payments.md) owns the experimental
+RPC shape, admission/publication checks, coverage limits and evidence. The
+shared full-block permit ends when the adapter drops its source; its single-work
+slot covers derived JSON rendering and the final consistency check. Complete
+scanning and wallet interoperability remain unverified.
 
 ### `API-01`: Single manifest owner
 

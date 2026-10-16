@@ -4,71 +4,19 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
-use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::hashes::{Hash as _, sha256};
-use bitcoin::hex::{DisplayHex as _, FromHex as _};
-use bitcoin::secp256k1::{Scalar, Secp256k1};
-use bitcoin::{Amount, Block, OutPoint, PublicKey, ScriptBuf, Sequence, Transaction, TxOut};
-use bitcoin_rs_e2e::helpers::{
-    COINBASE_MATURITY, coinbase_at, funding_address, funding_output, mine_blocks_to, raw_spend_to,
-    sign_p2pkh_inputs, submit_genesis, tx_hex,
-};
+use bitcoin::Block;
+use bitcoin::consensus::deserialize;
+use bitcoin::hex::FromHex as _;
+use bitcoin_rs_e2e::helpers::tx_hex;
 use bitcoin_rs_e2e::{Kind, ProcessNode, SpawnOptions};
 use serde_json::json;
 
+mod support {
+    pub(crate) mod silent_payment_spend;
+}
+use support::silent_payment_spend::{OUTPUT_KEY, mine_candidates};
+
 const OUTPUT_COUNT: usize = 11_000;
-const OUTPUT_KEY: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-
-// Independent single-input BIP352 oracle: the fixture's known public key,
-// serialized funding outpoint and tagged SHA256, without the node/index codec.
-fn expected_tweak(outpoint: OutPoint, prevout: &TxOut) -> Result<String> {
-    let key: PublicKey =
-        "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f".parse()?;
-    assert_eq!(
-        prevout.script_pubkey,
-        ScriptBuf::new_p2pkh(&key.pubkey_hash())
-    );
-    let tag = sha256::Hash::hash(b"BIP0352/Inputs");
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(tag.as_byte_array());
-    bytes.extend_from_slice(tag.as_byte_array());
-    bytes.extend_from_slice(&serialize(&outpoint));
-    bytes.extend_from_slice(&key.inner.serialize());
-    let scalar = Scalar::from_be_bytes(sha256::Hash::hash(&bytes).to_byte_array())?;
-    Ok(key
-        .inner
-        .mul_tweak(&Secp256k1::verification_only(), &scalar)?
-        .serialize()
-        .to_lower_hex_string())
-}
-
-fn mine_candidates(
-    node: &mut ProcessNode,
-    output_count: usize,
-) -> Result<(Transaction, String, String)> {
-    submit_genesis(node)?;
-    let _ = mine_blocks_to(
-        node,
-        COINBASE_MATURITY,
-        &format!("addr({})", funding_address()?),
-    )?;
-    let (outpoint, prevout) = funding_output(&coinbase_at(node, 1)?)?;
-    let expected = expected_tweak(outpoint, &prevout)?;
-    let script = ScriptBuf::from_bytes(Vec::from_hex(&format!("5120{OUTPUT_KEY}"))?);
-    let mut tx = raw_spend_to(outpoint, &prevout, 10_000, Sequence::MAX, &script);
-    // Keep duplicates and dust: candidate completeness is independent of policy.
-    tx.output.resize(
-        output_count,
-        TxOut {
-            value: Amount::ZERO,
-            script_pubkey: script,
-        },
-    );
-    sign_p2pkh_inputs(&mut tx, &[prevout])?;
-    let mined = node.rpc("generateblock", &json!(["raw(51)", [tx_hex(&tx)]]))?;
-    let hash = mined["hash"].as_str().context("mined hash")?.to_owned();
-    Ok((tx, hash, expected))
-}
 
 #[test]
 fn signed_dense_block_survives_reorg_and_restart() -> Result<()> {
@@ -143,89 +91,6 @@ fn signed_dense_block_survives_reorg_and_restart() -> Result<()> {
         datadir,
     )?;
     assert_eq!(node.rpc_raw(&request)?["error"]["code"], -32603);
-    node.stop()?;
-    Ok(())
-}
-
-/// Build the unmodified Oracle at the pin in docs/silent-payments.md first.
-#[test]
-#[ignore = "requires BLINDBIT_ORACLE pointing to the pinned upstream binary"]
-fn blindbit_indexes_existing_rest_without_the_tweak_service() -> Result<()> {
-    use std::fs::File;
-    use std::net::TcpListener;
-    use std::process::Command;
-    use std::time::{Duration, Instant};
-
-    use bitcoin_rs_e2e::rpc::Connection;
-
-    let oracle = std::env::var_os("BLINDBIT_ORACLE").context("BLINDBIT_ORACLE is required")?;
-    let mut node = ProcessNode::spawn_with(
-        Kind::BitcoinRs,
-        &SpawnOptions {
-            binary: Some(Path::new(env!("CARGO_BIN_EXE_bitcoin-rs"))),
-            extra_args: &["--rest=true"],
-            ..SpawnOptions::default()
-        },
-    )?;
-    let (_, hash, expected) = mine_candidates(&mut node, 1)?;
-    let disabled =
-        node.rpc_raw(&json!({"jsonrpc":"2.0","id":1,"method":"getblocktweaks","params":[101]}))?;
-    assert_eq!(disabled["error"]["code"], -32603);
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let address = listener.local_addr()?;
-    let config = node.evidence.join("blindbit.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "chain = \"regtest\"\ncore_rest_endpoint = \"http://{}\"\nhttp_host = \"{address}\"\ngrpc_host = \"\"\nsync_start_height = 101\nmax_parallel_requests = 1\nmax_parallel_tweak_computations = 1\nmax_cpu_cores = 1\ntweaks_only = true\ntweaks_full_basic = true\ntweaks_full_with_dust_filter = false\ntweaks_cut_through_with_dust_filter = false\nlog_level = \"debug\"\n",
-            node.rpc_addr,
-        ),
-    )?;
-    let log = File::create(node.evidence.join("blindbit.log"))?;
-    drop(listener);
-    let mut child = Command::new(oracle)
-        .args(["run", "--skip-precheck", "--datadir"])
-        .arg(node.evidence.join("blindbit"))
-        .arg("--config")
-        .arg(&config)
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
-        .context("start BLINDBIT_ORACLE")?;
-    // Reap the external process before propagating probe errors.
-    let outcome = (|| -> Result<()> {
-        let mut connection = Connection::new(address);
-        let response = node.wait_for(
-            "BlindBit positive REST index",
-            Duration::from_secs(30),
-            |_| {
-                let response = connection.http(
-                    "GET",
-                    "/tweaks/101",
-                    &[],
-                    None,
-                    Instant::now() + Duration::from_secs(2),
-                )?;
-                if response.status != 200 {
-                    return Ok(None);
-                }
-                let response = response.json()?;
-                Ok((response["block_identifier"]["block_hash"] == hash).then_some(response))
-            },
-        )?;
-        std::fs::write(
-            node.evidence.join("blindbit-tweaks.json"),
-            serde_json::to_vec_pretty(&response)?,
-        )?;
-        anyhow::ensure!(
-            response["index"] == json!([expected]),
-            "Oracle positive tweak differs"
-        );
-        Ok(())
-    })();
-    let _ = child.kill();
-    child.wait()?;
-    outcome?;
     node.stop()?;
     Ok(())
 }
