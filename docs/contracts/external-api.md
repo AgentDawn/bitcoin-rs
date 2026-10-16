@@ -6,11 +6,22 @@
 
 ## Clauses
 
-The optional BIP352 public scan codec is a library experiment, described in
-[silent-payments.md](../silent-payments.md). It adds no dispatch entries or
-network endpoints to `REGISTRY`/`MANIFEST`: draft `/getinfo` and
-`/tweaks/:blockheight` are not served. It is neither a Core RPC nor a finalized
-index-server protocol compatibility claim.
+The optional BIP352 `getblocktweaks` RPC is an experimental `Extension`, described
+in [silent-payments.md](../silent-payments.md). It requires the `silent-payments`
+build feature and runtime opt-in, uses ordinary RPC authentication, and accepts
+only one applied-chain height or hash. The retained-input owner below supplies
+complete historical prevouts. The adapter verifies the returned body identity,
+uses the requested height's native Taproot activation, and after projection
+tries transition exclusion without waiting to recheck recovery and applied hash
+before publication. No history/read failure becomes empty success. There is one
+nonqueued work slot, a global 100 ms admission interval, the shared block-render
+permit, an 8 MiB conservative result bound, bounded selection (at most 4,096
+fallback parent hops), and no history I/O during IBD.
+No new chain/index state or durable representation exists. Draft `/getinfo` and
+`/tweaks/:blockheight` are not served; no Core or finalized index-server protocol
+compatibility is claimed. Executable proof: RPC `handlers::silent_payments`
+tests, `manifest_coverage`, node `silent_payments` HTTP/reorg/restart test, and
+configuration tests.
 
 ### `API-01`: Single manifest owner
 

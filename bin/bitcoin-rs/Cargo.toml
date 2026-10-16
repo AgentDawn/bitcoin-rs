@@ -46,6 +46,7 @@ fjall = ["bitcoin-rs-node/fjall"]
 redb = ["bitcoin-rs-node/redb"]
 kernel = ["bitcoin-rs-node/kernel"]
 zmq = ["bitcoin-rs-node/zmq"]
+silent-payments = ["bitcoin-rs-node/silent-payments"]
 
 [[test]]
 name = "g17_dependency_direction"

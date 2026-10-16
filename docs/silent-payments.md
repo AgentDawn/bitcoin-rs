@@ -1,10 +1,71 @@
 # Experimental BIP352 public scan material
 
-This is the feasibility and codec stage of #1491, based on PR #1554.
-The opt-in `bitcoin-rs-index/silent-payments` Cargo feature exposes
-`transaction_tweak` and `block_tweaks`. No durable rows, startup rescan,
-runtime switch or wallet subsystem is added. A network service remains future
-work; the codec supports one certified retained block.
+The opt-in `silent-payments` build feature exposes the experimental
+`getblocktweaks` JSON-RPC extension when `--silent-payments` is enabled.
+It projects one certified retained block using the existing stateless
+`bitcoin-rs-index/silent-payments` codec (`transaction_tweak` / `block_tweaks`).
+There are no durable tweak rows, startup rescan, wallet subsystem or new server.
+
+## Using the service
+
+Build with `cargo build --locked -p bitcoin-rs --features silent-payments`,
+then start with `--silent-payments` (default: off). The corresponding environment
+variable is `BITCOIN_RS_SILENT_PAYMENTS`; the TOML key is `silent_payments`.
+Requesting this runtime option without the build feature fails configuration
+validation before opening node data. Existing RPC cookie/Basic authentication
+applies; `--rest` is not required and does not expose this method anonymously.
+
+Call `getblocktweaks` with one positional or named `block`: an integer height
+or a 64-character block hash on the applied chain. For example:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"getblocktweaks","params":{"block":850000}}
+```
+
+The result has `height`, `hash`, `tip_height`, `tip_hash`, `taproot_active`,
+and `transactions`. Each transaction has its display `txid`, a compressed
+33-byte `tweak` in hex, and complete `outputs` with integer `vout` and hex
+32-byte `output_key`. An empty transaction list means a complete block with
+no eligible candidates, including pre-Taproot blocks. No candidate is filtered
+by value, spent status or wallet interest. The result proves neither wallet
+ownership nor unspentness; use existing complete-block/transaction APIs to
+verify candidates, chain membership and subsequent spends.
+
+There is no range, subscription, secret-key or filtering parameter. Unknown
+parameters are rejected. Unknown hashes return `-5`; stale/header-only hashes
+and heights above the applied tip return `-8`. Incomplete ancestry, absent or
+pruned/certification-limited history, recovery closure, a changed chain and
+resource/admission refusals return `-1` with the reason, never empty success.
+Corrupt/inconsistent retained material or storage/undo failures return
+`-32603`; disabled runtime configuration also returns `-32603` with an explicit
+disabled message. A build without this feature returns method-not-found
+(`-32601`). Initial block download returns `-10` before history I/O.
+
+The service resolves ancestry against one captured applied publication and
+uses the requested height's native Taproot activation rule. After projection
+and JSON construction, it tries transition exclusion without waiting, checks
+recovery state and the exact applied hash, and publishes only on success.
+This is the response's consistency point; a chain can move after it. Clients
+must keep block identities and rewind their own scan when the chain changes.
+Restart recomputes from existing certified data; there is no tweak cursor or
+cache to recover. No full-history readiness watermark is invented: each
+requested block must establish its own coverage through the retained owner.
+
+All callers share one nonqueued work slot and a minimum 100 ms interval between
+admitted requests, including reads that fail. It also acquires an existing
+full-block materialization permit. A conservative JSON bound rejects results
+over 8 MiB before allocating their JSON tree; this bounds the result payload,
+not an arbitrary caller's JSON-RPC id/envelope. Busy/rate-limit responses ask
+callers to retry; rate-limit retries should wait at least 100 ms. CPU projection
+and body I/O hold no transition/tree guard. The final transition check uses
+`try_lock`, so it never queues behind validation. These bounds and refusal
+during IBD protect serving capacity; they are not a measured latency or
+mainnet throughput guarantee. The global limit is shared across credentials,
+not an anonymous per-IP quota.
+Ancestry selection uses the tree's trusted height index when available and
+refuses fallback walks exceeding 4,096 parent hops. Selection runs inside the
+same admission slot, before body I/O; header sync running ahead of the applied
+chain cannot trigger an unbounded ancestry walk under the tree read guard.
 
 ## Semantics and reference pins
 
@@ -69,10 +130,8 @@ Call this owner directly with a captured applied hash, then project its
 or second UTXO owner is needed.
 
 The codec checks row counts and outpoint alignment and returns the body's exact
-hash. It makes no unverified height or active-tip claim. A future adapter must
-resolve height/hash and Taproot activation on one applied ancestry and recheck
-publication after projection; `BlockSpends` does not carry activation context or
-height, and a completed source read cannot prevent a subsequent tip move.
+hash. Height selection, activation and final publication checks belong to the
+RPC adapter; `BlockSpends` itself carries neither height nor activation context.
 
 | Situation | Coverage and error policy |
 | --- | --- |
@@ -81,13 +140,14 @@ height, and a completed source read cannot prevent a subsequent tip move.
 | Pruned/reserved/missing history | Preserve the owner's typed history/read failure even for empty blocks; restore/replay required data before promising coverage. |
 | Missing/unready txindex | No effect on the certified-undo codec path; cannot mask missing undo. |
 | Snapshot prefix | Retained bytes are insufficient without certified archived validation progress. |
-| Reorg/restart/full rescan | Recompute from the chosen body. Source receipts/leases own readiness; a future cache must key full block identity and invalidate active-chain assignments. |
+| Reorg/restart/full rescan | Recompute from the chosen body. Source receipts/leases own readiness; the adapter rejects stale selection or a moved applied tip. |
 
 Partial-success lists are not returned. `None` means complete transaction
 ineligibility or coinbase, never missing history. Source commit, recovery,
 snapshot and lock/lease behavior remains covered by
 `crates/chainstate/tests/unit/block_spends_tests.rs`; those paths are unchanged.
-Codec replay tests do not prove lifecycle behavior of a future durable index.
+Codec replay tests alone do not prove service lifecycle behavior; the node HTTP
+test separately exercises invalidation, replacement and clean restart.
 
 ## Resources and consumer assessment
 
@@ -120,11 +180,13 @@ identity/coverage; wallet scanning stays local. No full duplicate coin database
 or wallet fork is justified by this stage. Funded regtest wallet discovery and
 confirmation has **not** been run.
 
-A production adapter still needs a pinned consumer contract, proven coverage
-and bounded CPU admission. It must use existing node/RPC/REST serving and
-materialization permits, bound ranges/responses, limit concurrency, rate-limit
-callers and keep validation/IBD responsive. No HTTP scheduler/rate limiter is
-introduced for this library-only stage.
+The draft `/getinfo` and `/tweaks/:height` shapes were evaluated. This adapter
+instead provides an explicitly bitcoin-rs-specific, authenticated JSON-RPC
+extension with transaction mapping and complete output keys, over the existing
+listener. It does not implement the draft's anonymous HTTP role or BlindBit's
+gRPC service. A consumer/sidecar must speak this documented extension; no
+unmodified wallet interoperability or funded discovery is claimed. The pinned
+WIP protocol incompatibility remains the recorded external integration limit.
 
 ## Evidence, privacy and API status
 
@@ -133,7 +195,11 @@ sums/tweaks, including labels/multiple outputs, NUMS, malleated P2PKH, invalid
 P2SH, uncompressed keys and infinity cases. The unmodified pinned Python
 reference passed the full vectors locally (WSL, Python 3.12.3). Additional
 tests cover future witness versions, missing material/history, empty blocks,
-output indices, limits and deterministic hash-scoped replay. Extraction is
+output indices, limits and deterministic hash-scoped replay. Adapter tests
+cover exact selection, unavailable history, publication races, recovery,
+IBD, admission and response limits. The production node HTTP test covers
+authentication, runtime gating, invalidation/replacement and restart.
+Extraction is
 recorded in `crates/index/tests/data/bip352-PROVENANCE.md`.
 
 No parameter accepts wallet private keys, addresses, subscriptions or payment
@@ -142,8 +208,8 @@ and logs can still reveal birthdays/access times/ranges: keyless computation
 alone is not anonymity. Spent/dust filtering and scan-interest parameters are
 absent. Query-log and traffic privacy policies remain deployment concerns.
 
-`REGISTRY`/`MANIFEST` gain no network entries: `/getinfo` and `/tweaks/:height`
-are not served and Core behavior is unchanged. The
-[ecosystem inventory](api/ecosystem-compat.toml) marks the codec experimental,
+`REGISTRY`/`MANIFEST` declare `getblocktweaks` as an optional `Extension`:
+`/getinfo` and `/tweaks/:height` are not served and existing Core behavior is
+unchanged. The [ecosystem inventory](api/ecosystem-compat.toml) marks it experimental,
 not a Core RPC or finalized index-server protocol. Compact filters inherited
 from PR #1554 remain a separate capability, not a codec requirement.

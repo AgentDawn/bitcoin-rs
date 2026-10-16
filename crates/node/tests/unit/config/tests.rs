@@ -8,6 +8,21 @@ use crate::options::{
 };
 
 #[test]
+fn silent_payments_defaults_off_and_requires_the_build_feature() {
+    let mut config = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
+    assert!(!config.rpc.silent_payments);
+    config.rpc.silent_payments = true;
+    let result = config.validate();
+    if cfg!(feature = "silent-payments") {
+        assert!(result.is_ok(), "{result:?}");
+    } else {
+        assert!(
+            result.is_err_and(|error| error.to_string().contains("silent-payments build feature"))
+        );
+    }
+}
+
+#[test]
 fn auth_debug_redacts_secrets() {
     let auth = Auth::basic("operator", "s3cret");
     let rendered = format!("{auth:?}");

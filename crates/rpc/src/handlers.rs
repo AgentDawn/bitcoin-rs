@@ -13,6 +13,8 @@ pub(crate) mod deployment;
 pub(crate) mod mempool;
 pub(crate) mod mining;
 pub(crate) mod network;
+#[cfg(feature = "silent-payments")]
+pub(crate) mod silent_payments;
 pub(crate) mod tx;
 pub(crate) mod util;
 pub(crate) mod wait;

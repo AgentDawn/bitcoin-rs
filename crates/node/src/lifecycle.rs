@@ -129,6 +129,7 @@ fn bind_rpc(
     let rpc_auth = Arc::new(config.rpc.auth.to_rpc_auth(&config.data_dir)?);
     let chainstate = state.chainstate();
     let context = Context::from_handles(ContextHandles {
+        silent_payments: config.rpc.silent_payments,
         chain: ChainHandles {
             chain_tip: chainstate.header_tip_reader(),
             applied_tip: chainstate.applied_tip_reader(),

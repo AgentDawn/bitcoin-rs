@@ -53,6 +53,7 @@ redb = [
 # chain stack and already forwards to `bitcoin-rs-consensus/kernel`.
 kernel = ["bitcoin-rs-chainstate/kernel"]
 zmq = ["bitcoin-rs-rpc/zmq"]
+silent-payments = ["bitcoin-rs-rpc/silent-payments"]
 
 [dependencies]
 hashbrown.workspace = true

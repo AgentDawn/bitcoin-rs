@@ -160,6 +160,8 @@ pub struct P2pConfig {
 pub struct RpcConfig {
     pub bind: SocketAddr,
     pub rest: bool,
+    /// Optional experimental keyless BIP352 read service, off by default.
+    pub silent_payments: bool,
     pub auth: Auth,
 }
 
@@ -271,6 +273,7 @@ impl NodeConfig {
             rpc: RpcConfig {
                 bind: settings.rpc.bind.unwrap_or(profile.rpc_bind),
                 rest: settings.rpc.rest.unwrap_or(false),
+                silent_payments: settings.rpc.silent_payments.unwrap_or(false),
                 auth: rpc_auth(settings),
             },
             indexes: IndexConfig {
@@ -315,6 +318,10 @@ impl NodeConfig {
     /// cannot execute is rejected here — before the data directory opens,
     /// chainstate exists, or any worker starts.
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.rpc.silent_payments || cfg!(feature = "silent-payments"),
+            "--silent-payments requires the silent-payments build feature"
+        );
         if let Auth::Basic { user, password } = &self.rpc.auth {
             anyhow::ensure!(
                 !user.is_empty() && !password.is_empty(),

@@ -11,6 +11,25 @@ use bitcoin_rs_primitives::Network;
 use bitcoin_rs_rpc::zmq::ZmqTopic;
 
 #[test]
+fn silent_payments_toml_overlay_preserves_explicit_disable() -> Result<()> {
+    let enabled: UserConfig = toml::from_str("silent_payments = true")?;
+    let disabled: UserConfig = toml::from_str("silent_payments = false")?;
+    assert!(!resolve(&[&enabled, &disabled])?.rpc.silent_payments);
+    let mut environment = UserConfig::default();
+    environment.apply_env("BITCOIN_RS_SILENT_PAYMENTS", std::ffi::OsStr::new("false"))?;
+    assert!(!resolve(&[&enabled, &environment])?.rpc.silent_payments);
+    let result = resolve(&[&disabled, &enabled]);
+    if cfg!(feature = "silent-payments") {
+        assert!(result?.rpc.silent_payments);
+    } else {
+        assert!(
+            result.is_err_and(|error| error.to_string().contains("silent-payments build feature"))
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn standard_network_uses_builtin_defaults() -> Result<()> {
     let layer = UserConfig {
         network: Some(NetworkSelection::Testnet4),
