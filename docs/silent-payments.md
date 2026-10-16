@@ -51,17 +51,36 @@ Restart recomputes from existing certified data; there is no tweak cursor or
 cache to recover. No full-history readiness watermark is invented: each
 requested block must establish its own coverage through the retained owner.
 
-All callers share one nonqueued work slot and a minimum 100 ms interval between
-admitted requests, including reads that fail. It also acquires an existing
+All callers share one nonqueued work slot. Each request also acquires an existing
 full-block materialization permit. A conservative JSON bound rejects results
 over 8 MiB before allocating their JSON tree; this bounds the result payload,
-not an arbitrary caller's JSON-RPC id/envelope. Busy/rate-limit responses ask
-callers to retry; rate-limit retries should wait at least 100 ms. CPU projection
+not an arbitrary caller's JSON-RPC id/envelope. Busy responses ask callers to
+retry; sequential requests have no timer-based admission delay. CPU projection
 and body I/O hold no transition/tree guard. The final transition check uses
 `try_lock_for(Duration::ZERO)`, so it never queues behind validation. These bounds and refusal
 during IBD protect serving capacity; they are not a measured latency or
 mainnet throughput guarantee. The global limit is shared across credentials,
 not an anonymous per-IP quota.
+
+The result budget accommodates every consensus-valid block. Its conservative
+bound is `512 + 256*T + 128*O` bytes for eligible transactions `T` and P2TR
+candidates `O`. Each eligible transaction consumes at least 51 stripped bytes
+outside its outputs; each P2TR candidate consumes 43 stripped output bytes.
+Since these cost four weight units per byte, the 4,000,000-weight limit gives
+`51*T + 43*O <= 1,000,000`. Both JSON coefficients are at most six times their
+wire costs, so the bound is at most 6,000,512 bytes, below 8 MiB. No pagination
+or candidate truncation is needed for this result limit. This does not establish
+historical-input availability. Missing/pruned/certification-limited history
+requires restoring/replaying the required data or using another complete source.
+The retained-input owner's separate 64 MiB verbose-projection budget can reject
+a consensus-valid block with many outputs before BIP352 computation. This
+extension therefore does not guarantee scanning every valid block. An unchanged
+resource-limit refusal cannot be resolved by retrying or replaying: the client
+must obtain that block and authenticated prevouts from another complete source
+and compute its scan material there. `getblock` verbosity 3 and `/rest/spenttxouts`
+share this owner and are not bypasses for its read limits. No empty or partial
+response marks such a block as scanned.
+
 Ancestry selection uses the tree's trusted height index when available and
 refuses fallback walks exceeding 4,096 parent hops. Selection runs inside the
 same admission slot, before body I/O; header sync running ahead of the applied
@@ -138,6 +157,7 @@ RPC adapter; `BlockSpends` itself carries neither height nor activation context.
 | Certified retained body/undo | One-block projection works without txindex or new durable rows. |
 | Birthday / full Taproot-era scan | Every requested body and undo must be retained and certified. Being unpruned today does not prove an old missing prefix. |
 | Pruned/reserved/missing history | Preserve the owner's typed history/read failure even for empty blocks; restore/replay required data before promising coverage. |
+| Source read/projection budget | Return an error for the whole block. Use another complete block/prevout source; unchanged retries and the local APIs sharing this owner cannot bypass the limit. |
 | Missing/unready txindex | No effect on the certified-undo codec path; cannot mask missing undo. |
 | Snapshot prefix | Retained bytes are insufficient without certified archived validation progress. |
 | Reorg/restart/full rescan | Recompute from the chosen body. Source receipts/leases own readiness; the adapter rejects stale selection or a moved applied tip. |
@@ -146,8 +166,15 @@ Partial-success lists are not returned. `None` means complete transaction
 ineligibility or coinbase, never missing history. Source commit, recovery,
 snapshot and lock/lease behavior remains covered by
 `crates/chainstate/tests/unit/block_spends_tests.rs`; those paths are unchanged.
-Codec replay tests alone do not prove service lifecycle behavior; the node HTTP
-test separately exercises invalidation, replacement and clean restart.
+The process test in `bin/bitcoin-rs/tests/silent_payments.rs` uses the existing
+`ProcessNode` harness. It mines a mature P2PKH coinbase, signs its spend into
+11,000 P2TR candidates, and applies the block through consensus validation.
+After confirming the funding output is spent, it checks the HTTP tweak against
+an independent single-input tagged-hash/public-key calculation and every output
+index/key. The block exceeds 1,890,000 weight units and its complete result fits
+both source and result budgets. It also exercises invalidation, replacement and
+clean restart. The separate arithmetic test establishes the JSON bound at the
+consensus weight limit; it does not establish source availability at that limit.
 
 ## Resources and consumer assessment
 
@@ -197,8 +224,9 @@ reference passed the full vectors locally (WSL, Python 3.12.3). Additional
 tests cover future witness versions, missing material/history, empty blocks,
 output indices, limits and deterministic hash-scoped replay. Adapter tests
 cover exact selection, unavailable history, publication races, recovery,
-IBD, admission and response limits. The production node HTTP test covers
-authentication, runtime gating, invalidation/replacement and restart.
+IBD, nonqueued admission and the weight-based result bound. The production
+process HTTP test covers the positive chain/undo/crypto path, dense-block result
+completeness, authentication, runtime gating, invalidation/replacement and restart.
 Extraction is
 recorded in `crates/index/tests/data/bip352-PROVENANCE.md`.
 

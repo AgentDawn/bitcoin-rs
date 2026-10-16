@@ -2,43 +2,22 @@
 
 use alloc::sync::Arc;
 use core::str::FromStr as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_index::silent_payments::{BlockTweaks, block_tweaks};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_utxo::contract::BlockSpendsError;
-use parking_lot::{Mutex, MutexGuard};
+use bitcoin_rs_utxo::contract::{BlockSpendsError, BoundedReadError};
 use sonic_rs::{JsonValueTrait as _, Value, json};
 
 use crate::context::{AppliedView, Context};
 use crate::error::RpcError;
 
-const ADMISSION_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const JSON_ENVELOPE_BYTES: usize = 512;
+const JSON_TRANSACTION_BYTES: usize = 256;
+const JSON_OUTPUT_BYTES: usize = 128;
 const MAX_SELECTION_HOPS: usize = 4_096;
-
-/// One global work slot and timestamp, shared by all callers and dispatchers.
-/// Holding the guard through rendering limits CPU work without a queue or timer.
-pub(crate) struct Admission(Mutex<Option<Instant>>);
-
-impl Admission {
-    pub(crate) fn new() -> Self {
-        Self(Mutex::new(None))
-    }
-
-    fn acquire(&self, now: Instant) -> Result<MutexGuard<'_, Option<Instant>>, RpcError> {
-        let mut guard = self
-            .0
-            .try_lock()
-            .ok_or_else(|| unavailable("busy; retry"))?;
-        if guard.is_some_and(|last| now.saturating_duration_since(last) < ADMISSION_INTERVAL) {
-            return Err(unavailable("rate limit; retry after 100 ms"));
-        }
-        *guard = Some(now);
-        Ok(guard)
-    }
-}
 
 fn unavailable(message: &str) -> RpcError {
     RpcError::Misc(format!("Silent payments unavailable: {message}"))
@@ -67,7 +46,9 @@ pub(crate) fn getblocktweaks(ctx: &Arc<Context>, params: &Value) -> Result<Value
             "getblocktweaks is unavailable during initial block download".to_owned(),
         ));
     }
-    let _admission = service.acquire(Instant::now())?;
+    let _admission = service
+        .try_lock()
+        .ok_or_else(|| unavailable("busy; retry"))?;
     let (height, hash) = select_block(ctx, &view, selector)?;
     let _render = ctx
         .try_acquire_block_render()
@@ -155,7 +136,11 @@ fn select_block(
 
 fn read_error(error: &BlockSpendsError) -> RpcError {
     match error {
-        BlockSpendsError::Corrupt(_) | BlockSpendsError::Storage(_) | BlockSpendsError::Undo(_) => {
+        BlockSpendsError::Corrupt(_)
+        | BlockSpendsError::Storage(_)
+        | BlockSpendsError::Undo(_)
+        | BlockSpendsError::BodyRead(BoundedReadError::Storage(_))
+        | BlockSpendsError::BoundedRead(BoundedReadError::Storage(_)) => {
             RpcError::Internal(error.to_string())
         }
         _ => unavailable(&error.to_string()),
@@ -165,12 +150,19 @@ fn read_error(error: &BlockSpendsError) -> RpcError {
 /// Conservative JSON bound before allocating hex strings or a JSON tree:
 /// envelope <512 bytes, txid/tweak/field framing <256 per transaction,
 /// u32 index/key/field framing <128 per candidate. No filtering or truncation.
+/// A valid block has at most 1,000,000 stripped bytes. Each eligible transaction
+/// needs at least 51 non-output bytes and each candidate 43 output bytes, so
+/// this bound is <=512 + 6 * 1,000,000, safely below 8 MiB. The limit cannot
+/// exclude a consensus-valid block; see the weight-bound test and process case.
 fn check_result_budget(material: &BlockTweaks) -> Result<(), RpcError> {
-    let bound = material.transactions.iter().fold(512_usize, |bytes, tx| {
-        bytes
-            .saturating_add(256)
-            .saturating_add(tx.outputs.len().saturating_mul(128))
-    });
+    let bound = material
+        .transactions
+        .iter()
+        .fold(JSON_ENVELOPE_BYTES, |bytes, tx| {
+            bytes
+                .saturating_add(JSON_TRANSACTION_BYTES)
+                .saturating_add(tx.outputs.len().saturating_mul(JSON_OUTPUT_BYTES))
+        });
     if bound > MAX_RESULT_BYTES {
         return Err(unavailable("result exceeds 8 MiB budget"));
     }

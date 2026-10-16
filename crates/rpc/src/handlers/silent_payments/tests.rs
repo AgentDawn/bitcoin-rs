@@ -1,6 +1,5 @@
 use super::*;
 use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
-use bitcoin_rs_index::silent_payments::{TaprootCandidate, TransactionTweak};
 use bitcoin_rs_primitives::{Block, Network};
 use bitcoin_rs_utxo::contract::{BlockSpends, BlockUndoSource, HistoryUnavailable};
 use sonic_rs::JsonContainerTrait as _;
@@ -79,58 +78,6 @@ fn height_and_named_hash_return_exact_identity_and_empty_success() -> Result {
                 .is_empty()
         );
     }
-    Ok(())
-}
-
-#[test]
-fn eligible_transactions_keep_complete_candidate_indices() -> Result {
-    use bitcoin::hex::FromHex as _;
-    use bitcoin_rs_primitives::{OutPoint, Script, Tx, TxIn, TxOut, Witness};
-    use bitcoin_rs_utxo::UtxoCoin;
-
-    // Public generator key; the source boundary is synthetic, as in fixture().
-    // Cryptographic expectations remain owned by the index's pinned vectors.
-    let key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-    let script: Script = [vec![0x51, 0x20], Vec::from_hex(key)?].concat().into();
-    let (mut ctx, mut block) = fixture()?;
-    let outpoint = OutPoint::new(block.txs[0].txid(), 0);
-    let mut tx = Tx::default();
-    tx.inputs.push(TxIn {
-        previous_output: outpoint,
-        witness: Witness::from(vec![vec![0; 64]]),
-        ..TxIn::default()
-    });
-    let coin = UtxoCoin {
-        outpoint,
-        txout: TxOut {
-            script_pubkey: script.clone(),
-            ..TxOut::default()
-        },
-        height: 1,
-        coinbase: false,
-    };
-    tx.outputs.push(TxOut::default());
-    tx.outputs.push(TxOut {
-        script_pubkey: script,
-        ..TxOut::default()
-    });
-    tx.outputs.push(tx.outputs[1].clone());
-    let txid = tx.txid().to_string();
-    block.txs.push(tx);
-    ctx.chain.block_undo_source = Some(Arc::new(Source(move |_, _| {
-        Ok(BlockSpends {
-            block: block.clone(),
-            spent: Ok(vec![vec![], vec![coin.clone()]]),
-        })
-    })));
-    let result = getblocktweaks(&Arc::new(ctx), &json!([0]))?;
-    let transaction = &result["transactions"][0];
-    assert_eq!(transaction["txid"].as_str(), Some(txid.as_str()));
-    assert_eq!(transaction["tweak"].as_str().ok_or("tweak")?.len(), 66);
-    assert_eq!(transaction["outputs"].as_array().ok_or("outputs")?.len(), 2);
-    assert_eq!(transaction["outputs"][0]["vout"].as_u64(), Some(1));
-    assert_eq!(transaction["outputs"][1]["vout"].as_u64(), Some(2));
-    assert_eq!(transaction["outputs"][0]["output_key"].as_str(), Some(key));
     Ok(())
 }
 
@@ -263,6 +210,19 @@ fn moved_tip_and_recovery_after_source_read_refuse_publication() -> Result {
 
 #[test]
 fn wrong_body_and_source_retry_are_errors() -> Result {
+    for wrap in [BlockSpendsError::BodyRead, BlockSpendsError::BoundedRead] {
+        let disk = std::io::Error::other("disk read failed").into();
+        assert_eq!(
+            read_error(&wrap(BoundedReadError::Storage(disk))).code(),
+            RpcError::INTERNAL_ERROR
+        );
+        for refusal in [
+            BoundedReadError::Unsupported,
+            BoundedReadError::Limit { size: 2, limit: 1 },
+        ] {
+            assert_eq!(read_error(&wrap(refusal)).code(), -1);
+        }
+    }
     for retry in [false, true] {
         let (mut ctx, mut block) = fixture()?;
         block.header.nonce ^= 1;
@@ -287,25 +247,15 @@ fn wrong_body_and_source_retry_are_errors() -> Result {
 }
 
 #[test]
-fn admission_is_nonblocking_rate_limited_and_releases_the_slot() -> Result {
-    let admission = Admission::new();
-    let now = Instant::now();
-    let held = admission.acquire(now)?;
-    assert!(admission.acquire(now + ADMISSION_INTERVAL).is_err());
-    drop(held);
-    assert!(
-        admission
-            .acquire(now + ADMISSION_INTERVAL.saturating_sub(Duration::from_nanos(1)))
-            .is_err()
-    );
-    drop(admission.acquire(now + ADMISSION_INTERVAL)?);
-    Ok(())
-}
-
-#[test]
 fn shared_materialization_budget_and_transition_never_queue_tweak_work() -> Result {
     let (ctx, _) = fixture()?;
     let ctx = Arc::new(ctx);
+    let held = ctx.silent_payments.as_ref().ok_or("service")?.lock();
+    assert!(getblocktweaks(&ctx, &json!([0])).is_err());
+    drop(held);
+    // Consecutive requests need no timer once the previous work releases its slot.
+    getblocktweaks(&ctx, &json!([0]))?;
+    getblocktweaks(&ctx, &json!([0]))?;
     let first = ctx.try_acquire_block_render().ok_or("permit")?;
     let second = ctx.try_acquire_block_render().ok_or("permit")?;
     let error = getblocktweaks(&ctx, &json!([0]))
@@ -371,45 +321,14 @@ fn historical_activation_uses_requested_height_not_the_captured_tip_height() -> 
 }
 
 #[test]
-fn result_budget_keeps_complete_candidates_and_refuses_excess() -> Result {
-    let (ctx, block) = fixture()?;
-    let tx = TransactionTweak {
-        txid: block.txs[0].txid(),
-        input_public_key_sum: [2; 33],
-        input_hash: [1; 32],
-        tweak: [3; 33],
-        outputs: vec![TaprootCandidate {
-            vout: u32::MAX,
-            output_key: [4; 32],
-        }],
-    };
-    let mut material = BlockTweaks {
-        hash: block.block_hash(),
-        transactions: vec![tx],
-    };
-    let result = render(&material, u32::MAX, &ctx.chain.applied_view(), true)?;
-    assert_eq!(
-        result["transactions"][0]["outputs"][0]["vout"].as_u64(),
-        Some(u64::from(u32::MAX))
-    );
-    assert_eq!(
-        result["transactions"][0]["tweak"].as_str(),
-        Some(
-            material.transactions[0]
-                .tweak
-                .to_lower_hex_string()
-                .as_str()
-        )
-    );
-    material.transactions[0].outputs =
-        vec![material.transactions[0].outputs[0].clone(); (MAX_RESULT_BYTES - 512 - 256) / 128];
-    check_result_budget(&material)?;
-    let value = render(&material, u32::MAX, &ctx.chain.applied_view(), true)?;
-    assert!(sonic_rs::to_vec(&value)?.len() <= MAX_RESULT_BYTES);
-    material.transactions[0].outputs.push(TaprootCandidate {
-        vout: 0,
-        output_key: [0; 32],
-    });
-    assert!(render(&material, 0, &ctx.chain.applied_view(), true).is_err());
+fn result_budget_covers_every_valid_block_weight() -> Result {
+    // Each eligible tx has >=51 stripped non-output bytes (version, counts,
+    // locktime and one input); each P2TR candidate consumes 43 stripped bytes.
+    // All these bytes cost four weight units, including for witness spends.
+    for (json_bytes, wire_bytes) in [(JSON_TRANSACTION_BYTES, 51), (JSON_OUTPUT_BYTES, 43)] {
+        assert!(json_bytes <= 6 * wire_bytes);
+    }
+    let max_stripped = usize::try_from(bitcoin_rs_consensus::MAX_BLOCK_WEIGHT)? / 4;
+    assert!(JSON_ENVELOPE_BYTES + 6 * max_stripped <= MAX_RESULT_BYTES);
     Ok(())
 }

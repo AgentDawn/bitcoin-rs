@@ -485,7 +485,7 @@ pub struct MiningHandles {
 /// groups; production wiring attaches nothing after construction.
 pub struct Context {
     #[cfg(feature = "silent-payments")]
-    pub(crate) silent_payments: Option<crate::handlers::silent_payments::Admission>,
+    pub(crate) silent_payments: Option<Mutex<()>>,
     /// Chain capability: tips, block log, UTXO set, block tree, transition
     /// barrier, and the chain-owned control surfaces.
     pub chain: ChainHandles,
@@ -692,7 +692,7 @@ impl Context {
         let _ = silent_payments;
         Self {
             #[cfg(feature = "silent-payments")]
-            silent_payments: silent_payments.then(crate::handlers::silent_payments::Admission::new),
+            silent_payments: silent_payments.then(|| Mutex::new(())),
             chain,
             mempool,
             indexes,

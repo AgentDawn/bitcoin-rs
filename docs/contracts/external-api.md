@@ -14,14 +14,17 @@ complete historical prevouts. The adapter verifies the returned body identity,
 uses the requested height's native Taproot activation, and after projection
 tries transition exclusion without waiting to recheck recovery and applied hash
 before publication. No history/read failure becomes empty success. There is one
-nonqueued work slot, a global 100 ms admission interval, the shared block-render
-permit, an 8 MiB conservative result bound, bounded selection (at most 4,096
-fallback parent hops), and no history I/O during IBD.
+nonqueued work slot, the shared block-render permit, an 8 MiB conservative result
+bound covering consensus-valid block weight (see the linked derivation), bounded
+selection (at most 4,096 fallback parent hops), and no history I/O during IBD.
+The source's separate read/projection budgets can refuse consensus-valid blocks;
+clients need another complete source for those blocks rather than unchanged
+retries. This extension does not guarantee complete scanning of every valid block.
 No new chain/index state or durable representation exists. Draft `/getinfo` and
 `/tweaks/:blockheight` are not served; no Core or finalized index-server protocol
 compatibility is claimed. Executable proof: RPC `handlers::silent_payments`
-tests, `manifest_coverage`, node `silent_payments` HTTP/reorg/restart test, and
-configuration tests.
+tests, `manifest_coverage`, binary `silent_payments` signed-spend/dense-block
+HTTP/reorg/restart process test, and configuration tests.
 
 ### `API-01`: Single manifest owner
 

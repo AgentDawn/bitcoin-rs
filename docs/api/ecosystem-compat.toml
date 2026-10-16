@@ -40,7 +40,7 @@ surface = "BIP352 public scan codec and getblocktweaks RPC extension"
 core_reference = "BIP352 v0; not a Bitcoin Core RPC"
 status = "experimental"
 representative_consumer = "evaluated: BlindBit Oracle f9ab7fd8bc35467c492324f743ba1b69049a2bb6; no wallet run"
-evidence = "29 public receiving-vector projections pin sums/tweaks; the pinned upstream Python reference passes the full vectors. Existing certified BlockSpends supplies historical prevouts. In-tree adapter and node HTTP tests cover selection, limits, unavailable history, reorg and restart. The authenticated getblocktweaks extension does not implement draft HTTP or the evaluated consumer's gRPC API; no funded wallet discovery is claimed. See docs/silent-payments.md."
+evidence = "29 public receiving-vector projections pin sums/tweaks; the pinned upstream Python reference passes the full vectors. Existing certified BlockSpends supplies historical prevouts. Adapter tests cover selection, limits and unavailable history; a ProcessNode HTTP test applies a signed spend with 11,000 P2TR candidates and checks the tweak, complete candidates, reorg and restart. Source read budgets can refuse valid blocks, so complete scanning requires another source for those blocks. The authenticated getblocktweaks extension does not implement draft HTTP or the evaluated consumer's gRPC API; no funded wallet discovery is claimed. See docs/silent-payments.md."
 
 [[row]]
 surface = "P2P v1 wire protocol"

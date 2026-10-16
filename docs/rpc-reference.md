@@ -105,7 +105,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
-| `getblocktweaks` | 0.14.0 | Experimental keyless BIP352 extension; requires --silent-payments. One applied-chain height or hash per call, certified retained inputs, final publication check, one in-flight projection, global 100 ms admission interval, shared block-render permits, and an 8 MiB result budget. No draft HTTP/gRPC compatibility or wallet discovery claim. See docs/silent-payments.md. |
+| `getblocktweaks` | 0.14.0 | Experimental keyless BIP352 extension; requires --silent-payments. One applied-chain height or hash per call, certified retained inputs, final publication check, one in-flight projection, shared block-render permits, and an 8 MiB result budget covering valid block weight. Source read budgets can refuse valid blocks; use another complete source for those blocks. No draft HTTP/gRPC compatibility or wallet discovery claim. See docs/silent-payments.md. |
 | `getcapabilities` | 0.4.0 | bitcoin-rs reporting of compiled/enabled concrete service capabilities and index lifecycle state (crates/rpc/src/handlers/chain.rs, crates/index/src/capabilities.rs). |
 
 ### Unimplemented
