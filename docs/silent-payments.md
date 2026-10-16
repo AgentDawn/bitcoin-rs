@@ -66,15 +66,14 @@ funded before a wallet birthday. Missing/pruned history needs restore/replay or
 another complete source; snapshots require archived validation progress. Txindex
 is not required and cannot substitute for missing certified inputs.
 
-**The source's 64 MiB verbose-projection budget can reject consensus-valid
-Taproot-heavy blocks.** Unchanged retries or replay cannot bypass that limit;
-clients need another complete block/prevout source for those blocks. `getblock`
-verbosity 3 and `/rest/spenttxouts` share this owner and are not bypasses. Fixing
-this requires a separate source-owner assessment of actual materialization costs;
-this RPC does not promise complete BIP352 scanning. The owner also bounds body
-copies to 4,000,000 bytes and undo copies to 64 MiB. The codec separately bounds
-body bytes and aggregate prevout scripts (64 MiB). CPU and memory costs on
-mainnet are unmeasured; these limits do not imply a full-history readiness mark.
+The source bounds body copies to 4,000,000 bytes and undo copies to 64 MiB,
+with decoded counts and script lengths bounded by the block and record. It does
+not estimate verbose JSON expansion. The codec separately bounds body bytes and
+aggregate prevout scripts (64 MiB). A raw-read or codec limit still requires
+another complete source; unchanged retries cannot bypass it. `getblock`
+verbosity 3 and `/rest/spenttxouts` share the input owner and its raw-read limits.
+These are not heap or JSON-size caps. Complete BIP352 scanning and mainnet CPU
+and memory costs remain unverified.
 
 [BIP352 and its reference vectors](https://github.com/bitcoin/bips/blob/8754690b725e9aa93ca8bd91bf0ac85dc44ce096/bip-0352.mediawiki)
 are pinned to `8754690b725e9aa93ca8bd91bf0ac85dc44ce096`; the
@@ -96,9 +95,11 @@ publication/recovery races, IBD and backpressure. The
 P2PKH spend with three P2TR candidates and checks the exact tweak and each
 candidate through authenticated HTTP, reorg and restart. The 100 funding blocks
 are required for coinbase maturity. Source commit/recovery and lease tests remain
-with `crates/chainstate/tests/unit/block_spends_tests.rs`. A recorded run at
-`12116e7390fc88d3f3dcbe570f051152c864716b` passed with 11,000 candidates
-(1,893,440 WU); that large-output case is outside the default CI scenario.
+with `crates/chainstate/tests/unit/block_spends_tests.rs`. The separate
+`bin/bitcoin-rs/tests/block_inputs.rs` regression applies a signed spend with
+12,500 P2TR outputs, which exceeded the removed JSON estimate. It checks complete
+`getblock` verbosity 3, binary spent-output REST and BIP352 candidates using real
+certified undo; it adds no lifecycle or external consumer scenarios.
 
 A recorded standalone REST probe ran unmodified
 [BlindBit Oracle](https://github.com/setavenger/blindbit-oracle/blob/f9ab7fd8bc35467c492324f743ba1b69049a2bb6/internal/server/README.md),
