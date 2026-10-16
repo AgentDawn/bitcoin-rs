@@ -50,6 +50,7 @@ fn template_renders_coinbase_subsidy_plus_fees_and_bip22_fields() -> Result<()> 
         mempool_tx.weight(),
         "rendered weight must match the transaction weight"
     );
+    assert_eq!(required_u64(&template_txs[0], "sigops")?, 0);
 
     // 3. Essential BIP22 mutable and capability sets for external miner interop.
     let mutable = template

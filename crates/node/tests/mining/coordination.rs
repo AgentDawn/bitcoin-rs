@@ -481,28 +481,34 @@ fn long_poll_returns_quickly_on_mempool_sequence_wake() -> Result<()> {
     let long_poll_id = CompactString::from(current.candidate.template_id.as_str());
 
     let (started_tx, started_rx) = bounded::<()>(1);
+    let (done_tx, done_rx) = bounded(1);
     let mining_wait = Arc::clone(&mining);
     let waiter = thread::spawn(move || {
         started_tx
             .send(())
             .unwrap_or_else(|error| panic!("start signal failed: {error}"));
-        mining_wait.get_block_template(template_request(Some(long_poll_id)))
+        let result = mining_wait.get_block_template(template_request(Some(long_poll_id)));
+        let _ = done_tx.send(result);
     });
 
     started_rx.recv_timeout(Duration::from_secs(2))?;
+    // Scheduling aid only: the start signal does not prove entry into the wait.
     thread::sleep(Duration::from_millis(50));
 
     // Advance the mempool sequence and wake via the lock-free path.
     advance_mempool_sequence(&state)?;
     let seq = state.mempool().read().sequence_number();
+    let wake_start = std::time::Instant::now();
     mining.publish_generation_from(seq);
 
-    let wake_start = std::time::Instant::now();
-    let result = waiter
-        .join()
-        .unwrap_or_else(|_| panic!("mempool long-poll waiter panicked"))
-        .unwrap_or_else(|error| panic!("mempool long poll failed: {error}"));
+    let result = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|error| anyhow::anyhow!("mempool long-poll waiter did not complete: {error}"))?;
     let elapsed = wake_start.elapsed();
+    waiter
+        .join()
+        .unwrap_or_else(|_| panic!("mempool long-poll waiter panicked"));
+    let result = result.unwrap_or_else(|error| panic!("mempool long poll failed: {error}"));
 
     assert!(
         elapsed < Duration::from_millis(800),
