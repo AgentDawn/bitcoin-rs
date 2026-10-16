@@ -47,6 +47,70 @@ const MEMPOOL_TX_FEE_SATS: u64 = 10_000;
 const WITNESS_RESERVED: [u8; 32] = [0_u8; 32];
 
 #[test]
+fn template_renders_coinbase_subsidy_plus_fees_and_bip22_fields() -> Result<()> {
+    let (state, _guard) = open_regtest()?;
+    apply_genesis(&state)?;
+    let _seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
+
+    // A spend of the height-1 seed coinbase matures exactly at height 101.
+    let mempool_tx = seed_coinbase_spend();
+    admit_to_mempool(&state, &mempool_tx)?;
+
+    let handler = mining_handler(&state);
+    let template = handler.dispatch("getblocktemplate", &json!([{"rules": ["segwit"]}]))?;
+
+    // 1. Exact reward calculation: subsidy + all mempool transaction fees.
+    assert_eq!(
+        required_u64(&template, "coinbasevalue")?,
+        REGTEST_SUBSIDY_SATS + MEMPOOL_TX_FEE_SATS,
+        "coinbasevalue must be subsidy plus selected fees"
+    );
+
+    let template_txs = template
+        .get("transactions")
+        .and_then(|entry| entry.as_array())
+        .map_or(&[][..], |entries| entries.as_slice());
+    assert_eq!(template_txs.len(), 1, "the mempool tx must be selected");
+
+    // 2. Exact transaction weight match (not just > 0).
+    assert_eq!(
+        required_u64(&template_txs[0], "weight")?,
+        mempool_tx.weight(),
+        "rendered weight must match the transaction weight"
+    );
+
+    // 3. Essential BIP22 mutable and capability sets for external miner interop.
+    let mutable = template
+        .get("mutable")
+        .and_then(|value| value.as_array())
+        .map_or(&[][..], |entries| entries.as_slice());
+    let mutables: Vec<&str> = mutable.iter().filter_map(|value| value.as_str()).collect();
+    for expected in ["time", "transactions", "prevblock"] {
+        assert!(
+            mutables.contains(&expected),
+            "mutable must contain {expected}"
+        );
+    }
+
+    let capabilities = template
+        .get("capabilities")
+        .and_then(|value| value.as_array())
+        .map_or(&[][..], |entries| entries.as_slice());
+    let capability_set: Vec<&str> = capabilities
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    for expected in ["proposal", "longpoll"] {
+        assert!(
+            capability_set.contains(&expected),
+            "capabilities must contain {expected}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn template_orders_parent_then_child_with_dependency() -> Result<()> {
     let (state, _guard) = open_regtest()?;
     apply_genesis(&state)?;
