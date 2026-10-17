@@ -30,6 +30,7 @@ pub fn consensus_reject_reason(error: &ConsensusError) -> CompactString {
         ConsensusError::UnexpectedWitness => "unexpected-witness",
         ConsensusError::WitnessCommitment => "bad-witness-merkle-match",
         ConsensusError::BlockWeight { .. } => "bad-blk-weight",
+        ConsensusError::BlockBaseSize { .. } => "bad-blk-length",
         ConsensusError::Script { reason, .. } => {
             return CompactString::from(format!("block-script-verify-flag-failed ({reason})"));
         }

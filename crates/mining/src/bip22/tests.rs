@@ -47,6 +47,13 @@ fn consensus_failures_use_core_bip22_reasons() {
         ),
         (ConsensusError::EmptyInputs, "bad-txns-vin-empty"),
         (
+            ConsensusError::BlockBaseSize {
+                size: 1_000_001,
+                max: 1_000_000,
+            },
+            "bad-blk-length",
+        ),
+        (
             ConsensusError::MissingPrevout { input_index: 0 },
             "bad-txns-inputs-missingorspent",
         ),

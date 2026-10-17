@@ -1122,11 +1122,7 @@ pub(crate) fn verifychain(
             || bitcoin_rs_chain::validate_pow(&header, expected_hash, ctx.chain.chain_network)
                 .is_err()
             || (checklevel >= 1
-                && bitcoin_rs_consensus::verify_block::verify_merkle_root_with_txids(
-                    &block,
-                    &block.txids(),
-                )
-                .is_err())
+                && bitcoin_rs_consensus::verify_block::verify_block_non_contextual(&block).is_err())
         {
             tracing::warn!(height, "verifychain: stored block validation failed");
             return typed_to_sonic(&v31::VerifyChain(false));

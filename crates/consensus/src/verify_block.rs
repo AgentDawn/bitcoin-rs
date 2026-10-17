@@ -83,6 +83,57 @@ pub fn verify_block_rules_precomputed(
     context: BlockRuleContext,
     facts: &BlockFacts,
 ) -> Result<(), ConsensusError> {
+    verify_block_structure(block, facts)?;
+
+    if let Some(wtxids) = facts.wtxids() {
+        check_witness_malleation(block, context.segwit_active, wtxids)?;
+    } else if context.segwit_active && witness_commitment(block).is_some() {
+        return Err(ConsensusError::WitnessNonceSize);
+    } else if facts.has_witness() {
+        return Err(ConsensusError::UnexpectedWitness);
+    }
+
+    let weight = facts.weight();
+    if weight > MAX_BLOCK_WEIGHT {
+        return Err(ConsensusError::BlockWeight {
+            weight,
+            max: MAX_BLOCK_WEIGHT,
+        });
+    }
+    Ok(())
+}
+
+/// Checks the context-free body rules used by Core 31.1 `CheckBlock`.
+///
+/// Header/PoW and signet-solution authentication belong to the caller.
+/// Witness commitments, total witness weight, finality and UTXO/script checks
+/// are contextual and deliberately absent from this level-one verification.
+pub fn verify_block_non_contextual(block: &Block) -> Result<(), ConsensusError> {
+    let facts = BlockFacts::from_txids(&block.txs, block.txids());
+    verify_block_structure(block, &facts)?;
+    let size = u64::try_from(block.stripped_size()).unwrap_or(u64::MAX);
+    let max = MAX_BLOCK_WEIGHT / 4;
+    if size > max {
+        return Err(ConsensusError::BlockBaseSize { size, max });
+    }
+    // The block-wide stripped-size bound also bounds each transaction and the
+    // transaction count. No witness-derived fact participates in these checks.
+    let mut sigop_cost = 0_u32;
+    for tx in &block.txs {
+        crate::verify_tx::verify_transaction_structure(tx)?;
+        sigop_cost = sigop_cost
+            .saturating_add(bitcoin_rs_script::sigops::count_tx_legacy(tx).saturating_mul(4));
+    }
+    if sigop_cost > crate::MAX_BLOCK_SIGOPS_COST {
+        return Err(ConsensusError::SigopsLimit {
+            cost: sigop_cost,
+            max: crate::MAX_BLOCK_SIGOPS_COST,
+        });
+    }
+    Ok(())
+}
+
+fn verify_block_structure(block: &Block, facts: &BlockFacts) -> Result<(), ConsensusError> {
     let txdata = &block.txs;
     if txdata.is_empty() {
         return Err(ConsensusError::EmptyBlock);
@@ -109,21 +160,6 @@ pub fn verify_block_rules_precomputed(
         return Err(ConsensusError::MerkleMutation);
     }
 
-    if let Some(wtxids) = facts.wtxids() {
-        check_witness_malleation(block, context.segwit_active, wtxids)?;
-    } else if context.segwit_active && witness_commitment(block).is_some() {
-        return Err(ConsensusError::WitnessNonceSize);
-    } else if facts.has_witness() {
-        return Err(ConsensusError::UnexpectedWitness);
-    }
-
-    let weight = facts.weight();
-    if weight > MAX_BLOCK_WEIGHT {
-        return Err(ConsensusError::BlockWeight {
-            weight,
-            max: MAX_BLOCK_WEIGHT,
-        });
-    }
     Ok(())
 }
 
@@ -416,8 +452,8 @@ mod tests {
     use super::{
         BlockRuleContext, WITNESS_COMMITMENT_PREFIX, block_merkle_root_matches_txids,
         compute_merkle_root, merkle_root_and_mutation, merkle_root_and_mutation_borrowed,
-        merkle_root_spine, verify_block_rules, verify_block_rules_precomputed, verify_flags,
-        verify_merkle_root_with_txids,
+        merkle_root_spine, verify_block_non_contextual, verify_block_rules,
+        verify_block_rules_precomputed, verify_flags, verify_merkle_root_with_txids,
     };
     use crate::ConsensusError;
     use crate::bip9::SoftforkState;
@@ -482,6 +518,120 @@ mod tests {
             facts.or_insert_wtxids_from(&block.txs);
         }
         verify_block_rules_precomputed(block, context, &facts)
+    }
+
+    #[test]
+    fn non_contextual_checks_reject_invalid_transactions_with_valid_merkle_roots() {
+        type Case = (fn(&mut Vec<Tx>), ConsensusError);
+        let cases: &[Case] = &[
+            (
+                |txs| txs[0].inputs[0].previous_output = txs[1].inputs[0].previous_output,
+                ConsensusError::MissingCoinbase,
+            ),
+            (
+                |txs| txs.push(coinbase_tx()),
+                ConsensusError::ExtraCoinbase { tx_index: 2 },
+            ),
+            (
+                |txs| txs[0].inputs[0].script_sig = Script::from_bytes(vec![0]),
+                ConsensusError::CoinbaseScriptSigSize { len: 1 },
+            ),
+            (
+                |txs| txs[0].inputs[0].script_sig = Script::from_bytes(vec![0; 101]),
+                ConsensusError::CoinbaseScriptSigSize { len: 101 },
+            ),
+            (|txs| txs[1].inputs.clear(), ConsensusError::EmptyInputs),
+            (|txs| txs[1].outputs.clear(), ConsensusError::EmptyOutputs),
+            (
+                |txs| txs[1].outputs[0].value = Amount::from_sat(u64::MAX),
+                ConsensusError::OutputValueOverflow,
+            ),
+            (
+                |txs| {
+                    let output = txs[1].outputs[0].clone();
+                    txs[1].outputs[0].value = Amount::MAX_MONEY;
+                    txs[1].outputs.push(output);
+                },
+                ConsensusError::OutputValueOverflow,
+            ),
+            (
+                |txs| {
+                    let input = txs[1].inputs[0].clone();
+                    txs[1].inputs.push(input);
+                },
+                ConsensusError::DuplicateInput { input_index: 1 },
+            ),
+            (
+                |txs| {
+                    let input = txs[1].inputs[0].clone();
+                    txs[1].inputs.push(input);
+                    txs[1].inputs[0].previous_output = OutPoint::null();
+                },
+                ConsensusError::NullPrevout { input_index: 0 },
+            ),
+        ];
+        assert_eq!(
+            verify_block_non_contextual(&Block::default()),
+            Err(ConsensusError::EmptyBlock)
+        );
+        for (mutate, error) in cases {
+            let mut txs = vec![coinbase_tx(), spend_tx(1, vec![])];
+            mutate(&mut txs);
+            let block = block_with_transactions(txs);
+            assert!(verify_merkle_root_with_txids(&block, &block.txids()).is_ok());
+            assert_eq!(verify_block_non_contextual(&block), Err(error.clone()));
+        }
+    }
+
+    #[test]
+    fn non_contextual_size_and_aggregate_legacy_sigops_have_core_boundaries() {
+        let mut txs = vec![coinbase_tx(), spend_tx(1, vec![])];
+        for tx in &mut txs {
+            tx.outputs[0].script_pubkey =
+                Script::from_bytes(vec![bitcoin_rs_script::opcode::OP_CHECKSIG; 10_000]);
+        }
+        assert!(verify_block_non_contextual(&block_with_transactions(txs.clone())).is_ok());
+        txs[1].outputs[0].script_pubkey =
+            Script::from_bytes(vec![bitcoin_rs_script::opcode::OP_CHECKSIG; 10_001]);
+        assert_eq!(
+            verify_block_non_contextual(&block_with_transactions(txs)),
+            Err(ConsensusError::SigopsLimit {
+                cost: 80_004,
+                max: 80_000
+            })
+        );
+
+        let mut tx = coinbase_tx();
+        tx.outputs[0].script_pubkey = Script::from_bytes(vec![0; 1_000_000]);
+        let excess = block_with_transactions(vec![tx.clone()]).stripped_size() - 1_000_000;
+        tx.outputs[0].script_pubkey = Script::from_bytes(vec![0; 1_000_000 - excess]);
+        let at_limit = block_with_transactions(vec![tx.clone()]);
+        assert_eq!(at_limit.stripped_size(), 1_000_000);
+        assert!(verify_block_non_contextual(&at_limit).is_ok());
+        tx.outputs[0].script_pubkey = Script::from_bytes(vec![0; 1_000_001 - excess]);
+        assert_eq!(
+            verify_block_non_contextual(&block_with_transactions(vec![tx])),
+            Err(ConsensusError::BlockBaseSize {
+                size: 1_000_001,
+                max: 1_000_000
+            })
+        );
+    }
+
+    #[test]
+    fn non_contextual_checks_do_not_apply_witness_or_chain_context() {
+        let mut coinbase = coinbase_tx();
+        coinbase.outputs[0].script_pubkey = Script::from_bytes(vec![0; 300_000]);
+        // Invalid witness nonce/commitment and excessive full weight are not
+        // CheckBlock rules; witness does not affect the txid or stripped bound.
+        coinbase.inputs[0].witness = Witness::from_stack(vec![vec![0; 3_000_000]]);
+        let mut spend = spend_tx(1, vec![]);
+        spend.lock_time = LockTime::from_consensus(499_999_999);
+        spend.inputs[0].sequence = Sequence::from_consensus(0);
+        let block = block_with_transactions(vec![coinbase, spend]);
+        assert!(block.weight() > super::MAX_BLOCK_WEIGHT);
+        assert!(verify_block_non_contextual(&block).is_ok());
+        assert!(verify_block_rules(&block).is_err());
     }
 
     fn commitment_output(commitment: [u8; 32]) -> TxOut {

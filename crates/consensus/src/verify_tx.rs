@@ -174,6 +174,24 @@ pub fn verify_transaction_input_outpoints(tx: &Tx) -> Result<(), ConsensusError>
     Ok(())
 }
 
+/// Checks transaction shape and output totals without consulting chain context.
+/// The caller owns the enclosing block/transaction serialized-size bound.
+pub(crate) fn verify_transaction_structure(tx: &Tx) -> Result<u64, ConsensusError> {
+    if tx.inputs.is_empty() {
+        return Err(ConsensusError::EmptyInputs);
+    }
+    if tx.outputs.is_empty() {
+        return Err(ConsensusError::EmptyOutputs);
+    }
+    let output_value = total_output_value(tx)?;
+    if tx.is_coinbase() {
+        verify_coinbase_script_sig_size(tx)?;
+    } else {
+        verify_transaction_input_outpoints(tx)?;
+    }
+    Ok(output_value)
+}
+
 fn prepare_tx_checks(
     tx: &Tx,
     height: u32,
@@ -191,20 +209,10 @@ fn prepare_tx_checks(
         });
     }
 
-    if tx.inputs.is_empty() {
-        return Err(ConsensusError::EmptyInputs);
-    }
-    if tx.outputs.is_empty() {
-        return Err(ConsensusError::EmptyOutputs);
-    }
-
-    let output_value = total_output_value(tx)?;
+    let output_value = verify_transaction_structure(tx)?;
     if tx.is_coinbase() {
-        verify_coinbase_script_sig_size(tx)?;
         return Ok(None);
     }
-
-    verify_transaction_input_outpoints(tx)?;
 
     let mut input_value = 0u64;
     let mut prevouts = Vec::with_capacity(tx.inputs.len());

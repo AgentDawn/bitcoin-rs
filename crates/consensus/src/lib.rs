@@ -145,6 +145,8 @@ pub enum ConsensusError {
     WitnessCommitment,
     #[error("block weight {weight} exceeds max {max}")]
     BlockWeight { weight: u64, max: u64 },
+    #[error("stripped block size {size} exceeds max {max}")]
+    BlockBaseSize { size: u64, max: u64 },
     #[error("{bip}: {reason}")]
     Bip { bip: &'static str, reason: String },
     #[error("block prevout matrix has {actual} rows for {expected} transactions")]

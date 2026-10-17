@@ -188,6 +188,29 @@ scanning and wallet interoperability remain unverified.
   `overhaul_process_harness::verifychain_reports_damaged_native_frames_without_repairing_them`
   checks those outcomes through the running daemon.
 
+- Levels 1–4 reuse consensus-owned context-free body checks: coinbase placement
+  and scriptSig bounds, nonempty transaction inputs/outputs, output money ranges,
+  null/duplicate inputs, a 1,000,000-byte stripped block limit, and aggregate
+  legacy sigop cost. Failure returns `false` even when the stored header, PoW
+  and Merkle root are valid. Shared shape/value rules retain the same owner as
+  normal transaction validation; RPC has no copy of those rules.
+  [Core 31.1 `CheckBlock`](https://github.com/bitcoin/bitcoin/blob/v31.1/src/validation.cpp#L3966-L4033)
+  excludes contextual witness commitments, full witness weight, finality and
+  UTXO/script execution. Level 1 therefore does not apply those checks or infer
+  activation flags. Verification retains only the current block and its facts,
+  rather than accumulating the requested history in memory.
+
+  Proof: `verify_block::tests::non_contextual_checks_reject_invalid_transactions_with_valid_merkle_roots`,
+  `non_contextual_size_and_aggregate_legacy_sigops_have_core_boundaries` and
+  `non_contextual_checks_do_not_apply_witness_or_chain_context`;
+  `handlers::chain::verifychain_tests::level_one_checks_transaction_rules_after_header_and_merkle_authentication`
+  exercises the RPC with valid-PoW, valid-Merkle invalid bodies;
+  `verifychain_block_rules::level_one_body_rules_agree_with_pinned_core_block_rejections`
+  compares the consensus entrypoint to Core's independent `submitblock` rejection
+  reasons (not an assertion that Core admitted invalid blocks);
+  `overhaul_process_harness::verifychain_reads_the_requested_window_and_preserves_state`
+  compares level-one witness-nonce mutation outcomes through both live daemons.
+
 - `chain::BlockBodySource` preserves read errors separately from unavailable
   bodies. An absent body may be pruned, absent from snapshot history, or missing
   unexpectedly; absence alone does not establish corruption. Unavailable bodies
@@ -213,7 +236,7 @@ scanning and wallet interoperability remain unverified.
   `applied_window_ignores_a_higher_header_tip_and_recovery_refuses_reads`.
 
 - This is a read-only integrity check: it never changes the UTXO set, rewrites
-  bodies, repairs storage, or advances a durable root. Full transaction validity,
+  bodies, repairs storage, or advances a durable root. Signet challenge validation,
   level-2 undo checks and level-3/4 disconnect/reconnect verification remain
   unimplemented. `Deviation` stays in the registry: Core returns `false` for
   incomplete verification where this implementation reports a reason via `-1`;
