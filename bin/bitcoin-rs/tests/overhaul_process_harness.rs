@@ -253,6 +253,72 @@ fn verifychain_reads_the_requested_window_and_preserves_state() {
     }
 }
 
+/// API-02: native framing damage is corruption, not unavailable history.
+#[test]
+fn verifychain_reports_damaged_native_frames_without_repairing_them() {
+    let mut core = start(Kind::Core);
+    let mut node = start(Kind::BitcoinRs);
+    let funds = mine_common_chain(&mut core, &mut node, 2).expect("common valid blocks");
+    core.stop().expect("reference mining finished");
+    let original_body = funds.common_block_bytes.last().expect("tip body");
+    let datadir = node.take_datadir().expect("isolated datadir custody");
+    let path = datadir.path().join("node/blocks/blk00000.dat");
+    let original = std::fs::read(&path).expect("native block file");
+    let body_start = original
+        .windows(original_body.len())
+        .position(|bytes| bytes == original_body)
+        .expect("tip body in file");
+    // Native frame: magic, length, height (four bytes each), then 32-byte hash.
+    let frame_start = body_start
+        .checked_sub(4 + 4 + 4 + 32)
+        .expect("frame header");
+    let tip = node
+        .rpc("getbestblockhash", &json!([]))
+        .expect("applied tip");
+    let coins = node
+        .rpc("gettxoutsetinfo", &json!(["hash_serialized_3"]))
+        .expect("coins before verification");
+    let mut faults = Vec::new();
+    for offset in [0, 4, 8, 12] {
+        let mut bytes = original.clone();
+        bytes[frame_start + offset] ^= 1;
+        faults.push(bytes);
+    }
+    faults.push(original[..body_start - 1].to_vec());
+    faults.push(original[..body_start + original_body.len() - 1].to_vec());
+    for bytes in faults {
+        std::fs::write(&path, &bytes).expect("inject frame damage");
+        for level in 0..=4 {
+            assert_eq!(
+                node.rpc("verifychain", &json!([level, 0]))
+                    .expect("damaged frame must yield a boolean"),
+                json!(false)
+            );
+        }
+        assert_eq!(std::fs::read(&path).expect("unrepaired file"), bytes);
+        assert_eq!(node.rpc("getbestblockhash", &json!([])).expect("tip"), tip);
+        let after = node
+            .rpc("gettxoutsetinfo", &json!(["hash_serialized_3"]))
+            .expect("unchanged coins");
+        assert_eq!(after["hash_serialized_3"], coins["hash_serialized_3"]);
+        std::fs::write(&path, &original).expect("restore fixture");
+        assert_eq!(
+            node.rpc("verifychain", &json!([0, 0]))
+                .expect("restored file"),
+            json!(true)
+        );
+    }
+    let missing = path.with_extension("missing");
+    std::fs::rename(&path, &missing).expect("hide fixture file");
+    assert!(matches!(
+        node.rpc("verifychain", &json!([0, 0])),
+        Err(Error::Rpc { code: -1, .. })
+    ));
+    std::fs::rename(missing, &path).expect("restore missing file");
+    node.stop().expect("stop before removing isolated datadir");
+    drop(datadir);
+}
+
 /// API-01/API-02: Core 31.1 omits inapplicable pruning and signet fields.
 /// The optional compact-filter RPC must remain unavailable until enabled.
 #[test]

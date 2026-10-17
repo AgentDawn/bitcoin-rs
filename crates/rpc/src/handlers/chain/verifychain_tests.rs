@@ -8,6 +8,21 @@ use parking_lot::Mutex;
 
 type BodyRead = Result<Option<Vec<u8>>, BlockBodyReadError>;
 
+// The signal comes from a failed timed lock attempt, on this worker only.
+// No hook or additional synchronization state exists in production builds.
+std::thread_local! {
+    static LOCK_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn notify_lock_wait() {
+    LOCK_WAIT.with(|slot| {
+        if let Some(signal) = slot.borrow_mut().take() {
+            signal.send(()).expect("test must observe lock contention");
+        }
+    });
+}
+
 struct Source {
     bodies: Mutex<Vec<(BlockHash, BodyRead)>>,
     during_read: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -20,7 +35,9 @@ impl BlockBodySource for Source {
             action();
         }
         let bodies = self.bodies.lock();
-        let (expected, bytes) = &bodies[usize::try_from(height).unwrap()];
+        let (expected, bytes) = bodies
+            .get(usize::try_from(height).unwrap())
+            .expect("verification must not read above the fixture's applied height");
         assert_eq!(
             hash, *expected,
             "verification must follow the captured ancestry"
@@ -132,6 +149,23 @@ fn merkle_and_stored_header_corruption_cannot_pass() {
 }
 
 #[test]
+fn corrupt_stored_frame_is_false_at_every_level() {
+    let (ctx, source) = fixture();
+    let handler = Handler::new(ctx);
+    source.bodies.lock()[1].1 = Err(BlockBodyReadError::Corrupt("truncated frame".to_owned()));
+    for level in 0..=4 {
+        assert_eq!(
+            handler.dispatch("verifychain", &json!([level, 1])).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            handler.dispatch("verifychain", &json!([level, 0])).unwrap(),
+            json!(false)
+        );
+    }
+}
+
+#[test]
 fn unavailable_history_and_io_failure_are_explicit_incomplete_results() {
     let (ctx, source) = fixture();
     let handler = Handler::new(ctx);
@@ -149,7 +183,7 @@ fn unavailable_history_and_io_failure_are_explicit_incomplete_results() {
             .to_string()
             .contains("Block data unavailable at height 1")
     );
-    source.bodies.lock()[1].1 = Err(BlockBodyReadError("injected I/O failure".to_owned()));
+    source.bodies.lock()[1].1 = Err(BlockBodyReadError::Read("injected I/O failure".to_owned()));
     let error = handler.dispatch("verifychain", &json!([2, 0])).unwrap_err();
     assert_eq!(error.code(), -1);
     assert!(
@@ -180,6 +214,14 @@ fn genesis_only_is_empty_but_snapshot_ancestry_is_not() {
     let error = handler.dispatch("verifychain", &json!([0, 0])).unwrap_err();
     assert_eq!(error.code(), -1);
     assert!(error.to_string().contains("ancestry unavailable"));
+
+    let (mut ctx, _) = fixture();
+    Arc::get_mut(&mut ctx).unwrap().chain.block_body_source = None;
+    let error = Handler::new(ctx)
+        .dispatch("verifychain", &json!([0, 0]))
+        .unwrap_err();
+    assert_eq!(error.code(), -1);
+    assert!(error.to_string().contains("reader unavailable"));
 }
 
 #[test]
@@ -309,10 +351,15 @@ fn shutdown_does_not_wait_for_a_chain_transition_or_tree_writer() {
         let handler = Arc::new(Handler::new(ctx.clone()));
         let worker = handler.clone();
         let (send, receive) = std::sync::mpsc::channel();
+        let (waiting, observed_wait) = std::sync::mpsc::channel();
         let task = std::thread::spawn(move || {
+            LOCK_WAIT.with(|slot| *slot.borrow_mut() = Some(waiting));
             send.send(worker.dispatch("verifychain", &json!([0, 0])))
                 .unwrap();
         });
+        observed_wait
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker must reach the contended lock before shutdown");
         handler.stop();
         let error = receive
             .recv_timeout(std::time::Duration::from_secs(2))

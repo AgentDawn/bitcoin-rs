@@ -250,8 +250,13 @@ impl BlockBodySource for StoredBlockBodySource {
         hash: bitcoin_rs_primitives::BlockHash,
     ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
         self.store
-            .load_block_body(height, hash.0)
-            .map_err(|error| bitcoin_rs_chain::BlockBodyReadError(error.to_string()))
+            .load_block_body_for_verification(height, hash.0)
+            .map_err(|error| match error {
+                StorageError::CorruptBlockFrame(_) => {
+                    bitcoin_rs_chain::BlockBodyReadError::Corrupt(error.to_string())
+                }
+                _ => bitcoin_rs_chain::BlockBodyReadError::Read(error.to_string()),
+            })
     }
 
     fn disk_usage(&self) -> Option<u64> {
@@ -452,8 +457,10 @@ mod body_read_tests {
     fn stored_body_read_preserves_failure_instead_of_reporting_absence() {
         let source = StoredBlockBodySource::new(Arc::new(UnreadableStore));
         match source.block_body(1, Hash256::default().into()) {
-            Err(error) => assert!(error.to_string().contains("injected body read failure")),
-            Ok(_) => panic!("failed read must not become an unavailable or successful body"),
+            Err(bitcoin_rs_chain::BlockBodyReadError::Read(error)) => {
+                assert!(error.contains("injected body read failure"));
+            }
+            _ => panic!("I/O failure proves neither corruption, absence nor a successful read"),
         }
     }
 }

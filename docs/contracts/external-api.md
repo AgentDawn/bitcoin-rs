@@ -168,33 +168,62 @@ scanning and wallet interoperability remain unverified.
   window. Defaults remain level 3 and six blocks; a nonpositive depth means
   all applied descendants and a larger depth is clipped to the applied height.
   Signed 32-bit parameters are required; levels are clamped to 0–4.
+
+  Proof: `handlers::chain::verifychain_tests::complete_window_and_level_zero_require_real_readable_blocks`,
+  `parameters_use_signed_core_ranges_without_silent_defaults` and
+  `applied_window_ignores_a_higher_header_tip_and_recovery_refuses_reads`;
+  `overhaul_process_harness::verifychain_reads_the_requested_window_and_preserves_state`
+  compares window and parameter behavior against pinned Core.
+
 - Every requested body is read and decoded, including level 0. Its header must
   match the captured ancestry and satisfy the chain owner's proof-of-work check.
   Levels 1–4 additionally check the Merkle root and mutation rule. Corrupt bytes,
-  mismatched headers, invalid work or failed Merkle checks return `false`.
+  malformed or truncated referenced frames, mismatched headers, invalid work or
+  failed Merkle checks return `false`.
+
+  Proof: `handlers::chain::verifychain_tests::merkle_and_stored_header_corruption_cannot_pass`
+  and `corrupt_stored_frame_is_false_at_every_level`;
+  `block_body::body_position_prefetch_tests::verification_distinguishes_corrupt_frames_from_missing_bodies`
+  exercises each frame field, short frames and unchanged availability-only reads;
+  `overhaul_process_harness::verifychain_reports_damaged_native_frames_without_repairing_them`
+  checks those outcomes through the running daemon.
+
 - `chain::BlockBodySource` preserves read errors separately from unavailable
   bodies. An absent body may be pruned, absent from snapshot history, or missing
   unexpectedly; absence alone does not establish corruption. Unavailable bodies
-  or ancestry, absent readers, and read errors return RPC `-1` with an incomplete
-  verification reason, even if an available suffix already passed. No requested
-  block is silently skipped. Snapshot history is checked only when available.
+  or ancestry, absent readers, and read errors return RPC `-1` when the requested
+  non-genesis window requires them, with an incomplete verification reason even
+  if an available suffix already passed. A genesis-only or empty applied window
+  needs no body reader and can return `true`. No requested block is silently
+  skipped. Snapshot history is checked only when available.
+
+  Proof: `handlers::chain::verifychain_tests::unavailable_history_and_io_failure_are_explicit_incomplete_results`
+  and `genesis_only_is_empty_but_snapshot_ancestry_is_not`;
+  `state::storage::body_read_tests::stored_body_read_preserves_failure_instead_of_reporting_absence`.
+
 - The scan holds no tree or chain-transition guard during body reads. The existing
   transition boundary fences publication checks; a replaced publication, recovery
   closure or shutdown returns `-1`. Shutdown is checked between reads and while
   waiting for tree/transition guards. A storage read already in progress must return
   before cancellation can be observed. The existing blocking-call budget applies.
+
+  Proof: `handlers::chain::verifychain_tests::shutdown_and_changed_tip_cannot_report_completion`,
+  `shutdown_does_not_wait_for_a_chain_transition_or_tree_writer` (shutdown begins
+  only after the worker observes lock contention), and
+  `applied_window_ignores_a_higher_header_tip_and_recovery_refuses_reads`.
+
 - This is a read-only integrity check: it never changes the UTXO set, rewrites
   bodies, repairs storage, or advances a durable root. Full transaction validity,
   level-2 undo checks and level-3/4 disconnect/reconnect verification remain
   unimplemented. `Deviation` stays in the registry: Core returns `false` for
   incomplete verification where this implementation reports a reason via `-1`;
   excess arguments retain the local `-32602` shape error.
-- Evidence: `handlers::chain::verifychain_tests` covers corruption, depth, read
-  failure, unavailable/snapshot history, shutdown and changed publications.
+
+  Proof: `handlers::chain::verifychain_tests::failure_and_cancellation_leave_chain_and_coins_untouched`;
   `overhaul_process_harness::verifychain_reads_the_requested_window_and_preserves_state`
-  compares the pinned Core daemon and bitcoin-rs on common blocks, parameter
-  errors and deliberately corrupted isolated block files. This is not proof of
-  the omitted higher-level checks or full AssumeUTXO/pruning lifecycle parity.
+  and `verifychain_reports_damaged_native_frames_without_repairing_them` check
+  unchanged tips, UTXO hashes and damaged bytes. This is not proof of the omitted
+  higher-level checks or full AssumeUTXO/pruning lifecycle parity.
 
 #### Native deployment reporting
 

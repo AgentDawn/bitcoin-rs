@@ -349,6 +349,17 @@ impl FlatFileBlockStore {
         self.reader().load(position, height, hash)
     }
 
+    /// Preserves corrupt referenced frames as errors, separately from missing files.
+    pub(crate) fn load_for_verification(
+        &self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.reader()
+            .load_frame_bytes(position, height, hash, 0, None)
+    }
+
     /// Loads at most `limit` body bytes after validating the complete frame header.
     ///
     /// The returned prefix is bound to `height` and `hash`; malformed, missing,
@@ -598,6 +609,22 @@ impl FlatFileBlockReader {
         skip: u64,
         take: Option<u64>,
     ) -> Result<Option<Vec<u8>>, StorageError> {
+        // Preserve the availability-only contract of full, prefix and ranged
+        // reads. Verification uses the same parser without discarding corruption.
+        match self.load_frame_bytes(position, height, hash, skip, take) {
+            Err(StorageError::CorruptBlockFrame(_)) => Ok(None),
+            result => result,
+        }
+    }
+
+    fn load_frame_bytes(
+        &mut self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+        skip: u64,
+        take: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
         if !self.select_file(position.file_no)? {
             return Ok(None);
         }
@@ -605,12 +632,12 @@ impl FlatFileBlockReader {
             unreachable!("selected file has reader state");
         };
         let Some(record_end) = record_end(position) else {
-            return Ok(None);
+            return Err(StorageError::CorruptBlockFrame("record end overflow"));
         };
         if record_end > state.file_len {
             state.file_len = state.reader.get_ref().metadata()?.len();
             if record_end > state.file_len {
-                return Ok(None);
+                return Err(StorageError::CorruptBlockFrame("truncated record"));
             }
         }
         if state.cursor != Some(position.offset) {
@@ -622,7 +649,7 @@ impl FlatFileBlockReader {
         }
 
         let Some(body_offset) = body_offset(position.offset) else {
-            return Ok(None);
+            return Err(StorageError::CorruptBlockFrame("body offset overflow"));
         };
         let mut header = [0_u8; RECORD_HEADER_LEN];
         let header_complete = match read_exact_or_none(&mut state.reader, &mut header) {
@@ -634,7 +661,7 @@ impl FlatFileBlockReader {
         };
         if !header_complete {
             state.cursor = None;
-            return Ok(None);
+            return Err(StorageError::CorruptBlockFrame("truncated header"));
         }
         state.cursor = Some(body_offset);
         if header[..4] != BLOCK_FILE_MAGIC
@@ -642,7 +669,7 @@ impl FlatFileBlockReader {
             || header[8..12] != height.to_le_bytes()
             || header[12..] != hash
         {
-            return Ok(None);
+            return Err(StorageError::CorruptBlockFrame("frame header mismatch"));
         }
 
         let body_len = u64::from(position.len);
@@ -685,7 +712,7 @@ impl FlatFileBlockReader {
         };
         if !body_complete {
             state.cursor = None;
-            return Ok(None);
+            return Err(StorageError::CorruptBlockFrame("truncated body"));
         }
         state.cursor = Some(
             target

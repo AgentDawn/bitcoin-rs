@@ -9,8 +9,14 @@ use bitcoin_rs_primitives::{BlockBodyMetadata, BlockHash};
 /// A failed body read, distinct from an unavailable body (for example, pruned
 /// or not yet present in snapshot history). Storage errors stay behind this seam.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{0}")]
-pub struct BlockBodyReadError(pub String);
+pub enum BlockBodyReadError {
+    /// The stored representation is demonstrably malformed or truncated.
+    #[error("{0}")]
+    Corrupt(String),
+    /// The read could not complete, without establishing corruption.
+    #[error("{0}")]
+    Read(String),
+}
 
 /// Storage-backed block body reader used when headers and bodies are stored
 /// separately.

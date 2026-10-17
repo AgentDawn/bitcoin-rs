@@ -1024,6 +1024,8 @@ pub(crate) fn verifychain(
         {
             return Ok(guard);
         }
+        #[cfg(test)]
+        verifychain_tests::notify_lock_wait();
     };
     let applied = {
         let _guard = stable_read()?;
@@ -1079,6 +1081,8 @@ pub(crate) fn verifychain(
                 {
                     break tree;
                 }
+                #[cfg(test)]
+                verifychain_tests::notify_lock_wait();
                 check_current()?;
             };
             let node = cursor
@@ -1096,9 +1100,16 @@ pub(crate) fn verifychain(
         })?;
         let body = source.block_body(height, expected_hash.into());
         check_current()?;
-        let bytes = body.map_err(|error| {
-            RpcError::Misc(format!("Unable to read block at height {height}: {error}"))
-        })?.ok_or_else(|| RpcError::Misc(format!(
+        let bytes = match body {
+            Err(bitcoin_rs_chain::BlockBodyReadError::Corrupt(error)) => {
+                tracing::warn!(height, %error, "verifychain: stored block frame is corrupt");
+                return typed_to_sonic(&v31::VerifyChain(false));
+            }
+            Err(error) => return Err(RpcError::Misc(format!(
+                "Unable to read block at height {height}: {error}"
+            ))),
+            Ok(bytes) => bytes,
+        }.ok_or_else(|| RpcError::Misc(format!(
             "Block data unavailable at height {height}; verification incomplete (history may be pruned or absent after snapshot import)"
         )))?;
         let Ok(block) = deserialize::<Block>(&bytes) else {
