@@ -4,6 +4,7 @@
 use super::*;
 use crate::handlers::Handler;
 use bitcoin_rs_chain::{BlockBodyReadError, BlockBodySource, regtest_fixture};
+use bitcoin_rs_primitives::{OutPoint, Tx, Txid};
 use parking_lot::Mutex;
 
 type BodyRead = Result<Option<Vec<u8>>, BlockBodyReadError>;
@@ -47,15 +48,23 @@ impl BlockBodySource for Source {
 }
 
 fn fixture() -> (Arc<Context>, Arc<Source>) {
+    fixture_with_tip(vec![regtest_fixture::coinbase(3)])
+}
+
+fn fixture_with_tip(txs: Vec<Tx>) -> (Arc<Context>, Arc<Source>) {
     let mut ctx = Context::new();
     ctx.chain.chain_network = Network::Regtest;
     let mut blocks = vec![Network::Regtest.genesis_block()];
-    for height in 1..=3 {
+    for height in 1..=2 {
         blocks.push(
             regtest_fixture::mined_regtest_child_at(blocks.last().unwrap().block_hash(), height)
                 .unwrap(),
         );
     }
+    blocks.push(
+        regtest_fixture::mined_block_with_prev_hash(blocks.last().unwrap().block_hash(), 3, txs)
+            .unwrap(),
+    );
     let source = Arc::new(Source {
         bodies: Mutex::new(
             blocks
@@ -84,6 +93,49 @@ fn fixture() -> (Arc<Context>, Arc<Source>) {
         .store(ctx.chain.block_tree.read().tip());
     ctx.chain.block_body_source = Some(source.clone());
     (Arc::new(ctx), source)
+}
+
+#[test]
+fn level_one_checks_transaction_rules_after_header_and_merkle_authentication() {
+    let mut short_coinbase = regtest_fixture::coinbase(3);
+    short_coinbase.inputs[0].script_sig = Script::from_bytes(vec![0]);
+    let mut overflowing = regtest_fixture::coinbase(3);
+    overflowing.outputs[0].value = Amount::from_sat(Amount::MAX_MONEY.to_sat() + 1);
+    let mut duplicate = regtest_fixture::coinbase(3);
+    duplicate.inputs[0].previous_output = OutPoint::new(Txid(Hash256::from_le_bytes(&[1; 32])), 0);
+    duplicate.inputs.push(duplicate.inputs[0].clone());
+    let mut sigops = regtest_fixture::coinbase(3);
+    sigops.outputs[0].script_pubkey =
+        Script::from_bytes(vec![bitcoin_rs_script::opcode::OP_CHECKSIG; 20_001]);
+    for txs in [
+        vec![short_coinbase],
+        vec![overflowing],
+        vec![regtest_fixture::coinbase(3), duplicate],
+        vec![sigops],
+    ] {
+        let (ctx, source) = fixture_with_tip(txs);
+        let tip = ctx.chain.applied_tip.load_full().unwrap();
+        let before = source.bodies.lock().clone();
+        let handler = Handler::new(ctx.clone());
+        assert_eq!(
+            handler.dispatch("verifychain", &json!([0, 1])).unwrap(),
+            json!(true)
+        );
+        for level in 1..=4 {
+            assert_eq!(
+                handler.dispatch("verifychain", &json!([level, 1])).unwrap(),
+                json!(false)
+            );
+        }
+        assert!(Arc::ptr_eq(
+            &tip,
+            &ctx.chain.applied_tip.load_full().unwrap()
+        ));
+        for (original, after) in before.iter().zip(source.bodies.lock().iter()) {
+            assert_eq!(original.0, after.0);
+            assert_eq!(original.1.as_ref().unwrap(), after.1.as_ref().unwrap());
+        }
+    }
 }
 
 #[test]

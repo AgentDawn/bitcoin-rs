@@ -179,6 +179,18 @@ fn verifychain_reads_the_requested_window_and_preserves_state() {
         .zip(original)
         .position(|(a, b)| a != b)
         .expect("changed amount");
+    let mut changed: bitcoin::Block = bitcoin::consensus::deserialize(original).expect("block one");
+    let mut witness = changed.txdata[0].input[0].witness.to_vec();
+    assert_eq!(witness[0].len(), 32, "Core-mined witness nonce");
+    witness[0][0] ^= 1;
+    changed.txdata[0].input[0].witness = bitcoin::Witness::from_slice(&witness);
+    let changed = bitcoin::consensus::serialize(&changed);
+    assert_eq!(changed.len(), original.len());
+    let witness_offset = changed
+        .iter()
+        .zip(original)
+        .position(|(a, b)| a != b)
+        .expect("changed witness nonce");
     for (mut process, relative) in [
         (core, "regtest/blocks/blk00000.dat"),
         (node, "node/blocks/blk00000.dat"),
@@ -200,9 +212,13 @@ fn verifychain_reads_the_requested_window_and_preserves_state() {
             .write(true)
             .open(&path)
             .expect("test fault injection");
-        // Corrupt an older transaction, then its stored header. The one-block
-        // suffix stays healthy, but a full-window verification must find both.
-        for (offset, level) in [(value_offset, 2), (0, 0)] {
+        // Core's level-one CheckBlock excludes contextual witness checks. A
+        // nonce mutation leaves txids unchanged and must still pass that level.
+        for (offset, level, verdict) in [
+            (value_offset, 2, false),
+            (0, 0, false),
+            (witness_offset, 1, true),
+        ] {
             let location = u64::try_from(position + offset).expect("file offset");
             file.seek(SeekFrom::Start(location)).expect("seek fault");
             file.write_all(&[original[offset] ^ 1])
@@ -218,7 +234,7 @@ fn verifychain_reads_the_requested_window_and_preserves_state() {
                 process
                     .rpc("verifychain", &json!([level, 0]))
                     .expect("corrupt full window"),
-                json!(false)
+                json!(verdict)
             );
             assert_eq!(
                 process

@@ -237,6 +237,7 @@ dependencies = [
  "bitcoin-rs-consensus",
  "bitcoin-rs-e2e",
  "bitcoin-rs-node",
+ "bitcoin-rs-primitives",
  "bitcoin-rs-rpc",
  "bitcoin-rs-storage",
  "clap",
