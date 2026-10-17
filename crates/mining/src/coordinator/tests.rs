@@ -214,3 +214,17 @@ fn long_poll_rejects_non_ascii_split_boundary_without_panicking() {
     assert_eq!(malformed.len(), 65);
     assert!(parse_long_poll_id(&malformed).is_none());
 }
+
+#[test]
+fn template_generation_race_classification_excludes_other_failures() {
+    assert!(generation_race().is_template_generation_race());
+    for error in [
+        MiningControlError::Unavailable("node is shutting down".into()),
+        MiningControlError::Unavailable("applied tip is not available".into()),
+        MiningControlError::InvalidRequest(GENERATION_RACE.into()),
+        MiningControlError::Failed(GENERATION_RACE.into()),
+        MiningControlError::Rejected(GENERATION_RACE.into()),
+    ] {
+        assert!(!error.is_template_generation_race(), "{error:?}");
+    }
+}

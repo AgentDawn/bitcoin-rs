@@ -131,6 +131,23 @@ listener spawn) rolls the graph back through the same ordered teardown in
 `StartupAbort` mode before the error is returned. Workers and storage are
 not handed out through a tuple or reconstructed through a second factory.
 
+## Typed mining access
+
+`Node::mining_control()` borrows the already attached `MiningControl` used by
+RPC. The reference cannot outlive the node; no coordinator, candidate cache,
+or chainstate authority is duplicated. Template long polls and solved-block
+submission remain synchronous. Embedders own blocking-worker placement and
+must drain submissions before shutdown. The existing `RuntimeInputs` shutdown
+notification cancels outstanding template waits through the node's shutdown
+latch; the embedder then joins its workers before consuming `Node::shutdown`.
+RPC behavior and the default node dependency graph are unchanged.
+
+Proof: `tools/stratum-sv2/template-provider/src/tests.rs` test
+`embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown` uses
+production `Node::start`, typed candidate/wire projection, canonical submission,
+a same-tip mempool update, bounded retained jobs, and shutdown of a long-poll
+worker without `test-seam` or an internal RPC client.
+
 ## Readiness
 
 `block_header(hash)` copies header, height and big-endian cumulative work from
