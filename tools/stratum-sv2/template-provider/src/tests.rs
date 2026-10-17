@@ -9,6 +9,33 @@ use stratum_apps::stratum_core::{bitcoin, template_distribution_sv2::SubmitSolut
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+pub(super) fn empty_candidate() -> bitcoin_rs_mining::Candidate {
+    use bitcoin_rs_mining::{CandidateContext, assemble_candidate};
+    assemble_candidate(
+        &CandidateContext {
+            previous_block_hash: Default::default(),
+            height: 1,
+            version: 0x20000000,
+            bits: bitcoin_rs_primitives::CompactTarget::from_consensus(0x207fffff),
+            min_time: 1,
+            current_time: 1,
+            locktime_cutoff: 1,
+            network: Network::Regtest,
+            csv_active: true,
+            segwit_active: true,
+            max_weight: 4_000_000,
+            max_size: 4_000_000,
+            max_sigops: 80_000,
+        },
+        &bitcoin_rs_mempool::MempoolMiningSnapshot {
+            sequence: 0,
+            entries: vec![],
+        },
+        &[0x51],
+    )
+    .unwrap()
+}
+
 fn candidate(node: &Node) -> Arc<bitcoin_rs_mining::Candidate> {
     let result = node
         .mining_control()

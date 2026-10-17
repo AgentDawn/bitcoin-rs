@@ -80,10 +80,12 @@ microseconds, canonical submission results, and the resulting applied height.
   shutdown closes the entire connection; a partial record is never resumed with
   a new decoder. Writes have a deadline and a failed write closes the session.
 - Templates are sent only after `CoinbaseOutputConstraints`. The adapter checks
-  conservative size/weight and sigop headroom including a full scriptSig and
-  output-count expansion. It refuses a tight candidate rather than constructing
-  a second transaction selector. This can reject templates a more complete
-  reservation-aware producer could serve.
+  conservative serialized-byte, weight-unit and sigop headroom including a full
+  scriptSig and output-count expansion. It refuses a tight candidate rather than constructing
+  a second transaction selector, closing that TDP session. A persistently full
+  mempool can therefore prevent fresh jobs. Accounting for the pool's coinbase
+  reservation in the mining owner's candidate budget remains a follow-up in
+  [#1560](https://github.com/gosuda/bitcoin-rs/issues/1560).
 - Coinbase prefix, version, sequence, locktime, required outputs and commitment
   come from the native candidate. The pool adds its payout outputs; native
   submission supplies the ordinary witness reserved value if required. The node
@@ -104,6 +106,14 @@ submission/duplicates, same-tip mempool refresh, a valid superseded solution,
 stale-parent refusal, retention eviction, recovery from injected generation
 races before initial publication and refresh, and cancellation on shutdown. Its
 100-block history is required to spend a matured coinbase.
+
+Focused localhost Noise tests hold back part of an encrypted request across a
+template refresh and verify the completed request and next record decode.
+They also pause a real native block submission through the existing mempool
+observer, request session shutdown, and verify submission drains and the block
+commits before Node teardown. A tight candidate closes its TDP session. Separate
+boundary checks distinguish serialized bytes from weight units and verify
+size, weight and sigop refusal.
 
 The [retained interoperability run](evidence/interop.md) records the final
 provider image with two real SRI devices, pool reconnect, and checkpoint

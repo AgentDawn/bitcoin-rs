@@ -29,6 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+bitcoin-rs-mempool = { path = "../../../crates/mempool" }
 
 [profile.dev]
 debug = 0

@@ -469,6 +469,7 @@ dependencies = [
 name = "bitcoin-rs-sv2-template-provider"
 version = "0.1.0"
 dependencies = [
+ "bitcoin-rs-mempool",
  "bitcoin-rs-mining",
  "bitcoin-rs-node",
  "bitcoin-rs-primitives",

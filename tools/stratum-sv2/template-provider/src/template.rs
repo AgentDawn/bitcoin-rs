@@ -1,7 +1,8 @@
 //! Typed mining candidate to SV2 wire projection. Mining policy stays in the node.
 use bitcoin_rs_mining::Candidate;
 use bitcoin_rs_primitives::{
-    Block, BlockHash, Hash256, Header, Tx, consensus_bytes, deserialize, encode::double_sha256,
+    Block, BlockHash, ConsensusEncode, Hash256, Header, Tx, consensus_bytes, deserialize,
+    encode::double_sha256, varint,
 };
 use std::sync::Arc;
 use stratum_apps::stratum_core::binary_sv2::{B016MOwned, Seq064KOwned, Seq0255Owned, U256Owned};
@@ -44,9 +45,18 @@ impl TemplateState {
     // additionally reserve all downstream outputs, a full scriptSig and count
     // expansion. Refuse a tight candidate rather than invent another selector.
     pub fn fits_constraints(&self, bytes: u32, sigops: u32) -> bool {
-        let reserved = (u64::from(bytes) + 109) * 4;
-        self.candidate.weight.saturating_add(reserved) <= self.candidate.max_weight
-            && self.candidate.weight.saturating_add(reserved) <= self.candidate.max_size
+        let reserved_bytes = u64::from(bytes) + 109;
+        let serialized_size = Header::LEN as u64
+            + varint::encoded_len(self.candidate.transactions.len() as u64 + 1) as u64
+            + self.candidate.coinbase.consensus_size() as u64
+            + self
+                .candidate
+                .transactions
+                .iter()
+                .map(|tx| tx.tx.consensus_size() as u64)
+                .sum::<u64>();
+        self.candidate.weight.saturating_add(reserved_bytes * 4) <= self.candidate.max_weight
+            && serialized_size.saturating_add(reserved_bytes) <= self.candidate.max_size
             && self
                 .candidate
                 .transactions
@@ -157,3 +167,6 @@ fn hash_pair(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     bytes[32..].copy_from_slice(b);
     *double_sha256(&bytes).as_byte_array()
 }
+
+#[cfg(test)]
+mod tests;

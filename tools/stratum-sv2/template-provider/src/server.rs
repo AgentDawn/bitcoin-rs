@@ -297,3 +297,6 @@ async fn send_error_tdp(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests;
