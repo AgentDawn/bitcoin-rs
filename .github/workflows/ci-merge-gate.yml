@@ -71,7 +71,7 @@ jobs:
       - name: Kernel consensus oracle parity tests
         run: |
           cargo test --locked -p bitcoin-rs-consensus --features kernel \
-            --lib --test shared_sighash \
+            --lib --test shared_sighash --test overhaul_parse_parity \
             --test kernel_block_parity --test kernel_vector_parity -- --nocapture
       - name: Kernel script core-vectors oracle test
         run: |

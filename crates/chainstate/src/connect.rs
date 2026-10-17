@@ -262,7 +262,7 @@ pub(super) fn apply_block_admitted<'b>(
         ),
     };
     let PreparedApply {
-        parsed,
+        script_source,
         mut view,
         tx_plan,
         resolved,
@@ -310,7 +310,7 @@ pub(super) fn apply_block_admitted<'b>(
             Arc::clone(&resolved),
             &validation_context,
             provenance,
-            &parsed,
+            &script_source,
         )
     };
     let script_verify_dur = script_verify_started.elapsed();

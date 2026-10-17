@@ -10,8 +10,7 @@ use bitcoin::sighash::{
 };
 use bitcoin_rs_consensus::kernel::{BlockParse, verify_tx_scripts};
 use bitcoin_rs_consensus::{
-    BlockFacts, BlockView, ConsensusError, ScriptStageTimings, ValidationEngine,
-    verify_block_input_scripts,
+    BlockView, ConsensusError, ScriptStageTimings, ValidationEngine, verify_block_input_scripts,
 };
 use bitcoin_rs_primitives::{
     Amount, Hash256, LockTime, Network, OutPoint, Script, Sequence, Sighash, SighashCache,
@@ -310,10 +309,8 @@ fn verify_block(
     let mut block = Network::Regtest.genesis_block();
     block.txs = vec![tx.clone()];
     let parsed = BlockParse::parse(&consensus_bytes(&block), engine)?;
-    let mut view = BlockView::from_facts(
-        &block.txs,
-        BlockFacts::from_txids(&block.txs, vec![tx.txid()]),
-    );
+    let (parsed, facts) = parsed.into_parts(&block.txs)?;
+    let mut view = BlockView::from_facts(&block.txs, facts);
     view.set_resolved(vec![prevouts.iter().cloned().map(Some).collect()]);
     verify_block_input_scripts(
         &mut view,
