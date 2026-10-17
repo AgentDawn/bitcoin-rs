@@ -27,10 +27,7 @@ pub(super) fn empty_candidate() -> bitcoin_rs_mining::Candidate {
             max_size: 4_000_000,
             max_sigops: 80_000,
         },
-        &bitcoin_rs_mempool::MempoolMiningSnapshot {
-            sequence: 0,
-            entries: vec![],
-        },
+        &bitcoin_rs_mempool::Mempool::new(Default::default()).mining_snapshot(),
         &[0x51],
     )
     .unwrap()
