@@ -1,4 +1,5 @@
 use super::*;
+
 use crate::{EXAMPLE_PRIVATE_KEY_HEX, Network, NodeConfig, RuntimeInputs};
 use bitcoin_rs_mempool::{AdmissionOrigin, MempoolObserver, MutationEnvelope};
 use bitcoin_rs_mining::{
@@ -35,6 +36,52 @@ use tokio::{
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 const DEADLINE: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn transient_accept_error_waits_before_retrying() {
+    let (_stop, mut cancel) = watch::channel(false);
+    for error in [
+        std::io::Error::from(std::io::ErrorKind::ConnectionAborted),
+        std::io::Error::other("temporary resource exhaustion"),
+    ] {
+        let started = Instant::now();
+        wait_after_accept_error(error, &mut cancel).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+}
+
+#[tokio::test]
+async fn accept_error_backoff_can_be_cancelled_by_shutdown() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+
+    let (stop, mut cancel) = watch::channel(false);
+    let wait = wait_after_accept_error(
+        std::io::Error::other("temporary resource exhaustion"),
+        &mut cancel,
+    );
+    tokio::pin!(wait);
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(wait.as_mut().poll(&mut context).is_pending());
+    stop.send_replace(true);
+    assert!(matches!(
+        wait.as_mut().poll(&mut context),
+        Poll::Ready(Ok(()))
+    ));
+}
+
+#[tokio::test]
+async fn permanent_accept_error_remains_fatal() {
+    let (_stop, mut cancel) = watch::channel(false);
+    let result = wait_after_accept_error(
+        std::io::Error::from(std::io::ErrorKind::InvalidInput),
+        &mut cancel,
+    )
+    .await;
+    assert!(result.is_err());
+}
 
 struct EmbeddedNode {
     node: Arc<Node>,

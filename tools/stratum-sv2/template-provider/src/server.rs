@@ -46,7 +46,15 @@ pub async fn run(
             _ = stop.changed() => break Ok(()),
             _ = sessions.join_next(), if !sessions.is_empty() => {},
             accepted = listener.accept() => {
-                let (stream, peer) = match accepted { Ok(value) => value, Err(error) => break Err(error.to_string()) };
+                let (stream, peer) = match accepted {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Err(error) = wait_after_accept_error(error, &mut stop).await {
+                            break Err(error);
+                        }
+                        continue;
+                    }
+                };
                 if sessions.len() >= MAX_SESSIONS { drop(stream); continue; }
                 let session = Session {
                     hub: hub.clone(), node: Arc::clone(&node), stop: session_cancel.clone(),
@@ -64,6 +72,33 @@ pub async fn run(
     // awaited blocking submissions before dropping their Node borrows.
     while sessions.join_next().await.is_some() {}
     outcome
+}
+
+async fn wait_after_accept_error(
+    error: std::io::Error,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    use std::io::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::InvalidInput
+            | ErrorKind::PermissionDenied
+            | ErrorKind::Unsupported
+            | ErrorKind::NotConnected
+    ) {
+        return Err(error.to_string());
+    }
+    // Aborted connections and temporary resource exhaustion need not kill Node.
+    // Back off even for OS-specific errors to avoid spinning on a busy listener.
+    warn!(%error, "TDP accept failed; retrying after 100ms");
+    if *stop.borrow() {
+        return Ok(());
+    }
+    tokio::select! {
+        _ = stop.changed() => {},
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+    }
+    Ok(())
 }
 
 struct Session {
