@@ -5,7 +5,10 @@ use bitcoin_rs_primitives::{Amount, Network, TxOut, Witness, encode::double_sha2
 use bitcoin_rs_storage::block_body::BlockBodyStore;
 use bitcoin_rs_utxo::UtxoSet;
 
-fn witness_child(parent: bitcoin_rs_primitives::BlockHash, height: u32) -> Block {
+fn witness_child(
+    parent: bitcoin_rs_primitives::BlockHash,
+    height: u32,
+) -> Result<Block, regtest_fixture::RegtestFixtureError> {
     let mut coinbase = regtest_fixture::coinbase(height);
     coinbase.inputs[0].witness = Witness::from_stack(vec![vec![0; 32]]);
     let commitment = double_sha256(&[0; 64]);
@@ -19,7 +22,6 @@ fn witness_child(parent: bitcoin_rs_primitives::BlockHash, height: u32) -> Block
         .into(),
     });
     regtest_fixture::mined_block_with_prev_hash(parent, height, vec![coinbase])
-        .expect("witness fixture")
 }
 
 #[test]
@@ -37,7 +39,7 @@ fn preserved_witness_body_is_bound_before_commit_and_disconnect_keeps_exact_byte
         chain.set_capture_flags(false, true);
         let genesis = Network::Regtest.genesis_block();
         chain.apply_block(&genesis, None)?;
-        let child = witness_child(genesis.block_hash(), 1);
+        let child = witness_child(genesis.block_hash(), 1)?;
         let raw = bytes::Bytes::from(consensus_bytes(&child));
         let before = chain.chain_snapshot();
         // A witness mutation leaves both txid and serialized length unchanged.
@@ -62,7 +64,7 @@ fn preserved_witness_body_is_bound_before_commit_and_disconnect_keeps_exact_byte
             Some(raw.as_ref())
         );
 
-        let mut bad_merkle = witness_child(child.block_hash(), 2);
+        let mut bad_merkle = witness_child(child.block_hash(), 2)?;
         bad_merkle.txs[0].outputs[0].value = Amount::from_sat(1);
         let bad_raw = bytes::Bytes::from(consensus_bytes(&bad_merkle));
         assert!(chain.apply_block(&bad_merkle, Some(bad_raw)).is_err());
