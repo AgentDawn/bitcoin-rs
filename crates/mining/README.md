@@ -27,6 +27,15 @@ long-poll publication over node-supplied capability sources. Generate assemble-s
 submission, and header-only admission (`submitheader` via `accept_headers`)
 live in the node-owned coordinator that implements `MiningControl`.
 
+Generation identity includes the applied hash and both pool-owned membership
+and fee-delta revisions. Capture, snapshot validation and post-assembly checks
+compare both revisions; prioritisation leaves the public membership sequence
+unchanged. The existing RPC `publish_generation()` invalidates the cached
+candidate and wakes long polls after a fee change. The membership observer
+still takes no pool read lock and carries no fee-only mutation event.
+Long-poll IDs retain `hash<sequence>` at fee revision zero, otherwise append
+`:<fee_revision>`. Both forms are accepted; legacy IDs imply fee revision zero.
+
 `cargo bench -p bitcoin-rs-mining --bench candidate` times `assemble_candidate`
 against pre-captured snapshots. It is a measurement seam, not a budget.
 

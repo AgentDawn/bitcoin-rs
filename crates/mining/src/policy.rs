@@ -237,6 +237,7 @@ mod tests {
         let leftover = snapshot_entry(independent_tx(2), 4_000, 10, 10, 0);
         let snapshot = MempoolMiningSnapshot {
             sequence: 1,
+            fee_delta_sequence: 0,
             entries: vec![filler, leftover],
         };
         for limits in [(1_004, 4_000_000), (4_000_000, 1_001)] {
@@ -258,6 +259,7 @@ mod tests {
         let zero_size = snapshot_entry(independent_tx(1), 1_000, 10, 0, 0);
         let snapshot = MempoolMiningSnapshot {
             sequence: 2,
+            fee_delta_sequence: 0,
             entries: vec![zero_size],
         };
 

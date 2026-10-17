@@ -53,11 +53,12 @@ state (`crates/mempool/src/orphan.rs`).
   commits, enqueues, and returns immediately, and its publication
   completes after the in-flight callback. The accepted-mutation mining
   wake threads the last change's sequence into
-  `MempoolSequenceWake::publish_generation_from`, which builds the
-  generation key from `applied_tip` plus that sequence and never touches
-  the mempool read lock (`crates/mining/src/generation_signal.rs`); `node` attaches that
-  mining observer at gateway construction and the ZMQ sequence observer as
-  an extra named leg on the gateway's `CompositeObserver`.
+  `MempoolSequenceWake::publish_generation_from`, which invalidates an older
+  membership generation and wakes waiters without a mempool read. The next
+  template read captures membership and fee revisions together; fee-priority
+  RPC changes use the existing explicit `publish_generation()` call.
+  `node` attaches that mining observer at gateway construction and the ZMQ
+  sequence observer as an extra named leg on the gateway's `CompositeObserver`.
 
 ### `MPL-02`: Atomic mutation records and sequence assignment
 

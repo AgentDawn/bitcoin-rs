@@ -18,6 +18,8 @@ use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_primitives::TxOut;
 use std::sync::Arc;
 
+mod fee_revision;
+
 fn sample_candidate(
     previous: Hash256,
     sequence: u64,
@@ -177,6 +179,7 @@ fn long_poll_round_trips_template_id() {
     let key = GenerationKey {
         tip_hash: tip,
         mempool_sequence: 7,
+        fee_delta_sequence: 0,
     };
     let id = key.template_id();
     let Some(parsed) = parse_long_poll_id(id.as_str()) else {
@@ -184,6 +187,22 @@ fn long_poll_round_trips_template_id() {
     };
     assert_eq!(parsed, key);
     assert_eq!(TemplateId::new(&tip, 7).as_str(), id.as_str());
+    for revision in [1, 12, u64::MAX] {
+        let key = GenerationKey {
+            fee_delta_sequence: revision,
+            ..key
+        };
+        assert_eq!(parse_long_poll_id(key.template_id().as_str()), Some(key));
+    }
+    for suffix in [
+        "7:",
+        "7:1:2",
+        "7:no",
+        "18446744073709551616",
+        "7:18446744073709551616",
+    ] {
+        assert!(parse_long_poll_id(&format!("{}{suffix}", tip.to_string_be())).is_none());
+    }
 }
 
 #[test]

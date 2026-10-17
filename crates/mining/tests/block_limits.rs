@@ -179,6 +179,7 @@ fn snapshot(count: usize, witness: bool) -> Result<MempoolMiningSnapshot, Box<dy
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     Ok(MempoolMiningSnapshot {
         sequence: 1,
+        fee_delta_sequence: 0,
         entries,
     })
 }

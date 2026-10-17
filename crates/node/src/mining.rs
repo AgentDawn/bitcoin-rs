@@ -228,13 +228,23 @@ struct MempoolAdapter {
 }
 
 impl MempoolSnapshotSource for MempoolAdapter {
-    fn current_sequence(&self) -> u64 {
-        self.mempool.read().sequence_number()
+    fn current_revisions(&self) -> (u64, u64) {
+        let mempool = self.mempool.read();
+        (
+            mempool.sequence_number(),
+            mempool.fee_delta_sequence_number(),
+        )
     }
 
-    fn mining_snapshot_at(&self, expected_sequence: u64) -> Option<MempoolMiningSnapshot> {
+    fn mining_snapshot_at(
+        &self,
+        expected_sequence: u64,
+        expected_fee_revision: u64,
+    ) -> Option<MempoolMiningSnapshot> {
         let mempool = self.mempool.read();
-        if mempool.sequence_number() != expected_sequence {
+        if mempool.sequence_number() != expected_sequence
+            || mempool.fee_delta_sequence_number() != expected_fee_revision
+        {
             return None;
         }
         Some(mempool.mining_snapshot())

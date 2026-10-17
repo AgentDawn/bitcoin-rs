@@ -110,6 +110,25 @@ fn template_renders_coinbase_subsidy_plus_fees_and_bip22_fields() -> Result<()> 
         .parse::<u64>()
         .map_err(|_| anyhow::anyhow!("invalid longpollid sequence"))?;
 
+    // A fee-only RPC change refreshes the cached identity without moving membership.
+    let sequence = state.mempool().read().sequence_number();
+    assert_eq!(
+        handler
+            .dispatch(
+                "prioritisetransaction",
+                &json!([mempool_tx.txid().to_string(), 0, 100_000])
+            )?
+            .as_bool(),
+        Some(true)
+    );
+    assert_eq!(state.mempool().read().sequence_number(), sequence);
+    let refreshed = handler.dispatch("getblocktemplate", &json!([{"rules": ["segwit"]}]))?;
+    assert_ne!(required_str(&refreshed, "longpollid")?, long_poll_id);
+    assert_eq!(
+        required_u64(&refreshed, "coinbasevalue")?,
+        REGTEST_SUBSIDY_SATS + MEMPOOL_TX_FEE_SATS
+    );
+
     Ok(())
 }
 

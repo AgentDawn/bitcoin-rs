@@ -81,7 +81,11 @@ pub(crate) fn insert_with_cost(
 }
 
 pub(crate) fn snapshot(sequence: u64, entries: Vec<SnapshotEntry>) -> MempoolMiningSnapshot {
-    MempoolMiningSnapshot { sequence, entries }
+    MempoolMiningSnapshot {
+        sequence,
+        fee_delta_sequence: 0,
+        entries,
+    }
 }
 
 /// Snapshot entry whose weight, size, and vsize are measured from `tx`.
