@@ -1537,9 +1537,13 @@ mod tests {
     }
 
     impl bitcoin_rs_chain::BlockBodySource for PanicUnlessBodySource {
-        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
+        fn block_body(
+            &self,
+            height: u32,
+            hash: BlockHash,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
             if height == self.height && hash == self.hash {
-                Some(self.body.clone())
+                Ok(Some(self.body.clone()))
             } else {
                 panic!("should not load unrelated body {height}:{hash}");
             }
@@ -1554,8 +1558,12 @@ mod tests {
     }
 
     impl bitcoin_rs_chain::BlockBodySource for ScriptedBodySource {
-        fn block_body(&self, _height: u32, _hash: BlockHash) -> Option<Vec<u8>> {
-            self.responses.lock().pop_front().flatten()
+        fn block_body(
+            &self,
+            _height: u32,
+            _hash: BlockHash,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+            Ok(self.responses.lock().pop_front().flatten())
         }
     }
 
@@ -1932,15 +1940,20 @@ mod tests {
         }
 
         impl bitcoin_rs_chain::BlockBodySource for LockProbeSource {
-            fn block_body(&self, height: u32, _hash: BlockHash) -> Option<Vec<u8>> {
+            fn block_body(
+                &self,
+                height: u32,
+                _hash: BlockHash,
+            ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
                 assert!(
                     self.blocks.raw_handle().try_write().is_some(),
                     "the block-record lock must not be held across a body load"
                 );
-                self.bodies
+                Ok(self
+                    .bodies
                     .iter()
                     .find(|(known, _)| *known == height)
-                    .map(|(_, bytes)| bytes.clone())
+                    .map(|(_, bytes)| bytes.clone()))
             }
         }
 

@@ -244,8 +244,19 @@ impl StoredBlockBodySource {
 }
 
 impl BlockBodySource for StoredBlockBodySource {
-    fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::BlockHash) -> Option<Vec<u8>> {
-        self.store.load_block_body(height, hash.0).ok().flatten()
+    fn block_body(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::BlockHash,
+    ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+        self.store
+            .load_block_body_for_verification(height, hash.0)
+            .map_err(|error| match error {
+                StorageError::CorruptBlockFrame(_) => {
+                    bitcoin_rs_chain::BlockBodyReadError::Corrupt(error.to_string())
+                }
+                _ => bitcoin_rs_chain::BlockBodyReadError::Read(error.to_string()),
+            })
     }
 
     fn disk_usage(&self) -> Option<u64> {
@@ -417,5 +428,39 @@ impl bitcoin_rs_index::runtime::IndexAheadSink for RecoveryReporter {
 impl bitcoin_rs_index::RollbackWarningSource for RecoveryReporter {
     fn rollback_warnings(&self) -> Vec<String> {
         self.0.warnings()
+    }
+}
+
+#[cfg(test)]
+mod body_read_tests {
+    use super::*;
+    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_storage::block_body::BlockBodyStore;
+
+    struct UnreadableStore;
+
+    impl BlockBodyStore for UnreadableStore {
+        fn persist_block_body(&self, _: u32, _: Hash256, _: &[u8]) -> Result<(), StorageError> {
+            panic!("a read must not repair or rewrite storage");
+        }
+
+        fn load_block_body(&self, _: u32, _: Hash256) -> Result<Option<Vec<u8>>, StorageError> {
+            Err(StorageError::InvalidOperation("injected body read failure"))
+        }
+
+        fn sync(&self) -> Result<(), StorageError> {
+            panic!("a read must not commit storage");
+        }
+    }
+
+    #[test]
+    fn stored_body_read_preserves_failure_instead_of_reporting_absence() {
+        let source = StoredBlockBodySource::new(Arc::new(UnreadableStore));
+        match source.block_body(1, Hash256::default().into()) {
+            Err(bitcoin_rs_chain::BlockBodyReadError::Read(error)) => {
+                assert!(error.contains("injected body read failure"));
+            }
+            _ => panic!("I/O failure proves neither corruption, absence nor a successful read"),
+        }
     }
 }

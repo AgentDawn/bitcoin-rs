@@ -102,6 +102,17 @@ pub trait BlockBodyStore: Send + Sync {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError>;
+
+    /// Reads for integrity verification. Backends with framed bodies preserve
+    /// malformed or truncated referenced frames as `StorageError::CorruptBlockFrame`.
+    /// Missing locators/files remain `None`; ordinary read failures remain errors.
+    fn load_block_body_for_verification(
+        &self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.load_block_body(height, hash)
+    }
     /// Reads a body only after its stored length fits the owned-copy bound.
     /// Unsupported implementations refuse without calling metadata or the
     /// unbounded body reader. Backend-internal reads are not an owned-copy bound.
@@ -463,6 +474,18 @@ impl<S: KvStore> BlockBodyStore for IndexedBlockBodyStore<S> {
         self.files.load(position, height, *hash.as_byte_array())
     }
 
+    fn load_block_body_for_verification(
+        &self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(position) = self.body_position(height, hash)? else {
+            return Ok(None);
+        };
+        self.files
+            .load_for_verification(position, height, *hash.as_byte_array())
+    }
+
     fn load_block_body_range(
         &self,
         height: u32,
@@ -530,6 +553,51 @@ impl<S: KvStore> BlockBodyStore for IndexedBlockBodyStore<S> {
 #[cfg(all(test, feature = "fjall"))]
 mod body_position_prefetch_tests {
     use super::*;
+
+    #[test]
+    fn verification_distinguishes_corrupt_frames_from_missing_bodies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let index = Arc::new(crate::FjallStore::open(temp.path().join("index"))?);
+        let files = Arc::new(FlatFileBlockStore::open(temp.path())?);
+        let store = IndexedBlockBodyStore::new(index, files.clone());
+        let hash = Hash256::from_le_bytes(&[7_u8; 32]);
+        assert_eq!(store.load_block_body_for_verification(1, hash)?, None);
+        store.persist_block_body(1, hash, b"body")?;
+        let path = files.file_path(0);
+        let original = std::fs::read(&path)?;
+        assert_eq!(
+            store.load_block_body_for_verification(1, hash)?.as_deref(),
+            Some(b"body".as_slice())
+        );
+
+        // Each frame-header field, then a short header and a short body.
+        let mut damaged = Vec::new();
+        for offset in [0, 4, 8, 12] {
+            let mut bytes = original.clone();
+            bytes[offset] ^= 1;
+            damaged.push(bytes);
+        }
+        damaged.push(original[..3].to_vec());
+        damaged.push(original[..original.len() - 1].to_vec());
+        for bytes in damaged {
+            std::fs::write(&path, &bytes)?;
+            assert!(matches!(
+                store.load_block_body_for_verification(1, hash),
+                Err(StorageError::CorruptBlockFrame(_))
+            ));
+            // Existing availability-only reads retain their public contract.
+            assert_eq!(store.load_block_body(1, hash)?, None);
+            assert_eq!(store.load_block_body_range(1, hash, 0, 1)?, None);
+            assert_eq!(store.block_body_metadata(1, hash)?, None);
+            assert_eq!(store.reader()?.load_block_body(1, hash)?, None);
+            assert_eq!(std::fs::read(&path)?, bytes, "reads must not repair frames");
+        }
+        std::fs::remove_file(&path)?;
+        assert_eq!(store.load_block_body_for_verification(1, hash)?, None);
+        std::fs::write(&path, original)?;
+        Ok(())
+    }
 
     #[test]
     fn prefetched_positions_stream_bodies_in_exact_request_order()

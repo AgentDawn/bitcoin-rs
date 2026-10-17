@@ -43,7 +43,7 @@ impl DerivedIndexQueryEngine {
         hash: BlockHash,
     ) -> Result<Vec<u8>, TxQueryError> {
         if let Some(body_source) = self.body_source.as_ref() {
-            if let Some(bytes) = body_source.block_body(height, hash) {
+            if let Ok(Some(bytes)) = body_source.block_body(height, hash) {
                 return Ok(bytes);
             }
         }

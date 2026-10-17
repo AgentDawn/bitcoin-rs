@@ -174,11 +174,15 @@ pub(super) struct SingleBlockBody {
 }
 
 impl BlockBodySource for SingleBlockBody {
-    fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
+    fn block_body(
+        &self,
+        height: u32,
+        hash: BlockHash,
+    ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
         if height == self.height && hash == self.hash {
             self.full_reads.fetch_add(1, Ordering::Relaxed);
         }
-        (height == self.height && hash == self.hash).then(|| self.body.clone())
+        Ok((height == self.height && hash == self.hash).then(|| self.body.clone()))
     }
 
     fn block_body_range(
