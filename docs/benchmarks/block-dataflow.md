@@ -7,6 +7,11 @@ after validation. The exact raw/decoded identity proof remains in
 `prepare::bytes_are_block`; the debug serialization assertion and the
 no-preserved-body fallback remain too.
 
+The follow-up transfers resolved prevouts into native/kernel prepared checks.
+The retained output owner and parallel-check lifetimes stay the same; script
+buffers move instead of being cloned. Borrowed transaction callers keep their
+existing cloning API. See the separate incremental comparison below.
+
 This is a bounded native-engine allocation result for #1570. Historical
 mainnet receive-to-commit and whole-node IBD non-regression are **BLOCKED**:
 this run has no contiguous historical corpus with its predecessor UTXO state
@@ -26,7 +31,7 @@ reach the same `connect` persistence transaction.
 | `prepare::parse_block_for_apply` | One streaming canonical encode/compare binds raw bytes, including witness, to the tree without allocating a whole-body buffer. One native checked borrowed-layout parse derives facts; it is not another materialized transaction tree. Keep both independent checks. |
 | Native `kernel::NativeBlock` | `txids()` copies the fact txids; `derive_facts()` clones facts for `BlockView`. Kernel derives facts from a txid-vector copy. These are real metadata copies, not repeated native transaction hashing. Lifetime/ownership changes were not measured here and are deferred. |
 | Transaction planning / resolved UTXOs | One plan tracks same-block dependencies; ordered overlay/prevout resolution fixes each transaction's inputs before parallel scripts. Existing serial-lookup evidence remains authoritative. Structural prechecks currently follow window resolution; no rejection-order change. |
-| Script preparation | Resolved `TxOut`s move into `TxPrep`; native `PreparedTransaction` validates ordered identities then clones outputs and scripts into its owned cache lifetime. Transaction-wide sighash material is shared across inputs. Borrowing prevouts would require changing the parallel-unit lifetime boundary; no such optimization or measured saving is claimed here. |
+| Script preparation | Resolved `TxOut`s move into `TxPrep`, then into native/kernel retained outputs after ordered-identity validation. Native `PreparedTransaction::from_owned` moves script buffers; borrowed `new` callers still clone. Transaction-wide sighash material remains shared across inputs. No parallel-unit lifetime expansion or borrowed-prevout redesign. |
 | `connect` / persistence | With a body consumer and preserved raw bytes, the old release guard called `consensus_bytes(block).len()`: one allocation and one complete output serialization per committed block. The candidate computes sizes, retaining the already-bound `Bytes`. No transaction precomputation, UTXO/undo mutation, journal ordering, head publication, or durable representation changes. |
 
 The targeted output writes eliminated are exactly the serialized lengths of
@@ -151,7 +156,105 @@ a speedup nor establish IBD non-regression; they must not be dismissed as
 noise to promote the change. This is a draft optimization pending a stable
 release-profile comparison and the missing historical/whole-node cells.
 
+## Resolved-prevout transfer comparison
+
+This incremental control already includes the preserved-body length fix:
+baseline `bc008b61a`, candidate `e5bf79eb3`. The exact same harness and three
+corpora are used. Both engines consume `Vec<(OutPoint, TxOut)>` after validating
+the ordered identities and retain the moved outputs for their checks. Their
+output vectors request `shrink_to_fit` after collection so in-place reuse of
+the larger tuple buffer does not intentionally retain spare outpoint capacity
+through parallel verification. No peak-RSS claim follows from this.
+
+Before moving `TxPrep.prevouts`, preparation computes the pure value/sigop
+post-error and holds it for the existing ordered scan. A backend setup error
+still returns the preparation error; input scripts still outrank their own
+transaction's post-error; that post-error still outranks later transactions.
+Only verdict computation moves earlier, not rejection publication or commit.
+The same one-cache/owned-prevout lifetime and per-input script context remain.
+
+The copy removed here is the prevout's script-buffer clone, not witness bytes
+or hashing. Each measured high-input corpus spends 8,192 nonempty prevouts:
+legacy scripts contain one byte each and P2WSH scripts 34 bytes each. Scalar
+output movement and allocator-internal relocation are not memcpy counters.
+
+[Manifest](data/prevout-transfer-20261017/manifest.json) and
+[summary](data/prevout-transfer-20261017/summary.json) retain this comparison's
+identities and full metric quantiles. The same directory contains all six
+`baseline-{1,2,3}.jsonl` / `candidate-{1,2,3}.jsonl` stdout files. Each arm/cell
+has 18 timed samples and three excluded warmups, using the quantile method
+above. All processes exited zero and all samples reached the exact expected
+tip. Fixture ingress allocation metrics and body-length buckets are unchanged.
+
+Incremental apply allocation results, p50 per block group:
+
+| Corpus / mode | Events baseline -> candidate | Requested bytes baseline -> candidate |
+| --- | ---: | ---: |
+| Early / commit | 3,546 -> 3,546 | 2,399,790 -> 2,399,790 |
+| Early / sync | 2,944 -> 2,944 | 2,539,446 -> 2,539,446 |
+| Legacy / commit | 78,036 -> 69,844 | 22,325,804 -> 22,317,612 |
+| Legacy / sync | 77,874.5 -> 69,682.5 | 26,496,102 -> 26,487,910 |
+| Witness / commit | 95,158.5 -> 86,966.5 | 36,538,032 -> 36,259,504 |
+| Witness / sync | 95,044 -> 86,852 | 40,709,882 -> 40,431,354 |
+
+The high-input groups remove 8,192 allocation/reallocation events, about
+8.6–10.5% of apply events. Requested-byte medians decrease by exactly the
+script payload totals above. This exceeds the observed one/two-event
+background variation. This is not an 8.6–10.5% reduction in RSS or IBD time.
+Vector compaction can still allocate/reallocate and relocate output structs;
+the claim is removal of the per-input script-buffer clones.
+
+Diagnostic apply wall in milliseconds (18 samples per arm/cell):
+
+| Corpus / mode | Baseline p50 | Baseline p95/p99/max | Candidate p50 | Candidate p95/p99/max |
+| --- | ---: | ---: | ---: | ---: |
+| Early / commit | 144.144 | 171.481 | 146.859 | 248.727 |
+| Early / sync | 20.369 | 28.081 | 19.700 | 24.220 |
+| Legacy / commit | 270.368 | 404.768 | 271.177 | 1,674.237 |
+| Legacy / sync | 187.897 | 238.581 | 193.822 | 461.948 |
+| Witness / commit | 351.900 | 458.876 | 355.116 | 451.558 |
+| Witness / sync | 300.751 | 388.019 | 284.304 | 331.335 |
+
+Per-run apply medians in milliseconds:
+
+| Corpus / mode | Baseline runs 1 / 2 / 3 | Candidate runs 1 / 2 / 3 |
+| --- | --- | --- |
+| Early / commit | 156.287 / 140.649 / 150.768 | 144.194 / 158.947 / 150.446 |
+| Early / sync | 20.625 / 17.975 / 21.138 | 19.433 / 20.091 / 20.146 |
+| Legacy / commit | 266.689 / 271.030 / 269.078 | 250.974 / 344.665 / 259.428 |
+| Legacy / sync | 187.140 / 196.503 / 187.709 | 179.968 / 314.998 / 187.226 |
+| Witness / commit | 347.812 / 344.031 / 398.116 | 364.150 / 338.042 / 354.356 |
+| Witness / sync | 300.933 / 296.364 / 320.123 | 284.304 / 282.181 / 285.797 |
+
+The witness-sync diagnostic median improves, but the shared timing gate
+still **does not pass**: stability and other-cell median/tail guards fail.
+The delays have not been attributed; no outliers are discarded. Release,
+historical-mainnet and whole-node non-regression qualification remain
+outstanding. Only the allocation/copy reduction is established here.
+
 ## Regression evidence
+
+For prevout transfer, the existing shared-sighash boundary tests now cover
+both borrowed and owned constructors: count before identity checks, swapped
+and foreign outpoints, valid inputs, and typed input-index bounds. The signed
+fixture compares the owned block-preparation path with the borrowed
+transaction API and independently generated ECDSA/SegWit/Taproot signatures,
+including ordered failures. Existing block/unit tests retain script-before-
+post-error, earlier-transaction precedence and same-block spend behavior.
+
+The native consensus/script selection passed 86 tests (47 consensus library,
+25 script library, four shared-sighash, four Core-vector and six Taproot-rule
+tests). Chainstate's 132-test native/fjall library suite also passed after the
+ownership change. The capacity-shrink follow-up passed the four shared-sighash
+tests and strict consensus/script Clippy. The chainstate fixture helper now
+propagates mining errors, fixing the previous CI `expect_used` failure; strict
+chainstate Clippy included its test targets. The existing Linux merge gate
+also runs consensus library and shared-sighash tests with `kernel`, so it
+executes owned block preparation alongside borrowed-API oracle parity.
+Its [kernel-consensus job](https://github.com/gosuda/bitcoin-rs/actions/runs/39020717179/job/117361819657)
+passed on `e5bf79eb3`: consensus/script kernel Clippy, the library and
+shared-sighash cases, kernel oracle parity and script Core vectors. This is
+correctness/compile evidence, not kernel performance or whole-node evidence.
 
 The new owner-local `connect::tests` regression rejects equal-length
 raw/decoded witness disagreement before commit, checks exact persisted and
