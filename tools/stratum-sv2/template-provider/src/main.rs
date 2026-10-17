@@ -2,7 +2,9 @@
 mod server;
 mod template;
 
-use bitcoin_rs_mining::{BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult};
+use bitcoin_rs_mining::{
+    BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult, MiningControlError,
+};
 use bitcoin_rs_node::{Network, Node, NodeConfig, RuntimeInputs};
 use futures_executor::block_on;
 use secp256k1::SecretKey;
@@ -13,16 +15,17 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use template::TemplateState;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 const EXAMPLE_PRIVATE_KEY_HEX: &str =
     "626974636f696e2d727320737632207470206578616d706c65206b6579203031";
 const RETAINED_TEMPLATES: usize = 16;
+const TEMPLATE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct Config {
@@ -106,20 +109,31 @@ impl Hub {
 
 // A dedicated OS worker owns the synchronous long poll. It holds no Node lock
 // between calls, and the injected normal shutdown signal cancels the wait.
-fn template_loop(node: Arc<Node>, hub: Hub) -> Result<(), String> {
+fn template_loop(
+    mut get_template: impl FnMut(
+        BlockTemplateRequest,
+    ) -> Result<BlockTemplateResult, MiningControlError>,
+    hub: Hub,
+) -> Result<(), String> {
     let mut long_poll_id = None;
     loop {
         let request = BlockTemplateRequest {
             mode: BlockTemplateMode::Template,
             capabilities: vec![],
             rules: vec![],
-            long_poll_id,
+            long_poll_id: long_poll_id.clone(),
         };
-        let result = node
-            .mining_control()
-            .map_err(|e| e.to_string())?
-            .get_block_template(request)
-            .map_err(|e| e.to_string())?;
+        let result = match get_template(request) {
+            Ok(result) => result,
+            Err(error) if error.is_template_generation_race() => {
+                warn!(%error, "template generation raced; retrying");
+                // The next acquisition rechecks the node shutdown latch;
+                // this delay bounds both retry load and added shutdown latency.
+                std::thread::sleep(TEMPLATE_RETRY_DELAY);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let BlockTemplateResult::Template(template) = result else {
             return Err("unexpected proposal response".into());
         };
@@ -162,7 +176,13 @@ async fn main() -> Result<(), String> {
     let worker_node = Arc::clone(&node);
     let worker_hub = hub.clone();
     let worker = std::thread::spawn(move || {
-        let _ = ended_tx.send(template_loop(worker_node, worker_hub));
+        let result = worker_node
+            .mining_control()
+            .map_err(|e| e.to_string())
+            .and_then(|mining| {
+                template_loop(|request| mining.get_block_template(request), worker_hub)
+            });
+        let _ = ended_tx.send(result);
     });
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut listener = tokio::spawn(server::run(config, hub, Arc::clone(&node), stop_rx));

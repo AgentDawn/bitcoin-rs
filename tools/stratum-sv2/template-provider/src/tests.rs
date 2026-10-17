@@ -5,7 +5,6 @@ use bitcoin_rs_mining::{BlockValidationResult, GenerateRequest, GenerateSelectio
 use bitcoin_rs_primitives::{
     Amount, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
 };
-use std::time::Duration;
 use stratum_apps::stratum_core::{bitcoin, template_distribution_sv2::SubmitSolutionOwned};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -60,7 +59,35 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
     let mut updates = hub.subscribe();
     let worker_node = Arc::clone(&node);
     let worker_hub = hub.clone();
-    let worker = std::thread::spawn(move || template_loop(worker_node, worker_hub));
+    let worker = std::thread::spawn(move || {
+        let mining = worker_node.mining_control().unwrap();
+        let mut calls = 0;
+        let mut last_id: Option<String> = None;
+        let mut retry_started: Option<Instant> = None;
+        template_loop(
+            |request| {
+                calls += 1;
+                assert_eq!(request.long_poll_id.as_deref(), last_id.as_deref());
+                if let Some(started) = retry_started.take() {
+                    assert!(started.elapsed() >= TEMPLATE_RETRY_DELAY);
+                }
+                // Race once before the initial job and once during refresh.
+                // Both must recover without losing the last published identity.
+                if calls == 1 || calls == 3 {
+                    retry_started = Some(Instant::now());
+                    return Err(MiningControlError::Unavailable(
+                        "generation key changed during candidate assembly".into(),
+                    ));
+                }
+                let result = mining.get_block_template(request)?;
+                if let BlockTemplateResult::Template(template) = &result {
+                    last_id = Some(template.candidate.template_id.as_str().to_owned());
+                }
+                Ok(result)
+            },
+            worker_hub,
+        )
+    });
     let first = next(&mut updates).await;
     let c = Arc::clone(&first.candidate);
     let wire = first.new_template_msg()?;
@@ -225,4 +252,54 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
     let node = Arc::try_unwrap(node).map_err(|_| "live node borrower")?;
     tokio::task::spawn_blocking(move || block_on(node.shutdown())).await??;
     Ok(())
+}
+
+#[test]
+fn template_errors_other_than_generation_races_are_terminal() {
+    let errors = [
+        MiningControlError::Unavailable("node is shutting down".into()),
+        MiningControlError::Unavailable("applied tip is not available".into()),
+        MiningControlError::InvalidRequest("invalid request".into()),
+        MiningControlError::Failed("assembly failed".into()),
+        MiningControlError::Rejected("rejected".into()),
+    ];
+    for error in errors {
+        let hub = Hub::new();
+        let mut calls = 0;
+        let result = template_loop(
+            |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "terminal errors must not be retried");
+                Err(error.clone())
+            },
+            hub.clone(),
+        );
+        assert_eq!(result, Err(error.to_string()));
+        assert!(hub.subscribe().borrow().is_none());
+    }
+}
+
+#[test]
+fn shutdown_during_generation_retry_is_terminal() {
+    let started = Instant::now();
+    let mut calls = 0;
+    let result = template_loop(
+        |_| {
+            calls += 1;
+            match calls {
+                1 => Err(MiningControlError::Unavailable(
+                    "generation key changed during candidate assembly".into(),
+                )),
+                // The owner observes its shutdown latch on the next acquisition.
+                2 => Err(MiningControlError::Unavailable(
+                    "node is shutting down".into(),
+                )),
+                _ => panic!("shutdown must not be retried"),
+            }
+        },
+        Hub::new(),
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(result, Err("node is shutting down".into()));
+    assert!(started.elapsed() >= TEMPLATE_RETRY_DELAY);
 }

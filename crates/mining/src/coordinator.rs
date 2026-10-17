@@ -473,8 +473,7 @@ impl MiningService {
                     }
                     last_race = Some(generation_race());
                 }
-                Err(error) if matches!(&error, MiningControlError::Unavailable(message) if message == GENERATION_RACE) =>
-                {
+                Err(error) if error.is_template_generation_race() => {
                     last_race = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -854,6 +853,17 @@ fn snapshot_entry_from_raw(
 /// Constructs the generation-race error callers retry against.
 fn generation_race() -> MiningControlError {
     MiningControlError::Unavailable(CompactString::from(GENERATION_RACE))
+}
+
+impl MiningControlError {
+    /// Whether candidate acquisition failed because its tip or mempool generation changed.
+    ///
+    /// Callers may retry this race after a delay. Other unavailable states,
+    /// including shutdown, are not classified as generation races.
+    #[must_use]
+    pub fn is_template_generation_race(&self) -> bool {
+        matches!(self, Self::Unavailable(message) if message == GENERATION_RACE)
+    }
 }
 
 /// Parses a BIP22/BIP23 long-poll id into its generation key.

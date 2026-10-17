@@ -65,6 +65,8 @@ microseconds, canonical submission results, and the resulting applied height.
 - A dedicated OS thread performs typed template long polls, using the mining
   owner's opaque template identity. Tip and same-tip membership changes reuse
   existing generation publication; there is no timer-based template poll.
+  Generation races during acquisition retry after 100 milliseconds with the
+  last published identity. Shutdown and other errors end the worker.
 - The hub retains the most recent 16 issued IDs. Old IDs remain resolvable while
   retained, then transaction-data requests receive `template-not-found`.
 - At most eight pool sessions are served. Solution assembly/validation and
@@ -99,7 +101,8 @@ cargo clippy --locked --manifest-path tools/stratum-sv2/template-provider/Cargo.
 The public-Node test uses a real datadir without a mock or test feature. It
 checks wire coinbase outputs, independent block merkle reconstruction, typed
 submission/duplicates, same-tip mempool refresh, a valid superseded solution,
-stale-parent refusal, retention eviction, and cancellation on shutdown. Its
+stale-parent refusal, retention eviction, recovery from injected generation
+races before initial publication and refresh, and cancellation on shutdown. Its
 100-block history is required to spend a matured coinbase.
 
 The [retained interoperability run](evidence/interop.md) records the final
