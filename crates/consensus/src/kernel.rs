@@ -138,12 +138,16 @@ mod kernel_backend {
             spent_outputs: Vec<(OutPoint, TxOut)>,
         ) -> Result<super::PreparedTx<'_>, ConsensusError> {
             let kernel_tx = self.block.transaction(index).map_err(map_kernel_error)?;
+            let state = prepare_kernel_tx(kernel_tx, &spent_outputs)?;
+            let mut spent_outputs: Vec<TxOut> = spent_outputs
+                .into_iter()
+                .map(|(_, output)| output)
+                .collect();
+            // Collection may reuse tuple capacity; retain only the output set.
+            spent_outputs.shrink_to_fit();
             Ok(super::PreparedTx::Kernel {
-                state: prepare_kernel_tx(kernel_tx, &spent_outputs)?,
-                spent_outputs: spent_outputs
-                    .into_iter()
-                    .map(|(_, output)| output)
-                    .collect(),
+                state,
+                spent_outputs,
             })
         }
 

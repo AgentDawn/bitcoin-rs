@@ -439,9 +439,13 @@ impl<'tx> PreparedTransaction<'tx> {
     /// Returns [`PrevoutError`] if the count or ordered outpoint identities differ.
     pub fn from_owned(tx: &'tx Tx, prevouts: Vec<(OutPoint, TxOut)>) -> Result<Self, PrevoutError> {
         validate_prevouts(tx, &prevouts)?;
+        let mut prevouts: Vec<TxOut> = prevouts.into_iter().map(|(_, output)| output).collect();
+        // In-place collection may reuse the larger tuple allocation. Do not
+        // retain that spare outpoint capacity for the parallel-check lifetime.
+        prevouts.shrink_to_fit();
         Ok(Self {
             tx,
-            prevouts: prevouts.into_iter().map(|(_, output)| output).collect(),
+            prevouts,
             cache: SighashCache::new(tx),
         })
     }
