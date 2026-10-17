@@ -1260,6 +1260,7 @@ fn run_connected_session(
     // completed handshake so relay never chooses a type during negotiation.
     info.wtxid_relay = peer.wtxid_relay.peer_supported();
     info.send_headers = peer.capabilities.send_headers;
+    info.transport = peer.transport();
     let setup_result: Result<std::thread::JoinHandle<()>, crate::wire::PeerError> = (|| {
         #[cfg(test)]
         if WRITER_SETUP_FAIL.swap(false, Ordering::Relaxed) {
@@ -1300,7 +1301,7 @@ fn run_connected_session(
     let ready = shared.publish_info_and_notify_ready(peer_addr, &lease, &info);
 
     let inbound = lease.is_inbound();
-    let transport = match peer.transport() {
+    let transport = match info.transport {
         crate::TransportProtocol::V1 => "v1",
         crate::TransportProtocol::V2 { .. } => "v2",
     };
@@ -2703,6 +2704,7 @@ mod writer_setup_cleanup_tests {
             addr_bind: addr,
             time_offset: 0,
             counters: Arc::new(crate::PeerCounters::default()),
+            transport: crate::TransportProtocol::V1,
         }
     }
 
@@ -2857,6 +2859,7 @@ mod writer_shutdown_tests {
             addr_bind: addr,
             time_offset: 0,
             counters: std::sync::Arc::new(crate::PeerCounters::default()),
+            transport: crate::TransportProtocol::V1,
         }
     }
 
@@ -3057,6 +3060,7 @@ mod writer_shutdown_tests {
                 addr_bind: addr,
                 time_offset: 0,
                 counters: std::sync::Arc::new(crate::PeerCounters::default()),
+                transport: crate::TransportProtocol::V1,
             },
         ));
         let mut peer = Peer::new(ScriptedEof(io::Cursor::new(wire)), Magic::BITCOIN);
@@ -3498,6 +3502,7 @@ mod writer_shutdown_tests {
                 addr_bind: peer_addr,
                 time_offset: 0,
                 counters: std::sync::Arc::new(crate::PeerCounters::default()),
+                transport: crate::TransportProtocol::V1,
             };
 
             let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -3583,6 +3588,7 @@ mod writer_shutdown_tests {
                 addr_bind: peer_addr,
                 time_offset: 0,
                 counters: std::sync::Arc::new(crate::PeerCounters::default()),
+                transport: crate::TransportProtocol::V1,
             };
 
             let mut peer = Peer::new(
@@ -3828,6 +3834,7 @@ mod ready_notify_tests {
             addr_bind: addr,
             time_offset: 0,
             counters: Arc::new(crate::PeerCounters::default()),
+            transport: crate::TransportProtocol::V1,
         }
     }
 
@@ -4741,6 +4748,11 @@ mod discouragement_tests {
             PeerError::Protocol("outbound peer lacks desirable services"),
             PeerError::PayloadTooLarge(usize::MAX),
             PeerError::Io(io::Error::from(io::ErrorKind::TimedOut)),
+            // A v2 key read with v2 off; Core only disconnects.
+            PeerError::inbound(PeerError::WrongNetwork {
+                expected: Magic::BITCOIN,
+                actual: Magic::from_bytes([0x2f, 0x1a, 0x7c, 0x05]),
+            }),
         ] {
             shared.note_misbehavior(address, &current, &error);
         }
@@ -4847,12 +4859,10 @@ mod discouragement_tests {
             assert!(!shared.banned.is_discouraged(address.ip()), "{ip}");
             assert_eq!(lease.ignores_protocol_error(&error), manual || noban);
             assert!(
-                !lease.ignores_protocol_error(&PeerError::Incoming(Box::new(
-                    PeerError::WrongNetwork {
-                        expected: Magic::BITCOIN,
-                        actual: Magic::REGTEST
-                    }
-                ))),
+                !lease.ignores_protocol_error(&PeerError::inbound(PeerError::WrongNetwork {
+                    expected: Magic::BITCOIN,
+                    actual: Magic::REGTEST
+                })),
                 "unread framing cannot be safely resumed"
             );
         }
