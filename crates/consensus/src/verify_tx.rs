@@ -481,7 +481,11 @@ fn prepare_block_input_checks<'b>(
             }
         };
 
-        let script_state = match parsed.prepare_tx(tx_index, tx, &prep.prevouts) {
+        // Compute, but do not publish, the post-script verdict before moving
+        // prevouts into the backend. Setup errors still win here, and the
+        // ordered result scan still reports scripts before this post-error.
+        let post_error = finalize_tx_value_and_sigops(tx, &prep, flags).err();
+        let script_state = match parsed.prepare_tx(tx_index, tx, prep.prevouts) {
             Ok(state) => state,
             Err(setup_error) => {
                 prepared.push(PreparedTx {
@@ -505,7 +509,6 @@ fn prepare_block_input_checks<'b>(
         }
         let checks_len = tx.inputs.len();
 
-        let post_error = finalize_tx_value_and_sigops(tx, &prep, flags).err();
         let stop_after_tx = post_error.is_some();
         prepared.push(PreparedTx {
             pre_error: None,

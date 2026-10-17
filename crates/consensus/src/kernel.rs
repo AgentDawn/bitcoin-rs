@@ -135,14 +135,14 @@ mod kernel_backend {
         pub(super) fn prepare_tx(
             &self,
             index: usize,
-            spent_outputs: &[(OutPoint, TxOut)],
+            spent_outputs: Vec<(OutPoint, TxOut)>,
         ) -> Result<super::PreparedTx<'_>, ConsensusError> {
             let kernel_tx = self.block.transaction(index).map_err(map_kernel_error)?;
             Ok(super::PreparedTx::Kernel {
-                state: prepare_kernel_tx(kernel_tx, spent_outputs)?,
+                state: prepare_kernel_tx(kernel_tx, &spent_outputs)?,
                 spent_outputs: spent_outputs
-                    .iter()
-                    .map(|(_, output)| output.clone())
+                    .into_iter()
+                    .map(|(_, output)| output)
                     .collect(),
             })
         }
@@ -273,15 +273,15 @@ impl BlockParse {
         &'b self,
         #[cfg_attr(not(feature = "kernel"), expect(unused_variables))] index: usize,
         tx: &'b Tx,
-        spent_outputs: &[(OutPoint, TxOut)],
+        spent_outputs: Vec<(OutPoint, TxOut)>,
     ) -> Result<PreparedTx<'b>, ConsensusError> {
         match self {
             Self::Native(_) => Ok(PreparedTx::Native(
-                bitcoin_rs_script::PreparedTransaction::new(tx, spent_outputs)?,
+                bitcoin_rs_script::PreparedTransaction::from_owned(tx, spent_outputs)?,
             )),
             #[cfg(feature = "kernel")]
             Self::Kernel(block) => {
-                bitcoin_rs_script::validate_prevouts(tx, spent_outputs)?;
+                bitcoin_rs_script::validate_prevouts(tx, &spent_outputs)?;
                 block.prepare_tx(index, spent_outputs)
             }
         }
@@ -421,9 +421,9 @@ mod tests {
         {
             let parsed = BlockParse::parse(&consensus_bytes(&block), engine)
                 .unwrap_or_else(|error| panic!("fixture parse: {error}"));
-            assert!(parsed.prepare_tx(0, tx, &rows).is_ok());
+            assert!(parsed.prepare_tx(0, tx, rows.clone()).is_ok());
             assert!(matches!(
-                parsed.prepare_tx(0, tx, &swapped),
+                parsed.prepare_tx(0, tx, swapped.clone()),
                 Err(ConsensusError::PrevoutMismatch { input_index: 0 })
             ));
         }
