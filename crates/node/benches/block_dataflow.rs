@@ -99,7 +99,8 @@ fn measured<T>(f: impl FnOnce() -> T) -> (T, serde_json::Value) {
 
 fn chain(kind: &str) -> Vec<Block> {
     let mut blocks = vec![Network::Regtest.genesis_block()];
-    let witness = kind == "witness_512_inputs";
+    let witness = kind.starts_with("witness_");
+    let many_transactions = kind.ends_with("_transactions");
     let inputs = if kind == "early_coinbase" { 0 } else { 512 };
     let last = if inputs == 0 { 32 } else { 116 };
     // OP_DROP OP_TRUE consumes a maximum-sized witness element without signatures.
@@ -126,38 +127,44 @@ fn chain(kind: &str) -> Vec<Block> {
         let mut txs = vec![coinbase];
         if inputs != 0 && height > 100 {
             let funding = &blocks[(height - 100) as usize].txs[0];
-            let value = funding
-                .outputs
-                .iter()
-                .map(|o| o.value.to_sat())
-                .sum::<u64>()
-                - 1000;
-            let tx = Tx {
-                version: 2,
-                lock_time: bitcoin_rs_primitives::LockTime::ZERO,
-                inputs: (0..inputs)
-                    .map(|vout| TxIn {
-                        previous_output: OutPoint::new(funding.txid(), vout as u32),
-                        script_sig: Script::new(),
-                        sequence: Sequence::MAX,
-                        witness: if witness {
-                            Witness::from_stack(vec![vec![42; 520], witness_script.to_vec()])
-                        } else {
-                            Witness::new()
-                        },
-                    })
-                    .collect(),
-                outputs: vec![TxOut {
-                    value: Amount::from_sat(value),
-                    script_pubkey: Script::from_bytes(vec![0x51]),
-                }],
-            };
+            let funding_txid = funding.txid();
+            for index in 0..if many_transactions { inputs } else { 1 } {
+                let input_range = if many_transactions {
+                    index..index + 1
+                } else {
+                    0..inputs
+                };
+                let value = funding.outputs[input_range.clone()]
+                    .iter()
+                    .map(|o| o.value.to_sat())
+                    .sum::<u64>()
+                    - if many_transactions { 1 } else { 1000 };
+                let tx = Tx {
+                    version: 2,
+                    lock_time: bitcoin_rs_primitives::LockTime::ZERO,
+                    inputs: input_range
+                        .map(|vout| TxIn {
+                            previous_output: OutPoint::new(funding_txid, vout as u32),
+                            script_sig: Script::new(),
+                            sequence: Sequence::MAX,
+                            witness: if witness {
+                                Witness::from_stack(vec![vec![42; 520], witness_script.to_vec()])
+                            } else {
+                                Witness::new()
+                            },
+                        })
+                        .collect(),
+                    outputs: vec![TxOut {
+                        value: Amount::from_sat(value),
+                        script_pubkey: Script::from_bytes(vec![0x51]),
+                    }],
+                };
+                txs.push(tx);
+            }
             if witness {
-                let root = bitcoin_rs_consensus::compute_merkle_root(&mut vec![
-                    [0; 32],
-                    *tx.wtxid().as_bytes(),
-                ])
-                .unwrap();
+                let mut leaves = vec![[0; 32]];
+                leaves.extend(txs.iter().skip(1).map(|tx| *tx.wtxid().as_bytes()));
+                let root = bitcoin_rs_consensus::compute_merkle_root(&mut leaves).unwrap();
                 let mut preimage = [0; 64];
                 preimage[..32].copy_from_slice(&root);
                 let commitment = double_sha256(&preimage);
@@ -173,7 +180,6 @@ fn chain(kind: &str) -> Vec<Block> {
                     ),
                 });
             }
-            txs.push(tx);
         }
         blocks.push(
             regtest_fixture::mined_block_with_prev_hash(
@@ -199,7 +205,13 @@ fn main() {
     let samples = std::env::args()
         .nth(1)
         .map_or(12, |s| s.parse::<usize>().unwrap());
-    for kind in ["early_coinbase", "legacy_512_inputs", "witness_512_inputs"] {
+    for kind in [
+        "early_coinbase",
+        "legacy_512_inputs",
+        "witness_512_inputs",
+        "legacy_512_transactions",
+        "witness_512_transactions",
+    ] {
         let blocks = chain(kind);
         let start = if kind == "early_coinbase" { 1 } else { 101 };
         let raw: Vec<bytes::Bytes> = blocks[start..]
