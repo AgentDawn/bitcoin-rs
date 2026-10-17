@@ -286,7 +286,7 @@ impl IndexWatermarks {
 
     /// Returns the single common watermark across `capabilities`, or
     /// `Err(IndexError::NonContiguousPrepared)` if none was selected or they disagree.
-    pub fn selected(
+    pub(crate) fn selected(
         self,
         capabilities: IndexCapabilities,
     ) -> Result<Option<IndexWatermark>, IndexError> {
@@ -305,7 +305,7 @@ impl IndexWatermarks {
     }
 
     /// Returns whether all `capabilities` are aligned at `target`.
-    pub fn is_aligned(
+    pub(crate) fn is_aligned(
         self,
         capabilities: IndexCapabilities,
         target: Option<IndexWatermark>,
