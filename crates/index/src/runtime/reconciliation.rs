@@ -14,8 +14,6 @@ use crate::IndexWatermarks;
 use crate::IndexWriteFence;
 use crate::reconcile::ReconcileLeg;
 use crate::reconcile::ReconcilePhase;
-use crate::reconcile::SelectedWatermark;
-use crate::reconcile::selected_watermark;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
 use std::sync::Arc;
@@ -324,9 +322,7 @@ impl Worker {
         }
         // A different watermark under the same fence is an incoherent writer
         // response, not a concurrent commit. Treat it as corruption.
-        if selected_watermark(watermarks, state.capabilities)
-            != SelectedWatermark::Valid(state.durable)
-        {
+        if watermarks.selected(state.capabilities).ok() != Some(state.durable) {
             return Err(DerivedIndexWorkerError::PendingDurableChanged);
         }
         let endpoint = state.endpoint();
@@ -385,16 +381,20 @@ impl Worker {
         Ok((target, fence, watermarks))
     }
 
+    pub(super) fn effective_enabled(&self) -> IndexCapabilities {
+        if self.runtime.compact_filter_failure.read().is_some() {
+            self.enabled.without(IndexCapability::CompactFilters)
+        } else {
+            self.enabled
+        }
+    }
+
     pub(super) fn rollback_selection(
         &self,
         watermarks: IndexWatermarks,
         target: Option<&TipSnapshot>,
     ) -> Option<(IndexCapabilities, IndexWatermark)> {
-        let enabled = if self.runtime.compact_filter_failure.read().is_some() {
-            self.enabled.without(IndexCapability::CompactFilters)
-        } else {
-            self.enabled
-        };
+        let enabled = self.effective_enabled();
         let enabled_watermark = |capability: IndexCapability| {
             enabled
                 .contains(capability)
@@ -421,11 +421,7 @@ impl Worker {
         watermarks: IndexWatermarks,
         target: &TipSnapshot,
     ) -> Option<(IndexCapabilities, Option<IndexWatermark>)> {
-        let enabled = if self.runtime.compact_filter_failure.read().is_some() {
-            self.enabled.without(IndexCapability::CompactFilters)
-        } else {
-            self.enabled
-        };
+        let enabled = self.effective_enabled();
         let enabled_watermark = |capability: IndexCapability| {
             enabled
                 .contains(capability)

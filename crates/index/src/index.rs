@@ -6,7 +6,6 @@ mod error;
 mod filters;
 mod prepared;
 mod reader;
-mod resolve;
 mod rows;
 mod snapshot;
 mod state;
@@ -18,8 +17,7 @@ pub use capability::{IndexCapabilities, IndexCapability, IndexWatermark, IndexWa
 pub use error::IndexError;
 pub use filters::BasicFilter;
 pub use prepared::{PreparedBatch, PreparedBatchLimits, PreparedBlock};
-pub use reader::Indexer;
-pub use resolve::{BlockSource, ScriptHistoryEntry};
+pub use reader::{BlockSource, Indexer, ScriptHistoryEntry};
 pub use rows::IndexRowCounts;
 pub use snapshot::{IndexReader, ScriptLiveScan, TxIndexScan, TxIndexScanRow, TxIndexSnapshot};
 pub use state::{ConsumerCursorUpdate, IndexWriteFence};
