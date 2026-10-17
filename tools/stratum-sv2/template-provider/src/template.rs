@@ -63,7 +63,8 @@ impl TemplateState {
                 .iter()
                 .map(|tx| u64::from(tx.sigop_cost))
                 .sum::<u64>()
-                .saturating_add(u64::from(sigops) * 4)
+                // SRI advertises additional sigops in BIP141 cost units already.
+                .saturating_add(u64::from(sigops))
                 <= self.candidate.max_sigops
     }
 
