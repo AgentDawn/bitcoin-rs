@@ -1,4 +1,4 @@
-# Preserved block-body allocation audit
+# Block preparation and commit allocation audit
 
 The measured change replaces the full-block serialization used only to check
 the length of preserved bytes in `chainstate::connect` with
@@ -11,6 +11,11 @@ The follow-up transfers resolved prevouts into native/kernel prepared checks.
 The retained output owner and parallel-check lifetimes stay the same; script
 buffers move instead of being cloned. Borrowed transaction callers keep their
 existing cloning API. See the separate incremental comparison below.
+
+Block facts now transfer as well: `BlockParse::into_parts` consumes the
+parse, moves native facts or the kernel txid vector into `BlockView`, and
+returns only the backend state needed by scripts. No mutable empty-facts
+state, shared cache, extra allocation, or expanded parallel lifetime is added.
 
 This is a bounded native-engine allocation result for #1570. Historical
 mainnet receive-to-commit and whole-node IBD non-regression are **BLOCKED**:
@@ -29,7 +34,7 @@ reach the same `connect` persistence transaction.
 | P2P `InboundBlock` | A wire block owns one decoded `Block` and its preserved `Bytes`. Local `from_decoded` injection instead serializes a supplied tree; that is fixture work, not an extra production receive serialization. |
 | `BlockStager` / `sync::commit` | Staging moves the tree and bytes into `ReceivedBlock`, then `DrainedBlock`. Successful windows borrow `&Block` and shallow-clone `Bytes`; they do not deep-clone each tree. Partial-failure restoration clones the uncommitted suffix, intentionally keeping retry state. No staging changes. |
 | `prepare::parse_block_for_apply` | One streaming canonical encode/compare binds raw bytes, including witness, to the tree without allocating a whole-body buffer. One native checked borrowed-layout parse derives facts; it is not another materialized transaction tree. Keep both independent checks. |
-| Native `kernel::NativeBlock` | `txids()` copies the fact txids; `derive_facts()` clones facts for `BlockView`. Kernel derives facts from a txid-vector copy. These are real metadata copies, not repeated native transaction hashing. Lifetime/ownership changes were not measured here and are deferred. |
+| `kernel::BlockParse` / `BlockView` | After the existing byte-identity and count checks, `into_parts` consumes the parse. Native facts, including cached txids/wtxids and Merkle verdicts, move into the view. Kernel facts take ownership of the collected txid vector; `BlockScriptSource` retains the kernel block for script borrows. Planning borrows the same fact IDs rather than creating a separate ID vector. No transaction rehash or changed independent verification. |
 | Transaction planning / resolved UTXOs | One plan tracks same-block dependencies; ordered overlay/prevout resolution fixes each transaction's inputs before parallel scripts. Existing serial-lookup evidence remains authoritative. Structural prechecks currently follow window resolution; no rejection-order change. |
 | Script preparation | Resolved `TxOut`s move into `TxPrep`, then into native/kernel retained outputs after ordered-identity validation. Native `PreparedTransaction::from_owned` moves script buffers; borrowed `new` callers still clone. Transaction-wide sighash material remains shared across inputs. No parallel-unit lifetime expansion or borrowed-prevout redesign. |
 | `connect` / persistence | With a body consumer and preserved raw bytes, the old release guard called `consensus_bytes(block).len()`: one allocation and one complete output serialization per committed block. The candidate computes sizes, retaining the already-bound `Bytes`. No transaction precomputation, UTXO/undo mutation, journal ordering, head publication, or durable representation changes. |
@@ -232,7 +237,118 @@ The delays have not been attributed; no outliers are discarded. Release,
 historical-mainnet and whole-node non-regression qualification remain
 outstanding. Only the allocation/copy reduction is established here.
 
+## Parsed-fact transfer comparison
+
+This incremental baseline `fafae0dc0` already includes the body-length and
+prevout-transfer changes. Candidate `6d8d90bd0` consumes parsed facts instead
+of cloning them. Both binaries use the same expanded harness: the original
+three corpora plus `legacy_512_transactions` and `witness_512_transactions`.
+The added corpora keep 512 mature funding outputs and 512 inputs per block,
+but split them into 512 one-input spends, so each block has 513 transactions
+including coinbase. Witness blocks commit all witness IDs in their BIP141
+commitment; validation remains Full/native with no assume-valid shortcut.
+
+Native removes two cloned txid vectors per block and a cloned wtxid vector
+when present, retaining the original facts in `BlockView`. The planning and
+commit paths borrow or consume those same IDs. Kernel moves its collected
+txid vector into facts and retains the parsed kernel block only as script
+backend state. The consuming handoff cannot be called a second time; no
+empty-facts sentinel or new shared cache is needed. Exact raw/decoded binding,
+the pre-handoff transaction-count error, script context and publication stay
+at their existing owners.
+
+Kernel weight/Merkle fact construction now completes inside the consuming
+parse handoff, before planning. In the window path this pure work therefore
+runs with the existing parallel parse jobs, and its diagnostic time moves
+from prepare to parse. It changes no rejection or mutation ordering, but is
+an unmeasured kernel timing/dispatch change; native allocation results do not
+qualify kernel performance. Ordered UTXO/prevout resolution remains serial.
+
+For a 513-transaction block, the removed native ID-vector payload copies are
+32,832 legacy bytes or 49,248 witness bytes. This is a source-attributed byte
+count (32-byte IDs times two or three vectors), not a dynamic memcpy counter.
+Container-size changes can also affect total requested heap bytes in the
+window path. Hashing, Merkle reduction and independent raw-byte verification
+are unchanged; no reduction in their invocation counts is claimed.
+
+[Manifest](data/block-facts-transfer-20261017/manifest.json) and
+[summary](data/block-facts-transfer-20261017/summary.json) retain both binary
+hashes, source commits, all identities, quantiles and per-run medians. The
+same directory holds the six `baseline-{1,2,3}.jsonl` /
+`candidate-{1,2,3}.jsonl` stdout files. All six processes exited zero; all 420
+sample/warmup executions reached their exact expected tip. Each arm/cell has
+18 timed samples and three excluded warmups, with the quantile method above.
+Fixture-ingress allocation metrics are unchanged. No outliers are removed.
+
+The two added corpora cover regtest heights 101..116, with 16 blocks each:
+502,048 raw bytes for legacy and 4,836,944 for witness. Bootstrap, configuration,
+durability, allocator and pinning follow the earlier cells; fixtures and
+header admission remain outside apply timing.
+
+Incremental apply allocation results, p50 per measured block group:
+
+| Corpus / mode | Events baseline -> candidate | Requested bytes baseline -> candidate |
+| --- | ---: | ---: |
+| Early / commit | 3,546 -> 3,482 | 2,400,142 -> 2,398,094 |
+| Early / sync | 2,944 -> 2,880 | 2,539,798 -> 2,531,350 |
+| 512-input legacy / commit | 69,844 -> 69,812 | 22,317,788 -> 22,315,740 |
+| 512-input legacy / sync | 69,682.5 -> 69,650.5 | 26,488,086 -> 26,482,838 |
+| 512-input witness / commit | 86,966.5 -> 86,918.5 | 36,259,680 -> 36,256,608 |
+| 512-input witness / sync | 86,852 -> 86,804 | 40,431,530 -> 40,425,258 |
+| 512-transaction legacy / commit | 191,510 -> 191,478 | 47,806,476 -> 47,281,164 |
+| 512-transaction legacy / sync | 199,540 -> 199,508 | 56,798,942 -> 56,270,430 |
+| 512-transaction witness / commit | 218,222 -> 218,174 | 61,669,223 -> 60,881,255 |
+| 512-transaction witness / sync | 226,300 -> 226,252 | 71,449,657 -> 70,658,489 |
+
+For the added corpora, direct connect removes exactly the vector payload
+totals above; BlockSync removes a further 3,200 requested bytes, consistent
+with its smaller parse/prepared containers. Counters do not type-tag these
+additional allocations.
+The repeated high-transaction BlockSync requested-byte counts are stable to
+within one 1,520-byte background event for legacy and exact for witness.
+Removed events match two vectors per block, or three with witness. These
+counts show an allocation/copy reduction, not a measured RSS reduction.
+
+Diagnostic apply wall in milliseconds (18 samples per arm/cell):
+
+| Corpus / mode | Baseline p50 | Baseline p95/p99/max | Candidate p50 | Candidate p95/p99/max |
+| --- | ---: | ---: | ---: | ---: |
+| Early / commit | 154.580 | 368.066 | 361.181 | 439.715 |
+| Early / sync | 19.772 | 28.532 | 24.911 | 34.141 |
+| 512-input legacy / commit | 292.953 | 365.198 | 341.422 | 420.434 |
+| 512-input legacy / sync | 178.757 | 205.985 | 178.749 | 202.585 |
+| 512-input witness / commit | 447.565 | 497.412 | 446.412 | 484.005 |
+| 512-input witness / sync | 273.705 | 329.374 | 272.029 | 566.347 |
+| 512-transaction legacy / commit | 394.234 | 456.932 | 394.331 | 474.119 |
+| 512-transaction legacy / sync | 233.617 | 256.372 | 231.207 | 241.216 |
+| 512-transaction witness / commit | 505.256 | 560.407 | 495.391 | 530.411 |
+| 512-transaction witness / sync | 337.412 | 523.477 | 337.924 | 409.575 |
+
+**The timing/non-regression gate did not pass.** Early direct-commit pooled
+p50 regresses about 2.34x; its baseline run medians are 145.398 / 139.034 /
+357.373 ms, versus candidate 140.328 / 365.961 / 368.488 ms. Other stability,
+median and tail guards also fail. These delays have not been causally
+attributed and cannot be discarded or dismissed to qualify this change.
+Release-profile and whole-node qualification remain outstanding despite
+reproducible allocation savings and passing functional tests.
+
 ## Regression evidence
+
+After fact transfer, the native selection passed 72 tests: 47 consensus
+library, 11 borrowed-fact boundary, five parse/golden parity, four shared
+sighash, two engine-selection and three witness/sigop activation cases.
+The parse-parity tests now consume the handoff and compare IDs, count, weight
+and Merkle results against independent rust-bitcoin/golden fixtures. Existing
+witness-only mutation, malformed layout, same-block spend, error-order and
+activation oracles remain. The chainstate native/fjall library suite passed
+132 tests. Strict Clippy covered consensus, chainstate and node with all test
+and benchmark targets; formatting passed. The Linux kernel gate includes
+parse parity alongside the existing library/shared-sighash/oracle cases.
+On `6d8d90bd0`, the [kernel-feature job](https://github.com/gosuda/bitcoin-rs/actions/runs/39021308739/job/117363563464)
+passed 71 selected tests and consensus/script kernel Clippy. The
+[full-node job](https://github.com/gosuda/bitcoin-rs/actions/runs/39021308739/job/117363563268)
+also passed Clippy with rocksdb/fjall/redb/kernel and all targets. These are
+functional/feature-build results, not IBD or kernel performance evidence.
 
 For prevout transfer, the existing shared-sighash boundary tests now cover
 both borrowed and owned constructors: count before identity checks, swapped
