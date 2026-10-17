@@ -22,6 +22,9 @@ use bitcoin_rs_utxo::contract::{BlockChangeError, build_block_changes};
 use hashbrown::HashMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod tests;
+
 struct ApplyScratch {
     txids: Vec<Txid>,
     raw_txs: Option<Vec<Vec<u8>>>,
