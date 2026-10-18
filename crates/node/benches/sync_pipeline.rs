@@ -63,11 +63,16 @@ use bitcoin_rs_consensus::compute_merkle_root;
 use bitcoin_rs_index::BlockSource;
 pub mod evidence;
 
+// seam: the shared measured-work sampler for MRP counted rows. The file is
+// owned by `tools/benchmark-support` and copied identically into every
+// control root; this bench consumes it by relative path.
+#[path = "../../../tools/benchmark-support/measured_samples.rs"]
+mod measured_samples;
+
 use bitcoin_rs_mempool::{LocalOrigin, MutationResult};
 use bitcoin_rs_mining::{
-    BlockTemplate, BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult,
-    BlockValidationResult, GenerateRequest, GeneratedBlock, MiningControl, MiningControlError,
-    MiningInfo,
+    BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, Candidate,
+    GenerateRequest, GeneratedBlock, MiningControl, MiningControlError, MiningInfo,
 };
 use bitcoin_rs_primitives::unix_time_secs;
 use bitcoin_rs_rpc::Handler;
@@ -85,7 +90,7 @@ use bitcoin_rs_p2p::Message;
 use bitcoin_rs_primitives::{consensus_bytes, deserialize};
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group};
 use crossbeam_channel::unbounded;
 use evidence::{Cell, Interval, IntervalKind, LEDGER_SCHEMA, Ledger, Sample};
 use parking_lot::Mutex as ParkingMutex;
@@ -268,6 +273,9 @@ fn sync_pipeline_apply_signed_spend_proxy(c: &mut Criterion) {
 /// durability it was taken under, so a later comparison can match or reject
 /// it; the ledger is append-only across runs.
 fn record_evidence(cell: &str, blocks: &[Block], sweeps: &[(Duration, Duration)]) {
+    if sweeps.is_empty() {
+        return;
+    }
     let config = production_state_config();
     let mut identity = EvidenceIdentity::of_process(&config)
         .unwrap_or_else(|error| panic!("evidence identity: {error}"));
@@ -2274,76 +2282,62 @@ fn legacy_build_signed_p2wsh_spend(
 /// whose non-coinbase transactions were admitted through the real mempool
 /// gateway, timed as last-apply only.
 ///
-/// Per sample: a fresh `NodeState`, every block but the last applied untimed,
+/// Per unit: a fresh `NodeState`, every block but the last applied untimed,
 /// every non-coinbase transaction of the last block admitted through
 /// `MempoolGateway::submit_local_transaction` (the production
 /// `sendrawtransaction` path, real `ChainAdmissionView`, no seams) untimed,
-/// then only `apply_block(last)` is timed. Criterion receives the accumulated
-/// per-iteration timed spans, so its reported time is apply-only; the
-/// companion `connect_unseen_signed_spend_block` skips admission and is the
-/// miss control.
-fn connect_admitted_signed_spend_block(c: &mut Criterion) {
-    let blocks = signed_spend_proxy_blocks();
-    let last_index = blocks.len().saturating_sub(1);
-    let last_block = blocks[last_index].clone();
-    let admission_txs: Vec<Arc<Tx>> = last_block.txs[1..]
-        .iter()
-        .map(|tx| Arc::new(tx.clone()))
-        .collect();
-
-    c.bench_function("connect_admitted_signed_spend_block", |b| {
-        b.iter_custom(|iters| {
-            let mut timed_total = Duration::ZERO;
-            for _ in 0..iters {
-                let (_dir, state) = open_regtest_state();
-                // Untimed prefix: every block but the last reaches the tip the
-                // final block builds on.
-                for block in &blocks[..last_index] {
-                    state
-                        .apply_block(block)
-                        .unwrap_or_else(|error| panic!("prefix apply failed: {error}"));
-                }
-                // Untimed real admission of the final block's spend set.
-                admit_signed_spends(&state, &admission_txs);
-                assert_admission_residency(&state, &admission_txs);
-                // Timed: only the connect of the admitted block.
-                let timed = Instant::now();
-                state
-                    .apply_block(black_box(&last_block))
-                    .unwrap_or_else(|error| panic!("admitted connect failed: {error}"));
-                timed_total += timed.elapsed();
-            }
-            timed_total
-        })
-    });
+/// then only `apply_block(last)` is timed. Counted sampling replaces the
+/// Criterion registration (`--mrp-counted`, full ID
+/// `connect_admitted_signed_spend_block/flat`): one second of measured work
+/// per sample, one warmup sample, ten measured samples, and the per-unit
+/// timed span stays apply-only; the companion
+/// `connect_unseen_signed_spend_block` skips admission and is the miss
+/// control.
+///
+/// Runs one whole unit with exactly the timed span above. The temp state
+/// drops at return, outside every timer.
+fn connect_admitted_unit_once(
+    blocks: &[Block],
+    last_index: usize,
+    last_block: &Block,
+    admission_txs: &[Arc<Tx>],
+) -> Duration {
+    let (_dir, state) = open_regtest_state();
+    for block in &blocks[..last_index] {
+        state
+            .apply_block(block)
+            .unwrap_or_else(|error| panic!("prefix apply failed: {error}"));
+    }
+    admit_signed_spends(&state, admission_txs);
+    assert_admission_residency(&state, admission_txs);
+    let timed = Instant::now();
+    state
+        .apply_block(black_box(last_block))
+        .unwrap_or_else(|error| panic!("admitted connect failed: {error}"));
+    timed.elapsed()
 }
 
 /// Step-4 miss control: the identical block connected without any mempool
-/// admission, so its script checks always run.
-fn connect_unseen_signed_spend_block(c: &mut Criterion) {
-    let blocks = signed_spend_proxy_blocks();
-    let last_index = blocks.len().saturating_sub(1);
-    let last_block = blocks[last_index].clone();
-
-    c.bench_function("connect_unseen_signed_spend_block", |b| {
-        b.iter_custom(|iters| {
-            let mut timed_total = Duration::ZERO;
-            for _ in 0..iters {
-                let (_dir, state) = open_regtest_state();
-                for block in &blocks[..last_index] {
-                    state
-                        .apply_block(block)
-                        .unwrap_or_else(|error| panic!("prefix apply failed: {error}"));
-                }
-                let timed = Instant::now();
-                state
-                    .apply_block(black_box(&last_block))
-                    .unwrap_or_else(|error| panic!("unseen connect failed: {error}"));
-                timed_total += timed.elapsed();
-            }
-            timed_total
-        })
-    });
+/// admission, so its script checks always run. Counted sampling replaces the
+/// Criterion registration (`--mrp-counted`, full ID
+/// `connect_unseen_signed_spend_block/flat`) with the same per-sample
+/// protocol as the admitted arm.
+///
+/// Runs one whole unit with exactly the timed span above: fresh state,
+/// untimed prefix to the penultimate tip, then the timed connect of the
+/// unseen block. The temp state drops at return, outside every timer.
+fn connect_unseen_unit_once(blocks: &[Block], last_index: usize, last_block: &Block) -> Duration {
+    let (_dir, state) = open_regtest_state();
+    for block in &blocks[..last_index] {
+        state
+            .apply_block(block)
+            .unwrap_or_else(|error| panic!("prefix apply failed: {error}"));
+    }
+    let timed = Instant::now();
+    state
+        .apply_block(black_box(last_block))
+        .unwrap_or_else(|error| panic!("unseen connect failed: {error}"));
+    timed.elapsed()
 }
 
 /// Admits the signed spend set through the production gateway. Never timed.
@@ -2393,33 +2387,83 @@ fn assert_admission_residency(state: &NodeState, txs: &[Arc<Tx>]) {
 /// Step-4 throughput arm: the same signed spend set through the production
 /// gateway, timed as gateway submits only, so the second verification pass's
 /// cost is visible before and after the cache lands. One residency check per
-/// iteration runs after the timed span closes.
-fn connect_admission_throughput(c: &mut Criterion) {
-    let blocks = signed_spend_proxy_blocks();
-    let last_index = blocks.len().saturating_sub(1);
-    let admission_txs: Vec<Arc<Tx>> = blocks[last_index].txs[1..]
-        .iter()
-        .map(|tx| Arc::new(tx.clone()))
-        .collect();
+/// unit runs after the timed span closes. Counted sampling replaces the
+/// Criterion registration (`--mrp-counted`, full ID
+/// `connect_admission_throughput/flat`) with the same per-sample protocol as
+/// the admitted arm.
+///
+/// Runs one whole unit with exactly the timed span above: fresh state,
+/// untimed prefix to the penultimate tip, the timed gateway submissions, then
+/// the residency check outside the timer. The temp state drops at return.
+fn connect_admission_unit_once(
+    blocks: &[Block],
+    last_index: usize,
+    admission_txs: &[Arc<Tx>],
+) -> Duration {
+    let (_dir, state) = open_regtest_state();
+    for block in &blocks[..last_index] {
+        state
+            .apply_block(block)
+            .unwrap_or_else(|error| panic!("prefix apply failed: {error}"));
+    }
+    let timed = Instant::now();
+    admit_signed_spends(&state, admission_txs);
+    let elapsed = timed.elapsed();
+    assert_admission_residency(&state, admission_txs);
+    elapsed
+}
 
-    c.bench_function("connect_admission_throughput", |b| {
-        b.iter_custom(|iters| {
-            let mut timed_total = Duration::ZERO;
-            for _ in 0..iters {
-                let (_dir, state) = open_regtest_state();
-                for block in &blocks[..last_index] {
-                    state
-                        .apply_block(block)
-                        .unwrap_or_else(|error| panic!("prefix apply failed: {error}"));
-                }
-                let timed = Instant::now();
-                admit_signed_spends(&state, &admission_txs);
-                timed_total += timed.elapsed();
-                assert_admission_residency(&state, &admission_txs);
-            }
-            timed_total
-        })
-    });
+/// Full counted row IDs, in dispatch order. The MRP measured-work stopping
+/// correction converts exactly these three T4 rows from Criterion
+/// registration to counted sampling; every other row keeps its Criterion or
+/// standalone protocol, and no duplicate Criterion registration remains for
+/// the converted rows.
+const COUNTED_ROWS: [&str; 3] = [
+    "connect_admission_throughput/flat",
+    "connect_admitted_signed_spend_block/flat",
+    "connect_unseen_signed_spend_block/flat",
+];
+
+/// Runs one counted row by full ID through the shared
+/// `measured_samples::run` sampler: one warmup sample plus ten measured
+/// samples, each accumulating whole independent units (fresh state per unit)
+/// until one second of measured work. The caller has already validated the
+/// ID against `COUNTED_ROWS`.
+fn run_counted_row(row: &str) {
+    match row {
+        "connect_admission_throughput/flat" => {
+            let blocks = signed_spend_proxy_blocks();
+            let last_index = blocks.len().saturating_sub(1);
+            let admission_txs: Vec<Arc<Tx>> = blocks[last_index].txs[1..]
+                .iter()
+                .map(|tx| Arc::new(tx.clone()))
+                .collect();
+            measured_samples::run(row, || {
+                connect_admission_unit_once(&blocks, last_index, &admission_txs)
+            });
+        }
+        "connect_admitted_signed_spend_block/flat" => {
+            let blocks = signed_spend_proxy_blocks();
+            let last_index = blocks.len().saturating_sub(1);
+            let last_block = blocks[last_index].clone();
+            let admission_txs: Vec<Arc<Tx>> = last_block.txs[1..]
+                .iter()
+                .map(|tx| Arc::new(tx.clone()))
+                .collect();
+            measured_samples::run(row, || {
+                connect_admitted_unit_once(&blocks, last_index, &last_block, &admission_txs)
+            });
+        }
+        "connect_unseen_signed_spend_block/flat" => {
+            let blocks = signed_spend_proxy_blocks();
+            let last_index = blocks.len().saturating_sub(1);
+            let last_block = blocks[last_index].clone();
+            measured_samples::run(row, || {
+                connect_unseen_unit_once(&blocks, last_index, &last_block)
+            });
+        }
+        other => panic!("unknown counted row: {other}"),
+    }
 }
 
 /// Prints p50/p95/p99/max from the collected per-sweep durations.
@@ -2456,6 +2500,12 @@ fn print_percentiles(label: &str, samples: &[Duration]) {
 // Step-21 block-to-template baseline: admitted 100k pool, coinbase-plus-2000
 // target blocks, connect tail through the first new-tip template.
 // ---------------------------------------------------------------------------
+
+/// MRP standalone floor: whole independent units repeat inside one sample
+/// until the measured total reaches this duration. No pilot counts, no
+/// post-hoc tuning: the loop always runs at least one unit and stops at the
+/// first unit that reaches the floor. Setup stays outside every timer.
+const MRP_SAMPLE_MEASURED_FLOOR: Duration = Duration::from_secs(2);
 
 /// Step-21 live pool before connect: 98,000 background spends plus one sample's
 /// 2,000 target spends, all admitted through the production gateway path at the
@@ -2960,7 +3010,7 @@ impl MiningControl for MeasuredMiningControl {
 ///
 /// Builds the production stack as node birth does, replays the corpus prefix,
 /// and admits the background plus the run's target spends (100k live). The
-/// measured connect tail runs in `run_block_template_sample`.
+/// measured connect tail runs in `run_block_template_unit`.
 struct BlockTemplateSetup {
     measured: Arc<MeasuredMiningControl>,
     handler: Handler,
@@ -3022,17 +3072,37 @@ fn setup_block_template_sample(
         background_len,
     }
 }
-/// Runs one independent sample: fresh state, untimed serving stack plus prefix
-/// plus admission, then the measured connect tail through the first new-tip
-/// template response.
+/// One measured T2 unit: fresh state, untimed serving stack plus prefix plus
+/// admission, then the timed connect tail through the first new-tip template
+/// response. The sample driver repeats whole units (reusing the sample's
+/// corpus index, so the frozen corpus is unchanged) until the measured total
+/// reaches `MRP_SAMPLE_MEASURED_FLOOR`; every unit is independent.
 ///
 /// Setup asserts fail closed: 98k background plus 2000 targets (100k live)
 /// before connect with every target spend resident, 98k after connect, the new
 /// tip equals the target hash, and both the recorded service call and the
 /// handler response name the new tip with a non-empty selection. Span capture
 /// asserts exactly one tail-begin, publish-profile, and on-connect event per
-/// sample, and the decorator asserts exactly one service call per reply.
-fn run_block_template_sample(corpus: &BlockTemplateCorpus, run: usize, warmup: bool) -> Duration {
+/// unit, and the decorator asserts exactly one service call per reply. All
+/// setup runs outside the timer; the asserts below run after the reply edge
+/// except the tip check, which is part of the measured path as before.
+struct BlockTemplateUnit {
+    tail_to_reply: Duration,
+    apply_call_us: u128,
+    durable_sync_us: u128,
+    durable_commit_us: u128,
+    on_connect_us: u128,
+    assembly_us: u128,
+    remainder_us: u128,
+    pool_live: usize,
+    background_len: usize,
+    pool_at_template: usize,
+    block_txs: usize,
+    block_noncoinbase: usize,
+    tip_hash_be: String,
+}
+
+fn run_block_template_unit(corpus: &BlockTemplateCorpus, run: usize) -> BlockTemplateUnit {
     let (_dir, state) = open_regtest_state();
     let BlockTemplateSetup {
         measured,
@@ -3116,85 +3186,92 @@ fn run_block_template_sample(corpus: &BlockTemplateCorpus, run: usize, warmup: b
             .saturating_add(on_connect_us)
             .saturating_add(assembly_us),
     );
-    let tip_hash_be = tip.hash.to_string_be();
-    let report = BlockTemplateReport {
-        pool_live,
-        background_len,
-        pool_at_template,
-        target,
-        tip_hash_be: &tip_hash_be,
-        tail_to_reply_us,
+    BlockTemplateUnit {
+        tail_to_reply: reply_at.duration_since(t0),
         apply_call_us,
         durable_sync_us,
         durable_commit_us,
         on_connect_us,
         assembly_us,
         remainder_us,
-        run,
-        warmup,
-    };
-    report_block_template_sample(&report);
-    reply_at.duration_since(t0)
+        pool_live,
+        background_len,
+        pool_at_template,
+        block_txs: target.txs.len(),
+        block_noncoinbase: target.txs.len().saturating_sub(1),
+        tip_hash_be: tip.hash.to_string_be(),
+    }
 }
 
-/// Ledger inputs for one Step-21 sample line. Borrows the connected block and
-/// the tip hash; every other field is a copied scalar.
-struct BlockTemplateReport<'a> {
-    pool_live: usize,
-    background_len: usize,
-    pool_at_template: usize,
-    target: &'a Block,
-    tip_hash_be: &'a str,
-    tail_to_reply_us: u128,
-    apply_call_us: u128,
-    durable_sync_us: u128,
-    durable_commit_us: u128,
-    on_connect_us: u128,
-    assembly_us: u128,
-    remainder_us: u128,
-    run: usize,
-    warmup: bool,
-}
 /// Prints the per-sample JSONL ledger line for one Step-21 sample.
 ///
-/// Carries the measured split and pool facts; the boundary excludes HTTP
-/// transport and JSON-RPC framing/auth only.
-fn report_block_template_sample(report: &BlockTemplateReport) {
-    let &BlockTemplateReport {
-        pool_live,
-        background_len,
-        pool_at_template,
-        target,
-        tip_hash_be,
-        tail_to_reply_us,
-        apply_call_us,
-        durable_sync_us,
-        durable_commit_us,
-        on_connect_us,
-        assembly_us,
-        remainder_us,
-        run,
-        warmup,
-    } = report;
+/// Carries every unit duration as exact integer nanoseconds (`unit_ns`), the
+/// unit count, and the exact measured total (`total_ns`; the parser derives
+/// the mean as `total_ns / unit_count`), plus the per-unit production splits
+/// (still `*_us` with explicit microsecond units); the boundary excludes HTTP
+/// transport and JSON-RPC framing/auth only. All units of one sample share
+/// the sample's corpus index, so pool facts and the tip are asserted equal
+/// across units and reported once.
+fn report_block_template_sample(run: usize, warmup: bool, units: &[BlockTemplateUnit]) {
+    let first = units
+        .first()
+        .unwrap_or_else(|| panic!("block-to-template sample {run} ran no units"));
+    for (index, unit) in units.iter().enumerate() {
+        assert_eq!(
+            unit.tip_hash_be, first.tip_hash_be,
+            "sample {run} unit {index} connected a different tip"
+        );
+        assert_eq!(
+            unit.pool_live, first.pool_live,
+            "sample {run} unit {index} saw a different live pool"
+        );
+    }
     let micros = |us: u128| u64::try_from(us).unwrap_or(u64::MAX);
+    let nanos = |duration: Duration| {
+        u64::try_from(duration.as_nanos()).unwrap_or_else(|error| {
+            panic!("block-to-template unit out of u64 nanoseconds: {error}")
+        })
+    };
+    assert!(
+        !units.is_empty(),
+        "block-to-template sample {run} ran no units"
+    );
+    let unit_ns: Vec<u64> = units.iter().map(|unit| nanos(unit.tail_to_reply)).collect();
+    let total_ns: u128 = units.iter().map(|unit| unit.tail_to_reply.as_nanos()).sum();
+    let total_ns = u64::try_from(total_ns)
+        .unwrap_or_else(|error| panic!("block-to-template total out of u64 nanoseconds: {error}"));
+    assert!(
+        total_ns > 0,
+        "block-to-template sample {run} measured zero total"
+    );
+    assert!(
+        total_ns >= u64::try_from(MRP_SAMPLE_MEASURED_FLOOR.as_nanos()).unwrap_or(u64::MAX),
+        "block-to-template sample {run} total {total_ns}ns below the 2s floor"
+    );
+    let count = units.len();
+    let splits = |pick: fn(&BlockTemplateUnit) -> u128| -> Vec<u64> {
+        units.iter().map(|unit| micros(pick(unit))).collect()
+    };
     let line = sonic_rs::to_string(&json!({
         "bench": "block_to_template_baseline",
         "sample": run,
         "warmup": warmup,
         "engine": std::env::var("BITCOIN_RS_VALIDATION_ENGINE").unwrap_or_else(|_| "native".into()),
-        "pool_txs": pool_live,
-        "background_txs": background_len,
-        "pool_at_template": pool_at_template,
-        "block_txs": target.txs.len(),
-        "block_noncoinbase": target.txs.len().saturating_sub(1),
-        "tip": tip_hash_be,
-        "tail_to_reply_us": micros(tail_to_reply_us),
-        "apply_call_to_reply_us": micros(apply_call_us),
-        "durable_sync_us": micros(durable_sync_us),
-        "durable_commit_us": micros(durable_commit_us),
-        "on_connect_us": micros(on_connect_us),
-        "assembly_us": micros(assembly_us),
-        "remainder_us": micros(remainder_us),
+        "pool_txs": first.pool_live,
+        "background_txs": first.background_len,
+        "pool_at_template": first.pool_at_template,
+        "block_txs": first.block_txs,
+        "block_noncoinbase": first.block_noncoinbase,
+        "tip": first.tip_hash_be,
+        "unit_ns": unit_ns,
+        "unit_count": count,
+        "total_ns": total_ns,
+        "apply_call_to_reply_us": splits(|unit| unit.apply_call_us),
+        "durable_sync_us": splits(|unit| unit.durable_sync_us),
+        "durable_commit_us": splits(|unit| unit.durable_commit_us),
+        "on_connect_us": splits(|unit| unit.on_connect_us),
+        "assembly_us": splits(|unit| unit.assembly_us),
+        "remainder_us": splits(|unit| unit.remainder_us),
         "boundary": "in-process RPC Handler::dispatch getblocktemplate response on a per-sample coordinator (parse, readiness, rule negotiation, one service assembly, mandatory-rule checks, JSON render); assembly_us is the single service call the dispatch performs; excludes HTTP transport and JSON-RPC framing/auth only",
     }))
     .unwrap_or_else(|error| panic!("render block-to-template sample: {error}"));
@@ -3228,9 +3305,13 @@ fn report_block_template_sample(report: &BlockTemplateReport) {
 /// corpus and runs 3 warmups plus 10 measured samples exactly once, and only
 /// when the bench binary receives the exact `block_to_template_baseline`
 /// argument; otherwise it returns before any workload or registration.
-/// Nothing is registered with criterion and no criterion measurement is
-/// reported: per-sample JSON lines plus the p50/p95/p99/max summary on stdout
-/// are the ledger.
+/// Inside each sample, whole independent units (fresh state each, same corpus
+/// index) repeat until the measured total reaches
+/// `MRP_SAMPLE_MEASURED_FLOOR`; at least one unit always runs. Nothing is
+/// registered with criterion and no criterion measurement is reported:
+/// per-sample JSON lines (`unit_ns`, `unit_count`, `total_ns`; the parser
+/// derives the mean as `total_ns / unit_count`) plus the p50/p95/p99/max
+/// summary over measured sample means on stdout are the ledger.
 /// Invocation: `cargo bench -p bitcoin-rs-node --bench sync_pipeline
 /// block_to_template_baseline -- --nocapture` (default features: fjall).
 fn block_to_template_baseline(_c: &mut Criterion) {
@@ -3250,14 +3331,31 @@ fn block_to_template_baseline(_c: &mut Criterion) {
     );
     tracing::subscriber::set_global_default(ProfileSubscriber)
         .unwrap_or_else(|error| panic!("profile subscriber install failed: {error}"));
-    let mut tail_to_reply = Vec::with_capacity(BLOCK_TEMPLATE_SAMPLES);
+    let mut sample_means = Vec::with_capacity(BLOCK_TEMPLATE_SAMPLES);
     for run in 0..corpus.target_blocks.len() {
-        let sample = run_block_template_sample(&corpus, run, run < BLOCK_TEMPLATE_WARMUPS);
-        if run >= BLOCK_TEMPLATE_WARMUPS {
-            tail_to_reply.push(sample);
+        let warmup = run < BLOCK_TEMPLATE_WARMUPS;
+        let mut units = Vec::new();
+        let mut total = Duration::ZERO;
+        loop {
+            let unit = run_block_template_unit(&corpus, run);
+            total += unit.tail_to_reply;
+            units.push(unit);
+            if total >= MRP_SAMPLE_MEASURED_FLOOR {
+                break;
+            }
+        }
+        let mean = total
+            .checked_div(
+                u32::try_from(units.len())
+                    .unwrap_or_else(|error| panic!("bad block-to-template unit count: {error}")),
+            )
+            .unwrap_or_else(|| panic!("block-to-template sample {run} ran no units"));
+        report_block_template_sample(run, warmup, &units);
+        if !warmup {
+            sample_means.push(mean);
         }
     }
-    print_percentiles("block_to_template_tail_to_reply", &tail_to_reply);
+    print_percentiles("block_to_template_tail_to_reply", &sample_means);
 }
 
 // ---------------------------------------------------------------------------
@@ -3358,24 +3456,193 @@ fn setup_template_render_sample(
         tip,
     }
 }
-/// Runs one independent warm-cache sample: fresh state, untimed serving stack
-/// plus prefix plus admission, then one cold-miss dispatch, two warm service
-/// calls, and one warm dispatch.
+/// One measured T3 cold unit: fresh state, untimed serving stack plus prefix
+/// plus admission, then the timed first (cold-miss) dispatch, which assembles
+/// on a cold cache (selection plus finish plus projection including
+/// `signalling_rules`) and renders the full JSON reply. Returns the owned
+/// prepared generation with its cold reply; the sample driver retains the
+/// last cold unit's generation for the warm arms, so every identity compare
+/// stays within one state. Never a sequence-wake invalidation: the miss is a
+/// genuinely cold cache in a fresh state, and the setup asserts (98k
+/// background plus the run's 2000 target spends, 100k live, every spend
+/// resident, prefix tip, no connect) run untimed before the dispatch.
+fn render_cold_unit(
+    corpus: &BlockTemplateCorpus,
+    run: usize,
+) -> (
+    TempDir,
+    NodeState,
+    TemplateRenderSetup,
+    Duration,
+    sonic_rs::Value,
+) {
+    let (dir, state) = open_regtest_state();
+    let setup = setup_template_render_sample(&state, corpus, run);
+    let cold_started = quanta::Instant::now();
+    let cold_rpc = setup
+        .handler
+        .dispatch("getblocktemplate", &setup.params)
+        .unwrap_or_else(|error| panic!("render cold dispatch failed: {error:?}"));
+    let cold = cold_started.elapsed();
+    (dir, state, setup, cold, cold_rpc)
+}
+
+/// Times one warm service call: `signalling_rules` plus
+/// `template_from_candidate` projection only, with no JSON serialization.
+/// Assembly is done on the retained generation; this is a pure hit. Returns
+/// the shared candidate `Arc` (moved, never cloned) so the driver can prove
+/// reuse without duplicating the selection.
+fn render_service_call(control: &Arc<dyn MiningControl>) -> (Duration, Arc<Candidate>) {
+    let svc_started = quanta::Instant::now();
+    let svc = control
+        .get_block_template(template_render_request())
+        .unwrap_or_else(|error| panic!("render service hit failed: {error:?}"));
+    let elapsed = svc_started.elapsed();
+    let BlockTemplateResult::Template(template) = svc else {
+        panic!("render service hit returned a proposal result");
+    };
+    (elapsed, template.candidate)
+}
+
+/// Times one warm RPC dispatch on the retained generation: parse, readiness,
+/// rule negotiation, the cache-hit projection, mandatory-rule checks, and
+/// JSON render (`consensus_bytes` plus hex per transaction). No assembly.
+fn render_warm_dispatch(
+    handler: &Handler,
+    params: &sonic_rs::Value,
+) -> (Duration, sonic_rs::Value) {
+    let hit_started = quanta::Instant::now();
+    let hit_rpc = handler
+        .dispatch("getblocktemplate", params)
+        .unwrap_or_else(|error| panic!("render warm dispatch failed: {error:?}"));
+    let elapsed = hit_started.elapsed();
+    (elapsed, hit_rpc)
+}
+
+/// Runs one independent warm-cache sample: fresh-state cold units until the
+/// cold total reaches `MRP_SAMPLE_MEASURED_FLOOR`, then warm service/RPC rows
+/// repeated on the retained fixed generation until each arm's total reaches
+/// the same floor. The last cold unit's prepared generation serves every warm
+/// arm, so all measured arms serve one fixed generation.
 ///
-/// Setup asserts fail closed: 98k background plus the run's 2000 target spends
-/// (100k live, every spend resident) on the prefix tip with no connect, so all
-/// measured arms serve one fixed generation. Identity asserts fail closed: the
-/// two service calls reuse one cached `Arc<Candidate>` with an unchanged
-/// generation, and the warm RPC reply matches the cold reply on every
-/// deterministic field while `curtime` is checked for permitted evolution,
-/// never strict equality. Returns the four arm timings in order
-/// `(rpc_miss, service_hit, service_hit2, rpc_hit)`.
+/// Setup asserts fail closed per cold unit (100k live, every spend resident,
+/// prefix tip, no connect). Identity asserts fail closed after the timers:
+/// the first and last warm service calls of each arm reuse one cached
+/// `Arc<Candidate>` with an unchanged generation, and the first and last
+/// warm RPC replies match the cold reply on every deterministic field while
+/// `curtime` is checked for permitted evolution, never strict equality.
+/// Returns the four arm means in order `(rpc_miss, service_hit, service_hit2,
+/// rpc_hit)`.
+/// Cold arm of one warm-cache sample: fresh-state cold units until the
+/// measured total reaches the floor. Returns the last prepared generation
+/// for the warm arms. Setup stays outside every timer; each unit boundary
+/// is inside `render_cold_unit`.
+fn collect_render_cold_arm(
+    corpus: &BlockTemplateCorpus,
+    run: usize,
+    cold_units: &mut Vec<Duration>,
+    cold_total: &mut Duration,
+) -> (TempDir, NodeState, TemplateRenderSetup, sonic_rs::Value) {
+    loop {
+        let (dir, state, setup, cold, cold_rpc) = render_cold_unit(corpus, run);
+        *cold_total += cold;
+        cold_units.push(cold);
+        if *cold_total >= MRP_SAMPLE_MEASURED_FLOOR {
+            break (dir, state, setup, cold_rpc);
+        }
+    }
+}
+
+/// Service-hit arm on the fixed generation: repeated trait calls until the
+/// measured total reaches the floor. Returns the first and last shared
+/// candidate `Arc`s plus the selection facts. Every timed span is inside
+/// `render_service_call`.
+fn collect_render_service_arm(
+    control: &Arc<dyn MiningControl>,
+    service_units: &mut Vec<Duration>,
+    service_total: &mut Duration,
+) -> (Arc<Candidate>, Arc<Candidate>, usize, u64) {
+    let (first_elapsed, first_candidate) = render_service_call(control);
+    *service_total += first_elapsed;
+    service_units.push(first_elapsed);
+    let selected_txs = first_candidate.transactions.len();
+    let selected_weight = first_candidate.weight;
+    let svc_first = Arc::clone(&first_candidate);
+    let svc_last = if *service_total >= MRP_SAMPLE_MEASURED_FLOOR {
+        first_candidate
+    } else {
+        loop {
+            let (elapsed, candidate) = render_service_call(control);
+            *service_total += elapsed;
+            service_units.push(elapsed);
+            if *service_total >= MRP_SAMPLE_MEASURED_FLOOR {
+                break candidate;
+            }
+        }
+    };
+    (svc_first, svc_last, selected_txs, selected_weight)
+}
+
+/// Service-hit stability arm on the same generation: continued repeats
+/// until the measured total reaches the floor. Returns the last shared
+/// candidate `Arc`. Every timed span is inside `render_service_call`.
+fn collect_render_service2_arm(
+    control: &Arc<dyn MiningControl>,
+    service2_units: &mut Vec<Duration>,
+    service2_total: &mut Duration,
+) -> Arc<Candidate> {
+    loop {
+        let (elapsed, candidate) = render_service_call(control);
+        *service2_total += elapsed;
+        service2_units.push(elapsed);
+        if *service2_total >= MRP_SAMPLE_MEASURED_FLOOR {
+            break candidate;
+        }
+    }
+}
+
+/// RPC warm-hit arm on the fixed generation: repeated dispatches until the
+/// measured total reaches the floor. Returns the first and last replies;
+/// a single-unit arm reuses the one reply for both roles. Every timed span
+/// is inside `render_warm_dispatch`.
+fn collect_render_rpc_arm(
+    handler: &Handler,
+    params: &sonic_rs::Value,
+    run: usize,
+    rpc_units: &mut Vec<Duration>,
+    rpc_total: &mut Duration,
+) -> (sonic_rs::Value, sonic_rs::Value) {
+    let mut rpc_first: Option<sonic_rs::Value> = None;
+    let mut rpc_last: Option<sonic_rs::Value> = None;
+    loop {
+        let (elapsed, reply) = render_warm_dispatch(handler, params);
+        *rpc_total += elapsed;
+        rpc_units.push(elapsed);
+        if rpc_first.is_none() {
+            rpc_first = Some(reply);
+        } else {
+            rpc_last = Some(reply);
+        }
+        if *rpc_total >= MRP_SAMPLE_MEASURED_FLOOR {
+            break;
+        }
+    }
+    let rpc_first = rpc_first.unwrap_or_else(|| panic!("render sample {run} ran no warm RPC hits"));
+    let rpc_last = rpc_last.unwrap_or_else(|| rpc_first.clone());
+    (rpc_first, rpc_last)
+}
+
 fn run_template_render_sample(
     corpus: &BlockTemplateCorpus,
     run: usize,
     warmup: bool,
 ) -> (Duration, Duration, Duration, Duration) {
-    let (_dir, state) = open_regtest_state();
+    // Cold arm: fresh-state units to the floor; retain the last prepared
+    // generation for the warm arms below.
+    let mut cold_units: Vec<Duration> = Vec::new();
+    let mut cold_total = Duration::ZERO;
+    let (_dir, _state, setup, cold_rpc) =
+        collect_render_cold_arm(corpus, run, &mut cold_units, &mut cold_total);
     let TemplateRenderSetup {
         control,
         handler,
@@ -3383,58 +3650,45 @@ fn run_template_render_sample(
         pool_live,
         background_len,
         tip,
-    } = setup_template_render_sample(&state, corpus, run);
+    } = setup;
     let tip_hash_be = tip.hash.to_string_be();
     let tip_height = tip.height;
-    // Arm 1, cold-miss control: the first dispatch assembles on a cold cache
-    // (selection plus finish plus projection including `signalling_rules`) and
-    // renders the full JSON reply. This warms the generation cache.
-    let cold_started = quanta::Instant::now();
-    let cold_rpc = handler
-        .dispatch("getblocktemplate", &params)
-        .unwrap_or_else(|error| panic!("render cold dispatch failed: {error:?}"));
-    let rpc_miss = cold_started.elapsed();
-    // Arm 2, service hit: the first trait call after the miss. Assembly is
-    // done; this times `signalling_rules` plus `template_from_candidate`
-    // projection only, with no JSON serialization.
-    let svc_started = quanta::Instant::now();
-    let svc_a = control
-        .get_block_template(template_render_request())
-        .unwrap_or_else(|error| panic!("render service hit failed: {error:?}"));
-    let service_hit = svc_started.elapsed();
-    let BlockTemplateResult::Template(template_a) = svc_a else {
-        panic!("render service hit returned a proposal result");
-    };
-    // Arm 3, service-hit proof: the second trait call must reuse the cached
-    // candidate `Arc` with an unchanged generation, proving the timed call in
-    // arm 2 was a pure hit.
-    let svc2_started = quanta::Instant::now();
-    let svc_b = control
-        .get_block_template(template_render_request())
-        .unwrap_or_else(|error| panic!("render service proof call failed: {error:?}"));
-    let service_hit2 = svc2_started.elapsed();
-    let BlockTemplateResult::Template(template_b) = svc_b else {
-        panic!("render service proof call returned a proposal result");
-    };
-    assert_render_service_reuse(&template_a, &template_b, &tip.hash);
-    // Arm 4, RPC warm hit: the second dispatch renders the same generation.
-    // No assembly runs; this times parse, readiness, rule negotiation, the
-    // cache-hit projection, mandatory-rule checks, and JSON render
-    // (`consensus_bytes` plus hex per transaction).
-    let hit_started = quanta::Instant::now();
-    let hit_rpc = handler
-        .dispatch("getblocktemplate", &params)
-        .unwrap_or_else(|error| panic!("render warm dispatch failed: {error:?}"));
-    let rpc_hit = hit_started.elapsed();
-    assert_render_deterministic_fields(&cold_rpc, &hit_rpc);
+    // Arm 2, service hits: repeated trait calls on the fixed generation. The
+    // driver retains the first and last shared candidate `Arc`s (moved, never
+    // cloned) plus the selection facts for the ledger.
+    let mut service_units: Vec<Duration> = Vec::new();
+    let mut service_total = Duration::ZERO;
+    let (svc_first, svc_last, selected_txs, selected_weight) =
+        collect_render_service_arm(&control, &mut service_units, &mut service_total);
+    // Arm 3, service-hit stability: continued repeats on the same generation.
+    // Every call must share the arm-2 candidate `Arc`, proving the timed
+    // calls were pure hits.
+    let mut service2_units: Vec<Duration> = Vec::new();
+    let mut service2_total = Duration::ZERO;
+    let svc2_last = collect_render_service2_arm(&control, &mut service2_units, &mut service2_total);
+    assert_render_service_reuse_arcs(&svc_first, &svc_last, &tip.hash);
+    assert_render_service_reuse_arcs(&svc_first, &svc2_last, &tip.hash);
+    // Arm 4, RPC warm hits: repeated dispatches rendering the same generation.
+    let mut rpc_units: Vec<Duration> = Vec::new();
+    let mut rpc_total = Duration::ZERO;
+    let (rpc_first, rpc_last) =
+        collect_render_rpc_arm(&handler, &params, run, &mut rpc_units, &mut rpc_total);
+    assert_render_deterministic_fields(&cold_rpc, &rpc_first);
+    assert_render_deterministic_fields(&cold_rpc, &rpc_last);
     let (cold_curtime, hit_curtime, mintime, cold_lp) = assert_render_reply_identity(
         &cold_rpc,
-        &hit_rpc,
+        &rpc_last,
         &tip_hash_be,
-        template_a.candidate.template_id.as_str(),
+        svc_first.template_id.as_str(),
     );
-    let selected_txs = template_a.candidate.transactions.len();
-    let selected_weight = template_a.candidate.weight;
+    let mean_of = |total: Duration, units: &[Duration]| {
+        total
+            .checked_div(
+                u32::try_from(units.len())
+                    .unwrap_or_else(|error| panic!("bad render unit count: {error}")),
+            )
+            .unwrap_or_else(|| panic!("render sample {run} ran no units"))
+    };
     let report = TemplateRenderReport {
         pool_live,
         background_len,
@@ -3443,58 +3697,67 @@ fn run_template_render_sample(
         cold_lp,
         selected_txs,
         selected_weight,
-        hit_rpc: &hit_rpc,
+        hit_rpc: &rpc_last,
         cold_curtime,
         hit_curtime,
         mintime,
-        rpc_miss,
-        service_hit,
-        service_hit2,
-        rpc_hit,
+        cold_units: &cold_units,
+        cold_total,
+        service_units: &service_units,
+        service_total,
+        service2_units: &service2_units,
+        service2_total,
+        rpc_units: &rpc_units,
+        rpc_total,
         run,
         warmup,
     };
     report_render_sample(&report);
-    (rpc_miss, service_hit, service_hit2, rpc_hit)
+    (
+        mean_of(cold_total, &cold_units),
+        mean_of(service_total, &service_units),
+        mean_of(service2_total, &service2_units),
+        mean_of(rpc_total, &rpc_units),
+    )
 }
 
-/// Proves the two warm service calls shared one cached candidate.
+/// Proves repeated warm service calls shared one cached candidate.
 ///
 /// Asserts `Arc` pointer reuse plus unchanged generation identity, tip, and
 /// height, and that the candidate extends the sample tip with a non-empty
 /// selection.
-fn assert_render_service_reuse(
-    template_a: &BlockTemplate,
-    template_b: &BlockTemplate,
+fn assert_render_service_reuse_arcs(
+    candidate_a: &Arc<Candidate>,
+    candidate_b: &Arc<Candidate>,
     tip_hash: &Hash256,
 ) {
     assert!(
-        Arc::ptr_eq(&template_a.candidate, &template_b.candidate),
+        Arc::ptr_eq(candidate_a, candidate_b),
         "warm service calls must reuse the cached candidate Arc"
     );
     assert_eq!(
-        template_a.candidate.template_id.as_str(),
-        template_b.candidate.template_id.as_str(),
+        candidate_a.template_id.as_str(),
+        candidate_b.template_id.as_str(),
         "warm service calls must keep the generation identity"
     );
     assert_eq!(
-        template_a.candidate.previous_block_hash, template_b.candidate.previous_block_hash,
+        candidate_a.previous_block_hash, candidate_b.previous_block_hash,
         "warm service calls must name the same tip"
     );
     assert_eq!(
-        template_a.candidate.mempool_sequence, template_b.candidate.mempool_sequence,
+        candidate_a.mempool_sequence, candidate_b.mempool_sequence,
         "warm service calls must keep the mempool sequence"
     );
     assert_eq!(
-        template_a.candidate.height, template_b.candidate.height,
+        candidate_a.height, candidate_b.height,
         "warm service calls must keep the candidate height"
     );
     assert_eq!(
-        template_a.candidate.previous_block_hash, *tip_hash,
+        candidate_a.previous_block_hash, *tip_hash,
         "render candidate must extend the prefix tip"
     );
     assert_ne!(
-        template_a.candidate.transactions.len(),
+        candidate_a.transactions.len(),
         0,
         "render candidate must select transactions from the 100k pool"
     );
@@ -3616,8 +3879,9 @@ fn assert_render_reply_identity<'a>(
     (cold_curtime, hit_curtime, hit_mintime, cold_lp)
 }
 
-/// Ledger inputs for one Step-8 sample line. Borrows the rendered reply and
-/// the generation id; every other field is a copied scalar.
+/// Ledger inputs for one Step-8 sample line. Borrows the rendered reply, the
+/// generation id, the tip hash, and every arm's unit slices; every other
+/// field is a copied scalar.
 struct TemplateRenderReport<'a> {
     pool_live: usize,
     background_len: usize,
@@ -3630,36 +3894,38 @@ struct TemplateRenderReport<'a> {
     cold_curtime: u64,
     hit_curtime: u64,
     mintime: u64,
-    rpc_miss: Duration,
-    service_hit: Duration,
-    service_hit2: Duration,
-    rpc_hit: Duration,
+    cold_units: &'a [Duration],
+    cold_total: Duration,
+    service_units: &'a [Duration],
+    service_total: Duration,
+    service2_units: &'a [Duration],
+    service2_total: Duration,
+    rpc_units: &'a [Duration],
+    rpc_total: Duration,
     run: usize,
     warmup: bool,
 }
 /// Records selection facts and prints the per-sample JSONL ledger line.
 ///
-/// The rendered transaction count must equal the semantic selection, and the
+/// Every arm carries its unit durations as exact integer nanoseconds
+/// (`<arm>_ns`), the unit count (`<arm>_count`), and the exact measured total
+/// (`<arm>_total_ns`; the parser derives the mean as `total / count`). The
+/// rendered transaction count must equal the semantic selection, and the
 /// `data` byte total bounds the serialization work Step 8.1 targets.
-fn report_render_sample(report: &TemplateRenderReport) {
+/// Assertion phase of the per-sample ledger line: selection facts plus the
+/// fail-closed sample checks. Returns the rendered transaction count and the
+/// `data` byte total. No timers run here; the JSON emission stays in
+/// `report_render_sample` with identical fields and units.
+fn render_report_selection_facts(report: &TemplateRenderReport) -> (usize, usize) {
     let &TemplateRenderReport {
-        pool_live,
-        background_len,
-        tip_hash_be,
-        tip_height,
-        cold_lp,
-        selected_txs,
-        selected_weight,
         hit_rpc,
-        cold_curtime,
-        hit_curtime,
-        mintime,
-        rpc_miss,
-        service_hit,
-        service_hit2,
-        rpc_hit,
+        selected_txs,
+        cold_units,
+        service_units,
+        service2_units,
+        rpc_units,
         run,
-        warmup,
+        ..
     } = report;
     let rpc_array = hit_rpc
         .get("transactions")
@@ -3679,7 +3945,69 @@ fn report_render_sample(report: &TemplateRenderReport) {
             .len();
         rpc_data_bytes = rpc_data_bytes.saturating_add(data_len / 2);
     }
-    let micros = |us: u128| u64::try_from(us).unwrap_or(u64::MAX);
+    assert!(
+        !cold_units.is_empty(),
+        "render sample {run} ran no cold units"
+    );
+    assert!(
+        !service_units.is_empty(),
+        "render sample {run} ran no service hits"
+    );
+    assert!(
+        !service2_units.is_empty(),
+        "render sample {run} ran no service proof hits"
+    );
+    assert!(
+        !rpc_units.is_empty(),
+        "render sample {run} ran no warm RPC hits"
+    );
+    (rpc_txs, rpc_data_bytes)
+}
+
+fn report_render_sample(report: &TemplateRenderReport) {
+    let (rpc_txs, rpc_data_bytes) = render_report_selection_facts(report);
+    let &TemplateRenderReport {
+        pool_live,
+        background_len,
+        tip_hash_be,
+        tip_height,
+        cold_lp,
+        selected_txs,
+        selected_weight,
+        hit_rpc: _,
+        cold_curtime,
+        hit_curtime,
+        mintime,
+        cold_units,
+        cold_total,
+        service_units,
+        service_total,
+        service2_units,
+        service2_total,
+        rpc_units,
+        rpc_total,
+        run,
+        warmup,
+    } = report;
+    let nanos = |duration: Duration| {
+        u64::try_from(duration.as_nanos())
+            .unwrap_or_else(|error| panic!("template-render unit out of u64 nanoseconds: {error}"))
+    };
+    let unit_ns =
+        |units: &[Duration]| -> Vec<u64> { units.iter().map(|unit| nanos(*unit)).collect() };
+    let total_ns = |total: Duration, arm: &str| -> u64 {
+        assert!(
+            total > Duration::ZERO,
+            "render sample {run} {arm} measured zero total"
+        );
+        assert!(
+            total >= MRP_SAMPLE_MEASURED_FLOOR,
+            "render sample {run} {arm} total {total:?} below the 2s floor"
+        );
+        u64::try_from(total.as_nanos()).unwrap_or_else(|error| {
+            panic!("template-render {arm} total out of u64 nanoseconds: {error}")
+        })
+    };
     let line = sonic_rs::to_string(&json!({
         "bench": "template_render_baseline",
         "sample": run,
@@ -3695,18 +4023,26 @@ fn report_render_sample(report: &TemplateRenderReport) {
         "tip": tip_hash_be,
         "tip_height": tip_height,
         "longpollid": cold_lp,
-        "rpc_miss_us": micros(rpc_miss.as_micros()),
-        "service_hit_us": micros(service_hit.as_micros()),
-        "service_hit2_us": micros(service_hit2.as_micros()),
-        "rpc_hit_us": micros(rpc_hit.as_micros()),
+        "rpc_miss_ns": unit_ns(cold_units),
+        "rpc_miss_count": cold_units.len(),
+        "rpc_miss_total_ns": total_ns(cold_total, "rpc_miss"),
+        "service_hit_ns": unit_ns(service_units),
+        "service_hit_count": service_units.len(),
+        "service_hit_total_ns": total_ns(service_total, "service_hit"),
+        "service_hit2_ns": unit_ns(service2_units),
+        "service_hit2_count": service2_units.len(),
+        "service_hit2_total_ns": total_ns(service2_total, "service_hit2"),
+        "rpc_hit_ns": unit_ns(rpc_units),
+        "rpc_hit_count": rpc_units.len(),
+        "rpc_hit_total_ns": total_ns(rpc_total, "rpc_hit"),
         "cold_curtime": cold_curtime,
         "hit_curtime": hit_curtime,
         "mintime": mintime,
         "arc_reuse": true,
-        "boundary_rpc_miss": "in-process Handler::dispatch cold miss: parse, readiness, rule negotiation, one service assembly (selection plus finish plus projection including signalling_rules), mandatory-rule checks, JSON render (consensus_bytes plus hex per tx); warms the generation cache; excludes HTTP transport and JSON-RPC framing/auth only",
-        "boundary_service_hit": "MiningControl::get_block_template hit on the warm generation: signalling_rules plus template_from_candidate projection only; no assembly, no JSON",
-        "boundary_rpc_hit": "in-process Handler::dispatch warm hit on the same generation: parse, readiness, rule negotiation, cache-hit projection, mandatory-rule checks, JSON render; no assembly; excludes HTTP transport and JSON-RPC framing/auth only",
-        "time_note": "candidate_context reads the wall clock (current_unix_seconds, no injection); the warm hit reuses the cached Arc so curtime matches today; asserted as hit >= cold and both >= mintime, never strict equality",
+        "boundary_rpc_miss": "in-process Handler::dispatch cold miss on a fresh state: parse, readiness, rule negotiation, one service assembly (selection plus finish plus projection including signalling_rules), mandatory-rule checks, JSON render (consensus_bytes plus hex per tx); warms the generation cache; excludes HTTP transport and JSON-RPC framing/auth only",
+        "boundary_service_hit": "MiningControl::get_block_template hit on the retained generation: signalling_rules plus template_from_candidate projection only; no assembly, no JSON",
+        "boundary_rpc_hit": "in-process Handler::dispatch warm hit on the retained generation: parse, readiness, rule negotiation, cache-hit projection, mandatory-rule checks, JSON render; no assembly; excludes HTTP transport and JSON-RPC framing/auth only",
+        "time_note": "candidate_context reads the wall clock (current_unix_seconds, no injection); asserted as hit >= cold and both >= mintime, never strict equality",
     }))
     .unwrap_or_else(|error| panic!("render template_render sample: {error}"));
     println!("{line}");
@@ -3726,30 +4062,35 @@ fn report_render_sample(report: &TemplateRenderReport) {
 /// [{"rules": ["segwit"]}])`.
 ///
 /// Arms per sample, timed separately with `quanta` and reported as distinct
-/// JSONL fields: `rpc_miss_us` (first dispatch, cold: assembly plus render),
-/// `service_hit_us` (first trait call after the miss: projection only),
-/// `service_hit2_us` (second trait call: `Arc` reuse proof and hit stability),
-/// `rpc_hit_us` (second dispatch: render on the warm cache). The service-hit
-/// versus RPC-hit difference isolates the per-reply serialization cost Step
-/// 8.1 targets (`consensus_bytes` plus hex per transaction in
-/// `render_template_transactions`); the signalling skip lives inside the
-/// service-hit projection. Identity: `Arc::ptr_eq` plus unchanged
-/// `template_id`, tip hash, mempool sequence, and height for the service hits;
-/// strict equality on every deterministic RPC field (including the full
-/// `transactions` array) with `curtime` checked for permitted evolution
-/// (`hit >= cold`, both `>= mintime`), never strict equality, because the
-/// candidate clock has no injection point. Counts recorded per sample:
-/// resident pool, selected transactions and candidate weight, rendered
-/// transactions and `data` byte total.
+/// JSONL fields, each with its exact unit durations (`<arm>_ns`), unit count
+/// (`<arm>_count`), and exact measured total (`<arm>_total_ns`; the parser
+/// derives the mean as `total / count`): `rpc_miss_ns` (cold dispatches, each
+/// a fresh state: assembly plus render), `service_hit_ns` (trait calls after
+/// the miss: projection only), `service_hit2_ns` (continued trait calls:
+/// `Arc` reuse proof and hit stability), `rpc_hit_ns` (warm dispatches:
+/// render on the warm cache). Every arm repeats to `MRP_SAMPLE_MEASURED_FLOOR`; cold units
+/// use fresh states while warm rows repeat on the last cold unit's retained
+/// fixed generation. The service-hit versus RPC-hit difference isolates the
+/// per-reply serialization cost Step 8.1 targets (`consensus_bytes` plus hex
+/// per transaction in `render_template_transactions`); the signalling skip
+/// lives inside the service-hit projection. Identity: `Arc::ptr_eq` plus
+/// unchanged `template_id`, tip hash, mempool sequence, and height across
+/// every warm service call; strict equality on every deterministic RPC field
+/// (including the full `transactions` array) between the cold reply and the
+/// first and last warm replies, with `curtime` checked for permitted
+/// evolution (`hit >= cold`, both `>= mintime`), never strict equality,
+/// because the candidate clock has no injection point. Counts recorded per
+/// sample: resident pool, selected transactions and candidate weight,
+/// rendered transactions and `data` byte total.
 ///
 /// Protocol: standalone and explicitly selected. This function builds the
 /// corpus and runs 3 warmups plus 10 measured samples exactly once, and only
 /// when the bench binary receives the exact `template_render_baseline`
 /// argument; otherwise it returns before any workload or registration.
 /// Nothing is registered with criterion and no criterion measurement is
-/// reported: per-sample JSON lines plus per-arm p50/p95/p99/max summaries on
-/// stdout are the ledger. The same command runs the baseline and the
-/// candidate trees; the parent labels the runs.
+/// reported: per-sample JSON lines plus per-arm p50/p95/p99/max summaries
+/// over measured sample means on stdout are the ledger. The same command runs
+/// the baseline and the candidate trees; the parent labels the runs.
 /// Invocation: `cargo bench -p bitcoin-rs-node --bench sync_pipeline
 /// template_render_baseline -- --nocapture` (default features: fjall).
 fn template_render_baseline(_c: &mut Criterion) {
@@ -3787,16 +4128,256 @@ fn template_render_baseline(_c: &mut Criterion) {
     print_percentiles("template_render_rpc_hit", &rpc_hit);
 }
 
+// MRP Criterion config: the shared `Criterion` defaults carry 10 measured
+// samples, 1 second of warmup, and 20 seconds of measurement for the legacy
+// rows. The three T4 arms moved from Criterion registration to counted
+// sampling (`--mrp-counted`, shared `measured_samples` sampler); their full
+// IDs stay `<arm>/flat`, with one warmup sample plus ten measured samples of
+// one second of measured work each. The standalone T2/T3 rows above register
+// nothing with Criterion; their duration rule is the per-sample
+// `MRP_SAMPLE_MEASURED_FLOOR` loop.
 criterion_group!(
-    benches,
-    sync_pipeline_apply_proxy,
+    name = benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(20));
+    targets = sync_pipeline_apply_proxy,
     sync_pipeline_apply_signed_spend_proxy,
     deterministic_initial_sync_proxy,
     block_source_height_lookup,
-    connect_admitted_signed_spend_block,
-    connect_unseen_signed_spend_block,
-    connect_admission_throughput,
     block_to_template_baseline,
     template_render_baseline
 );
-criterion_main!(benches);
+
+/// Untimed MRP verification entrypoint (`--mrp-verify`, called from `main`
+/// below). Executes the real unit/identity/assertion paths and proves,
+/// without running Criterion or emitting timing samples:
+/// - T2: one full unit on corpus target 0 (fresh state, untimed serving
+///   stack plus prefix plus 100k admission, timed-path connect tail through
+///   the first new-tip template reply) with every setup, tip, pool, service,
+///   and span assertion;
+/// - T3: one cold unit on corpus target 0 plus two warm service calls and
+///   one warm dispatch on its retained generation, with the `Arc` reuse,
+///   deterministic-field, and reply-identity assertions;
+/// - T4: one fresh-state unit per Criterion arm (admitted connect with
+///   gateway admission plus residency, unseen connect, admission
+///   throughput with residency) through the production paths.
+///
+/// Panics (fail-closed, nonzero exit) on any mismatch; prints deterministic
+/// `mrp-verify` lines and a final `mrp-verify: PASS` on success.
+fn mrp_verify() {
+    let corpus = build_block_template_corpus();
+    print_block_template_corpus_summary(&corpus);
+    assert_eq!(
+        corpus.target_blocks.len(),
+        BLOCK_TEMPLATE_WARMUPS.saturating_add(BLOCK_TEMPLATE_SAMPLES),
+        "one distinct target block per warmup and measured sample"
+    );
+    assert_eq!(
+        corpus.target_spends.len(),
+        TEMPLATE_RENDER_WARMUPS.saturating_add(TEMPLATE_RENDER_SAMPLES),
+        "one distinct resident pool per warmup and measured sample"
+    );
+    tracing::subscriber::set_global_default(ProfileSubscriber)
+        .unwrap_or_else(|error| panic!("profile subscriber install failed: {error}"));
+    let unit = run_block_template_unit(&corpus, 0);
+    println!(
+        "mrp-verify: block_to_template unit ok (tip {}, pool {} live)",
+        unit.tip_hash_be, unit.pool_live,
+    );
+    let (_dir, _state, setup, _, cold_reply) = render_cold_unit(&corpus, 0);
+    let (_, candidate_a) = render_service_call(&setup.control);
+    let (_, candidate_b) = render_service_call(&setup.control);
+    assert_render_service_reuse_arcs(&candidate_a, &candidate_b, &setup.tip.hash);
+    let (_, warm_reply) = render_warm_dispatch(&setup.handler, &setup.params);
+    assert_render_deterministic_fields(&cold_reply, &warm_reply);
+    let (_, _, _, cold_lp) = assert_render_reply_identity(
+        &cold_reply,
+        &warm_reply,
+        setup.tip.hash.to_string_be().as_str(),
+        candidate_a.template_id.as_str(),
+    );
+    println!(
+        "mrp-verify: template_render unit ok (tip {}, pool {} live, generation {cold_lp})",
+        setup.tip.hash.to_string_be(),
+        setup.pool_live,
+    );
+    let blocks = signed_spend_proxy_blocks();
+    let last_index = blocks.len().saturating_sub(1);
+    let last_block = &blocks[last_index];
+    let admission_txs: Vec<Arc<Tx>> = last_block.txs[1..]
+        .iter()
+        .map(|tx| Arc::new(tx.clone()))
+        .collect();
+    let admitted = admission_txs.len();
+    {
+        let (_dir, state) = open_regtest_state();
+        for block in &blocks[..last_index] {
+            state
+                .apply_block(block)
+                .unwrap_or_else(|error| panic!("mrp-verify prefix apply failed: {error}"));
+        }
+        admit_signed_spends(&state, &admission_txs);
+        assert_admission_residency(&state, &admission_txs);
+        let tip = state
+            .apply_block(last_block)
+            .unwrap_or_else(|error| panic!("mrp-verify admitted connect failed: {error}"));
+        assert_eq!(
+            tip.hash,
+            last_block.block_hash().0,
+            "mrp-verify admitted connect must publish the final block"
+        );
+    }
+    println!("mrp-verify: connect_admitted unit ok ({admitted} admitted spends connected)");
+    {
+        let (_dir, state) = open_regtest_state();
+        for block in &blocks[..last_index] {
+            state
+                .apply_block(block)
+                .unwrap_or_else(|error| panic!("mrp-verify prefix apply failed: {error}"));
+        }
+        let tip = state
+            .apply_block(last_block)
+            .unwrap_or_else(|error| panic!("mrp-verify unseen connect failed: {error}"));
+        assert_eq!(
+            tip.hash,
+            last_block.block_hash().0,
+            "mrp-verify unseen connect must publish the final block"
+        );
+    }
+    println!("mrp-verify: connect_unseen unit ok (final block connected without admission)");
+    {
+        let (_dir, state) = open_regtest_state();
+        for block in &blocks[..last_index] {
+            state
+                .apply_block(block)
+                .unwrap_or_else(|error| panic!("mrp-verify prefix apply failed: {error}"));
+        }
+        admit_signed_spends(&state, &admission_txs);
+        assert_admission_residency(&state, &admission_txs);
+    }
+    println!("mrp-verify: admission_throughput unit ok ({admitted} gateway submits resident)");
+    println!("mrp-verify: PASS");
+}
+
+/// Untimed counted-verification entrypoint (`--mrp-verify-counted`, called
+/// from `main` below). Executes each converted real unit exactly once through
+/// the production paths with the counted arms' exact timer boundaries, then
+/// exercises the shared stopping-rule arithmetic on deterministic durations.
+/// Emits no `MRP_COUNTED_SAMPLE` records and no timing measurements.
+///
+/// Panics (fail-closed, nonzero exit) on any mismatch; prints deterministic
+/// `mrp-verify-counted` lines and a final `mrp-verify-counted: PASS` on
+/// success.
+fn mrp_verify_counted() {
+    {
+        let blocks = signed_spend_proxy_blocks();
+        let last_index = blocks.len().saturating_sub(1);
+        let last_block = blocks[last_index].clone();
+        let admission_txs: Vec<Arc<Tx>> = last_block.txs[1..]
+            .iter()
+            .map(|tx| Arc::new(tx.clone()))
+            .collect();
+        let admitted = admission_txs.len();
+        connect_admitted_unit_once(&blocks, last_index, &last_block, &admission_txs);
+        println!(
+            "mrp-verify-counted: connect_admitted_signed_spend_block/flat unit ok ({admitted} admitted spends connected)"
+        );
+    }
+    {
+        let blocks = signed_spend_proxy_blocks();
+        let last_index = blocks.len().saturating_sub(1);
+        let last_block = blocks[last_index].clone();
+        connect_unseen_unit_once(&blocks, last_index, &last_block);
+        println!(
+            "mrp-verify-counted: connect_unseen_signed_spend_block/flat unit ok (final block connected without admission)"
+        );
+    }
+    {
+        let blocks = signed_spend_proxy_blocks();
+        let last_index = blocks.len().saturating_sub(1);
+        let admission_txs: Vec<Arc<Tx>> = blocks[last_index].txs[1..]
+            .iter()
+            .map(|tx| Arc::new(tx.clone()))
+            .collect();
+        let admitted = admission_txs.len();
+        connect_admission_unit_once(&blocks, last_index, &admission_txs);
+        println!(
+            "mrp-verify-counted: connect_admission_throughput/flat unit ok ({admitted} gateway submits resident)"
+        );
+    }
+    measured_samples::verify_stopping_rule();
+    println!("mrp-verify-counted: stopping-rule arithmetic ok");
+    println!("mrp-verify-counted: PASS");
+}
+
+/// Validates the `--mrp-counted` invocation shape before any benchmark
+/// framework use: the flag first, exactly one ID argument, no other
+/// arguments, and a known counted row. Malformed or unknown IDs exit nonzero
+/// without entering Criterion.
+fn counted_cli_row(args: &[String]) -> &str {
+    let fail = |message: &str| -> ! {
+        eprintln!("mrp-counted: {message}");
+        eprintln!(
+            "usage: sync_pipeline --mrp-counted <{}>",
+            COUNTED_ROWS.join("|")
+        );
+        std::process::exit(2);
+    };
+    if args.len() != 2 {
+        fail("expected exactly one row ID after --mrp-counted");
+    }
+    if args[0] != "--mrp-counted" {
+        fail("unexpected arguments around --mrp-counted");
+    }
+    if !COUNTED_ROWS.contains(&args[1].as_str()) {
+        fail("unknown counted row ID");
+    }
+    &args[1]
+}
+
+/// Rejects any single-flag counted invocation that carries extra arguments,
+/// before the benchmark framework starts.
+fn require_bare_counted_flag(args: &[String], flag: &str) {
+    if args.len() != 1 {
+        eprintln!("{flag}: expected no additional arguments");
+        std::process::exit(2);
+    }
+}
+
+/// Binary entrypoint: `--mrp-verify` runs the untimed real-fixture
+/// verification path with no Criterion involvement and no timing output;
+/// `--mrp-list-counted` lists the counted row IDs without fixture
+/// construction or sampling; `--mrp-counted ROW_ID` runs one counted row
+/// through the shared measured-work sampler; `--mrp-verify-counted` runs
+/// each converted real unit once plus the stopping-rule arithmetic without
+/// sample records. Malformed counted invocations are rejected before the
+/// benchmark framework starts. Every other invocation runs the Criterion
+/// benchmarks exactly as `criterion_main!` did.
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--mrp-list-counted") {
+        require_bare_counted_flag(&args, "--mrp-list-counted");
+        for row in COUNTED_ROWS {
+            println!("{row}");
+        }
+        return;
+    }
+    if args.iter().any(|arg| arg == "--mrp-counted") {
+        let row = counted_cli_row(&args);
+        run_counted_row(row);
+        return;
+    }
+    if args.iter().any(|arg| arg == "--mrp-verify-counted") {
+        require_bare_counted_flag(&args, "--mrp-verify-counted");
+        mrp_verify_counted();
+        return;
+    }
+    if args.iter().any(|arg| arg == "--mrp-verify") {
+        mrp_verify();
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
