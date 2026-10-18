@@ -92,7 +92,11 @@ never lead it. `commit_id` is strictly monotonic on disconnect as well as on
 connect: a reorg lowers `height`, never `commit_id`.
 
 AssumeUTXO activation and historical archive updates use the same transition
-reservation but separate recovery namespaces. Activation first syncs immutable
+reservation but separate recovery namespaces. The manager holds a required
+persistent data directory; activation archive writes, full-revalidation marker
+checks, reservation cleanup, and historical checkpoint maintenance always use
+it. The required path guarantees a directory was supplied, not filesystem
+health; missing or corrupt files fail at use. Activation first syncs immutable
 `coins.dat` and `headers.dat` under `assumeutxo/<base_hash>/`, then commits the pinned base,
 count, and lifecycle in the head. An unreferenced import is an orphan, not a
 checkpoint or activation authority. Historical updates advance `commit_id`
