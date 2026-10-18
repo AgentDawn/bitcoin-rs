@@ -920,6 +920,79 @@ fn failed_sweep_probe_requests_headers_from_live_peer_in_same_tick() -> TestResu
 }
 
 #[test]
+fn failed_sweep_probe_reassigns_fresh_inflight_body_in_same_tick() -> TestResult {
+    let (tree, blocks) = mined_chain(1, 0)?;
+    let SyncHarness { sync, peers, .. } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    install_budget(
+        &sync,
+        super::super::SyncBudget {
+            max_pending_blocks: 1,
+            ..super::super::default_sync_budget(Network::Regtest)
+        },
+    );
+    let now = Instant::now();
+    let dead = test_addr(9_922, 0)?;
+    let live = test_addr(9_922, 1)?;
+    let (tx, dead_rx) = unbounded::<Message>();
+    let connected_at = now.checked_sub(MINIMUM_CONNECT_TIME).ok_or("connect age")?;
+    let lease = PeerLease::new_connected_at(tx, connected_at);
+    peers.register(dead, lease.clone());
+    peers.publish_info(dead, &lease, synthetic_peer(dead, 5));
+    let source = current_source(&peers, dead);
+    let chain = sync.observe_chain_frontier();
+    assert!(
+        sync.send_getdata_for_pending_blocks(source, false, 5, &chain)
+            .sent
+    );
+    assert_eq!(
+        witness_block_inventory(next_getdata(&dead_rx)?)?,
+        vec![blocks[0].block_hash()]
+    );
+    let required = Hash256::from(blocks[0].block_hash());
+    assert_eq!(
+        sync.scheduler.lock().window.pending_owner(&required),
+        Some(source)
+    );
+    let live_rx = connect_peer(&peers, synthetic_peer(live, 3));
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), now);
+    let peer = frontier
+        .usable_peers
+        .iter()
+        .find(|peer| peer.source == source)
+        .ok_or("probe peer")?;
+    let mut state = ChainSyncState::default();
+    let mut protected = 0;
+    assert_eq!(
+        consider_eviction(
+            peer,
+            &mut state,
+            1,
+            now.checked_sub(Duration::from_mins(20)).ok_or("timeout")?,
+            &mut protected
+        ),
+        None
+    );
+    sync.scheduler.lock().chain_sync.insert(source, state);
+    drop(dead_rx);
+
+    sync.tick();
+
+    assert!(!peers.is_current(source));
+    assert_eq!(
+        witness_block_inventory(next_getdata(&live_rx)?)?,
+        vec![blocks[0].block_hash()],
+        "same tick must reassign the disconnected peer's fresh block request"
+    );
+    assert_eq!(
+        sync.scheduler.lock().window.pending_owner(&required),
+        Some(current_source(&peers, live))
+    );
+    assert!(!sync.scheduler.lock().chain_sync.contains_key(&source));
+    Ok(())
+}
+
+#[test]
 #[expect(clippy::expect_used)]
 fn a_failed_sweep_probe_restores_the_armed_record() {
     let t0 = Instant::now();

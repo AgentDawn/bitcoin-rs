@@ -607,8 +607,10 @@ impl BlockSync {
         let peers_changed = self.sweep_chain_sync(&frontier, now);
         self.follow_tip_progress(&frontier, now);
         // Both explicit eviction and a failed probe send can remove a peer.
-        // Refresh only when needed, so planning cannot reuse a removed lease.
+        // Release its work before refreshing the frontier, so a full pending
+        // budget cannot prevent same-tick reassignment to a live connection.
         if peers_changed {
+            self.reconcile_peer_sessions();
             frontier = self.observe_frontier(chain, now);
         }
         let plan = frontier.plan();

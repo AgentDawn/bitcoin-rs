@@ -325,8 +325,8 @@ impl BlockSync {
     /// keeps its flag for the next recheck instead of being evicted from
     /// under the apply that is about to need it.
     fn recheck_staged_gates(&self) {
-        let tree = self.chain.block_tree();
         let resolved: Vec<Hash256> = {
+            let tree = self.chain.block_tree();
             let scheduler = self.scheduler.lock();
             scheduler
                 .stager
@@ -340,6 +340,7 @@ impl BlockSync {
         let chain_tip = self.chain.chain_tip();
         let applied_tip = self.chain.applied_tip();
         let minimum_chain_work = self.chain.network().minimum_chain_work();
+        let tree = self.chain.block_tree();
         let switch_pending = match (chain_tip.as_deref(), applied_tip.as_deref()) {
             (Some(tip), Some(applied)) => tree
                 .lookup(applied.hash)
@@ -607,6 +608,13 @@ impl BlockSync {
             );
         }
 
+        // Check liveness before acquiring the tree guard: waiting on the peer
+        // table must not retain a tree read lock. Credit publication below
+        // still revalidates the exact connection with `with_current`.
+        for (_, source, _) in &mut staged_blocks {
+            *source = source.filter(|source| self.peer_table.is_current(*source));
+        }
+
         // The block tree owns heights: bodies this insert count-evicts are
         // requeued at their tree-resolved heights, never at a stored sentinel
         // (there is no stored height). The source is the whole connection
@@ -615,8 +623,7 @@ impl BlockSync {
             let tree = self.chain.block_tree();
             staged_blocks
                 .into_iter()
-                .map(|(hash, source, staged)| {
-                    let source_peer = source.filter(|source| self.peer_table.is_current(*source));
+                .map(|(hash, source_peer, staged)| {
                     let dropped_heights = match &staged {
                         StagedBlock::Memory { dropped, .. } => dropped
                             .iter()
