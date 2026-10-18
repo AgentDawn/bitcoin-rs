@@ -39,6 +39,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 | [Offline comparator](#9-offline-full-validation-comparator) | Harness tested; campaign pending |
 | [Ecosystem compatibility](#10-external-ecosystem-compatibility-matrix) | Per-surface evidence |
 | [USDT observability](#11-usdt--bpftrace-observability-validation) | ABI tested; live tracing planned |
+| [Measured campaign runner & analyzer](#12-measured-campaign-runner-and-analyzer) | Harness tested; campaign pending |
 
 ---
 
@@ -338,4 +339,28 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   # Separately verify that a feature-off build contains no probe notes:
   cargo test --locked -p bitcoin-rs-consensus \
     --no-default-features --test sdt_notes
+  ```
+
+---
+
+## 12. Measured campaign runner and analyzer
+
+- **Tier**: In-tree benchmark campaign harness.
+- **Contract & guide**: [`docs/benchmarks/measured-campaign.md`](benchmarks/measured-campaign.md),
+  [`docs/benchmarks/README.md`](benchmarks/README.md),
+  [`docs/contracts/hot-path-attribution.md`](contracts/hot-path-attribution.md) (`HPA-10`, `HPA-13`).
+- **Owner scripts & tools**:
+  - Runner: `tools/benchmark-campaign/measured_runner.py`.
+  - Analyzer: `tools/benchmark-campaign/measured_analyze.py`.
+  - Synthetic smoke probe: `tools/benchmark-campaign/test_measured_campaign.py`.
+  - Shared counted sampler: `tools/benchmark-support/measured_samples.rs`.
+- **What is verified**:
+  - Validates complete campaign registration JSON inputs, five-tree source/bench/lock digests, build receipts, baseline evidence documents, and live `/proc/cpuinfo` processor affinity and model bindings before any benchmark launch (`validate`, `plan`, `run`).
+  - Parses Criterion `sample.json` files, `MRP_COUNTED_SAMPLE` measured-work stdout lines, and T2/T3 standalone node JSONL stdout into fail-closed per-target verdicts (`INCONCLUSIVE`, `REGRESSION`, `NON_REGRESSION_EVIDENCED`, `AT_FLOOR`).
+  - The offline synthetic probe verifies schema, parser, self-binding, and statistical adversaries on temporary stub fixtures without launching any benchmark process; a passing probe does not constitute a registered campaign or performance acceptance.
+- **Reproduce**:
+  ```sh
+  # Run offline hermetic synthetic smoke probe (launches no workloads):
+  uv run --offline --no-project --script tools/benchmark-campaign/test_measured_campaign.py
+  python3 tools/benchmark-campaign/test_measured_campaign.py
   ```
