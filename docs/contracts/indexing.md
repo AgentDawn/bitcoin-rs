@@ -1,6 +1,6 @@
 # Indexing contract
 
-**Contract version: 1.2** (2026-10-13)
+**Contract version: 1.3** (2026-10-18)
 
 The normative contract for node-owned indexing runtimes, capability gating, and
 asynchronous reconciliation across restarts, reorganizations, and selective
@@ -233,6 +233,45 @@ unneeded funding record lists when callers only require history records.
     same-block create/spend pairs cancel before the anchor is consulted.
     Live inserts use the same admission predicate as the UTXO set, including
     OP_RETURN, oversize-script, and genesis exclusions.
+  - Enabled capabilities whose next height is equal form one forward group;
+    groups never mix capabilities with different next heights, and the lowest
+    group runs first. A body absent from the group's next window (up to 256
+    bodies) with no rows retained by that leg lets the same pass try the next
+    higher start height, at most once per distinct start. The skipped leg wrote
+    nothing, so the pass keeps the fence and watermarks it captured. No cursor
+    or queue outlives the pass: the next pass tries the lowest group first and
+    it resumes as soon as its body exists. Rows the leg already retained answer
+    `Buffered` instead: they commit at their original deadline, and only a
+    later pass, with nothing retained and a fresh fence and watermark capture,
+    may reach another group. A stop request, a rejected or stale commit, a
+    deferred or revoked history grant, a pruned-history answer, and an
+    undo-anchor failure end the pass and are never skipped.
+  - When every group that still needs rows waits on an absent body, the pass
+    reports `Stalled`: the worker retries after one quiet period without
+    needing a wake, never reports caught-up or publishes the cursor, and does
+    not loop on progress. A group that reaches the tip while a lower group is
+    owed rows keeps its rows and watermark; each capability's queries still
+    gate on its own watermark (`IDX-03`), so full history stays not-ready until
+    its watermark and coverage floor say otherwise.
+  - Preparation of `ScriptLive` and `CompactFilters` decodes each block's undo
+    anchor inside that block's own preparation task, before the writer's shared
+    read lock, and drops it when that block's rows are prepared. Anchors alive
+    at once are bounded by the preparation tasks in flight on the process-wide
+    rayon pool, not by the window's block count. The pool's width is whatever
+    the process installed: the node requests the smaller of host parallelism
+    and four, while an embedding that initialized the global pool earlier keeps
+    its own. Without those capabilities no undo record is read.
+  - Before any block of a window is admitted, its outcomes are read in height
+    order for an anchor failure, and the lowest-height one decides: a missing or
+    unreadable record follows `IDX-07`, and any other failure, including a
+    failed undo read, fails with its own error and resets nothing. Only without
+    an anchor failure are preparation results consumed in height order: blocks
+    before a preparation failure are admitted (and committed when the batch
+    fills) and the failure then surfaces unchanged.
+  - Unmeasured: peak resident memory of these stages. A window's bodies (at
+    most 256, or 32 MiB plus one body), its in-flight anchors, its prepared
+    rows, and the admitted batch are limited independently; this contract
+    claims no total resident bound and no bound that depends on script sizes.
 - If a rival reorg or tip extension occurs while a forward batch is being
   prepared, the atomic commit detects the watermark divergence, discards the
   stale prepared batch, and re-plans from the new active tip on the next pass.
@@ -250,6 +289,8 @@ unneeded funding record lists when callers only require history records.
   scripts for historical filters. Its durable rows and watermark are preserved,
   its queries refuse and its status is unsynced; sibling indexes and validation
   continue. Restore the required history and restart to retry filter reconciliation.
+  An undo read that fails with a storage error is not an absent record: it
+  fails the worker with its own error and resets nothing.
 - When `ScriptLive` has no watermark after restoration or reset, the worker
   rebuilds it by scanning one stable authoritative UTXO view. Each seed batch
   and the watermark stamp are ordinary fenced writes (reset, revision, and
@@ -344,6 +385,19 @@ Core/Kyoto runner are described in
   - `index_ahead_of_restored_tip_is_reported_once_and_rewound`
   - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
   - `pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`
+  - Forward group scheduling (`IDX-06`):
+    `absent_prefix_body_holds_back_only_its_own_group`,
+    `shutdown_after_an_absent_body_does_not_run_a_higher_group`,
+    `deferred_history_grant_does_not_run_a_higher_group`,
+    `retained_prefix_commits_before_any_group_switch_and_never_outlives_a_fence_change`,
+    `run_loop_commits_a_retained_prefix_and_retries_an_absent_body_without_a_wake`.
+  - Forward undo anchors (`IDX-06`, `IDX-07`):
+    `forward_script_live_follows_undo_present_missing_or_corrupt`,
+    `anchor_failure_outranks_an_earlier_preparation_failure`,
+    `preparation_failure_keeps_its_height_after_committed_successes`,
+    `undo_read_failure_is_not_a_missing_undo`, and the existing
+    `unavailable_filter_history_preserves_sibling_indexes_and_filter_watermark`
+    for the filter side.
 - `crates/index/src/runtime/startup.rs` and
   `crates/index/src/runtime/supervisor_tests.rs`: lifecycle
   publication, open failure/timeout, and shutdown abandonment.
