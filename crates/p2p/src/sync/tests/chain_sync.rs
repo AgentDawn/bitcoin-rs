@@ -860,6 +860,66 @@ fn expired_chain_sync_probe_does_not_suppress_frontier_request() -> TestResult {
 }
 
 #[test]
+fn failed_sweep_probe_requests_headers_from_live_peer_in_same_tick() -> TestResult {
+    let (tree, _) = mined_chain(0, 0)?;
+    let SyncHarness { sync, peers, .. } = SyncHarness::new(tree);
+    sync.chain.bootstrap_genesis();
+    let now = Instant::now();
+    let dead = test_addr(9_921, 0)?;
+    let live = test_addr(9_921, 1)?;
+    let (tx, dead_rx) = unbounded::<Message>();
+    let connected_at = now.checked_sub(MINIMUM_CONNECT_TIME).ok_or("connect age")?;
+    let lease = PeerLease::new_connected_at(tx, connected_at);
+    peers.register(dead, lease.clone());
+    peers.publish_info(dead, &lease, synthetic_peer(dead, 5));
+    let source = current_source(&peers, dead);
+    let live_rx = connect_peer(&peers, synthetic_peer(live, 3));
+
+    let frontier = sync.observe_frontier(sync.observe_chain_frontier(), now);
+    let peer = frontier
+        .usable_peers
+        .iter()
+        .find(|peer| peer.source == source)
+        .ok_or("missing probe peer")?;
+    let mut state = ChainSyncState::default();
+    let mut protected = 0;
+    assert_eq!(
+        consider_eviction(
+            peer,
+            &mut state,
+            0,
+            now.checked_sub(Duration::from_mins(20))
+                .ok_or("timeout start")?,
+            &mut protected,
+        ),
+        None,
+    );
+    sync.scheduler.lock().chain_sync.insert(source, state);
+    drop(dead_rx);
+
+    sync.tick();
+
+    assert!(
+        !peers.is_current(source),
+        "the failed sweep probe removes its connection"
+    );
+    assert!(
+        live_rx
+            .try_iter()
+            .any(|message| matches!(message, Message::GetHeaders(_))),
+        "the same tick must select the live peer after the sweep probe disconnects the highest claimant"
+    );
+    assert_eq!(
+        sync.scheduler
+            .lock()
+            .header_request()
+            .map(|request| request.source),
+        Some(current_source(&peers, live)),
+    );
+    Ok(())
+}
+
+#[test]
 #[expect(clippy::expect_used)]
 fn a_failed_sweep_probe_restores_the_armed_record() {
     let t0 = Instant::now();

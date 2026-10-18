@@ -604,12 +604,11 @@ impl BlockSync {
         // the same tick can re-request it.
         self.reconcile_peer_sessions();
         let mut frontier = self.observe_frontier(chain.clone(), now);
-        let evicted = self.sweep_chain_sync(&frontier, now);
+        let peers_changed = self.sweep_chain_sync(&frontier, now);
         self.follow_tip_progress(&frontier, now);
-        // The sweep can disconnect a peer; re-observe only when an eviction
-        // occurred so selection and body planning never address a lease the
-        // sweep just removed.
-        if evicted {
+        // Both explicit eviction and a failed probe send can remove a peer.
+        // Refresh only when needed, so planning cannot reuse a removed lease.
+        if peers_changed {
             frontier = self.observe_frontier(chain, now);
         }
         let plan = frontier.plan();
@@ -748,10 +747,20 @@ impl BlockSync {
         let chain_tip = self.chain.chain_tip()?;
         let applied_tip = self.chain.applied_tip()?;
         let tree = self.chain.block_tree();
-        let height = Self::first_connect_height(&tree, applied_tip.hash, chain_tip.tip_id)?;
-        let node_id = tree.node_at_height_from(chain_tip.tip_id, height)?;
+        Self::required_body_from_tips(&tree, applied_tip.hash, chain_tip.tip_id)
+    }
+
+    /// Resolve ancestry against the caller's captured tips without sampling
+    /// either published tip again.
+    fn required_body_from_tips(
+        tree: &BlockTree,
+        applied_hash: Hash256,
+        chain_tip: NodeId,
+    ) -> Option<RequiredBody> {
+        let height = Self::first_connect_height(tree, applied_hash, chain_tip)?;
+        let node_id = tree.node_at_height_from(chain_tip, height)?;
         let node = tree.node(node_id).ok()?;
-        Some(frontier::RequiredBody {
+        Some(RequiredBody {
             height: node.height,
             hash: node.hash,
         })
@@ -762,7 +771,13 @@ impl BlockSync {
     pub(super) fn observe_chain_frontier(&self) -> ChainFrontier {
         let applied_tip = self.chain.applied_tip();
         let chain_tip = self.chain.chain_tip();
-        let next_required = self.next_required_body();
+        let next_required = match (&applied_tip, &chain_tip) {
+            (Some(applied), Some(chain)) => {
+                let tree = self.chain.block_tree();
+                Self::required_body_from_tips(&tree, applied.hash, chain.tip_id)
+            }
+            _ => None,
+        };
         ChainFrontier {
             applied_tip,
             chain_tip,
