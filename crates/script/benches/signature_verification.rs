@@ -340,12 +340,7 @@ fn schnorr_fixtures() -> SchnorrFixtures {
         assert_valid(prepared, &format!("schnorr miss {i}"));
     }
 
-    let mut bad_tx = hit.tx.clone();
-    bad_tx.inputs[0].witness[0][0] ^= 0x01;
-    let bad = Case {
-        tx: bad_tx,
-        rows: hit.rows.clone(),
-    };
+    let bad = schnorr_negative_case(&hit);
     let bad_prepared = PreparedTransaction::new(&bad.tx, &bad.rows).expect("schnorr bad prevouts");
     for flags in [VerifyFlags::MANDATORY, VerifyFlags::STANDARD] {
         assert_eq!(
@@ -497,7 +492,7 @@ fn signature_verification(c: &mut Criterion) {
     group.finish();
 }
 
-/// Flipped-byte Schnorr negative rebuilt from the hit spend (mirrors `schnorr_fixtures`).
+/// Flipped-byte Schnorr negative rebuilt from the hit spend.
 fn schnorr_negative_case(hit: &Case) -> Case {
     let mut bad_tx = hit.tx.clone();
     bad_tx.inputs[0].witness[0][0] ^= 0x01;

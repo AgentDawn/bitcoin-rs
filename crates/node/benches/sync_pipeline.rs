@@ -1168,8 +1168,7 @@ fn production_state_config() -> NodeConfig {
 /// other arm. Recorded in every summary line and covered by each evidence
 /// sample's resolved-configuration identity.
 fn bench_engine() -> bitcoin_rs_node::ValidationEngine {
-    let spelling =
-        std::env::var("BITCOIN_RS_VALIDATION_ENGINE").unwrap_or_else(|_| "native".into());
+    let spelling = sample_engine_label();
     let engine = bitcoin_rs_node::ValidationEngine::parse(&spelling)
         .unwrap_or_else(|| panic!("unknown BITCOIN_RS_VALIDATION_ENGINE {spelling:?}"));
     assert!(

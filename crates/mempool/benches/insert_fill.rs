@@ -148,15 +148,7 @@ fn bench_mempool_fill(c: &mut Criterion) {
     for size in POOL_SIZES {
         group.bench_function(format!("fill/{size}"), |b| {
             b.iter(|| {
-                let mut pool = Mempool::new(MempoolLimits {
-                    min_relay_fee_sat_per_kvb: 0,
-                    ..MempoolLimits::default()
-                });
-                for seed in 0..size {
-                    pool.insert_entry(entry(seed))
-                        .expect("independent fixture insert must succeed");
-                }
-                assert_eq!(pool.len(), usize::try_from(size).expect("size fits usize"));
+                let pool = fill_pool(size);
                 black_box(pool.len())
             });
         });

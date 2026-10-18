@@ -340,23 +340,23 @@ fn counted_snapshot_unit(pool: &Mempool, unit_count: usize) -> Duration {
     elapsed
 }
 
-/// One counted snapshot row: pool construction and the untimed warm-up
-/// snapshot (with its size assertion) stay outside the measured units.
-fn snapshot_row(row: &str, unit_count: usize) {
-    let pool = snapshot_with(unit_count);
+/// Warmed independent-transaction fixture: pool construction plus the untimed
+/// warm-up snapshot with its size assertion. Returns the pool for the measured units.
+fn warmed_snapshot_fixture(count: usize) -> Mempool {
+    let pool = snapshot_with(count);
     let warmed = pool.mining_snapshot();
     assert_eq!(
         warmed.entries.len(),
-        unit_count,
+        count,
         "warm-up snapshot must already name the fixture size"
     );
     drop(warmed);
-    measured_samples::run(row, || counted_snapshot_unit(&pool, unit_count));
+    pool
 }
 
-/// One counted chained snapshot row: the same boundary over the 800×25
-/// chained fixture.
-fn chained_snapshot_row(row: &str) {
+/// Warmed 800×25 chained fixture: the same boundary over the chained pool.
+/// Returns the pool for the measured units.
+fn warmed_chained_fixture() -> Mempool {
     let pool = chained_snapshot();
     let warmed = pool.mining_snapshot();
     assert_eq!(
@@ -365,6 +365,20 @@ fn chained_snapshot_row(row: &str) {
         "warm-up snapshot must already name the chained fixture size"
     );
     drop(warmed);
+    pool
+}
+
+/// One counted snapshot row: pool construction and the untimed warm-up
+/// snapshot (with its size assertion) stay outside the measured units.
+fn snapshot_row(row: &str, unit_count: usize) {
+    let pool = warmed_snapshot_fixture(unit_count);
+    measured_samples::run(row, || counted_snapshot_unit(&pool, unit_count));
+}
+
+/// One counted chained snapshot row: the same boundary over the 800×25
+/// chained fixture.
+fn chained_snapshot_row(row: &str) {
+    let pool = warmed_chained_fixture();
     measured_samples::run(row, || {
         counted_snapshot_unit(&pool, CHAIN_POOL_CHAINS * CHAIN_DEPTH)
     });
@@ -424,14 +438,7 @@ fn main() {
 /// One untimed counted snapshot unit with its warm-up assertions; used by
 /// `--mrp-verify-counted` without campaign sample records.
 fn verify_snapshot_unit(count: usize) {
-    let pool = snapshot_with(count);
-    let warmed = pool.mining_snapshot();
-    assert_eq!(
-        warmed.entries.len(),
-        count,
-        "warm-up snapshot must already name the fixture size"
-    );
-    drop(warmed);
+    let pool = warmed_snapshot_fixture(count);
     counted_snapshot_unit(&pool, count);
 }
 
@@ -475,14 +482,7 @@ fn mrp_verify_counted() {
 /// One untimed counted chained snapshot unit with its warm-up assertions;
 /// used by `--mrp-verify-counted` without campaign sample records.
 fn verify_chained_snapshot_unit() {
-    let pool = chained_snapshot();
-    let warmed = pool.mining_snapshot();
-    assert_eq!(
-        warmed.entries.len(),
-        CHAIN_POOL_CHAINS * CHAIN_DEPTH,
-        "warm-up snapshot must already name the chained fixture size"
-    );
-    drop(warmed);
+    let pool = warmed_chained_fixture();
     counted_snapshot_unit(&pool, CHAIN_POOL_CHAINS * CHAIN_DEPTH);
 }
 
