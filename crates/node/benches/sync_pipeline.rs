@@ -34,6 +34,7 @@
 )]
 
 use std::hint::black_box;
+use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -95,6 +96,7 @@ use crossbeam_channel::unbounded;
 use evidence::{Cell, Interval, IntervalKind, LEDGER_SCHEMA, Ledger, Sample};
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot::RwLock;
+use serde::Serialize as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 use tempfile::TempDir;
 
@@ -1176,6 +1178,14 @@ fn bench_engine() -> bitcoin_rs_node::ValidationEngine {
          cannot run: compile the capability feature (`kernel`) to benchmark that arm"
     );
     engine
+}
+
+/// The raw engine label that evidence samples and the `--mrp-verify` pin line
+/// report: `BITCOIN_RS_VALIDATION_ENGINE` verbatim, `native` when unset.
+/// Unlike `bench_engine` it neither validates nor normalizes, so a
+/// non-canonical spelling stays visible to the registration's engine pin.
+fn sample_engine_label() -> String {
+    std::env::var("BITCOIN_RS_VALIDATION_ENGINE").unwrap_or_else(|_| "native".into())
 }
 
 fn populate_sync_header_chain(
@@ -3256,7 +3266,7 @@ fn report_block_template_sample(run: usize, warmup: bool, units: &[BlockTemplate
         "bench": "block_to_template_baseline",
         "sample": run,
         "warmup": warmup,
-        "engine": std::env::var("BITCOIN_RS_VALIDATION_ENGINE").unwrap_or_else(|_| "native".into()),
+        "engine": sample_engine_label(),
         "pool_txs": first.pool_live,
         "background_txs": first.background_len,
         "pool_at_template": first.pool_at_template,
@@ -4012,7 +4022,7 @@ fn report_render_sample(report: &TemplateRenderReport) {
         "bench": "template_render_baseline",
         "sample": run,
         "warmup": warmup,
-        "engine": std::env::var("BITCOIN_RS_VALIDATION_ENGINE").unwrap_or_else(|_| "native".into()),
+        "engine": sample_engine_label(),
         "pool_txs": pool_live,
         "background_txs": background_len,
         "pool_at_template": pool_live,
@@ -4165,7 +4175,10 @@ criterion_group!(
 ///   throughput with residency) through the production paths.
 ///
 /// Panics (fail-closed, nonzero exit) on any mismatch; prints deterministic
-/// `mrp-verify` lines and a final `mrp-verify: PASS` on success.
+/// `mrp-verify` lines, then one `mrp-verify: node_identity {json}` line (the
+/// registration's `node_identity` pins, built from the corpus, unit, and cold
+/// setup verified above, so it adds no timed work), and a final
+/// `mrp-verify: PASS` on success.
 fn mrp_verify() {
     let corpus = build_block_template_corpus();
     print_block_template_corpus_summary(&corpus);
@@ -4258,7 +4271,54 @@ fn mrp_verify() {
         assert_admission_residency(&state, &admission_txs);
     }
     println!("mrp-verify: admission_throughput unit ok ({admitted} gateway submits resident)");
+    print_mrp_node_identity(&corpus, &unit, &setup);
     println!("mrp-verify: PASS");
+}
+
+/// Prints the untimed `mrp-verify` node-identity pins: the raw engine label
+/// verbatim, both baselines' tips, and the pool/block shape counters. Object
+/// keys are emitted in sorted order so separate binaries produce
+/// byte-identical output for cross-binary byte comparison.
+fn print_mrp_node_identity(
+    corpus: &BlockTemplateCorpus,
+    unit: &BlockTemplateUnit,
+    setup: &TemplateRenderSetup,
+) {
+    let engine = sample_engine_label();
+    let tips: Vec<String> = corpus
+        .target_blocks
+        .iter()
+        .map(|block| block.block_hash().0.to_string_be())
+        .collect();
+    let mut serializer =
+        sonic_rs::Serializer::new(b"mrp-verify: node_identity ".to_vec()).sort_map_keys();
+    json!({
+        "block_to_template_baseline": {
+            "engine": engine,
+            "tips": tips,
+            "pool_txs": unit.pool_live,
+            "background_txs": unit.background_len,
+            "pool_at_template": unit.pool_at_template,
+            "block_txs": unit.block_txs,
+            "block_noncoinbase": unit.block_noncoinbase,
+        },
+        "template_render_baseline": {
+            "engine": engine,
+            "tip": setup.tip.hash.to_string_be(),
+            "tip_height": setup.tip.height,
+            "pool_txs": setup.pool_live,
+            "background_txs": setup.background_len,
+            "pool_at_template": setup.pool_live,
+        },
+    })
+    .serialize(&mut serializer)
+    .unwrap_or_else(|error| panic!("render node identity pins: {error}"));
+    let mut line = serializer.into_inner();
+    line.push(b'\n');
+    std::io::stdout()
+        .lock()
+        .write_all(&line)
+        .unwrap_or_else(|error| panic!("write node identity pins: {error}"));
 }
 
 /// Untimed counted-verification entrypoint (`--mrp-verify-counted`, called

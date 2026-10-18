@@ -362,5 +362,4 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   ```sh
   # Run offline hermetic synthetic smoke probe (launches no workloads):
   uv run --offline --no-project --script tools/benchmark-campaign/test_measured_campaign.py
-  python3 tools/benchmark-campaign/test_measured_campaign.py
   ```

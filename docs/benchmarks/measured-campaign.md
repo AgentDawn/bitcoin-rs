@@ -8,7 +8,7 @@ Status: `planned_not_executed`, as defined in [`README.md`](README.md#status-voc
 
 ## CLI and verification boundary
 
-The runner and analyzer live side by side in `tools/benchmark-campaign/` with zero third-party Python dependencies.
+The runner and analyzer live side by side in `tools/benchmark-campaign/` with zero third-party Python dependencies (Python `>= 3.11`; `uv` runs the documented offline synthetic probe; live validation and campaign runs require a Linux x86 host exposing `/proc/cpuinfo` `model name` and `os.sched_getaffinity(0)`, plus `taskset` and `perf` with permission to count `task-clock,cycles:u,instructions:u`).
 
 ```sh
 # Validate registration schema, file hashes, live CPU affinity, and CPU model (launches nothing):
@@ -33,10 +33,10 @@ Rust benchmark binaries in the four campaign targets also expose untimed inspect
 
 - `--mrp-list-counted` prints the supported counted row IDs for that binary without constructing fixtures or collecting samples (supported on `insert_fill`, `candidate`, and `sync_pipeline`).
 - `--mrp-verify-counted` runs each converted real unit once and checks the counted-sampler stopping arithmetic boundaries (`0` durations, exact-floor stopping, and overshoot) without emitting `MRP_COUNTED_SAMPLE` lines (supported on `insert_fill`, `candidate`, and `sync_pipeline`).
-- `--mrp-verify` runs the untimed fixture, residency, oracle, and identity assertions for the target's rows without emitting campaign sample records (supported on all four campaign bench binaries, including `signature_verification`).
-- `--list` lists ordinary Criterion benchmark IDs.
+- `--mrp-verify` runs the untimed fixture, residency, oracle, and identity assertions for the target's rows without emitting campaign sample records (supported on all four campaign bench binaries, including `signature_verification`). On `sync_pipeline` it also prints the `corpus` and `node_identity` pin lines that [freeze-time capture](#freeze-time-capture) copies into the registration.
+- `--list` lists ordinary Criterion benchmark IDs (`sync_pipeline --list` enters Criterion benchmark registration and also executes non-campaign timed proxy preludes; those printed timings are not campaign evidence).
 
-Untimed `--mrp-verify` and `--mrp-verify-counted` runs, `--mrp-list-counted` and `--list` inventories, and `test_measured_campaign.py` prove harness mechanics and rejection boundaries on synthetic fixtures. None of them collect campaign samples, supply frozen build or baseline receipts, or establish a performance verdict.
+Untimed `--mrp-verify`, `--mrp-verify-counted`, and `--mrp-list-counted` runs, `--list` inventories (including `sync_pipeline --list`'s non-campaign timed proxy preludes), and `test_measured_campaign.py` prove harness mechanics and rejection boundaries on synthetic fixtures. None of them collect campaign samples, supply frozen build or baseline receipts, or establish a performance verdict.
 
 ## Registration
 
@@ -62,15 +62,15 @@ All 16 top-level keys are required. Any missing or unrecognized key (including r
 | `host` | `{"cpu": int >= 0, "cpu_model": nonempty string}` | Target CPU core and exact `/proc/cpuinfo` `model name` for that processor block. Every case runs under `taskset -c <cpu>` and records `host_before` and `host_after`. |
 | `timeout_seconds` | finite number `> 0` | Fixed per-case wall timeout in seconds. |
 | `scripts` | `{"runner": {"path", "sha256"}, "analyzer": {"path", "sha256"}}` | `runner.path` must resolve to the executing `measured_runner.py`; `analyzer.path` must resolve to its sibling `measured_analyze.py` in the same directory. Both file hashes must match. |
-| `source_roots` | `{tree: abs_dir}` for `candidate`, `control_T1`, `control_T2`, `control_T3`, `control_T4` | Five non-overlapping existing directories containing frozen source-only trees. Any `target` or `.git` entry, path containing `target`, symlinked directory, symlink leaving the root, or non-regular file is refused. |
+| `source_roots` | `{tree: abs_dir}` for `candidate`, `control_T1`, `control_T2`, `control_T3`, `control_T4` | Five non-overlapping existing directories containing frozen source-only trees. Any `target` or `.git` entry, resolved root path with a path component named `target`, symlinked directory, symlink leaving the root, or non-regular file is refused. |
 | `source_fingerprints` | `{tree: {relpath: sha256}}` | Per tree, the exact POSIX relative-path to SHA-256 map of every regular file in `source_roots[tree]`. No omitted, extra, or mismatched file is permitted. All five full-tree `identity_digest` values must be pairwise distinct. |
 | `bench_fingerprints` | `{tree: {5 relpaths: sha256}}` | Per tree, the exact five common benchmark files: `crates/mempool/benches/insert_fill.rs`, `crates/mining/benches/candidate.rs`, `crates/node/benches/sync_pipeline.rs`, `crates/script/benches/signature_verification.rs`, and `tools/benchmark-support/measured_samples.rs`. Each hash must match the file in `source_roots[tree]`, and the map must be identical across all five trees. |
 | `lock_fingerprints` | `{tree: {5 relpaths: sha256}}` | Per tree, the exact five workspace lockfiles: `Cargo.lock`, `fuzz/Cargo.lock`, `tools/ldk/Cargo.lock`, `tools/compact-filter-interop/Cargo.lock`, and `tools/stratum-sv2/template-provider/Cargo.lock`. Each hash must match the file in `source_roots[tree]`, and the map must be identical across all five trees. |
 | `binaries` | `{10 keys: {"path", "sha256", "receipt": {"path", "sha256"}}}` | The ten compiled benchmark executables and their build receipts (see below). Every binary and receipt file must exist outside all `source_roots`, be pairwise distinct files on disk, and match its pinned SHA-256. Every binary must have execute permission (`os.X_OK`). |
 | `source_baseline_evidence` | nonempty list of `{"path", "sha256"}` | Pinned JSON documents certifying a passed source baseline for the exact five-tree source digests and script digests (see below). Duplicate paths are refused. |
 | `dependency_baseline_evidence` | nonempty list of `{"path", "sha256"}` | Pinned JSON documents certifying a passed dependency baseline for the exact five-tree lock digests (see below). Duplicate paths are refused. |
-| `corpus` | `{"prefix_blocks", "tip_height", "funded_outputs", "background", "targets", "target_spends", "total_txs_per_target"}` | Nonnegative integers pinning the `block_to_template corpus:` summary line emitted on stdout by T2 and T3 node workloads. |
-| `node_identity` | `{"block_to_template_baseline": {...}, "template_render_baseline": {...}}` | Per-sample workload identity pins for T2 and T3 (see below). |
+| `corpus` | `{"prefix_blocks", "tip_height", "funded_outputs", "background", "targets", "target_spends", "total_txs_per_target"}` | Nonnegative integers pinning the `block_to_template corpus:` summary line emitted on stdout by T2 and T3 node workloads. An operator-supplied freeze-time pin captured from untimed `--mrp-verify` logs before registration (see [Freeze-time capture](#freeze-time-capture)). |
+| `node_identity` | `{"block_to_template_baseline": {...}, "template_render_baseline": {...}}` | Per-sample workload identity pins for T2 and T3 (see below). An operator-supplied freeze-time pin copied verbatim from untimed `--mrp-verify` logs before registration (see [Freeze-time capture](#freeze-time-capture)). |
 | `targets` | `{"T1": {...}, "T2": {...}, "T3": {...}, "T4": {...}}` | Each target object has exact keys `{"control_tree": "control_T<n>", "rows": [...]}` matching the pinned 31-row inventory in exact order. |
 | `schedule` | `{"target_order": ["T1", "T2", "T3", "T4"], "blocks": [...]}` | Canonical serialized target order and per-target block list: one `{"target": "T<n>", "kind": "zero"}` block followed by three `{"target": "T<n>", "kind": "measure"}` blocks for each target. |
 
@@ -111,25 +111,48 @@ Each entry in `source_baseline_evidence` and `dependency_baseline_evidence` must
 
 ### Node identity and corpus pins
 
-T2 and T3 standalone node workloads emit a corpus summary line (`block_to_template corpus: prefix_blocks=<N> tip_height=<N> funded_outputs=<N> background=<N> targets=<N>x<spends> total_txs_per_target=<N>`) that must match `corpus` field for field. Their per-sample JSON lines must match `node_identity`:
+T2 and T3 standalone node workloads emit a corpus summary line (`block_to_template corpus: prefix_blocks=<prefix_blocks> tip_height=<tip_height> funded_outputs=<funded_outputs> background=<background> targets=<targets>x<target_spends> total_txs_per_target=<total_txs_per_target>`) that must match `corpus` field for field. Their per-sample JSON lines must match `node_identity`:
 
 | Workload key | Required `node_identity` fields |
 |---|---|
 | `block_to_template_baseline` | `engine`: `"native"`; `tips`: list of exactly 13 distinct lowercase 64-hex block hashes (one per sample index `0..12`, since each warmup and measured sample connects its own target block); nonnegative ints `pool_txs`, `background_txs`, `pool_at_template`, `block_txs`, `block_noncoinbase`. |
 | `template_render_baseline` | `engine`: `"native"`; `tip`: one lowercase 64-hex prefix tip hash (the tip never connects); nonnegative ints `tip_height`, `pool_txs`, `background_txs`, `pool_at_template`. (Each sample also carries a nonempty per-sample `longpollid`.) |
 
+#### Freeze-time capture
+
+`corpus` and `node_identity` are operator-supplied freeze-time pins. The runner and analyzer never derive them. They are never taken from a campaign's own `stdout.log`, and no standalone `block_to_template_baseline` run, `template_render_baseline` run, or `--mrp-counted` run is performed before registration to obtain them.
+
+"Freeze-time capture" means running the existing untimed `--mrp-verify` once on each frozen `candidate/sync_pipeline`, `control_T2/sync_pipeline`, and `control_T3/sync_pipeline` executable with `BITCOIN_RS_VALIDATION_ENGINE=native`. These are the three executables that run the T2 and T3 node workloads. Capture from the exact executables that the registration will list under `binaries`, after they are built and before the registration is written; rebuilding or replacing one makes its retained log stale. `--mrp-verify` builds the corpus and runs the untimed T2 and T3 fixture units once each. It starts no Criterion run and no sample loop, and it prints no sample record or timing measurement.
+
+```sh
+# Untimed freeze-time pin capture (launches no campaign workload); repeat for candidate, control_T2, and control_T3, one retained log each:
+env BITCOIN_RS_VALIDATION_ENGINE=native /abs/path/to/frozen/<tree>-sync_pipeline --mrp-verify \
+  > /abs/path/to/retained-logs/<tree>-sync_pipeline-mrp-verify.log
+```
+
+Accept a log only if the process exited `0` and the final line of the retained stdout log is `mrp-verify: PASS`. An accepted log contains exactly one `block_to_template corpus:` line and exactly one `mrp-verify: node_identity ` line. The `node_identity` line is printed immediately before `mrp-verify: PASS`, after every verification assertion has passed. Retain all three logs with the registration.
+
+Transcribe the pins from an accepted log:
+
+- `corpus`: copy each field of the single `block_to_template corpus:` line into the key of the same name. `targets=<targets>x<target_spends>` carries two keys: `targets` is the number before the `x` and `target_spends` is the number after it. The static validator accepts any nonnegative integers, so a swapped pair passes `validate` and is caught only when node workload output is parsed during `run`.
+- `node_identity`: copy the JSON object after `mrp-verify: node_identity ` verbatim; do not retype, reorder, or edit any value. It has exactly the two workload keys and inner keys in the table above: `tips` lists the target block hashes in corpus order (one per sample index) and `engine` is the label the samples report, which must be exactly `native`. It carries no `longpollid`, duration, or `bench`/`sample`/`warmup` key.
+
+The `block_to_template corpus:` line and the `mrp-verify: node_identity ` line must be byte-identical in the logs of all three executables. The registration holds one `corpus` and one `node_identity` per workload and cannot express per-binary pins, so on any mismatch stop. Do not choose one binary's values, edit a pin by hand, or register per-binary values.
+
+`validate` and `plan` launch nothing, so they do not compare these pins with any executable's output. A pin that disagrees with an executable is detected only when node workload output is parsed during `run`. Compare the registration's `corpus` and `node_identity` against the retained logs before registering.
+
 ### How the six benchmark sample identities map to registration and records
 
-[`README.md`](README.md#required-identities-per-sample) requires six identities per sample: Artifact, Configuration, Corpus, Durability, Toolchain, and Hardware. In a measured campaign, individual Criterion `sample.json` files and `MRP_COUNTED_SAMPLE` stdout lines carry only timing arrays (`iters`/`times` or `unit_ns`/`unit_count`/`total_ns`) and row identifiers. The six identities are bound across the registration, build receipts, and per-case runner records rather than duplicated inside each sample JSON object:
+[`README.md`](README.md#required-identities-per-sample) is binding and requires six identities per sample: Artifact, Configuration, Corpus, Durability, Toolchain, and Hardware. In a measured campaign, individual Criterion `sample.json` files and `MRP_COUNTED_SAMPLE` stdout lines carry only timing arrays (`iters`/`times` or `unit_ns`/`unit_count`/`total_ns`) and row identifiers. The table below distinguishes the subset of fields validated directly by `measured_runner.py` and `measured_analyze.py` from the additional operator-retained configuration, durability, toolchain, and hardware metadata required by [`README.md`](README.md#required-identities-per-sample). Successful registration validation alone does not certify complete performance-acceptance evidence, and implied source state or timing splits never waive or substitute for the policy-required identities:
 
-| Identity | Where it lives in the measured campaign |
+| Identity | Fields validated by `measured_runner.py` / `measured_analyze.py` and operator-retained metadata boundary |
 |---|---|
-| Artifact | `source_fingerprints`, `bench_fingerprints`, `lock_fingerprints`, `scripts`, `binaries[key].sha256`, `binaries[key].receipt`, and per-case `binary_sha256_before` / `binary_sha256_after` re-hashed before and after each child invocation. |
-| Configuration | Pinned row `argv` in `targets[T<n>].rows`, runner-enforced `BITCOIN_RS_VALIDATION_ENGINE=native` in every child environment, and `node_identity[*].engine == "native"` on T2/T3 stdout. |
-| Corpus | Pinned `corpus` and `node_identity` objects in registration, verified against T2/T3 stdout (`node_corpus` and per-sample `identity`), plus deterministic in-bench fixture assertions verified by `--mrp-verify` / `--mrp-verify-counted`. |
-| Durability | The frozen source and bench files pinned in `source_fingerprints` and `bench_fingerprints` (for example, T2/T3 regtest Fjall state and per-unit component splits `durable_sync_us` and `durable_commit_us`). |
-| Toolchain | `lock_fingerprints` across all five trees, `dependency_baseline_evidence`, and the compiler/toolchain provenance recorded in each `binaries[key].receipt` alongside `source_digest` and `lock_digest`. |
-| Hardware | Registration `host.cpu` and `host.cpu_model`, enforced via `taskset -c <cpu>` and verified against live `/proc/cpuinfo` and `/sys/devices/system/cpu` in per-case `host_before`, `host_after`, and `perf` (`task-clock`, `cycles:u`, `instructions:u`). |
+| Artifact | Validated by tools: `source_fingerprints`, `bench_fingerprints`, `lock_fingerprints`, `scripts`, `binaries[key].sha256`, `binaries[key].receipt`, and per-case `binary_sha256_before` / `binary_sha256_after` re-hashed before and after each child invocation. |
+| Configuration | Validated by tools: pinned row `argv` in `targets[T<n>].rows`, runner-enforced `BITCOIN_RS_VALIDATION_ENGINE=native` in every child environment, and `node_identity[*].engine == "native"` on T2/T3 stdout. Although frozen source and build provenance (`source_fingerprints`, `lock_fingerprints`, `binaries[key].receipt`) fix the compiled tree, the runner and analyzer do not independently capture or validate runtime fields for resolved `NodeConfig`, feature set, or allocator; those remain additional operator-retained metadata required by [`README.md`](README.md#required-identities-per-sample). |
+| Corpus | Validated by tools: pinned `corpus` and `node_identity` objects in registration, verified against T2/T3 stdout (`node_corpus` and per-sample `identity`), plus deterministic in-bench fixture assertions verified by `--mrp-verify` / `--mrp-verify-counted`. |
+| Durability | Validated by tools: frozen source, bench, and lock digests (`source_fingerprints`, `bench_fingerprints`, `lock_fingerprints`, `binaries[key].receipt`) and presence/shape of T2's per-unit `durable_sync_us` and `durable_commit_us` arrays. Those arrays are descriptive timing splits, not durability identity fields, and source hashes alone do not record runtime backend, batch mode (`write`, `write_deferred`, `write_durable`), or flush/sync posture; those remain additional operator-retained metadata required by [`README.md`](README.md#required-identities-per-sample). |
+| Toolchain | Validated by tools: `lock_fingerprints` across all five trees, `dependency_baseline_evidence`, and the required digest fields (`source_digest`, `bench_source_sha256`, `lock_digest`, `binary_sha256`) in each `binaries[key].receipt`. Exact `rustc` version, edition, profile, and enabled feature strings in receipts or campaign records are not schema-enforced by the validator and remain operator-retained metadata required by [`README.md`](README.md#required-identities-per-sample). |
+| Hardware | Validated by tools: registration `host.cpu` and `host.cpu_model`, enforced via `taskset -c <cpu>` and verified against live `/proc/cpuinfo`, `os.sched_getaffinity(0)`, `/sys/devices/system/cpu` (`cpufreq`), and `perf` (`task-clock`, `cycles:u`, `instructions:u`) in per-case `host_before` and `host_after`. System memory, storage device, and OS kernel identity are not validated by the runner or analyzer and remain operator-retained metadata required by [`README.md`](README.md#required-identities-per-sample). |
 
 ### Pinned row inventory (31 rows: 17 Criterion, 12 counted, 2 node)
 
@@ -170,7 +193,7 @@ Before freezing a registration, confirm every Criterion ID with `--list` and eve
 - **Schedule**: Targets run serially `T1 -> T2 -> T3 -> T4`. Each target runs 4 blocks of 4 visits (`16` visits per target, `31 * 16 = 496` cases total):
   - Block `0` (`kind: "zero"`): visits `candidate, zero, zero, candidate` (`v00..v03`). Both `"candidate"` and `"zero"` arms resolve to `row["candidate_binary"]` and its pinned hash. This measures same-binary host and visit noise on the target's workload without independent-build variation; there is no separate `zero` source tree or `zero` executable in the registration.
   - Blocks `1..3` (`kind: "measure"`): visits `candidate, control, control, candidate` (`v04..v15`, three ABBA blocks). `"candidate"` runs `candidate/<bench_target>`; `"control"` runs `control_T<n>/<bench_target>`.
-  - Within every visit, all rows of that target run in their pinned table order. Only one benchmark child process is alive at a time.
+  - Within every visit, all rows of that target run in their pinned table order. Only one benchmark child process is alive at a time; builds and tests must never run concurrently with measurements, and no host-setting changes are made for the campaign.
 - **Per-case custody**: Each case writes to a fresh directory `<campaign_root>/<target>/v<visit:02d>-<arm>/<sanitized_row>/` (`exist_ok=False`), hashes the binary before and after execution, pins `BITCOIN_RS_VALIDATION_ENGINE=native`, sets a fresh `CRITERION_HOME` for Criterion rows, and launches `taskset -c <cpu> perf stat -x, -e task-clock,cycles:u,instructions:u -o <perf.csv> -- <binary> <argv...>`.
 - **No retry, resume, or overwrite**: `cmd_run` creates `campaign_root` with `exist_ok=False`, flushes `results.json` and append-only `results.jsonl` after every case, kills the child process group with `SIGKILL` on timeout or interruption, and stops immediately on the first case error or binary hash mismatch. At completion or early stop it writes `manifest.json` (SHA-256 of every file under `campaign_root` except the manifest files) and `manifest.sha256`.
 - **Fresh registration after renaming or editing scripts**: Because `scripts.runner` and `scripts.analyzer` bind the exact resolved file paths and SHA-256 digests of `measured_runner.py` and `measured_analyze.py`, and `source_baseline_evidence[*].frozen_identity.scripts` pins those same digests, renaming, moving, or editing either Python script invalidates any prior registration JSON and source-baseline evidence document. After any script path or byte change, regenerate `source_baseline_evidence` and the registration JSON with the new paths and SHA-256 digests before running `validate`, `plan`, `run`, or `measured_analyze.py`.
@@ -198,8 +221,10 @@ From the 10 normalized estimates of a visit:
 
 ### Quality and stability gates (all fail closed to `INCONCLUSIVE`)
 
+Every row, including `report_only` and `diagnostic` rows, must pass raw-sample validation and its duration floor. The statistical verdict gates below retain their stated role scope; counted sampling creates no exemption from a gate that applies to the row.
+
 1. **Effective CPU frequency control (`FREQ_RATIO_MAX = 1.03`)**: For every gated row (`acceptance`, `primary`, `cold`, `guard_keep`, `connect_guard`), each case's effective CPU frequency is `cycles_u / task_clock_ms` from `perf.csv`. The ratio `max(median_A, median_B) / min(median_A, median_B)` must be `<= 1.03` in the zero block (`candidate` vs `zero`), across all 12 measurement visits (`candidate` vs `control`), and within each of the three measurement ABBA blocks `1`, `2`, and `3` individually.
-2. **5% stability rule (`ARM_STABILITY_BAND = 0.05`)**: Applies to every gated row **except** T1 `acceptance` rows (`primary`, `cold`, `guard_keep`, `connect_guard`), in both measurement and zero blocks:
+2. **5% stability rule (`ARM_STABILITY_BAND = 0.05`)**: Applies to the governed non-`acceptance` gated roles (`primary`, `cold`, `guard_keep`, `connect_guard`), which is every gated row **except** T1 `acceptance` rows, in both measurement and zero blocks:
    - Within every visit (measurement and zero), all 10 normalized sample estimates `x_i` must lie within 5% of that visit's median `m`: `max_i |x_i - m| / m <= 0.05`.
    - Across visits, all 6 `candidate` visit medians must lie within 5% of `M_candidate`, all 6 `control` visit medians must lie within 5% of `M_control`, and all 4 zero-block visit medians must lie within 5% of their combined median.
 3. **T1 singleton acceptance noise gates (`CASE_STDDEV_RATIO_MAX = 0.20`, `ARM_SPREAD_MAX = 1.15`)**: Applies only to T1 `acceptance` rows (`mempool_insert_entry/fill/{200,800,3200,12800,51200}`), in both measurement and zero blocks:
@@ -328,5 +353,6 @@ This repository does not ship an automated control-tree generator or build wrapp
 
 1. Construct the five clean source-only directories (`candidate` and `control_T1..control_T4`) outside the working checkout, with no `.git` or `target` directories inside any root, and copy the exact five `bench_fingerprints` files and five `lock_fingerprints` files identically into every tree.
 2. Build the ten benchmark executables with each tree isolated in its own never-before-used Cargo target directory, build directory, and `TMPDIR` (and without `RUSTC_WRAPPER` cache sharing across trees), so compiler artifacts from one tree can never populate another tree's binary.
-3. Run `--mrp-verify`, `--mrp-verify-counted`, `--mrp-list-counted`, and `--list` on the built binaries to confirm untimed invariants and exact row IDs before writing receipts.
-4. Record the ten `rbitcoin-mrp-build-receipt` JSON files, the passed `source_baseline_evidence` and `dependency_baseline_evidence` JSON files, and the registration JSON, then verify the package with `measured_runner.py validate --registration <path>` and `measured_runner.py plan --registration <path>`.
+3. Run `--mrp-verify`, `--mrp-verify-counted`, `--mrp-list-counted`, and `--list` on the built binaries to confirm untimed invariants and exact row IDs before writing receipts (`sync_pipeline --list` also executes non-campaign timed proxy preludes whose printed timings are not campaign evidence).
+4. Capture the `corpus` and `node_identity` pins from the frozen executables, before writing the registration: run `--mrp-verify` with `BITCOIN_RS_VALIDATION_ENGINE=native` on `candidate/sync_pipeline`, `control_T2/sync_pipeline`, and `control_T3/sync_pipeline`; accept only logs with exit status `0` and a final `mrp-verify: PASS` line; require the `block_to_template corpus:` and `mrp-verify: node_identity ` lines to be byte-identical across the three logs; and retain the logs with the registration. The procedure and field mapping are in [Freeze-time capture](#freeze-time-capture). Never take these pins from measured campaign output.
+5. Record the ten `rbitcoin-mrp-build-receipt` JSON files, the passed `source_baseline_evidence` and `dependency_baseline_evidence` JSON files, and the registration JSON with `corpus` and `node_identity` transcribed from the step 4 logs, then verify the package with `measured_runner.py validate --registration <path>` and `measured_runner.py plan --registration <path>`.
