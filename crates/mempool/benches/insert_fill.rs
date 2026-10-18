@@ -241,8 +241,9 @@ fn mrp_verify_counted() {
     println!("mrp_verify_counted {COUNTED_CLUSTER_ROW} pass");
 }
 
-/// Builds the timed `fill/{size}` workload once, untimed: `size`
-/// independent transactions at the lifted relay floor.
+/// Builds the `fill/{size}` workload: `size` independent transactions at the
+/// lifted relay floor, with the residency assertion. The Criterion `fill/{size}`
+/// iteration times it; the `--mrp-verify` paths call it untimed.
 fn fill_pool(size: u64) -> Mempool {
     let mut pool = Mempool::new(MempoolLimits {
         min_relay_fee_sat_per_kvb: 0,
