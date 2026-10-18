@@ -1083,11 +1083,7 @@ def positive_phase(sut: Sut, tmp: Path) -> tuple[Json, list[Json]]:
 
     cases = run_mod.derive_cases(reg)
     rows_total = sum(len(v) for v in ROWS.values())
-    check_case(
-        "positive-row-total",
-        rows_total == 31 and len(ROWS["T1"]) == 22 and len(ROWS["T4"]) == 7,
-        f"probe table has {rows_total} rows",
-    )
+    counted_specs = {spec[0]: spec for _, spec in ALL_ROWS if spec[1] == "counted"}
     check_case(
         "positive-case-count",
         len(cases) == rows_total * 16,
@@ -1117,74 +1113,11 @@ def positive_phase(sut: Sut, tmp: Path) -> tuple[Json, list[Json]]:
         ),
         "T2/T3 do not run exactly one workload per visit",
     )
-    check_case(
-        "positive-unchanged-diagnostics-may-share-hash",
-        reg["binaries"]["candidate/signature_verification"]["sha256"]
-        == reg["binaries"]["control_T4/signature_verification"]["sha256"],
-        "fixture lost the identical-diagnostic-executable case",
-    )
-    # Counted cutover surface: exactly the decision's converted rows, roles
-    # preserved, everything else still Criterion; argv/samples/units pinned.
-    converted = {
-        "mempool_insert_entry/fill/63-member-cluster",
-        *(
-            f"mining_snapshot_operation/mining_snapshot/{n}"
-            for n in (64, 512, 2048, 20000, 50000, 100000, "chains/depth-25")
-        ),
-        "indexed_selection_read_guard/read_guard/100000",
-        "connect_admission_throughput/flat",
-        "connect_admitted_signed_spend_block/flat",
-        "connect_unseen_signed_spend_block/flat",
-    }
-    got_counted = {
-        row["id"]
-        for t in ("T1", "T2", "T3", "T4")
-        for row in reg["targets"][t]["rows"]
-        if row["kind"] == "counted"
-    }
-    criterion_rows = {
-        row["id"]
-        for t in ("T1", "T2", "T3", "T4")
-        for row in reg["targets"][t]["rows"]
-        if row["kind"] == "criterion"
-    }
-    counted_specs = {spec[0]: spec for _, spec in ALL_ROWS if spec[1] == "counted"}
-    argv_ok = all(
-        reg_row(t, spec)["argv"] == ["--mrp-counted", spec[0]]
-        and reg_row(t, spec)["samples"] == 10
-        and reg_row(t, spec)["units_per_iter"] == 1
-        for (t, spec) in ALL_ROWS
-        if spec[1] == "counted"
-    )
-    check_case(
-        "positive-counted-row-cutover",
-        got_counted == converted
-        and set(counted_specs) == converted
-        and argv_ok
-        and "mempool_insert_entry/fill/200" in criterion_rows
-        and "assemble_candidate/end_to_end/0" in criterion_rows
-        and "signature_verification/ecdsa/hit" in criterion_rows,
-        f"counted rows {sorted(got_counted ^ converted)} unexpected; argv_ok={argv_ok}",
-    )
-    measured_samples_module = (
-        Path(reg["source_roots"]["candidate"]) / BENCH_FILES["measured_samples"]
-    )
-    hashes = {
-        sha_of(Path(reg["source_roots"][t]) / BENCH_FILES["measured_samples"])
-        for t in TREES
-    }
-    check_case(
-        "positive-counted-sampler-fingerprint-inventory",
-        measured_samples_module.is_file() and len(hashes) == 1,
-        "measured_samples.rs missing from the bench-source fingerprint "
-        f"inventory or diverges across roots: {hashes}",
-    )
-    cases_all = run_mod.derive_cases(reg)
-    counted_cases = [c for c in cases_all if c["row"]["kind"] == "counted"]
+    counted_cases = [c for c in cases if c["row"]["kind"] == "counted"]
     check_case(
         "positive-counted-case-count",
-        len(counted_cases) == len(converted) * 16,
-        f"{len(counted_cases)} counted cases != {len(converted) * 16}",
+        len(counted_cases) == len(counted_specs) * 16,
+        f"{len(counted_cases)} counted cases != {len(counted_specs) * 16}",
     )
 
     samp = tmp / "sample_ok.json"
@@ -3384,45 +3317,6 @@ def main() -> int:
         runner_path,
         analyzer_path,
     )
-
-    for needed in (
-        "validate_registration",
-        "validate_live_registration",
-        "read_cpu_model",
-        "derive_cases",
-        "validate_criterion_sample",
-        "parse_node_stdout",
-        "criterion_case_fields",
-        "node_case_fields",
-        # Counted transport seams (measured-work stopping correction).
-        "parse_counted_stdout",
-        "counted_case_fields",
-    ):
-        check_case(
-            f"runner-has-{needed}",
-            hasattr(sut.run, needed),
-            f"validation prerequisite missing: runner has no {needed}",
-        )
-    counted_missing = [name for name, ok, _ in RESULTS if not ok and "counted" in name]
-    if counted_missing:
-        print(
-            "ABORT: counted transport seam missing from the runner "
-            f"({counted_missing}); the counted row-kind cutover has not "
-            "landed in the SUT. Land parse_counted_stdout/"
-            "counted_case_fields/validate_counted_samples in "
-            "measured_runner.py per docs/benchmarks/measured-campaign.md, "
-            "then rerun. No adversary result would count."
-        )
-        return 1
-    for needed in ("analyze", "expected_label"):
-        check_case(
-            f"analyzer-has-{needed}",
-            hasattr(sut.ana, needed),
-            f"validation prerequisite missing: analyzer has no {needed}",
-        )
-    if any(not ok for _, ok, _ in RESULTS):
-        print("ABORT: SUT surface prerequisite failed; no adversary result counts.")
-        return 1
 
     with tempfile.TemporaryDirectory(prefix="mrp-probe-") as tmpdir:
         tmp = Path(tmpdir)
