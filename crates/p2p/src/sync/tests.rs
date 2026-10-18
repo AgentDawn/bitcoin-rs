@@ -61,6 +61,9 @@ pub(crate) struct TestChain {
     minimum_chain_work: ChainWork,
     scripted_commit_failure: Mutex<Option<(Hash256, WindowApplyDisposition)>>,
     scripted_branch_switch: Mutex<Option<ScriptedBranchSwitch>>,
+    /// Publishes a new tip pair immediately after returning the old header
+    /// snapshot, making an observation-time tip race deterministic.
+    scripted_tip_update: Mutex<Option<(Arc<TipSnapshot>, Arc<TipSnapshot>)>>,
     historical: Mutex<std::collections::VecDeque<(u32, Hash256)>>,
     historical_connected: Mutex<Vec<Hash256>>,
     historical_replay_pending: Mutex<bool>,
@@ -80,6 +83,7 @@ impl TestChain {
             minimum_chain_work: ChainWork::from_be_bytes(Network::Regtest.minimum_chain_work()),
             scripted_commit_failure: Mutex::new(None),
             scripted_branch_switch: Mutex::new(None),
+            scripted_tip_update: Mutex::new(None),
             historical: Mutex::new(std::collections::VecDeque::new()),
             historical_connected: Mutex::new(Vec::new()),
             historical_replay_pending: Mutex::new(false),
@@ -154,7 +158,13 @@ impl SyncChain for TestChain {
     }
 
     fn chain_tip(&self) -> Option<Arc<TipSnapshot>> {
-        self.chain_tip.load_full()
+        let tip = self.chain_tip.load_full();
+        let update = self.scripted_tip_update.lock().take();
+        if let Some((chain, applied)) = update {
+            self.chain_tip.store(Some(chain));
+            self.applied_tip.store(Some(applied));
+        }
+        tip
     }
 
     fn applied_tip(&self) -> Option<Arc<TipSnapshot>> {
@@ -1388,7 +1398,7 @@ fn stage_body(sync: &BlockSync, block: &Block) {
 }
 
 fn cache_snapshot(sync: &BlockSync) -> Option<super::ExpectedApplyCache> {
-    sync.expected_apply_cache.lock().clone()
+    sync.scheduler.lock().expected_apply_cache.clone()
 }
 
 /// Commit a delivered fixture through the ordinary binding and apply path.
