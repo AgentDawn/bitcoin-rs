@@ -405,6 +405,11 @@ fn mrp_verify_removal_plan() {
         799,
         "the block must confirm exactly one entry"
     );
+    assert_eq!(
+        projected_count,
+        removed.len(),
+        "the projection must name every surviving entry"
+    );
     let live = removed.mining_snapshot();
     let mut live_state = 0xcbf2_9ce4_8422_2325_u64;
     for entry in &live.entries {

@@ -599,6 +599,10 @@ fn mrp_verify_end_to_end(ctx: &CandidateContext, payout: &[u8]) {
             .unwrap_or_else(|error| panic!("fixture assemble {count} failed: {error}"));
         let selected = select_template_body(&pool, ctx, payout)
             .unwrap_or_else(|error| panic!("fixture selection {count} failed: {error}"));
+        assert!(
+            !selected.transactions.is_empty(),
+            "fixture selection {count} must select at least one transaction"
+        );
         assert_selection_sound(&pool, &selected);
         assert_eq!(
             candidate
@@ -628,6 +632,10 @@ fn mrp_verify_end_to_end(ctx: &CandidateContext, payout: &[u8]) {
     );
     let chained = select_template_body(&chains, ctx, payout)
         .unwrap_or_else(|error| panic!("chained selection failed: {error}"));
+    assert!(
+        !chained.transactions.is_empty(),
+        "chained fixture selection must select at least one transaction"
+    );
     assert_selection_sound(&chains, &chained);
     println!(
         "mrp_verify end_to_end/chains/depth-25 entries={} order_fp={:016x} body_fp={:016x}",
@@ -649,6 +657,17 @@ fn mrp_verify_removal_plan(ctx: &CandidateContext, payout: &[u8]) {
     };
     let projected = select_template_body_after(&source, &plan, ctx, payout)
         .unwrap_or_else(|error| panic!("projected selection failed: {error}"));
+    assert!(
+        !projected.transactions.is_empty(),
+        "projected selection must select at least one transaction"
+    );
+    assert!(
+        projected
+            .transactions
+            .iter()
+            .all(|tx| tx.txid != victim_txid),
+        "projected selection must exclude the removed victim"
+    );
     let mut twin = snapshot_with(512);
     let victim_ref: &Tx = &victim_tx;
     twin.remove_for_block(std::slice::from_ref(&victim_ref), &[victim_txid], 250, 20);
