@@ -3,7 +3,8 @@ mod server;
 mod template;
 
 use bitcoin_rs_mining::{
-    BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult, MiningControlError,
+    BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult, Candidate, MiningControlError,
+    TemplateId,
 };
 use bitcoin_rs_node::{Network, Node, NodeConfig, RuntimeInputs};
 use futures_executor::block_on;
@@ -15,7 +16,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use stratum_apps::key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use template::TemplateState;
@@ -71,9 +72,12 @@ fn config_from_env() -> Result<(Config, NodeConfig), String> {
     ))
 }
 
+/// Shared by every session: a generation counter that wakes them, and the
+/// bounded history of jobs they issued. A session pins its own current job, so
+/// this history only has to answer for superseded ones.
 #[derive(Clone)]
 pub struct Hub {
-    latest: watch::Sender<Option<Arc<TemplateState>>>,
+    generation: watch::Sender<u64>,
     issued: Arc<Mutex<BTreeMap<u64, Arc<TemplateState>>>>,
     next_id: Arc<AtomicU64>,
 }
@@ -81,34 +85,59 @@ pub struct Hub {
 impl Hub {
     fn new() -> Self {
         Self {
-            latest: watch::channel(None).0,
+            generation: watch::channel(0).0,
             issued: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
-    fn subscribe(&self) -> watch::Receiver<Option<Arc<TemplateState>>> {
-        self.latest.subscribe()
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+    /// Tells every session the mining owner's generation moved. It carries no
+    /// candidate: each session asks the owner for one fitting its own budget.
+    fn wake(&self) {
+        self.generation.send_modify(|count| *count += 1);
     }
     pub fn lookup(&self, id: u64) -> Option<Arc<TemplateState>> {
         self.issued.lock().unwrap().get(&id).cloned()
     }
-    fn publish(&self, candidate: Arc<bitcoin_rs_mining::Candidate>) {
+    /// Returns the retained job for `candidate`'s owner identity, or retains a
+    /// new one. Sessions given equal identities share one id and one state.
+    fn issue(&self, candidate: Arc<Candidate>) -> Arc<TemplateState> {
+        if let Some(state) = retained(&self.issued.lock().unwrap(), &candidate.template_id) {
+            return state;
+        }
+        // Built before taking the lock again: hashing the merkle branch is
+        // linear in the transaction count.
         let state = Arc::new(TemplateState::new(
             self.next_id.fetch_add(1, Ordering::Relaxed),
             candidate,
         ));
         let mut issued = self.issued.lock().unwrap();
+        if let Some(raced) = retained(&issued, &state.candidate.template_id) {
+            return raced;
+        }
         issued.insert(state.id, Arc::clone(&state));
         while issued.len() > RETAINED_TEMPLATES {
             issued.pop_first();
         }
-        drop(issued);
-        self.latest.send_replace(Some(state));
+        state
     }
 }
 
+fn retained(
+    issued: &BTreeMap<u64, Arc<TemplateState>>,
+    identity: &TemplateId,
+) -> Option<Arc<TemplateState>> {
+    issued
+        .values()
+        .find(|state| state.candidate.template_id == *identity)
+        .map(Arc::clone)
+}
+
 // A dedicated OS worker owns the synchronous long poll. It holds no Node lock
-// between calls, and the injected normal shutdown signal cancels the wait.
+// between calls, and the injected normal shutdown signal cancels the wait. Its
+// unconstrained template is never sent to a pool: it only wakes the sessions.
 fn template_loop(
     mut get_template: impl FnMut(
         BlockTemplateRequest,
@@ -122,6 +151,7 @@ fn template_loop(
             capabilities: vec![],
             rules: vec![],
             long_poll_id: long_poll_id.clone(),
+            coinbase_budget: None,
         };
         let result = match get_template(request) {
             Ok(result) => result,
@@ -138,13 +168,10 @@ fn template_loop(
             return Err("unexpected proposal response".into());
         };
         long_poll_id = Some(template.candidate.template_id.as_str().into());
-        let started = Instant::now();
-        let height = template.candidate.height;
-        hub.publish(template.candidate);
+        hub.wake();
         info!(
-            height,
-            projection_us = started.elapsed().as_micros(),
-            "issued typed template"
+            height = template.candidate.height,
+            "generation changed; waking sessions"
         );
     }
 }

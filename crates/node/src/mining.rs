@@ -27,6 +27,7 @@ use bitcoin_rs_mining::BlockValidationResult;
 use bitcoin_rs_mining::Candidate;
 use bitcoin_rs_mining::CandidateContext;
 use bitcoin_rs_mining::ChainContextSource;
+use bitcoin_rs_mining::CoinbaseBudget;
 use bitcoin_rs_mining::GenerateRequest;
 use bitcoin_rs_mining::GenerateSelection;
 use bitcoin_rs_mining::GenerateTx;
@@ -267,10 +268,12 @@ impl MempoolSnapshotSource for MempoolAdapter {
         expected_sequences: Option<(u64, u64)>,
         context: &CandidateContext,
         payout: &[u8],
+        budget: Option<CoinbaseBudget>,
     ) -> Result<Option<SelectedBody>, MiningControlError> {
         // One read guard covers both sequence checks and the index walk; only
         // the selected transactions leave the pool, and the guard drops
-        // before the service builds the coinbase and Merkle roots.
+        // before the service builds the coinbase and Merkle roots. A budget
+        // reaches the same selector the ordinary walk uses.
         let pool = self.mempool.read();
         if expected_sequences.is_some_and(|(sequence, fee_delta_sequence)| {
             pool.sequence_number() != sequence
@@ -278,7 +281,7 @@ impl MempoolSnapshotSource for MempoolAdapter {
         }) {
             return Ok(None);
         }
-        select_template_body(&pool, context, payout)
+        select_template_body(&pool, context, payout, budget)
             .map(Some)
             .map_err(|error| MiningControlError::Failed(CompactString::from(error.to_string())))
     }
@@ -438,7 +441,7 @@ impl MiningControl for MiningCoordinator {
             }
             BlockTemplateMode::Template => Ok(BlockTemplateResult::Template(
                 self.service
-                    .get_block_template(request.long_poll_id.as_deref())?,
+                    .get_block_template(request.long_poll_id.as_deref(), request.coinbase_budget)?,
             )),
         }
     }

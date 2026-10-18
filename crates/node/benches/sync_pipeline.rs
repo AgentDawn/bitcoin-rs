@@ -3282,6 +3282,7 @@ fn template_render_request() -> BlockTemplateRequest {
         capabilities: Vec::new(),
         rules: Vec::new(),
         long_poll_id: None,
+        coinbase_budget: None,
     }
 }
 

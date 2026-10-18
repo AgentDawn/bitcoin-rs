@@ -7,7 +7,8 @@ use bitcoin_rs_primitives::Tx;
 
 use crate::MiningError;
 use crate::template::{
-    CandidateContext, FixedReservation, SelectedBody, SelectedTx, transaction_count_size,
+    CandidateContext, FixedReservation, Reservation, SelectedBody, SelectedTx,
+    transaction_count_size,
 };
 
 /// Core `DEFAULT_BLOCK_MIN_TX_FEE` (`policy.h`): the lowest rate a template
@@ -373,37 +374,37 @@ impl Selection {
 /// rule here. `sequences` is the generation the body was read at: the live
 /// sequences for the live walk, or the predicted post-removal sequences for a
 /// projection. The projection owner must outlive the borrowed iteration.
+///
+/// `reservation.growth` is the room a budgeted consumer's coinbase may add. It
+/// starts the running totals beside the header, coinbase, and empty count, so
+/// the walk and the tail pass see one set of limits and choose a body that
+/// leaves it. The block's own weight never includes it: the returned body
+/// weight and `reservation.fixed` describe only what the block contains. An
+/// empty block that cannot hold the growth is refused before any chunk is read.
 pub(crate) fn select_packages<'a>(
     context: &CandidateContext,
     pool: &Mempool,
     chunks: impl Iterator<Item = ChunkView<'a>>,
     sequences: (u64, u64),
-    reservation: FixedReservation,
+    reservation: Reservation,
 ) -> Result<SelectedBody, MiningError> {
     let count_size = transaction_count_size(0)?;
-    let weight = reservation
-        .weight
-        .checked_add(count_size * 4)
-        .ok_or(MiningError::CandidateScalarOverflow { field: "weight" })?;
-    let size = reservation
-        .size
-        .checked_add(count_size)
-        .ok_or(MiningError::CandidateScalarOverflow { field: "size" })?;
-    if weight > context.max_weight {
-        return Err(MiningError::CapacityExhausted { field: "weight" });
-    }
-    if size > context.max_size {
-        return Err(MiningError::CapacityExhausted { field: "size" });
-    }
-    if reservation.sigops > context.max_sigops {
-        return Err(MiningError::CapacityExhausted { field: "sigops" });
-    }
+    let empty_count = FixedReservation {
+        weight: count_size * 4,
+        size: count_size,
+        sigops: 0,
+    };
+    let start = reservation
+        .fixed
+        .checked_add(empty_count)?
+        .checked_add(reservation.growth)?;
+    start.check(context.max_weight, context.max_size, context.max_sigops)?;
 
     let mut selection = Selection {
         usage: BodyUsage {
-            weight,
-            size,
-            sigops: reservation.sigops,
+            weight: start.weight,
+            size: start.size,
+            sigops: start.sigops,
             fees: 0,
         },
         selected: HashSet::new(),
@@ -412,13 +413,18 @@ pub(crate) fn select_packages<'a>(
     let skipped = selection.walk(context, pool, chunks)?;
     selection.fill_tail(context, pool, skipped)?;
 
+    let held_back = reservation
+        .fixed
+        .weight
+        .saturating_add(reservation.growth.weight);
     Ok(SelectedBody {
         sequence: sequences.0,
         fee_delta_sequence: sequences.1,
         transactions: selection.ordered,
         fees: selection.usage.fees,
-        weight: selection.usage.weight.saturating_sub(reservation.weight),
-        reservation,
+        weight: selection.usage.weight.saturating_sub(held_back),
+        reservation: reservation.fixed,
+        budget: reservation.budget,
     })
 }
 

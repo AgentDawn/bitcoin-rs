@@ -1,39 +1,45 @@
 //! Production public-Node consumer: no RPC client, test seam, or fake coordinator.
 use super::*;
 use bitcoin::hashes::Hash as _;
-use bitcoin_rs_mining::{BlockValidationResult, GenerateRequest, GenerateSelection, solve_block};
-use bitcoin_rs_primitives::{
-    Amount, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
+use bitcoin_rs_mining::{
+    BlockValidationResult, CoinbaseBudget, GenerateRequest, GenerateSelection, solve_block,
 };
+use bitcoin_rs_primitives::{
+    Amount, Hash256, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
+};
+use std::time::Instant;
 use stratum_apps::stratum_core::{bitcoin, template_distribution_sv2::SubmitSolutionOwned};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-pub(super) fn empty_candidate() -> bitcoin_rs_mining::Candidate {
+/// An empty candidate on the parent `parent`; distinct parents have distinct identities.
+pub(super) fn empty_candidate(parent: u8) -> Arc<Candidate> {
     use bitcoin_rs_mining::{CandidateContext, assemble_candidate};
-    assemble_candidate(
-        &CandidateContext {
-            previous_block_hash: Default::default(),
-            height: 1,
-            version: 0x20000000,
-            bits: bitcoin_rs_primitives::CompactTarget::from_consensus(0x207fffff),
-            min_time: 1,
-            current_time: 1,
-            locktime_cutoff: 1,
-            network: Network::Regtest,
-            csv_active: true,
-            segwit_active: true,
-            max_weight: 4_000_000,
-            max_size: 4_000_000,
-            max_sigops: 80_000,
-        },
-        &bitcoin_rs_mempool::Mempool::new(Default::default()).mining_snapshot(),
-        &[0x51],
+    Arc::new(
+        assemble_candidate(
+            &CandidateContext {
+                previous_block_hash: Hash256::from_le_bytes(&[parent; 32]),
+                height: 1,
+                version: 0x20000000,
+                bits: bitcoin_rs_primitives::CompactTarget::from_consensus(0x207fffff),
+                min_time: 1,
+                current_time: 1,
+                locktime_cutoff: 1,
+                network: Network::Regtest,
+                csv_active: true,
+                segwit_active: true,
+                max_weight: 4_000_000,
+                max_size: 4_000_000,
+                max_sigops: 80_000,
+            },
+            &bitcoin_rs_mempool::Mempool::new(Default::default()),
+            &[0x51],
+        )
+        .unwrap(),
     )
-    .unwrap()
 }
 
-fn candidate(node: &Node) -> Arc<bitcoin_rs_mining::Candidate> {
+fn candidate(node: &Node) -> Arc<Candidate> {
     let result = node
         .mining_control()
         .unwrap()
@@ -42,6 +48,7 @@ fn candidate(node: &Node) -> Arc<bitcoin_rs_mining::Candidate> {
             capabilities: vec![],
             rules: vec![],
             long_poll_id: None,
+            coinbase_budget: None,
         })
         .unwrap();
     let BlockTemplateResult::Template(template) = result else {
@@ -50,12 +57,14 @@ fn candidate(node: &Node) -> Arc<bitcoin_rs_mining::Candidate> {
     template.candidate
 }
 
-async fn next(rx: &mut watch::Receiver<Option<Arc<TemplateState>>>) -> Arc<TemplateState> {
-    tokio::time::timeout(Duration::from_secs(5), rx.changed())
+/// Waits for the worker's next wake, then does what a session does: asks the
+/// mining owner for its own candidate and retains it.
+async fn next(hub: &Hub, wakes: &mut watch::Receiver<u64>, node: &Node) -> Arc<TemplateState> {
+    tokio::time::timeout(Duration::from_secs(5), wakes.changed())
         .await
         .unwrap()
         .unwrap();
-    rx.borrow_and_update().clone().unwrap()
+    hub.issue(candidate(node))
 }
 
 #[tokio::test]
@@ -92,6 +101,10 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
             |request| {
                 calls += 1;
                 assert_eq!(request.long_poll_id.as_deref(), last_id.as_deref());
+                assert_eq!(
+                    request.coinbase_budget, None,
+                    "the worker only learns that the generation moved"
+                );
                 if let Some(started) = retry_started.take() {
                     assert!(started.elapsed() >= TEMPLATE_RETRY_DELAY);
                 }
@@ -112,7 +125,7 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
             worker_hub,
         )
     });
-    let first = next(&mut updates).await;
+    let first = next(&hub, &mut updates, &node).await;
     let c = Arc::clone(&first.candidate);
     let wire = first.new_template_msg()?;
     assert_eq!(wire.coinbase_tx_value_remaining, c.coinbase_value);
@@ -129,8 +142,16 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
             .flat_map(consensus_bytes)
             .collect::<Vec<_>>()
     );
-    assert!(first.fits_constraints(1000, 100));
-    assert!(!first.fits_constraints(u32::MAX, u32::MAX));
+    let ample = CoinbaseBudget {
+        additional_size: 1000,
+        additional_sigops: 100,
+    };
+    let unbounded = CoinbaseBudget {
+        additional_size: u32::MAX,
+        additional_sigops: u16::MAX,
+    };
+    assert!(first.candidate.admits(ample).is_ok());
+    assert!(first.candidate.admits(unbounded).is_err());
     let mut solved = c.into_unsolved_block()?;
     solve_block(&mut solved, 1_000_000)?;
     let solution = SubmitSolutionOwned {
@@ -156,8 +177,8 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
         .await??,
         BlockValidationResult::Accepted
     );
-    let second = next(&mut updates).await;
-    assert_ne!(second.candidate.template_id, c.template_id);
+    let second = next(&hub, &mut updates, &node).await;
+    assert_ne!(second.candidate.template_id, first.candidate.template_id);
     assert!(Arc::ptr_eq(&hub.lookup(first.id).unwrap(), &first));
     assert_eq!(
         node.mining_control()?
@@ -190,7 +211,7 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
             witness: Witness::from_stack(vec![vec![0x51]]),
         }],
         outputs: vec![TxOut {
-            value: Amount::from_sat(c.coinbase_value - 2000),
+            value: Amount::from_sat(first.candidate.coinbase_value - 2000),
             script_pubkey: funding.outputs[0].script_pubkey.clone(),
         }],
     };
@@ -202,19 +223,19 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
     let after = candidate(&node);
     assert_eq!(before.previous_block_hash, after.previous_block_hash);
     assert_ne!(before.template_id, after.template_id);
+    // The worker wakes once per generation; the template a session would be
+    // given for the generation that admitted the transaction carries it.
     let with_tx = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let latest = updates.borrow_and_update().clone();
-            if let Some(state) = latest
-                && state
-                    .candidate
-                    .transactions
-                    .iter()
-                    .any(|entry| entry.txid == txid)
+            let state = next(&hub, &mut updates, &node).await;
+            if state
+                .candidate
+                .transactions
+                .iter()
+                .any(|entry| entry.txid == txid)
             {
                 break state;
             }
-            updates.changed().await.unwrap();
         }
     })
     .await?;
@@ -260,11 +281,6 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
         BlockValidationResult::Rejected(_)
     ));
 
-    for _ in 0..RETAINED_TEMPLATES + 1 {
-        hub.publish(Arc::clone(&c));
-    }
-    assert!(hub.lookup(first.id).is_none());
-    assert_eq!(hub.issued.lock().unwrap().len(), RETAINED_TEMPLATES);
     shutdown_tx.send(())?;
     let ended = tokio::time::timeout(
         Duration::from_secs(5),
@@ -276,6 +292,35 @@ async fn embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown() -
     let node = Arc::try_unwrap(node).map_err(|_| "live node borrower")?;
     tokio::task::spawn_blocking(move || block_on(node.shutdown())).await??;
     Ok(())
+}
+
+#[test]
+fn equal_candidate_identities_share_one_job_and_history_stays_bounded() {
+    let hub = Hub::new();
+    let first = hub.issue(empty_candidate(1));
+    // A second session given the same owner identity gets the same job.
+    assert!(Arc::ptr_eq(&hub.issue(empty_candidate(1)), &first));
+    assert!(Arc::ptr_eq(&hub.lookup(first.id).unwrap(), &first));
+    for parent in (2..).take(RETAINED_TEMPLATES) {
+        hub.issue(empty_candidate(parent));
+    }
+    assert_eq!(hub.issued.lock().unwrap().len(), RETAINED_TEMPLATES);
+    assert!(hub.lookup(first.id).is_none());
+    // Only a retained state deduplicates: an evicted identity is issued afresh.
+    assert_ne!(hub.issue(empty_candidate(1)).id, first.id);
+}
+
+#[test]
+fn worker_wake_reaches_every_subscriber_without_carrying_a_job() {
+    let hub = Hub::new();
+    let (mut a, mut b) = (hub.subscribe(), hub.subscribe());
+    assert!(!a.has_changed().unwrap());
+    hub.wake();
+    hub.wake();
+    // Wakes coalesce: sessions refresh from the owner's live generation.
+    assert!(a.has_changed().unwrap() && b.has_changed().unwrap());
+    assert_eq!((*a.borrow_and_update(), *b.borrow_and_update()), (2, 2));
+    assert!(hub.issued.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -299,7 +344,7 @@ fn template_errors_other_than_generation_races_are_terminal() {
             hub.clone(),
         );
         assert_eq!(result, Err(error.to_string()));
-        assert!(hub.subscribe().borrow().is_none());
+        assert_eq!(*hub.subscribe().borrow(), 0, "a failed poll wakes nobody");
     }
 }
 

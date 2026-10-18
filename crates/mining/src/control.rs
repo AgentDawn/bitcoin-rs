@@ -17,7 +17,7 @@ use compact_str::CompactString;
 #[cfg(any(test, feature = "test-seam"))]
 use parking_lot::Mutex;
 
-use crate::Candidate;
+use crate::{Candidate, CoinbaseBudget};
 
 /// One capability advertised by a `getblocktemplate` caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +75,18 @@ pub struct BlockTemplateRequest {
     pub rules: Vec<MiningRule>,
     /// Opaque BIP22/BIP23 generation to wait beyond in template mode.
     pub long_poll_id: Option<CompactString>,
+    /// Coinbase growth the consumer will add after assembly, in template mode.
+    ///
+    /// `None` is the ordinary template: its selection, identity, long-poll id,
+    /// and reporting are unchanged. `Some` asks the owner for a template whose
+    /// selected body already leaves that room, so a consumer that rebuilds the
+    /// coinbase (a Stratum V2 pool) never receives a body too full to extend.
+    /// The returned candidate's `template_id` is authoritative: the owner may
+    /// answer with the generation's ordinary candidate when it already admits
+    /// the budget. An unsatisfiable budget fails as
+    /// [`MiningControlError::Failed`]. Proposal mode ignores the field; the
+    /// BIP22/BIP23 JSON surface never sets it.
+    pub coinbase_budget: Option<CoinbaseBudget>,
 }
 
 /// One versionbits deployment available for caller negotiation.

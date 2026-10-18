@@ -303,11 +303,15 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 - **Contract & matrix**: [`docs/contracts/ecosystem-compatibility.md`](contracts/ecosystem-compatibility.md) (`ECO-08`),
   [`docs/api/ecosystem-compat.toml`](api/ecosystem-compat.toml).
 - **Status overview**:
-  - **Externally verified**: P2P v1 wire protocol, Compact block relay (BIP152), BIP324 v2 transport.
+  - **Externally verified**: P2P v1 wire protocol, Compact block relay (BIP152),
+    Compact block filters (BIP157/BIP158), BIP324 v2 transport.
   - **Partially compatible**: Peer lifecycle and address management (recorded deviations in P2P policy).
   - **Implemented**: JSON-RPC, REST, ZMQ notifications, Esplora-compatible API, GetBlockTemplate,
     block submission, USDT tracepoints.
-  - **Intentionally unsupported**: BIP157/BIP158 (block filters), Stratum V2 / Core IPC adapters.
+  - **Experimental**: the Stratum V2 Template Distribution adapter, a regtest-only example
+    outside the workspace (not a compatibility commitment, no production pool
+    qualification; see [`tools/stratum-sv2/README.md`](../tools/stratum-sv2/README.md)).
+  - **Intentionally unsupported**: Core IPC adapters.
 - **Reproduction & audit**:
   - Audit status strings against the canonical matrix:
     ```sh

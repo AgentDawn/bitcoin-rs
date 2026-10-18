@@ -46,6 +46,79 @@ captures both live pool revisions.
 Long-poll IDs retain `hash<sequence>` at fee revision zero, otherwise append
 `:<fee_revision>`. Both forms are accepted; legacy IDs imply fee revision zero.
 
+## Coinbase-budgeted templates
+
+A consumer that rebuilds the coinbase, such as a Stratum V2 pool, asks for room
+instead of refusing a body that left none. [`BlockTemplateRequest::coinbase_budget`](crate::BlockTemplateRequest::coinbase_budget)
+carries a [`CoinbaseBudget`](crate::CoinbaseBudget): the serialized bytes
+(`additional_size`) and BIP141 sigop cost (`additional_sigops`, already in
+cost units and never rescaled) of the outputs it will add. `None` is the
+ordinary template: selection, identity, long-poll id, reporting, and every
+existing caller are unchanged. Only template mode on the typed `MiningControl`
+surface carries a budget; `generate`, proposals, and the BIP22/BIP23 JSON
+surface never do.
+
+- **One rule, derived from the owner's coinbase.** The same selector
+  (`select_packages`) serves ordinary, prepared, and budgeted selection. A
+  budget adds *growth* to its starting totals: `additional_size`, the scriptSig
+  headroom to the 100-byte consensus limit, and the extra `CompactSize` width the
+  output count may need (at least 9 bytes per output bounds how many outputs
+  `additional_size` buys, so the width is derived, not assumed). Every grown
+  byte is non-witness, so weight growth is four times size growth. The sigop
+  allowance is added to the coinbase's own sigop cost, which stays in the fixed
+  reservation. The header, transaction count, and owner coinbase are counted
+  once, and `Candidate.weight` is always the real block weight: the growth is
+  held back from the limits, never included in the block. The owner payout
+  output stays counted although a consumer that replaces it needs less, a
+  deliberate conservative slack.
+- **Empty infeasibility.** When the empty block cannot hold the growth, the
+  selector fails before reading any chunk with `MiningError::CapacityExhausted`
+  naming the first of weight, size, and sigops. The facade reports it as the
+  existing `MiningControlError::Failed`, which is terminal for that budget.
+  `Some(0, 0)` still reserves the coinbase's growth, so it is not `None`.
+- **One fit rule.** [`Candidate::admits`](crate::Candidate::admits) applies the
+  same check to a finished candidate from its actual weight, serialized size,
+  and sigop cost (coinbase included) plus the growth derived from its own
+  coinbase. A tight feasible pool therefore gets a body the selector chose to
+  fit, rather than a candidate refused after selection.
+- **Identity.** A cached candidate is keyed by generation and budget. A
+  budgeted candidate's `template_id` appends `@cb<size>.<sigops>` to the
+  generation id; ordinary ids stay byte-identical. A long-poll id may carry the
+  qualifier, which parses strictly (canonical decimals, exact grammar) and is
+  then dropped: waiting compares generations, and the budget of the template
+  served next comes from the request.
+- **Reuse is an optimisation, not a claim.** A budgeted request is answered by
+  the exact cached candidate, else by the generation's ordinary candidate (the
+  cached one, or a finished preparation that already holds its committed
+  receipt, installed without waiting) when it `admits` the budget, else by one
+  selection under the budget. The returned `template_id` says which. Nothing is
+  promised about how a budgeted body relates to the ordinary one: a greedy walk
+  under tighter limits may skip a large early chunk and take different later
+  ones. A budgeted request never assembles an ordinary candidate, never
+  compares a budgeted id against a preparation, and so never discards one.
+  Budgeted assemblies do not update `last_candidate`.
+- **Finite owner admission.** At most one budgeted selection walks the pool at a
+  time, beside the ordinary single flight, which neither waits for it nor
+  displaces it. Publication drops the old generation's cached candidates of
+  every budget but never frees the slot while its assembler runs; the
+  assembler's guard releases it on every exit, including unwinding, and an
+  install for a generation that is no longer live is refused under the
+  coordinator mutex. A caller behind the slot waits at most one second per
+  attempt and at most eight attempts per call, re-running the cache and reuse
+  lookups on each wake and ending at the next wake after shutdown. Exhaustion
+  is `Unavailable` and classified retryable by
+  [`MiningControlError::is_template_generation_race`](crate::MiningControlError::is_template_generation_race),
+  like a generation race. Nothing promises progress under endless generation
+  churn or contention; each call starts afresh.
+- **Memory.** The cache bounds entries (eight, shared by every budget), not
+  memory. A candidate owns its transactions and their hex, and the `Arc`s served
+  to callers, or reused from the ordinary slot, stay alive after eviction for as
+  long as their holders keep them.
+
+Consistency: selection reads the pool under one guard (snapshot isolation);
+cache publication, installs, and slot hand-off are linearizable under the
+coordinator mutex. Repeated identical requests and notifications are idempotent.
+
 ## Projected selection and template preparation
 
 During durable block synchronization, the node stages prospective tip blocks to

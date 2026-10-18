@@ -4,18 +4,24 @@ use bitcoin_rs_chain::{BlockTree, ChainTxCount, NodeStatus};
 use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
 use bitcoin_rs_primitives::{Block, Sequence, TxIn, Txid, Witness};
 use compact_str::CompactString;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-struct Sources {
+/// Real block tree and pool behind every capability source, shared with the
+/// coinbase-budget proofs.
+pub(super) struct Sources {
     tree: BlockTree,
-    tip: TipSnapshot,
-    pool: Mutex<Mempool>,
+    pub(super) tip: TipSnapshot,
+    pub(super) pool: Mutex<Mempool>,
     // Signals a particular live-key read while the service holds its state lock.
     wait_probe: Mutex<Option<(usize, Sender<()>)>>,
+    /// Selections that walked the pool for the ordinary template.
+    pub(super) ordinary_walks: AtomicUsize,
+    /// Selections that walked the pool under a coinbase budget.
+    pub(super) budgeted_walks: AtomicUsize,
 }
 
 impl AppliedTipSource for Sources {
@@ -58,6 +64,7 @@ impl MempoolSnapshotSource for Sources {
         expected_sequences: Option<(u64, u64)>,
         context: &CandidateContext,
         payout: &[u8],
+        budget: Option<CoinbaseBudget>,
     ) -> Result<Option<SelectedBody>, MiningControlError> {
         // One read guard covers both sequence checks and the index walk; only
         // the selected transactions leave the pool, and the guard drops
@@ -68,7 +75,13 @@ impl MempoolSnapshotSource for Sources {
         }) {
             return Ok(None);
         }
-        select_template_body(&pool, context, payout)
+        let walks = if budget.is_some() {
+            &self.budgeted_walks
+        } else {
+            &self.ordinary_walks
+        };
+        walks.fetch_add(1, Ordering::SeqCst);
+        select_template_body(&pool, context, payout, budget)
             .map(Some)
             .map_err(|error| MiningControlError::Failed(CompactString::from(error.to_string())))
     }
@@ -118,7 +131,9 @@ impl MempoolSnapshotSource for Sources {
     }
 }
 
-fn fixture() -> TestResult<(Arc<Sources>, Arc<MiningService>, Txid)> {
+/// A service over `pool` with a real genesis block tree: the applied tip is
+/// genesis, so the candidate under assembly is block 1 on regtest.
+pub(super) fn service_over(pool: Mempool) -> TestResult<(Arc<Sources>, Arc<MiningService>)> {
     let mut tree = BlockTree::new();
     let genesis = Network::Regtest.genesis_block();
     let tip_id = tree.insert_header(genesis.header, NodeStatus::HeaderValid)?;
@@ -130,6 +145,26 @@ fn fixture() -> TestResult<(Arc<Sources>, Arc<MiningService>, Txid)> {
         chainwork: node.chainwork,
         chain_tx_count: ChainTxCount::established(1),
     };
+    let source = Arc::new(Sources {
+        tree,
+        tip,
+        pool: Mutex::new(pool),
+        wait_probe: Mutex::new(None),
+        ordinary_walks: AtomicUsize::new(0),
+        budgeted_walks: AtomicUsize::new(0),
+    });
+    let service = Arc::new(MiningService::new(
+        Network::Regtest,
+        source.clone(),
+        source.clone(),
+        source.clone(),
+        vec![0x51],
+        Arc::new(AtomicBool::new(false)),
+    ));
+    Ok((source, service))
+}
+
+fn fixture() -> TestResult<(Arc<Sources>, Arc<MiningService>, Txid)> {
     let mut pool = Mempool::new(MempoolLimits::default());
     let mut low = Txid::default();
     for (label, fee) in [(1_u8, 1_000), (2, 10_000)] {
@@ -153,31 +188,18 @@ fn fixture() -> TestResult<(Arc<Sources>, Arc<MiningService>, Txid)> {
         // Entries supply admitted mining facts; this is not a consensus-spend test.
         pool.insert_entry(MempoolEntry::new(tx, 100, fee, 1, 0, 0))?;
     }
-    let source = Arc::new(Sources {
-        tree,
-        tip,
-        pool: Mutex::new(pool),
-        wait_probe: Mutex::new(None),
-    });
-    let service = Arc::new(MiningService::new(
-        Network::Regtest,
-        source.clone(),
-        source.clone(),
-        source.clone(),
-        vec![0x51],
-        Arc::new(AtomicBool::new(false)),
-    ));
+    let (source, service) = service_over(pool)?;
     Ok((source, service, low))
 }
 
 #[test]
 fn prioritisation_rebuilds_cached_order_and_wakes_a_waiting_long_poll() -> TestResult {
     let (source, service, low) = fixture()?;
-    let first = service.get_block_template(None)?.candidate;
+    let first = service.get_block_template(None, None)?.candidate;
     assert_ne!(first.transactions[0].txid, low);
     assert!(Arc::ptr_eq(
         &first,
-        &service.get_block_template(None)?.candidate
+        &service.get_block_template(None, None)?.candidate
     ));
     let original = source.current_revisions();
     let legacy_id = TemplateId::new(&source.tip.hash, original.0);
@@ -189,7 +211,7 @@ fn prioritisation_rebuilds_cached_order_and_wakes_a_waiting_long_poll() -> TestR
     let (done_tx, done_rx) = channel();
     let waiting = Arc::clone(&service);
     let poll = thread::spawn(move || {
-        let _ = done_tx.send(waiting.get_block_template(Some(legacy_id.as_str())));
+        let _ = done_tx.send(waiting.get_block_template(Some(legacy_id.as_str()), None));
     });
     entered_rx.recv_timeout(Duration::from_secs(2))?;
     // The signalled predicate holds this mutex. Acquiring it proves that the
@@ -206,7 +228,7 @@ fn prioritisation_rebuilds_cached_order_and_wakes_a_waiting_long_poll() -> TestR
     assert!(!Arc::ptr_eq(&first, &next));
     assert!(Arc::ptr_eq(
         &next,
-        &service.get_block_template(None)?.candidate
+        &service.get_block_template(None, None)?.candidate
     ));
     Ok(())
 }
@@ -224,7 +246,7 @@ fn stale_fee_snapshot_cannot_populate_the_candidate_cache() -> TestResult {
         service
             .state
             .lock()
-            .cache_get(&stale.template_id())
+            .cache_get(&CandidateKey::ordinary(stale))
             .is_none()
     );
     let full = source.pool.lock().mining_snapshot();
@@ -239,7 +261,11 @@ fn stale_fee_snapshot_cannot_populate_the_candidate_cache() -> TestResult {
         (full.sequence, full.fee_delta_sequence)
     );
     assert_eq!(
-        service.get_block_template(None)?.candidate.transactions[0].txid,
+        service
+            .get_block_template(None, None)?
+            .candidate
+            .transactions[0]
+            .txid,
         low
     );
     Ok(())

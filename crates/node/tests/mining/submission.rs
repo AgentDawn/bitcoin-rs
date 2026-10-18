@@ -39,6 +39,7 @@ fn proposal_has_no_side_effects() -> Result<()> {
         capabilities: Vec::new(),
         rules: Vec::new(),
         long_poll_id: None,
+        coinbase_budget: None,
     })?;
     match result {
         BlockTemplateResult::Proposal(BlockValidationResult::Accepted) => {}
@@ -73,6 +74,7 @@ fn proposal_rejects_excess_coinbase_without_side_effects() -> Result<()> {
         capabilities: Vec::new(),
         rules: Vec::new(),
         long_poll_id: None,
+        coinbase_budget: None,
     })?;
     match result {
         BlockTemplateResult::Proposal(BlockValidationResult::Rejected(reason)) => {
@@ -661,6 +663,7 @@ fn unsolved_pow_is_rejected_by_proposal_and_submit() -> Result<()> {
         capabilities: Vec::new(),
         rules: Vec::new(),
         long_poll_id: None,
+        coinbase_budget: None,
     })?;
     match proposal {
         BlockTemplateResult::Proposal(BlockValidationResult::Accepted) => {}

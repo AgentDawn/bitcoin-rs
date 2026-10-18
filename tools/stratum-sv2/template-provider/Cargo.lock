@@ -264,6 +264,7 @@ dependencies = [
  "bitcoin-rs-primitives",
  "bitcoin-rs-script",
  "hashbrown 0.17.1",
+ "parking_lot",
  "rayon",
  "sha2 0.11.1",
  "thiserror",
@@ -304,6 +305,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "sha2 0.11.1",
+ "smallvec",
  "thiserror",
  "tracing",
 ]
@@ -321,6 +323,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "parking_lot",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -342,6 +345,7 @@ dependencies = [
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
  "bytes",
+ "cap-fs-ext",
  "cap-std",
  "compact_str",
  "crossbeam-channel",

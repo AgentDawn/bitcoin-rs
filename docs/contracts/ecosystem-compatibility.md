@@ -125,7 +125,9 @@ existing external tool -> generic Bitcoin implementation interface -> Core | bit
 - Compatibility surfaces are tracked independently: Network (P2P v1, BIP324
   /v2, tx/block relay, compact blocks and filters, peer lifecycle);
   Application APIs (JSON-RPC, REST, ZMQ); Mining (GBT, block
-  submission/proposal, future mining IPC or Stratum V2 adapters);
+  submission/proposal, the experimental regtest Stratum V2 adapter described in
+  [../../tools/stratum-sv2/README.md](../../tools/stratum-sv2/README.md), and
+  future mining IPC);
   Observability (Core-compatible USDT, bpftrace/BCC, bitcoin-dev-tools);
   Process/component interfaces (optional Core IPC as a narrowly scoped
   adapter).

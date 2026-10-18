@@ -212,7 +212,7 @@ fn indexed_selection_read_guard_bench(c: &mut Criterion) {
     let ctx = context();
     let payout = [0x51_u8];
     let guarded = pool.read();
-    let warmed = select_template_body(&guarded, &ctx, &payout)
+    let warmed = select_template_body(&guarded, &ctx, &payout, None)
         .unwrap_or_else(|error| panic!("fixture selection failed: {error}"));
     drop(guarded);
     drop(warmed);
@@ -222,7 +222,7 @@ fn indexed_selection_read_guard_bench(c: &mut Criterion) {
             for _ in 0..iters {
                 let guard = pool.read();
                 let start = Instant::now();
-                let body = select_template_body(&guard, &ctx, &payout)
+                let body = select_template_body(&guard, &ctx, &payout, None)
                     .unwrap_or_else(|error| panic!("selection failed: {error}"));
                 drop(guard);
                 total += start.elapsed();
