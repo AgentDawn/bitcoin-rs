@@ -93,7 +93,8 @@ const MEASURE_SECS: u64 = 20;
 const ECDSA_EXTRA_SEED: u8 = 75;
 /// Extra Schnorr seed beyond the miss range (`SCHNORR_FIRST_SEED..=164`).
 const SCHNORR_EXTRA_SEED: u8 = 165;
-/// First ECDSA seed byte; hit uses it, miss spans the next `INNER_REPS` bytes.
+/// First ECDSA seed byte; the miss arm consumes the `INNER_REPS` seed bytes
+/// starting there, so the miss range includes the hit seed.
 const ECDSA_FIRST_SEED: u8 = 11;
 /// First Schnorr seed byte; disjoint from the ECDSA range by construction.
 const SCHNORR_FIRST_SEED: u8 = 101;
@@ -629,9 +630,10 @@ fn mrp_verify() {
 }
 
 /// Runs the `--mrp-verify` capacity-pressure and refutation phases through the
-/// shared `cache`: over-capacity extras re-verified alongside the retained
-/// hits, then every negative repeated against the same cache to catch a cached
-/// false success. Its `println!` lines are this binary's CLI output.
+/// shared `cache`: over-capacity extras re-verified alongside the earlier
+/// verified fixtures, then every negative repeated against the same cache to
+/// catch a cached false success. Its `println!` lines are this binary's CLI
+/// output.
 fn verify_capacity_pressure_and_refutation(
     ecdsa_hit: &PreparedTransaction<'_>,
     schnorr_hit: &PreparedTransaction<'_>,

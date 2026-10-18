@@ -728,7 +728,7 @@ def build_fixture(
         cpu = sorted(os.sched_getaffinity(0))[0]
     except OSError:
         cpu = 0
-    # L1: live-positive fixture uses the observed local CPU model so the real
+    # Live-positive fixture uses the observed local CPU model so the real
     # validate/plan live path is meaningful; never an echoed label or mock.
     observed_model = sut.run.read_cpu_model(cpu)
     blocks: list[dict[str, str]] = []
@@ -904,21 +904,12 @@ def counted_case_fields_via_sut(sut: Sut, stdout: Path, row: Json) -> Json:
     """The counted record fields through the SUT's real counted seam.
 
     Mirrors the runner's own call shape: parse_counted_stdout + the shared
-    validator (validate_counted_samples) when present, else the single
-    counted_case_fields entry point. Never fabricates a normalized record.
+    validator (validate_counted_samples) + the single counted_case_fields
+    entry point. Never fabricates a normalized record.
     """
     row_id = str(row["id"])
-    parse = getattr(sut.run, "parse_counted_stdout", None)
-    fields_fn = getattr(sut.run, "counted_case_fields", None)
-    if parse is None or fields_fn is None:
-        raise SystemExit(
-            "probe prerequisite missing: runner has no counted transport seam "
-            "(parse_counted_stdout/counted_case_fields); the counted row-kind "
-            "cutover has not landed in the SUT yet"
-        )
-    warmups, measured = parse(stdout, row_id)
-    validate = getattr(sut.run, "validate_counted_samples", None)
-    fields = fields_fn(stdout, row)
+    warmups, measured = sut.run.parse_counted_stdout(stdout, row_id)
+    fields = sut.run.counted_case_fields(stdout, row)
     wanted = {
         "counted_stdout_path",
         "counted_warmups_seen",
@@ -942,20 +933,21 @@ def counted_case_fields_via_sut(sut: Sut, stdout: Path, row: Json) -> Json:
             "probe prerequisite violated: counted record carries Criterion "
             f"artifact keys {criterion_leak}"
         )
-    if validate is not None:
-        iters, times, normalized, median, std = validate(warmups, measured, row_id)
-        agrees = (
-            fields["sample_iters"] == iters
-            and fields["sample_times_ns"] == times
-            and fields["normalized_ns"] == normalized
-            and fields["case_median_ns"] == median
-            and fields["case_std_ns"] == std
+    iters, times, normalized, median, std = sut.run.validate_counted_samples(
+        warmups, measured, row_id
+    )
+    agrees = (
+        fields["sample_iters"] == iters
+        and fields["sample_times_ns"] == times
+        and fields["normalized_ns"] == normalized
+        and fields["case_median_ns"] == median
+        and fields["case_std_ns"] == std
+    )
+    if not agrees:
+        raise SystemExit(
+            "probe prerequisite violated: counted_case_fields disagrees "
+            f"with validate_counted_samples for {row_id}"
         )
-        if not agrees:
-            raise SystemExit(
-                "probe prerequisite violated: counted_case_fields disagrees "
-                f"with validate_counted_samples for {row_id}"
-            )
     return fields
 
 
@@ -1271,7 +1263,7 @@ def analyze_with(sut: Sut, reg: Json, records: list[Json]) -> Json:
     )
 
 
-def row_adversaries(sut: Sut, reg: Json, records: list[Json]) -> None:
+def row_adversaries(sut: Sut, reg: Json) -> None:
     """Every mandatory row: omission, role, workload, scaling, kind, binding."""
     other_role = {
         "acceptance": "report_only",
@@ -1296,7 +1288,6 @@ def row_adversaries(sut: Sut, reg: Json, records: list[Json]) -> None:
             if k.startswith("control_") and not k.startswith(f"control_{target}/")
         )
         tag = f"{target}/{row_id}"
-        where = f"targets[{target}]"
 
         def omit(bad: Json, t: str = target, r: str = row_id) -> None:
             rows = bad["targets"][t]["rows"]
@@ -2123,7 +2114,7 @@ def identity_adversaries(sut: Sut, reg: Json) -> None:
         lambda b: b["host"].update(cpu=10**6),
         "affinity mask",
     )
-    # L1: observed model binds the live path only; static stays offline-usable
+    # Observed model binds the live path only; static stays offline-usable
     # (the analyzer path) so a wrong model passes static but fails live.
     static_model = copy.deepcopy(reg)
     static_model["host"].update(cpu_model="wrong-model-probe")
@@ -2336,7 +2327,7 @@ def distinctness_and_loader_adversaries(sut: Sut, reg: Json, tmp: Path) -> None:
 
 
 def analyzer_self_binding_adversaries(sut: Sut, reg: Json, tmp: Path) -> None:
-    """L2 analyzer self-binding: executing analyzer bytes vs registered analyzer.
+    """Analyzer self-binding: executing analyzer bytes vs registered analyzer.
 
     Catches accidental stale analyzer execution; not tamper-proof attestation.
     Each copy is imported as a real module and analyzed with real files; no
@@ -3320,13 +3311,13 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="mrp-probe-") as tmpdir:
         tmp = Path(tmpdir)
-        reg, records = positive_phase(sut, tmp)
+        reg, _ = positive_phase(sut, tmp)
         if any(not ok for _, ok, _ in RESULTS):
             failed = [n for n, ok, _ in RESULTS if not ok]
             print(f"ABORT: positive phase failed {failed}; no adversary result counts.")
             return 1
         positives = len(RESULTS)
-        row_adversaries(sut, reg, records)
+        row_adversaries(sut, reg)
         freeze_adversaries(sut, reg, tmp)
         script_and_evidence_adversaries(sut, reg, tmp)
         identity_adversaries(sut, reg)

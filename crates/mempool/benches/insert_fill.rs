@@ -260,6 +260,8 @@ fn fill_pool(size: u64) -> Mempool {
     pool
 }
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
 /// FNV-1a over one `u64`: the deterministic fingerprint fold shared by every
 /// `--mrp-verify` line below. Standard-library hashers randomise their keys,
 /// so they cannot serve as cross-arm fingerprints.
@@ -289,7 +291,6 @@ fn fold_bytes(state: u64, bytes: &[u8]) -> u64 {
 /// (residency, topological order) carry equivalence; matching fingerprints
 /// are supporting evidence.
 fn snapshot_order_fingerprint(pool: &Mempool) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     let snapshot = pool.mining_snapshot();
     let mut state = FNV_OFFSET;
     state = fold_u64(state, snapshot.sequence);
@@ -351,7 +352,7 @@ fn mrp_verify_removal_plan() {
         removals: vec![(victim_id, RemovalReason::BlockInclusion)],
         fee_deltas_cleared: 0,
     };
-    let mut projected_state = 0xcbf2_9ce4_8422_2325_u64;
+    let mut projected_state = FNV_OFFSET;
     let mut projected_count = 0_usize;
     for chunk in projected_source.chunks_after(&plan).iter() {
         for txid in chunk.txids {
@@ -378,7 +379,7 @@ fn mrp_verify_removal_plan() {
         "the projection must name every surviving entry"
     );
     let live = removed.mining_snapshot();
-    let mut live_state = 0xcbf2_9ce4_8422_2325_u64;
+    let mut live_state = FNV_OFFSET;
     for entry in &live.entries {
         live_state = fold_bytes(live_state, entry.txid.as_bytes());
     }

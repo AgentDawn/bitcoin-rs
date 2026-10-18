@@ -486,6 +486,8 @@ fn verify_chained_snapshot_unit() {
     counted_snapshot_unit(&pool, CHAIN_POOL_CHAINS * CHAIN_DEPTH);
 }
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
 /// FNV-1a over one `u64`. Standard-library hashers randomise their keys, so
 /// they cannot serve as cross-arm fingerprints.
 fn fold_u64(state: u64, value: u64) -> u64 {
@@ -514,7 +516,6 @@ fn fold_bytes(state: u64, bytes: &[u8]) -> u64 {
 /// (residency, topological order) carry equivalence; matching fingerprints
 /// are supporting evidence.
 fn snapshot_order_fingerprint(pool: &Mempool) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     let snapshot = pool.mining_snapshot();
     let mut state = FNV_OFFSET;
     state = fold_u64(state, snapshot.sequence);
@@ -533,7 +534,6 @@ fn snapshot_order_fingerprint(pool: &Mempool) -> u64 {
 
 /// Deterministic fingerprint of a selected body: transaction order and fees.
 fn body_fingerprint(body: &SelectedBody) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     let mut state = FNV_OFFSET;
     for tx in &body.transactions {
         state = fold_bytes(state, tx.txid.as_bytes());

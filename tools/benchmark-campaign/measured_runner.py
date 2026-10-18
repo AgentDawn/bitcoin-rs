@@ -5,7 +5,7 @@ Implements the authorized new controlled bitcoin-rs performance campaign
 harness. Local-only, stdlib only. Reads a real complete registration JSON
 and refuses unregistered, missing, or incomplete inputs before any launch.
 
-Mechanisms reused from the step19 matched-protocol runner (host state, strict
+Mechanisms reused from the earlier matched-protocol runner (host state, strict
 perf CSV parsing, process-group kill, incremental results). The campaign
 contract is docs/benchmarks/measured-campaign.md.
 

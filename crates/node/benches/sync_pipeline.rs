@@ -4083,10 +4083,11 @@ fn report_render_sample(report: &TemplateRenderReport) {
 /// per-reply serialization cost Step 8.1 targets (`consensus_bytes` plus hex
 /// per transaction in `render_template_transactions`); the signalling skip
 /// lives inside the service-hit projection. Identity: `Arc::ptr_eq` plus
-/// unchanged `template_id`, tip hash, mempool sequence, and height across
-/// every warm service call; strict equality on every deterministic RPC field
-/// (including the full `transactions` array) between the cold reply and the
-/// first and last warm replies, with `curtime` checked for permitted
+/// unchanged `template_id`, tip hash, mempool sequence, and height across the
+/// first and last warm service call of each arm; strict equality on every
+/// deterministic RPC field (including the full `transactions` array) between
+/// the cold reply and the first and last warm replies, with `curtime` checked
+/// for permitted
 /// evolution (`hit >= cold`, both `>= mintime`), never strict equality,
 /// because the candidate clock has no injection point. Counts recorded per
 /// sample: resident pool, selected transactions and candidate weight,
@@ -4137,9 +4138,9 @@ fn template_render_baseline(_c: &mut Criterion) {
     print_percentiles("template_render_rpc_hit", &rpc_hit);
 }
 
-// MRP Criterion config: the shared `Criterion` defaults carry 10 measured
-// samples, 1 second of warmup, and 20 seconds of measurement for the legacy
-// rows. The three T4 arms moved from Criterion registration to counted
+// MRP Criterion config: the explicit Criterion configuration below sets the
+// sample, warmup, and measurement budgets for the legacy rows. The three T4
+// arms moved from Criterion registration to counted
 // sampling (`--mrp-counted`, shared `measured_samples` sampler); their full
 // IDs stay `<arm>/flat`, with one warmup sample plus ten measured samples of
 // one second of measured work each. The standalone T2/T3 rows above register

@@ -14,7 +14,7 @@ Frozen rules implemented (thresholds are constants, not knobs):
       median of its 10. Each measured arm holds 6 visit medians; M is their
       median and S their sample stdev. The zero block holds 4 same-binary
       visit medians. No outlier removal.
-  T1  step19 matched protocol per singleton acceptance row only: case
+  T1  matched protocol per singleton acceptance row only: case
       stdev/median <= 0.20, visit-median max/min < 1.15, effective
       frequency difference <= 3% overall and per ABBA block; then
       REGRESSION iff M_cand - M_ctrl > S_cand + S_ctrl. Case medians are
@@ -82,7 +82,7 @@ import statistics
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 
 
 TARGET_ORDER: tuple[str, ...] = ("T1", "T2", "T3", "T4")
