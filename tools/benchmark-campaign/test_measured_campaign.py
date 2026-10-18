@@ -16,6 +16,9 @@ Optional overrides:
 Both scripts must keep their canonical file names and live in one directory:
 the analyzer loads the runner's validator from its registered path with digest-checked loading.
 
+The probe requires Linux/x86 because it exercises the runner's
+/proc/cpuinfo model lookup and sched_getaffinity.
+
 It loads the two scripts under test (SUT) and exercises their REAL validation,
 parsing and analysis functions plus their launch-nothing CLIs (`validate`,
 `plan`, analyzer) on synthetic fixtures. It NEVER calls `run` or

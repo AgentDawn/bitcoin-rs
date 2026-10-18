@@ -3081,20 +3081,7 @@ fn setup_block_template_sample(
         background_len,
     }
 }
-/// One measured T2 unit: fresh state, untimed serving stack plus prefix plus
-/// admission, then the timed connect tail through the first new-tip template
-/// response. The sample driver repeats whole units (reusing the sample's
-/// corpus index, so the frozen corpus is unchanged) until the measured total
-/// reaches `MRP_SAMPLE_MEASURED_FLOOR`; every unit is independent.
-///
-/// Setup asserts fail closed: 98k background plus 2000 targets (100k live)
-/// before connect with every target spend resident, 98k after connect, the new
-/// tip equals the target hash, and both the recorded service call and the
-/// handler response name the new tip with a non-empty selection. Span capture
-/// asserts exactly one tail-begin, publish-profile, and on-connect event per
-/// unit, and the decorator asserts exactly one service call per reply. All
-/// setup runs outside the timer; the asserts below run after the reply edge
-/// except the tip check, which is part of the measured path as before.
+/// Results of one measured T2 unit: timing splits plus identity counters.
 struct BlockTemplateUnit {
     tail_to_reply: Duration,
     apply_call_us: u128,
@@ -3111,6 +3098,20 @@ struct BlockTemplateUnit {
     tip_hash_be: String,
 }
 
+/// One measured T2 unit: fresh state, untimed serving stack plus prefix plus
+/// admission, then the timed connect tail through the first new-tip template
+/// response. The sample driver repeats whole units (reusing the sample's
+/// corpus index, so the frozen corpus is unchanged) until the measured total
+/// reaches `MRP_SAMPLE_MEASURED_FLOOR`; every unit is independent.
+///
+/// Setup asserts fail closed: 98k background plus 2000 targets (100k live)
+/// before connect with every target spend resident, 98k after connect, the new
+/// tip equals the target hash, and both the recorded service call and the
+/// handler response name the new tip with a non-empty selection. Span capture
+/// asserts exactly one tail-begin, publish-profile, and on-connect event per
+/// unit, and the decorator asserts exactly one service call per reply. All
+/// setup runs outside the timer; the asserts below run after the reply edge
+/// except the tip check, which is part of the measured path as before.
 fn run_block_template_unit(corpus: &BlockTemplateCorpus, run: usize) -> BlockTemplateUnit {
     let (_dir, state) = open_regtest_state();
     let BlockTemplateSetup {
@@ -3528,20 +3529,6 @@ fn render_warm_dispatch(
     (elapsed, hit_rpc)
 }
 
-/// Runs one independent warm-cache sample: fresh-state cold units until the
-/// cold total reaches `MRP_SAMPLE_MEASURED_FLOOR`, then warm service/RPC rows
-/// repeated on the retained fixed generation until each arm's total reaches
-/// the same floor. The last cold unit's prepared generation serves every warm
-/// arm, so all measured arms serve one fixed generation.
-///
-/// Setup asserts fail closed per cold unit (100k live, every spend resident,
-/// prefix tip, no connect). Identity asserts fail closed after the timers:
-/// the first and last warm service calls of each arm reuse one cached
-/// `Arc<Candidate>` with an unchanged generation, and the first and last
-/// warm RPC replies match the cold reply on every deterministic field while
-/// `curtime` is checked for permitted evolution, never strict equality.
-/// Returns the four arm means in order `(rpc_miss, service_hit, service_hit2,
-/// rpc_hit)`.
 /// Cold arm of one warm-cache sample: fresh-state cold units until the
 /// measured total reaches the floor. Returns the last prepared generation
 /// for the warm arms. Setup stays outside every timer; each unit boundary
@@ -3641,6 +3628,20 @@ fn collect_render_rpc_arm(
     (rpc_first, rpc_last)
 }
 
+/// Runs one independent warm-cache sample: fresh-state cold units until the
+/// cold total reaches `MRP_SAMPLE_MEASURED_FLOOR`, then warm service/RPC rows
+/// repeated on the retained fixed generation until each arm's total reaches
+/// the same floor. The last cold unit's prepared generation serves every warm
+/// arm, so all measured arms serve one fixed generation.
+///
+/// Setup asserts fail closed per cold unit (100k live, every spend resident,
+/// prefix tip, no connect). Identity asserts fail closed after the timers:
+/// the first and last warm service calls of each arm reuse one cached
+/// `Arc<Candidate>` with an unchanged generation, and the first and last
+/// warm RPC replies match the cold reply on every deterministic field while
+/// `curtime` is checked for permitted evolution, never strict equality.
+/// Returns the four arm means in order `(rpc_miss, service_hit, service_hit2,
+/// rpc_hit)`.
 fn run_template_render_sample(
     corpus: &BlockTemplateCorpus,
     run: usize,
@@ -3914,13 +3915,6 @@ struct TemplateRenderReport<'a> {
     run: usize,
     warmup: bool,
 }
-/// Records selection facts and prints the per-sample JSONL ledger line.
-///
-/// Every arm carries its unit durations as exact integer nanoseconds
-/// (`<arm>_ns`), the unit count (`<arm>_count`), and the exact measured total
-/// (`<arm>_total_ns`; the parser derives the mean as `total / count`). The
-/// rendered transaction count must equal the semantic selection, and the
-/// `data` byte total bounds the serialization work Step 8.1 targets.
 /// Assertion phase of the per-sample ledger line: selection facts plus the
 /// fail-closed sample checks. Returns the rendered transaction count and the
 /// `data` byte total. No timers run here; the JSON emission stays in
@@ -3973,6 +3967,13 @@ fn render_report_selection_facts(report: &TemplateRenderReport) -> (usize, usize
     (rpc_txs, rpc_data_bytes)
 }
 
+/// Records selection facts and prints the per-sample JSONL ledger line.
+///
+/// Every arm carries its unit durations as exact integer nanoseconds
+/// (`<arm>_ns`), the unit count (`<arm>_count`), and the exact measured total
+/// (`<arm>_total_ns`; the parser derives the mean as `total / count`). The
+/// rendered transaction count must equal the semantic selection, and the
+/// `data` byte total bounds the serialization work Step 8.1 targets.
 fn report_render_sample(report: &TemplateRenderReport) {
     let (rpc_txs, rpc_data_bytes) = render_report_selection_facts(report);
     let &TemplateRenderReport {
