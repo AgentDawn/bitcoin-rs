@@ -336,34 +336,9 @@ fn assert_snapshot_topological(pool: &Mempool) {
 }
 
 fn mrp_verify_cluster() {
-    let cluster = fill_pool(0);
-    let mut chain = cluster;
-    let mut last_txid = None;
-    for seed in 0..62 {
-        let tx = distinct_tx(seed, last_txid);
-        last_txid = Some(tx.txid());
-        chain
-            .insert_entry(MempoolEntry::new(
-                Arc::new(tx),
-                200,
-                spread_fee(seed),
-                seed,
-                0,
-                0,
-            ))
-            .expect("chain fixture insert must succeed");
-    }
-    assert_eq!(chain.len(), 62, "setup must build exactly 62 members");
-    let tip = last_txid.expect("62-chain has a tip");
+    let (mut chain, child) = cluster_fixture();
     chain
-        .insert_entry(MempoolEntry::new(
-            Arc::new(distinct_tx(62, Some(tip))),
-            200,
-            spread_fee(62),
-            62,
-            0,
-            0,
-        ))
+        .insert_entry(child)
         .expect("63rd member insert must succeed");
     assert_eq!(chain.len(), 63, "cluster insert must add the 63rd member");
     assert_snapshot_topological(&chain);

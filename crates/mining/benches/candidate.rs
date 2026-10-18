@@ -542,15 +542,9 @@ fn body_fingerprint(body: &SelectedBody) -> u64 {
     state
 }
 
-/// Every selected transaction must be resident, and every ancestor position
-/// in the snapshot must precede its entry.
-fn assert_selection_sound(pool: &Mempool, body: &SelectedBody) {
-    for tx in &body.transactions {
-        assert!(
-            pool.contains_txid(&tx.txid),
-            "selection must not invent transactions"
-        );
-    }
+/// Every ancestor position in the snapshot must precede its entry, and the
+/// snapshot must name every live entry exactly once.
+fn assert_snapshot_topological(pool: &Mempool) {
     let snapshot = pool.mining_snapshot();
     for (index, entry) in snapshot.entries.iter().enumerate() {
         let index = u32::try_from(index).expect("snapshot fits u32");
@@ -566,6 +560,18 @@ fn assert_selection_sound(pool: &Mempool, body: &SelectedBody) {
         pool.len(),
         "the snapshot must name every live entry exactly once"
     );
+}
+
+/// Every selected transaction must be resident, and the pool snapshot must
+/// satisfy [`assert_snapshot_topological`].
+fn assert_selection_sound(pool: &Mempool, body: &SelectedBody) {
+    for tx in &body.transactions {
+        assert!(
+            pool.contains_txid(&tx.txid),
+            "selection must not invent transactions"
+        );
+    }
+    assert_snapshot_topological(pool);
 }
 
 /// First snapshot entry no pool transaction spends: removing it confirms
@@ -712,23 +718,7 @@ fn mrp_verify() {
         100_000,
         "mature fixture pool must retain every inserted transaction"
     );
-    {
-        let snapshot = mature.mining_snapshot();
-        for (index, entry) in snapshot.entries.iter().enumerate() {
-            let index = u32::try_from(index).expect("snapshot fits u32");
-            for &ancestor in &entry.ancestors {
-                assert!(
-                    ancestor < index,
-                    "ancestor position {ancestor} must precede entry {index}"
-                );
-            }
-        }
-        assert_eq!(
-            snapshot.entries.len(),
-            mature.len(),
-            "the snapshot must name every live entry exactly once"
-        );
-    }
+    assert_snapshot_topological(&mature);
     println!(
         "mrp_verify residency/100000 entries=100000 order_fp={:016x}",
         snapshot_order_fingerprint(&mature)
