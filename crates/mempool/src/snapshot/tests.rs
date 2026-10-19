@@ -188,13 +188,14 @@ fn restores_dependencies_priorities_and_gateway_publication() -> TestResult {
     );
     drop(pool);
     let batches = seen.0.lock();
-    assert_eq!(batches.len(), 2);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].result.changes.len(), 2);
     assert_eq!(
         batches[0].result.changes[0].txid,
         Hash256::from(parent.txid())
     );
     assert_eq!(
-        batches[1].result.changes[0].txid,
+        batches[0].result.changes[1].txid,
         Hash256::from(child.txid())
     );
     assert!(
@@ -439,6 +440,14 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
         NOW - 10,
         &chain,
     )?;
+    // A now-nonfinal descendant makes the whole-family preflight fail. The
+    // original B+D then A+C fallback must still retry C when B is restored.
+    let mut nonfinal = spend(OutPoint::new(d.txid(), 0), 48_000);
+    nonfinal.lock_time = LockTime::from_consensus(150);
+    nonfinal.inputs[0].sequence = Sequence::ZERO;
+    chain.height = 200;
+    admit(&source, &nonfinal, &chain)?;
+    chain.height = 100;
     save(
         dir.path(),
         &source,
@@ -459,6 +468,8 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
     )?
     .ok_or("snapshot")?;
     assert_eq!((report.restored, report.timed_out), (4, false));
+    assert_eq!((report.candidates, report.skipped), (5, 1));
+    assert!(!target.read().contains_txid(&nonfinal.txid()));
     for tx in [&a, &b, &c, &d] {
         assert!(target.read().contains_txid(&tx.txid()));
     }
@@ -1196,6 +1207,56 @@ fn restores_cpfp_after_saved_ancestors_confirm_and_are_fully_spent() -> TestResu
 }
 
 #[test]
+fn restores_parent_paying_for_a_low_fee_child_before_standalone_admission() -> TestResult {
+    for with_sibling in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (chain, mut parent, _) = family();
+        parent.outputs = vec![output(49_000), output(49_000)];
+        let child = spend(OutPoint::new(parent.txid(), 0), 49_000);
+        let sibling = spend(OutPoint::new(parent.txid(), 1), 48_000);
+        let source = gateway(MempoolLimits::default(), None);
+        source.submit_local_package(
+            vec![parent.clone(), child.clone()],
+            LocalOrigin::Rpc,
+            None,
+            NOW - 20,
+            &chain,
+        )?;
+        if with_sibling {
+            admit(&source, &sibling, &chain)?;
+        }
+        let expected = if with_sibling { 3 } else { 2 };
+        assert_eq!(source.read().len(), expected, "normal gateway control");
+        save(
+            dir.path(),
+            &source,
+            Network::Regtest,
+            DEFAULT_MAX_BYTES,
+            deadline(),
+        )?;
+        let target = gateway(MempoolLimits::default(), None);
+        let report = restore(
+            dir.path(),
+            &target,
+            Network::Regtest,
+            &chain,
+            NOW,
+            DEFAULT_MAX_BYTES,
+            deadline(),
+        )?
+        .ok_or("missing snapshot")?;
+        assert!(!report.timed_out);
+        assert_eq!(
+            report.restored, expected,
+            "a resident parent's fee cannot be reused later"
+        );
+        assert!(target.read().contains_txid(&parent.txid()));
+        assert!(target.read().contains_txid(&child.txid()));
+    }
+    Ok(())
+}
+
+#[test]
 fn restore_timeout_preserves_all_priorities_through_the_next_save() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (chain, parent, _) = family();
@@ -1290,29 +1351,51 @@ fn ancestor_collection_stops_at_the_package_count_boundary() -> TestResult {
     for count in [limit, limit + 1, limit * 4] {
         let rows = saved_ancestor_chain(count);
         let positions = rows.iter().map(|row| (row.txid, row)).collect();
-        let chain = AncestorReads {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            expire_at: None,
-        };
-        let target = gateway(MempoolLimits::default(), None);
-        let missing = collect_missing_ancestors(
-            &rows.last().ok_or("missing leaf")?.tx,
-            &target,
-            &chain,
-            &positions,
-            |_| true,
-            deadline(),
-        )?;
-        assert_eq!(missing.len(), (count - 1).min(limit));
-        assert_eq!(
-            chain.calls.load(std::sync::atomic::Ordering::Relaxed),
-            count.min(limit)
-        );
-        assert_eq!(
-            missing.len() < limit,
-            count == limit,
-            "the candidate counts as one package member"
-        );
+        let children = rows
+            .windows(2)
+            .map(|pair| (pair[0].txid, vec![pair[1].txid]))
+            .collect();
+        for whole_family in [false, true] {
+            let chain = AncestorReads {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                expire_at: None,
+            };
+            let target = gateway(MempoolLimits::default(), None);
+            let missing = collect_saved_dependencies(
+                &if whole_family {
+                    rows.first()
+                } else {
+                    rows.last()
+                }
+                .ok_or("missing member")?
+                .tx,
+                &target,
+                &chain,
+                &positions,
+                whole_family.then_some(&children),
+                |_| true,
+                deadline(),
+            )?;
+            let expected = if whole_family {
+                count.min(limit + 1)
+            } else {
+                (count - 1).min(limit)
+            };
+            assert_eq!(missing.len(), expected);
+            assert_eq!(
+                chain.calls.load(std::sync::atomic::Ordering::Relaxed),
+                count.min(limit)
+            );
+            assert_eq!(
+                if whole_family {
+                    missing.len() <= limit
+                } else {
+                    missing.len() < limit
+                },
+                count == limit,
+                "the candidate counts as one package member"
+            );
+        }
     }
     Ok(())
 }
@@ -1327,11 +1410,12 @@ fn ancestor_collection_stops_when_a_chain_read_exhausts_the_deadline() -> TestRe
         calls: std::sync::atomic::AtomicUsize::new(0),
         expire_at: Some(expires),
     };
-    let error = collect_missing_ancestors(
+    let error = collect_saved_dependencies(
         &rows.last().ok_or("missing leaf")?.tx,
         &target,
         &chain,
         &positions,
+        None,
         |_| true,
         expires,
     )

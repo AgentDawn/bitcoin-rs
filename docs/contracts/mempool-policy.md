@@ -141,8 +141,12 @@ per-peer relay state is persisted.
 
 Startup revalidates after authoritative recovery and before RPC/P2P workers
 or external mempool observers are exposed. Transactions are considered in
-deterministic parent-first order through ordinary gateway admission; a CPFP
-or ephemeral-dust family uses the existing atomic child-with-parents path.
+deterministic parent-first order through ordinary gateway admission. Before
+admitting a member alone, restore attempts its eligible saved dependency family
+atomically within the package limit, preserving fees that a parent may pay for
+a low-fee child. Rejected or oversized families fall back to individual
+admission and missing-ancestor package retries. Resident and confirmed fees
+remain excluded by the existing gateway policy.
 Current fees, limits, scripts, TRUC, maturity and next-block finality apply.
 Saved-ancestor collection stops at each input available from Chainstate; it
 does not pull confirmed, fully spent ancestors into a descendant's retry.
@@ -225,6 +229,8 @@ remain unsupported RPCs; this format makes no Core disk-format claim.
   restored descendants with direct gateway package admission after the saved
   ancestors confirm. `restore_timeout_preserves_all_priorities_through_the_next_save`
   expires the admission budget after decoding and checks the next saved overlay.
+  `restores_parent_paying_for_a_low_fee_child_before_standalone_admission`
+  compares native admission with restart restoration, including a paying sibling.
   `ancestor_collection_stops_at_the_package_count_boundary` counts chain reads
   at and beyond the package limit; `ancestor_collection_stops_when_a_chain_read_exhausts_the_deadline`
   verifies that traversal performs no next read after budget exhaustion.

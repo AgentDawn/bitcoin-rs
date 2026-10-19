@@ -451,18 +451,23 @@ pub fn restore(
     restore_candidates(&snapshot, gateway, chain, now, deadline).map(Some)
 }
 
-// Return at most MAX_PACKAGE_COUNT missing ancestors. Reaching that count
-// proves the candidate plus its ancestors cannot fit, so no further chain
-// reads or ancestor allocations are needed. Admission still owns policy checks.
-fn collect_missing_ancestors(
+// With children, collect a family before standalone admission consumes its
+// shared fee budget. Without them, collect only missing ancestors for retry.
+// Both traversals stop as soon as the package cannot fit the existing limit.
+fn collect_saved_dependencies(
     tx: &Tx,
     gateway: &MempoolGateway,
     chain: &dyn AdmissionChain,
     positions: &HashMap<Txid, &SavedTransaction>,
+    children: Option<&HashMap<Txid, Vec<Txid>>>,
     eligible: impl Fn(&SavedTransaction) -> bool,
     deadline: Instant,
 ) -> io::Result<hashbrown::HashSet<Txid>> {
     let mut missing = hashbrown::HashSet::new();
+    if children.is_some() {
+        missing.insert(tx.txid());
+    }
+    let limit = crate::standardness::MAX_PACKAGE_COUNT + usize::from(children.is_some());
     let mut stack = vec![tx];
     while let Some(tx) = stack.pop() {
         check_deadline(deadline)?;
@@ -483,10 +488,25 @@ fn collect_missing_ancestors(
                 && eligible(ancestor)
                 && missing.insert(point.txid)
             {
-                if missing.len() >= crate::standardness::MAX_PACKAGE_COUNT {
+                if missing.len() >= limit {
                     return Ok(missing);
                 }
                 stack.push(ancestor.tx.as_ref());
+            }
+        }
+        if let Some(descendants) = children.and_then(|children| children.get(&tx.txid())) {
+            for id in descendants {
+                check_deadline(deadline)?;
+                if !gateway.read().contains_txid(id)
+                    && let Some(child) = positions.get(id)
+                    && eligible(child)
+                    && missing.insert(*id)
+                {
+                    if missing.len() >= limit {
+                        return Ok(missing);
+                    }
+                    stack.push(child.tx.as_ref());
+                }
             }
         }
     }
@@ -530,6 +550,21 @@ fn restore_candidates(
             .map_err(|_| invalid("snapshot fee delta overflow"))?;
     }
     let mut timed_out = false;
+    let mut children: HashMap<Txid, Vec<Txid>> = HashMap::new();
+    'dependencies: for row in &snapshot.transactions {
+        for input in &row.tx.inputs {
+            if check_deadline(deadline).is_err() {
+                timed_out = true;
+                break 'dependencies;
+            }
+            if positions.contains_key(&input.previous_output.txid) {
+                children
+                    .entry(input.previous_output.txid)
+                    .or_default()
+                    .push(row.txid);
+            }
+        }
+    }
     let mut ready = VecDeque::from(order);
     let mut queued = vec![true; snapshot.transactions.len()];
     let mut waiting: HashMap<Txid, hashbrown::HashSet<usize>> = HashMap::new();
@@ -544,18 +579,66 @@ fn restore_candidates(
         if !eligible(row) || gateway.read().contains_txid(&row.txid) {
             continue;
         }
-        let mut result = gateway
-            .submit_transaction(
-                Arc::clone(&row.tx),
-                AdmissionOrigin::Snapshot,
-                None,
-                row.time,
-                chain,
-            )
-            .map(|outcome| match outcome {
-                crate::SubmitOutcome::Committed(result) => result,
-                _ => crate::MutationResult::empty(),
-            });
+        let Ok(family) = collect_saved_dependencies(
+            &row.tx,
+            gateway,
+            chain,
+            &positions,
+            Some(&children),
+            eligible,
+            deadline,
+        ) else {
+            timed_out = true;
+            break;
+        };
+        let mut family: Vec<_> =
+            if (2..=crate::standardness::MAX_PACKAGE_COUNT).contains(&family.len()) {
+                family.into_iter().collect()
+            } else {
+                Vec::new()
+            };
+        family.sort_unstable_by_key(|id| topo_order[id]);
+        let family: Vec<_> = family
+            .iter()
+            .map(|id| positions[id].tx.as_ref().clone())
+            .collect();
+        if check_deadline(deadline).is_err() {
+            timed_out = true;
+            break;
+        }
+        let restored_family = if family.is_empty() {
+            None
+        } else {
+            gateway
+                .submit_package_with_times(
+                    &family,
+                    LocalOrigin::Snapshot,
+                    None,
+                    |tx| positions[&tx.txid()].time,
+                    chain,
+                )
+                .ok()
+        };
+        if restored_family.is_none() && check_deadline(deadline).is_err() {
+            timed_out = true;
+            break;
+        }
+        let mut result = if let Some(result) = restored_family {
+            Ok(result)
+        } else {
+            gateway
+                .submit_transaction(
+                    Arc::clone(&row.tx),
+                    AdmissionOrigin::Snapshot,
+                    None,
+                    row.time,
+                    chain,
+                )
+                .map(|outcome| match outcome {
+                    crate::SubmitOutcome::Committed(result) => result,
+                    _ => crate::MutationResult::empty(),
+                })
+        };
         // A native CPFP/ephemeral-dust package may have parents and ancestors
         // that cannot enter alone. Recursively collect unconfirmed in-snapshot
         // ancestors in topological order; package validation enforces limits,
@@ -563,9 +646,9 @@ fn restore_candidates(
         let mut package = Vec::new();
         let mut missing = hashbrown::HashSet::new();
         if result.is_err() {
-            let Ok(ancestors) =
-                collect_missing_ancestors(&row.tx, gateway, chain, &positions, eligible, deadline)
-            else {
+            let Ok(ancestors) = collect_saved_dependencies(
+                &row.tx, gateway, chain, &positions, None, eligible, deadline,
+            ) else {
                 timed_out = true;
                 break;
             };
