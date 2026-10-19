@@ -451,6 +451,48 @@ pub fn restore(
     restore_candidates(&snapshot, gateway, chain, now, deadline).map(Some)
 }
 
+// Return at most MAX_PACKAGE_COUNT missing ancestors. Reaching that count
+// proves the candidate plus its ancestors cannot fit, so no further chain
+// reads or ancestor allocations are needed. Admission still owns policy checks.
+fn collect_missing_ancestors(
+    tx: &Tx,
+    gateway: &MempoolGateway,
+    chain: &dyn AdmissionChain,
+    positions: &HashMap<Txid, &SavedTransaction>,
+    eligible: impl Fn(&SavedTransaction) -> bool,
+    deadline: Instant,
+) -> io::Result<hashbrown::HashSet<Txid>> {
+    let mut missing = hashbrown::HashSet::new();
+    let mut stack = vec![tx];
+    while let Some(tx) = stack.pop() {
+        check_deadline(deadline)?;
+        let confirmed_inputs = chain.snapshot(tx).map(|view| view.prevouts);
+        for input in &tx.inputs {
+            check_deadline(deadline)?;
+            let point = input.previous_output;
+            // Follow only unavailable inputs. A saved parent can now
+            // be confirmed, with fully spent ancestors behind it.
+            if gateway.read().contains_txid(&point.txid)
+                || confirmed_inputs
+                    .as_ref()
+                    .is_some_and(|coins| coins.iter().any(|(confirmed, _)| *confirmed == point))
+            {
+                continue;
+            }
+            if let Some(ancestor) = positions.get(&point.txid)
+                && eligible(ancestor)
+                && missing.insert(point.txid)
+            {
+                if missing.len() >= crate::standardness::MAX_PACKAGE_COUNT {
+                    return Ok(missing);
+                }
+                stack.push(ancestor.tx.as_ref());
+            }
+        }
+    }
+    Ok(missing)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "keep bounded dependency retries and gateway publication together"
@@ -521,30 +563,13 @@ fn restore_candidates(
         let mut package = Vec::new();
         let mut missing = hashbrown::HashSet::new();
         if result.is_err() {
-            let mut stack = vec![row.tx.as_ref()];
-            let mut visited = hashbrown::HashSet::new();
-            while let Some(tx) = stack.pop() {
-                let confirmed_inputs = chain.snapshot(tx).map(|view| view.prevouts);
-                for input in &tx.inputs {
-                    let point = input.previous_output;
-                    // Follow only unavailable inputs. A saved parent can now
-                    // be confirmed, with fully spent ancestors behind it.
-                    if gateway.read().contains_txid(&point.txid)
-                        || confirmed_inputs.as_ref().is_some_and(|coins| {
-                            coins.iter().any(|(confirmed, _)| *confirmed == point)
-                        })
-                    {
-                        continue;
-                    }
-                    if visited.insert(point.txid)
-                        && let Some(ancestor) = positions.get(&point.txid)
-                        && eligible(ancestor)
-                    {
-                        missing.insert(point.txid);
-                        stack.push(ancestor.tx.as_ref());
-                    }
-                }
-            }
+            let Ok(ancestors) =
+                collect_missing_ancestors(&row.tx, gateway, chain, &positions, eligible, deadline)
+            else {
+                timed_out = true;
+                break;
+            };
+            missing = ancestors;
             if !missing.is_empty() && missing.len() < crate::standardness::MAX_PACKAGE_COUNT {
                 let mut ancestor_ids: Vec<_> = missing.iter().copied().collect();
                 ancestor_ids.sort_by_key(|id| topo_order.get(id).copied().unwrap_or(usize::MAX));

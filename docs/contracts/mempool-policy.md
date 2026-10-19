@@ -146,6 +146,9 @@ or ephemeral-dust family uses the existing atomic child-with-parents path.
 Current fees, limits, scripts, TRUC, maturity and next-block finality apply.
 Saved-ancestor collection stops at each input available from Chainstate; it
 does not pull confirmed, fully spent ancestors into a descendant's retry.
+It checks the cooperative deadline before every ancestor chain read and input
+visit, and stops collecting as soon as the candidate plus saved ancestors
+exceeds `MAX_PACKAGE_COUNT`. An in-progress chain read is not preempted.
 Confirmed/spent, missing-parent, expired and newly refused candidates are not
 forced back into the pool. Ages use saved wall-clock admission seconds;
 future-dated or more-than-fourteen-day-old candidates are skipped. A restored
@@ -222,6 +225,9 @@ remain unsupported RPCs; this format makes no Core disk-format claim.
   restored descendants with direct gateway package admission after the saved
   ancestors confirm. `restore_timeout_preserves_all_priorities_through_the_next_save`
   expires the admission budget after decoding and checks the next saved overlay.
+  `ancestor_collection_stops_at_the_package_count_boundary` counts chain reads
+  at and beyond the package limit; `ancestor_collection_stops_when_a_chain_read_exhausts_the_deadline`
+  verifies that traversal performs no next read after budget exhaustion.
 - `tx_relay::tests::pending_local_broadcast_survives_absent_peers_and_saturation`
   and `dispatch::tests::getdata_completes_initial_broadcast_only_after_successful_send`
   cover retry and completion through the existing relay/getdata owners.

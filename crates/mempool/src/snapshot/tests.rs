@@ -1246,3 +1246,98 @@ fn restore_timeout_preserves_all_priorities_through_the_next_save() -> TestResul
     assert!(next.read().is_empty());
     Ok(())
 }
+
+struct AncestorReads {
+    calls: std::sync::atomic::AtomicUsize,
+    expire_at: Option<Instant>,
+}
+
+impl AdmissionChain for AncestorReads {
+    fn snapshot(&self, _: &Tx) -> Option<ChainAdmissionSnapshot> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(deadline) = self.expire_at {
+            // Simulate a chain read that consumes the cooperative budget.
+            // Its in-progress call cannot be preempted, but no next read is allowed.
+            while Instant::now() < deadline {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }
+        }
+        Some(ChainAdmissionSnapshot::default())
+    }
+}
+
+fn saved_ancestor_chain(count: usize) -> Vec<SavedTransaction> {
+    let mut point = OutPoint::new(Txid(Hash256::from_le_bytes(&[31; 32])), 0);
+    let mut rows = Vec::new();
+    for _ in 0..count {
+        let tx = Arc::new(spend(point, 100_000));
+        point = OutPoint::new(tx.txid(), 0);
+        rows.push(SavedTransaction {
+            txid: tx.txid(),
+            tx,
+            time: NOW,
+            unbroadcast: false,
+            sigop_cost: 0,
+        });
+    }
+    rows
+}
+
+#[test]
+fn ancestor_collection_stops_at_the_package_count_boundary() -> TestResult {
+    let limit = crate::standardness::MAX_PACKAGE_COUNT;
+    for count in [limit, limit + 1, limit * 4] {
+        let rows = saved_ancestor_chain(count);
+        let positions = rows.iter().map(|row| (row.txid, row)).collect();
+        let chain = AncestorReads {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            expire_at: None,
+        };
+        let target = gateway(MempoolLimits::default(), None);
+        let missing = collect_missing_ancestors(
+            &rows.last().ok_or("missing leaf")?.tx,
+            &target,
+            &chain,
+            &positions,
+            |_| true,
+            deadline(),
+        )?;
+        assert_eq!(missing.len(), (count - 1).min(limit));
+        assert_eq!(
+            chain.calls.load(std::sync::atomic::Ordering::Relaxed),
+            count.min(limit)
+        );
+        assert_eq!(
+            missing.len() < limit,
+            count == limit,
+            "the candidate counts as one package member"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn ancestor_collection_stops_when_a_chain_read_exhausts_the_deadline() -> TestResult {
+    let rows = saved_ancestor_chain(100);
+    let positions = rows.iter().map(|row| (row.txid, row)).collect();
+    let target = gateway(MempoolLimits::default(), None);
+    let expires = Instant::now() + Duration::from_secs(1);
+    let chain = AncestorReads {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        expire_at: Some(expires),
+    };
+    let error = collect_missing_ancestors(
+        &rows.last().ok_or("missing leaf")?.tx,
+        &target,
+        &chain,
+        &positions,
+        |_| true,
+        expires,
+    )
+    .err()
+    .ok_or("deadline must stop traversal")?;
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(chain.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    Ok(())
+}
