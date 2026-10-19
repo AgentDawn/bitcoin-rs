@@ -399,6 +399,15 @@ impl NodeState {
         // mempool observer is exposed until revalidation has finished.
         if config.persist_mempool {
             let started = std::time::Instant::now();
+            let deadline = started
+                .checked_add(std::time::Duration::from_secs(
+                    config.mempool_snapshot_restore_timeout_secs,
+                ))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "mempool snapshot restore timeout exceeds the platform clock range"
+                    )
+                })?;
             let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
                 chainstate.utxo_reader(),
                 chainstate.applied_tip_reader(),
@@ -415,8 +424,7 @@ impl NodeState {
                 &chain,
                 now,
                 config.mempool_snapshot_max_bytes,
-                started
-                    + std::time::Duration::from_secs(config.mempool_snapshot_restore_timeout_secs),
+                deadline,
             ) {
                 Ok(Some(report)) => {
                     if report.timed_out {

@@ -144,6 +144,8 @@ or external mempool observers are exposed. Transactions are considered in
 deterministic parent-first order through ordinary gateway admission; a CPFP
 or ephemeral-dust family uses the existing atomic child-with-parents path.
 Current fees, limits, scripts, TRUC, maturity and next-block finality apply.
+Saved-ancestor collection stops at each input available from Chainstate; it
+does not pull confirmed, fully spent ancestors into a descendant's retry.
 Confirmed/spent, missing-parent, expired and newly refused candidates are not
 forced back into the pool. Ages use saved wall-clock admission seconds;
 future-dated or more-than-fourteen-day-old candidates are skipped. A restored
@@ -151,12 +153,18 @@ package retains each member's own saved time. Failed children are retried
 only when a saved missing parent is admitted; each parent wakes dependents
 at most once, bounding retries by saved dependency edges. Fee deltas, including absent-txid
 overlays, retain their operator meaning even when membership is refused.
+After decoding and dependency validation succeed, all saved fee deltas are
+applied before candidate admission, independently of the cooperative admission
+deadline. Timeout cannot leave a priority prefix for the next save to publish.
 Restored transactions do not register fresh estimator samples or blanket
 relay announcements. Successfully re-admitted members retain their saved
 initial-broadcast flags; the P2P relay worker retries only pending local bodies
 through its ordinary peer/fee/inventory policy. Fresh local RPC/Esplora commits
 mark the live entry pending before publication; successful getdata body responses
 clear that flag through the gateway without changing membership or its sequence.
+The pool maintains an ordered index derived from these flags. Retry batches
+resume strictly after the last witness id and visit at most 1,024 indexed
+pending entries; an empty index does not scan ordinary membership.
 Removal drops the flag with the entry. Ordinary gateway sequence assignment and mining wakes
 still run; fee-estimator history remains a separately owned file.
 
@@ -173,9 +181,11 @@ a large enough budget retains every live family, subject to the cooperative
 deadline. Selection stops at the first family that does not fit.
 `mempool_snapshot_restore_timeout_secs` (CLI `--mempool-snapshot-restore-timeout-secs`,
 environment `BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS`) configures the
-startup restore deadline in seconds. It scales dynamically with the configured byte budget
-(`max(60, mempool_snapshot_max_mb)`), ensuring large or complex snapshot revalidation
-does not prematurely time out.
+startup restore deadline in seconds. When unset, its default scales with the
+configured byte budget (`max(60, mempool_snapshot_max_mb)`); an explicit value
+is used as configured. Zero and durations outside the platform clock's range
+are configuration errors. The deadline is cooperative and can expire before
+all candidates have been revalidated.
 
 Clean teardown waits at most ten seconds for a staging worker, which cannot
 touch the live file. Mempool persistence applies exclusively to clean, graceful
@@ -208,9 +218,15 @@ remain unsupported RPCs; this format makes no Core disk-format claim.
   package restoration, upfront sigop standardness validation, per-member times,
   whole-family capacity bounds, raised byte budgets, more than 100,000 records,
   pending initial-broadcast flags and rejected-file quarantine.
+  `restores_cpfp_after_saved_ancestors_confirm_and_are_fully_spent` compares
+  restored descendants with direct gateway package admission after the saved
+  ancestors confirm. `restore_timeout_preserves_all_priorities_through_the_next_save`
+  expires the admission budget after decoding and checks the next saved overlay.
 - `tx_relay::tests::pending_local_broadcast_survives_absent_peers_and_saturation`
   and `dispatch::tests::getdata_completes_initial_broadcast_only_after_successful_send`
   cover retry and completion through the existing relay/getdata owners.
+  `tx_relay::tests::pending_broadcast_batches_resume_by_key_after_completion_and_removal`
+  covers batch progress as pending entries complete or leave the pool.
 - `lifecycle::tests::timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot`
   covers shutdown timeout followed by a newer save and late worker completion.
 - `bin/bitcoin-rs/tests/mempool_restart.rs` drives real daemon shutdowns,

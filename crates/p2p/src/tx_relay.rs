@@ -326,18 +326,21 @@ fn transaction_is_live(gateway: &MempoolGateway, request: &RelayRequest) -> bool
 // Pending state belongs to the live mempool entries, not a second relay queue.
 // Retry bounded batches so absent peers or queue saturation cannot consume the
 // only announcement. The existing sink applies peer, fee and inventory rules.
-fn retry_initial_broadcast(gateway: &MempoolGateway, sink: &dyn RelaySink, cursor: &mut usize) {
+fn retry_initial_broadcast(
+    gateway: &MempoolGateway,
+    sink: &dyn RelaySink,
+    cursor: &mut Option<Wtxid>,
+) {
     let requests: Vec<_> = gateway
         .read()
-        .unbroadcast_transactions()
-        .skip(*cursor)
+        .unbroadcast_transactions_after(*cursor)
         .take(INITIAL_BROADCAST_BATCH)
         .map(|(txid, wtxid, sequence)| RelayRequest::new(txid, wtxid, None, sequence))
         .collect();
     *cursor = if requests.len() < INITIAL_BROADCAST_BATCH {
-        0
+        None
     } else {
-        cursor.saturating_add(requests.len())
+        requests.last().map(|request| request.wtxid)
     };
     for request in requests {
         if transaction_is_live(gateway, &request) {
@@ -408,7 +411,7 @@ pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
         .name("bitcoin-rs-tx-relay".to_owned())
         .spawn(move || {
             let mut next_initial = std::time::Instant::now() + INITIAL_BROADCAST_RETRY;
-            let mut initial_cursor = 0;
+            let mut initial_cursor = None;
             while !shutdown.load() {
                 {
                     let Some(gateway) = gateway.upgrade() else {
@@ -590,7 +593,7 @@ mod tests {
             )
             .expect("peer member");
         let sink = FakeSink::new(Vec::new());
-        let mut cursor = 0;
+        let mut cursor = None;
         retry_initial_broadcast(&gateway, &sink, &mut cursor);
         assert_eq!(sink.log()[0].2.attempted, 0);
         let (mut peers, _) = fake_peers(1);
@@ -606,6 +609,73 @@ mod tests {
         gateway.mark_broadcast(local.wtxid());
         retry_initial_broadcast(&gateway, &sink, &mut cursor);
         assert_eq!(sink.log().len(), 3);
+    }
+
+    #[test]
+    fn pending_broadcast_batches_resume_by_key_after_completion_and_removal() {
+        let gateway = relay_identity_gateway();
+        for marker in 0_u32..1027 {
+            let mut tx = (*relay_identity_tx()).clone();
+            let mut hash = [0_u8; 32];
+            hash[..4].copy_from_slice(&marker.to_le_bytes());
+            tx.inputs[0].previous_output.txid = Txid(Hash256::from_le_bytes(&hash));
+            admit_entry(&Arc::new(tx), &gateway);
+        }
+        let sink = FakeSink::new(Vec::new());
+        let mut cursor = None;
+        retry_initial_broadcast(&gateway, &sink, &mut cursor);
+        assert_eq!(sink.log().len(), INITIAL_BROADCAST_BATCH);
+        let mut first = gateway
+            .read()
+            .unbroadcast_transactions()
+            .take(INITIAL_BROADCAST_BATCH)
+            .collect::<Vec<_>>();
+        assert_eq!(cursor, first.last().map(|(_, wtxid, _)| *wtxid));
+        let (removed_id, _, _) = first.pop().expect("full batch");
+        let removed = gateway
+            .read()
+            .transaction_by_txid(&removed_id)
+            .expect("live cursor entry");
+        gateway.remove_for_block(
+            AdmissionOrigin::Block,
+            &[removed.as_ref()],
+            &[removed_id],
+            2,
+        );
+        for (_, wtxid, _) in first {
+            gateway.mark_broadcast(wtxid);
+        }
+        retry_initial_broadcast(&gateway, &sink, &mut cursor);
+        assert_eq!(
+            sink.log().len(),
+            1027,
+            "completion must not shift an offset past pending entries"
+        );
+        assert!(cursor.is_none());
+        let remaining = gateway
+            .read()
+            .unbroadcast_transactions()
+            .collect::<Vec<_>>();
+        for (_, wtxid, _) in remaining {
+            gateway.mark_broadcast(wtxid);
+        }
+        // Reusing the removed transaction as a peer admission must not inherit
+        // its previous local pending flag or index membership.
+        gateway
+            .insert_entry(
+                relay_identity_peer(),
+                bitcoin_rs_mempool::MempoolEntry::new(removed, 100, 10_000, 1, 0, 0),
+            )
+            .expect("peer readmission");
+        retry_initial_broadcast(&gateway, &sink, &mut cursor);
+        assert_eq!(sink.log().len(), 1027);
+        assert_eq!(
+            gateway.read().len(),
+            1027,
+            "idle retry keeps ordinary membership"
+        );
+        gateway.clear(AdmissionOrigin::Block);
+        assert_eq!(gateway.read().unbroadcast_transactions().count(), 0);
     }
 
     #[test]

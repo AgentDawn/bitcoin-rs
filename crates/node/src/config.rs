@@ -340,8 +340,13 @@ impl NodeConfig {
             "mempool-snapshot-max-mb must be positive and fit the platform byte limit"
         );
         anyhow::ensure!(
-            self.mempool_snapshot_restore_timeout_secs > 0,
-            "mempool-snapshot-restore-timeout-secs must be positive"
+            self.mempool_snapshot_restore_timeout_secs > 0
+                && std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(
+                        self.mempool_snapshot_restore_timeout_secs
+                    ))
+                    .is_some(),
+            "mempool-snapshot-restore-timeout-secs must be positive and fit the platform clock range"
         );
         anyhow::ensure!(
             !self.rpc.silent_payments || cfg!(feature = "silent-payments"),

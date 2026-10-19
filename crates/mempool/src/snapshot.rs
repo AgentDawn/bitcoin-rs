@@ -428,10 +428,6 @@ pub fn save(
 ///
 /// No saved membership, base fee, height or admission token is trusted. A malformed artifact changes
 /// nothing; a budget-limited restore retains only successfully re-admitted rows.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep restore validation, bounded dependency retries and gateway publication together"
-)]
 pub fn restore(
     data_dir: &Path,
     gateway: &MempoolGateway,
@@ -452,6 +448,20 @@ pub fn restore(
     };
     let snapshot = Snapshot::decode(&bytes, network, max_bytes, deadline)?;
     drop(bytes);
+    restore_candidates(&snapshot, gateway, chain, now, deadline).map(Some)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep bounded dependency retries and gateway publication together"
+)]
+fn restore_candidates(
+    snapshot: &Snapshot,
+    gateway: &MempoolGateway,
+    chain: &dyn AdmissionChain,
+    now: u64,
+    deadline: Instant,
+) -> io::Result<RestoreReport> {
     let order = snapshot.order()?;
     let topo_order: HashMap<Txid, usize> = order
         .iter()
@@ -468,16 +478,16 @@ pub fn restore(
             && now - row.time <= MAX_AGE
             && row.sigop_cost <= crate::standardness::MAX_STANDARD_TX_SIGOPS_COST
     };
-    let mut timed_out = false;
+    // The decoded overlay is operator state, not optional admission work.
+    // Finish it even if the cooperative transaction budget has expired, so
+    // the next save cannot replace the file with only a prefix of priorities.
+    // Decode rejects duplicate txids and startup requires an empty overlay.
     for (txid, delta) in &snapshot.deltas {
-        if check_deadline(deadline).is_err() {
-            timed_out = true;
-            break;
-        }
         gateway
             .prioritise(*txid, *delta)
             .map_err(|_| invalid("snapshot fee delta overflow"))?;
     }
+    let mut timed_out = false;
     let mut ready = VecDeque::from(order);
     let mut queued = vec![true; snapshot.transactions.len()];
     let mut waiting: HashMap<Txid, hashbrown::HashSet<usize>> = HashMap::new();
@@ -511,28 +521,27 @@ pub fn restore(
         let mut package = Vec::new();
         let mut missing = hashbrown::HashSet::new();
         if result.is_err() {
-            let mut stack = Vec::new();
+            let mut stack = vec![row.tx.as_ref()];
             let mut visited = hashbrown::HashSet::new();
-            for input in &row.tx.inputs {
-                if !gateway.read().contains_txid(&input.previous_output.txid) {
-                    stack.push(input.previous_output.txid);
-                }
-            }
-            while let Some(ancestor_id) = stack.pop() {
-                if !visited.insert(ancestor_id) {
-                    continue;
-                }
-                if gateway.read().contains_txid(&ancestor_id) {
-                    continue;
-                }
-                if let Some(ancestor) = positions.get(&ancestor_id)
-                    && eligible(ancestor)
-                {
-                    missing.insert(ancestor_id);
-                    for input in &ancestor.tx.inputs {
-                        if !gateway.read().contains_txid(&input.previous_output.txid) {
-                            stack.push(input.previous_output.txid);
-                        }
+            while let Some(tx) = stack.pop() {
+                let confirmed_inputs = chain.snapshot(tx).map(|view| view.prevouts);
+                for input in &tx.inputs {
+                    let point = input.previous_output;
+                    // Follow only unavailable inputs. A saved parent can now
+                    // be confirmed, with fully spent ancestors behind it.
+                    if gateway.read().contains_txid(&point.txid)
+                        || confirmed_inputs.as_ref().is_some_and(|coins| {
+                            coins.iter().any(|(confirmed, _)| *confirmed == point)
+                        })
+                    {
+                        continue;
+                    }
+                    if visited.insert(point.txid)
+                        && let Some(ancestor) = positions.get(&point.txid)
+                        && eligible(ancestor)
+                    {
+                        missing.insert(point.txid);
+                        stack.push(ancestor.tx.as_ref());
                     }
                 }
             }
@@ -591,12 +600,12 @@ pub fn restore(
     }
     timed_out |= check_deadline(deadline).is_err();
     let restored = gateway.read().len();
-    Ok(Some(RestoreReport {
+    Ok(RestoreReport {
         candidates: snapshot.transactions.len(),
         restored,
         skipped: snapshot.transactions.len().saturating_sub(restored),
         timed_out,
-    }))
+    })
 }
 
 #[cfg(test)]

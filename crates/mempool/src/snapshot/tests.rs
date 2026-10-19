@@ -1132,3 +1132,117 @@ fn snapshot_decode_rejects_excessive_sigop_cost() -> TestResult {
     assert!(Snapshot::decode(&encoded, Network::Regtest, DEFAULT_MAX_BYTES, deadline()).is_err());
     Ok(())
 }
+
+#[test]
+fn restores_cpfp_after_saved_ancestors_confirm_and_are_fully_spent() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (original_chain, grandparent, parent) = family();
+    let low_fee = spend(OutPoint::new(parent.txid(), 0), 98_000);
+    let paying_child = spend(OutPoint::new(low_fee.txid(), 0), 90_000);
+    let source = gateway(MempoolLimits::default(), None);
+    admit(&source, &grandparent, &original_chain)?;
+    admit(&source, &parent, &original_chain)?;
+    source.submit_local_package(
+        vec![low_fee.clone(), paying_child.clone()],
+        LocalOrigin::Rpc,
+        None,
+        NOW - 10,
+        &original_chain,
+    )?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
+
+    // G and P confirmed while offline. All G outputs are spent; only P's
+    // output funding A remains in Chainstate. A needs C to pay its relay fee.
+    let changed_chain = Coins {
+        outputs: vec![(OutPoint::new(parent.txid(), 0), parent.outputs[0].clone())],
+        height: 102,
+        coinbase: false,
+    };
+    let control = gateway(MempoolLimits::default(), None);
+    control.submit_local_package(
+        vec![low_fee.clone(), paying_child.clone()],
+        LocalOrigin::Rpc,
+        None,
+        NOW,
+        &changed_chain,
+    )?;
+    assert_eq!(control.read().len(), 2, "independent gateway control");
+    let target = gateway(MempoolLimits::default(), None);
+    let report = restore(
+        dir.path(),
+        &target,
+        Network::Regtest,
+        &changed_chain,
+        NOW,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?
+    .ok_or("missing snapshot")?;
+    assert_eq!(
+        (report.candidates, report.restored, report.skipped),
+        (4, 2, 2)
+    );
+    assert!(target.read().contains_txid(&low_fee.txid()));
+    assert!(target.read().contains_txid(&paying_child.txid()));
+    assert!(!target.read().contains_txid(&grandparent.txid()));
+    assert!(!target.read().contains_txid(&parent.txid()));
+    Ok(())
+}
+
+#[test]
+fn restore_timeout_preserves_all_priorities_through_the_next_save() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (chain, parent, _) = family();
+    let source = gateway(MempoolLimits::default(), None);
+    admit(&source, &parent, &chain)?;
+    source.prioritise(parent.txid(), 500)?;
+    source.prioritise(Txid(Hash256::from_le_bytes(&[8; 32])), i64::MIN)?;
+    source.prioritise(Txid(Hash256::from_le_bytes(&[9; 32])), i64::MAX)?;
+    let snapshot = Snapshot::capture(&source, deadline(), DEFAULT_MAX_BYTES, usize::MAX)?;
+    let bytes = snapshot.encode(Network::Regtest, DEFAULT_MAX_BYTES, deadline())?;
+    let decoded = Snapshot::decode(&bytes, Network::Regtest, DEFAULT_MAX_BYTES, deadline())?;
+    let target = gateway(MempoolLimits::default(), None);
+    // Deterministically expire the admission budget after successful decoding.
+    let report = restore_candidates(&decoded, &target, &chain, NOW, Instant::now())?;
+    assert!(report.timed_out);
+    assert_eq!(report.restored, 0);
+    let expected: std::collections::BTreeMap<_, _> = source.read().fee_deltas().collect();
+    assert_eq!(
+        target
+            .read()
+            .fee_deltas()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        expected
+    );
+    save(
+        dir.path(),
+        &target,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
+    let next = gateway(MempoolLimits::default(), None);
+    restore(
+        dir.path(),
+        &next,
+        Network::Regtest,
+        &chain,
+        NOW,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
+    assert_eq!(
+        next.read()
+            .fee_deltas()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        expected
+    );
+    assert!(next.read().is_empty());
+    Ok(())
+}

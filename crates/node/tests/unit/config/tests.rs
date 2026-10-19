@@ -90,11 +90,19 @@ fn mempool_snapshot_restore_timeout_is_configurable_and_scales_with_budget() {
         300
     );
 
-    let invalid = UserConfig {
-        mempool_snapshot_restore_timeout_secs: Some(0),
-        ..Default::default()
-    };
-    assert!(super::resolve(&[&invalid]).is_err());
+    for seconds in [0, u64::MAX] {
+        let invalid = UserConfig {
+            mempool_snapshot_restore_timeout_secs: Some(seconds),
+            ..Default::default()
+        };
+        assert!(super::resolve(&[&invalid]).is_err());
+        let mut config = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
+        config.mempool_snapshot_restore_timeout_secs = seconds;
+        assert!(
+            config.validate().is_err(),
+            "direct embedding config must also reject {seconds}"
+        );
+    }
 }
 
 #[test]

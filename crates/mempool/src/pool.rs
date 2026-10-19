@@ -175,6 +175,9 @@ struct Derived {
     /// Witness-id index. Reach it through `contains_wtxid` and
     /// `entry_by_wtxid`.
     by_wtxid: HashMap<Wtxid, EntryId>,
+    /// Ordered index of live entries whose initial broadcast is pending.
+    /// Derived from each entry's flag; key ranges bound relay retry work.
+    unbroadcast: std::collections::BTreeSet<Wtxid>,
     /// Cached connected-component (cluster) summaries, indexed by component
     /// id. Maintained by `commit_insert` and `remove_entries_with_reasons`;
     /// read by the admission fast path in `check_cluster_limits`.
@@ -246,6 +249,7 @@ impl Derived {
         }
         self.by_txid.remove(&entry.txid);
         self.by_wtxid.remove(&entry.wtxid);
+        self.unbroadcast.remove(&entry.wtxid);
         for output in &entry.tx.outputs {
             let _ = self
                 .funding
@@ -866,6 +870,7 @@ impl Mempool {
         let tx = Arc::clone(&entry.tx);
         let txid = entry.txid;
         let wtxid = entry.wtxid;
+        let unbroadcast = entry.unbroadcast;
         let added_vsize = u64::from(entry.vsize);
         let added_fee = entry.fee;
         let added_fee_rate = entry.fee_rate;
@@ -891,6 +896,9 @@ impl Mempool {
             },
         );
         self.derived.by_wtxid.insert(wtxid, id);
+        if unbroadcast {
+            self.derived.unbroadcast.insert(wtxid);
+        }
         for output in &tx.outputs {
             self.derived
                 .funding
@@ -1098,6 +1106,11 @@ impl Mempool {
             && let Some(entry) = self.entry_mut(id)
         {
             entry.unbroadcast = pending;
+            if pending {
+                self.derived.unbroadcast.insert(wtxid);
+            } else {
+                self.derived.unbroadcast.remove(&wtxid);
+            }
         }
     }
 
@@ -1238,6 +1251,9 @@ impl Mempool {
         let by_wtxid = u64::try_from(self.derived.by_wtxid.capacity())
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::try_from(size_of::<(Wtxid, EntryId)>()).unwrap_or(0));
+        let unbroadcast = u64::try_from(self.derived.unbroadcast.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<Wtxid>()).unwrap_or(0));
         let links = self.entries.iter_links().fold(0_u64, |total, link| {
             let payload = link
                 .parents
@@ -1258,6 +1274,7 @@ impl Mempool {
             .saturating_add(transactions)
             .saturating_add(by_txid)
             .saturating_add(by_wtxid)
+            .saturating_add(unbroadcast)
             .saturating_add(funding)
             .saturating_add(spending)
             .saturating_add(links)
@@ -1375,9 +1392,24 @@ impl Mempool {
 
     /// Pending local initial broadcasts with their current admission epochs.
     pub fn unbroadcast_transactions(&self) -> impl Iterator<Item = (Txid, Wtxid, u64)> + '_ {
-        self.iter_entries()
-            .filter(|entry| entry.unbroadcast)
-            .filter_map(|entry| {
+        self.unbroadcast_transactions_after(None)
+    }
+
+    /// Pending local initial broadcasts strictly after `after`, in witness-id
+    /// order, with their current admission epochs. Visits only indexed pending
+    /// entries, so callers can bound work with `take` without rescanning a prefix.
+    pub fn unbroadcast_transactions_after(
+        &self,
+        after: Option<Wtxid>,
+    ) -> impl Iterator<Item = (Txid, Wtxid, u64)> + '_ {
+        self.derived
+            .unbroadcast
+            .range((
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Unbounded,
+            ))
+            .filter_map(|wtxid| {
+                let entry = self.entry_by_wtxid(wtxid)?;
                 let indexed = self.derived.by_txid.get(&entry.txid)?;
                 Some((entry.txid, entry.wtxid, indexed.admitted_sequence))
             })
@@ -2268,6 +2300,43 @@ mod tests {
         assert_eq!(result.sequence_of(0), Some(u64::MAX));
         assert_eq!(result.sequence_of(1), Some(0));
         assert_eq!(result.sequence_of(2), None);
+    }
+
+    #[test]
+    fn pending_broadcast_index_tracks_flags_across_entry_lifecycle() -> Result<(), MempoolError> {
+        let mut pool = Mempool::new(MempoolLimits::default());
+        let first = Arc::new(tx(1, Vec::new()));
+        let second = Arc::new(tx(2, Vec::new()));
+        let assert_index = |pool: &Mempool| {
+            let flags: std::collections::BTreeSet<_> = pool
+                .iter_entries()
+                .filter(|entry| entry.unbroadcast)
+                .map(|entry| entry.wtxid)
+                .collect();
+            assert_eq!(pool.derived.unbroadcast, flags);
+        };
+        let mut entry = MempoolEntry::new(Arc::clone(&first), 100, 10_000, 1, 0, 0);
+        entry.unbroadcast = true;
+        pool.insert_entry(entry)?;
+        pool.insert_entry(MempoolEntry::new(Arc::clone(&second), 100, 10_000, 1, 0, 0))?;
+        assert_index(&pool);
+        pool.set_unbroadcast(second.wtxid(), true);
+        pool.set_unbroadcast(second.wtxid(), true);
+        pool.set_unbroadcast(first.wtxid(), false);
+        assert_index(&pool);
+        pool.remove_for_block(&[second.as_ref()], &[second.txid()], 2);
+        assert_index(&pool);
+        assert!(
+            pool.derived.unbroadcast.is_empty(),
+            "removal must retire the index key, not leave a tombstone"
+        );
+        pool.insert_entry(MempoolEntry::new(second, 100, 10_000, 1, 0, 0))?;
+        assert_index(&pool);
+        pool.set_unbroadcast(first.wtxid(), true);
+        assert_index(&pool);
+        pool.clear();
+        assert_index(&pool);
+        Ok(())
     }
 
     #[test]
