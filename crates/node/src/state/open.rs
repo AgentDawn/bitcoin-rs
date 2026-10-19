@@ -427,13 +427,20 @@ impl NodeState {
                 deadline,
             ) {
                 Ok(Some(report)) => {
+                    if report.limited != 0 {
+                        tracing::warn!(
+                            limited = report.limited,
+                            package_attempts = report.package_attempts,
+                            "mempool snapshot candidates not restored because bounded subset search did not complete"
+                        );
+                    }
                     if report.timed_out {
                         tracing::warn!(
                             candidates = report.candidates,
                             restored = report.restored,
                             skipped = report.skipped,
                             timeout_secs = config.mempool_snapshot_restore_timeout_secs,
-                            "mempool snapshot restore timed out before validating all candidates; consider raising --mempool-snapshot-restore-timeout-secs"
+                            "mempool snapshot restore deadline expired; consider raising --mempool-snapshot-restore-timeout-secs"
                         );
                     }
                     tracing::info!(
@@ -441,6 +448,8 @@ impl NodeState {
                         restored = report.restored,
                         skipped = report.skipped,
                         timed_out = report.timed_out,
+                        limited = report.limited,
+                        package_attempts = report.package_attempts,
                         elapsed_ms = started.elapsed().as_millis(),
                         status = if report.skipped == 0 && !report.timed_out {
                             "restored"

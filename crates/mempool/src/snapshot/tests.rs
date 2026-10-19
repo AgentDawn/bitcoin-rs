@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ChainAdmissionSnapshot, Mempool, MempoolLimits, PrevoutMeta};
+use crate::{AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolLimits, PrevoutMeta};
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_primitives::{Amount, LockTime, OutPoint, Script, Sequence, TxIn, TxOut, Witness};
 use parking_lot::{Mutex, RwLock};
@@ -8,6 +8,8 @@ use std::time::Duration;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 const NOW: u64 = 2_000_000;
 const INTERRUPTED_STAGE: &str = "mempool-snapshot-interrupted.tmp";
+
+mod restore_model;
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
@@ -19,7 +21,7 @@ struct Coins {
     coinbase: bool,
 }
 impl AdmissionChain for Coins {
-    fn snapshot(&self, _: &Tx) -> Option<ChainAdmissionSnapshot> {
+    fn snapshot(&self, tx: &Tx) -> Option<ChainAdmissionSnapshot> {
         Some(ChainAdmissionSnapshot {
             prevouts: self.outputs.clone(),
             height: self.height,
@@ -37,6 +39,10 @@ impl AdmissionChain for Coins {
                     )
                 })
                 .collect(),
+            confirmed: self
+                .outputs
+                .iter()
+                .any(|(point, _)| point.txid == tx.txid()),
             ..Default::default()
         })
     }
@@ -402,7 +408,7 @@ fn reseal(bytes: &mut [u8]) {
 }
 
 #[test]
-fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
+fn restores_valid_subset_when_a_descendant_becomes_nonfinal() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (mut chain, mut a, _) = family();
     a.outputs[0].value = Amount::from_sat(100_000);
@@ -416,15 +422,7 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
     c.inputs.push(second);
     let fee = a.vsize() + c.vsize();
     c.outputs[0].value = Amount::from_sat(150_000 - fee);
-    let mut d = spend(OutPoint::new(b.txid(), 1), 49_000);
-    // Force the problematic deterministic order: both parents, then C, then D.
-    for nonce in 0..10_000 {
-        d.lock_time = LockTime::from_consensus(nonce);
-        if d.txid() > a.txid().max(b.txid()).max(c.txid()) {
-            break;
-        }
-    }
-    assert!(d.txid() > a.txid().max(b.txid()).max(c.txid()));
+    let d = spend(OutPoint::new(b.txid(), 1), 49_000);
     let source = gateway(MempoolLimits::default(), None);
     source.submit_local_package(
         vec![b.clone(), d.clone()],
@@ -440,8 +438,8 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
         NOW - 10,
         &chain,
     )?;
-    // A now-nonfinal descendant makes the whole-family preflight fail. The
-    // original B+D then A+C fallback must still retry C when B is restored.
+    // The complete family fails finality, but its four valid members can
+    // still enter together without consuming either shared fee budget early.
     let mut nonfinal = spend(OutPoint::new(d.txid(), 0), 48_000);
     nonfinal.lock_time = LockTime::from_consensus(150);
     nonfinal.inputs[0].sequence = Sequence::ZERO;
@@ -474,7 +472,8 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
         assert!(target.read().contains_txid(&tx.txid()));
     }
     let batches = seen.0.lock();
-    assert_eq!(batches.len(), 2);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].result.changes.len(), 4);
     assert!(
         batches[0]
             .result
@@ -483,7 +482,7 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
             .any(|row| row.txid == Hash256::from(d.txid()))
     );
     assert!(
-        batches[1]
+        batches[0]
             .result
             .changes
             .iter()
@@ -1346,81 +1345,52 @@ fn saved_ancestor_chain(count: usize) -> Vec<SavedTransaction> {
 }
 
 #[test]
-fn ancestor_collection_stops_at_the_package_count_boundary() -> TestResult {
+fn family_collection_stops_at_the_package_count_boundary() -> TestResult {
     let limit = crate::standardness::MAX_PACKAGE_COUNT;
     for count in [limit, limit + 1, limit * 4] {
         let rows = saved_ancestor_chain(count);
-        let positions = rows.iter().map(|row| (row.txid, row)).collect();
-        let children = rows
-            .windows(2)
-            .map(|pair| (pair[0].txid, vec![pair[1].txid]))
-            .collect();
-        for whole_family in [false, true] {
-            let chain = AncestorReads {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                expire_at: None,
-            };
-            let target = gateway(MempoolLimits::default(), None);
-            let missing = collect_saved_dependencies(
-                &if whole_family {
-                    rows.first()
-                } else {
-                    rows.last()
-                }
-                .ok_or("missing member")?
-                .tx,
-                &target,
-                &chain,
-                &positions,
-                whole_family.then_some(&children),
-                |_| true,
-                deadline(),
-            )?;
-            let expected = if whole_family {
-                count.min(limit + 1)
-            } else {
-                (count - 1).min(limit)
-            };
-            assert_eq!(missing.len(), expected);
-            assert_eq!(
-                chain.calls.load(std::sync::atomic::Ordering::Relaxed),
-                count.min(limit)
-            );
-            assert_eq!(
-                if whole_family {
-                    missing.len() <= limit
-                } else {
-                    missing.len() < limit
-                },
-                count == limit,
-                "the candidate counts as one package member"
-            );
+        let mut graph = RestoreGraph {
+            neighbors: HashMap::new(),
+            confirmed: hashbrown::HashSet::new(),
+        };
+        for pair in rows.windows(2) {
+            graph
+                .neighbors
+                .entry(pair[0].txid)
+                .or_default()
+                .push(pair[1].txid);
+            graph
+                .neighbors
+                .entry(pair[1].txid)
+                .or_default()
+                .push(pair[0].txid);
         }
+        let family = collect_saved_family(rows[0].txid, &graph, deadline())?;
+        assert_eq!(family.len(), count.min(limit + 1));
+        assert_eq!(family.len() <= limit, count == limit);
     }
     Ok(())
 }
 
 #[test]
-fn ancestor_collection_stops_when_a_chain_read_exhausts_the_deadline() -> TestResult {
-    let rows = saved_ancestor_chain(100);
-    let positions = rows.iter().map(|row| (row.txid, row)).collect();
-    let target = gateway(MempoolLimits::default(), None);
+fn graph_build_stops_when_a_chain_read_exhausts_the_deadline() -> TestResult {
+    let snapshot = Snapshot {
+        transactions: saved_ancestor_chain(100),
+        deltas: Vec::new(),
+    };
+    let positions = snapshot
+        .transactions
+        .iter()
+        .map(|row| (row.txid, row))
+        .collect();
     let expires = Instant::now() + Duration::from_secs(1);
     let chain = AncestorReads {
         calls: std::sync::atomic::AtomicUsize::new(0),
         expire_at: Some(expires),
     };
-    let error = collect_saved_dependencies(
-        &rows.last().ok_or("missing leaf")?.tx,
-        &target,
-        &chain,
-        &positions,
-        None,
-        |_| true,
-        expires,
-    )
-    .err()
-    .ok_or("deadline must stop traversal")?;
+    let error = build_restore_graph(&snapshot, &positions, &chain, expires)
+        .err()
+        .ok_or("deadline must stop graph construction")?;
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(chain.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     Ok(())

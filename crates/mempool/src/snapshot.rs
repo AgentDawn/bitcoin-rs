@@ -3,7 +3,6 @@
 //! Persist only canonical transactions, admission times and operator fee deltas.
 //! Graphs, fees, admission stamps and sequences are reconstructed by the gateway.
 
-use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use bitcoin_rs_primitives::{
 use hashbrown::HashMap;
 use sha2::{Digest, Sha256};
 
-use crate::{AdmissionChain, AdmissionOrigin, LocalOrigin, MempoolGateway};
+use crate::{AdmissionChain, LocalOrigin, MempoolGateway, MutationResult};
 
 /// This artifact is optional and never participates in authoritative recovery.
 const FILE_NAME: &str = "mempool-snapshot.dat";
@@ -26,6 +25,8 @@ pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TX_BYTES: usize = 400_000;
 /// Candidates older than fourteen days are not reconsidered at startup.
 const MAX_AGE: u64 = 14 * 24 * 60 * 60;
+/// Every subset of an eight-member family fits this budget (2^8 - 1).
+const MAX_SUBSET_ATTEMPTS: usize = 256;
 
 struct SavedTransaction {
     tx: Arc<Tx>,
@@ -49,8 +50,12 @@ pub struct RestoreReport {
     pub restored: usize,
     /// Candidates not present, including expired, confirmed and rejected entries.
     pub skipped: usize,
-    /// The cooperative startup deadline stopped further admissions.
+    /// The cooperative deadline expired during restoration.
     pub timed_out: bool,
+    /// Candidates not restored because the bounded search could not complete.
+    pub limited: usize,
+    /// Atomic gateway package attempts, including rejected subsets.
+    pub package_attempts: u64,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -451,72 +456,136 @@ pub fn restore(
     restore_candidates(&snapshot, gateway, chain, now, deadline).map(Some)
 }
 
-// With children, collect a family before standalone admission consumes its
-// shared fee budget. Without them, collect only missing ancestors for retry.
-// Both traversals stop as soon as the package cannot fit the existing limit.
-fn collect_saved_dependencies(
-    tx: &Tx,
-    gateway: &MempoolGateway,
-    chain: &dyn AdmissionChain,
-    positions: &HashMap<Txid, &SavedTransaction>,
-    children: Option<&HashMap<Txid, Vec<Txid>>>,
-    eligible: impl Fn(&SavedTransaction) -> bool,
-    deadline: Instant,
-) -> io::Result<hashbrown::HashSet<Txid>> {
-    let mut missing = hashbrown::HashSet::new();
-    if children.is_some() {
-        missing.insert(tx.txid());
-    }
-    let limit = crate::standardness::MAX_PACKAGE_COUNT + usize::from(children.is_some());
-    let mut stack = vec![tx];
-    while let Some(tx) = stack.pop() {
-        check_deadline(deadline)?;
-        let confirmed_inputs = chain.snapshot(tx).map(|view| view.prevouts);
-        for input in &tx.inputs {
-            check_deadline(deadline)?;
-            let point = input.previous_output;
-            // Follow only unavailable inputs. A saved parent can now
-            // be confirmed, with fully spent ancestors behind it.
-            if gateway.read().contains_txid(&point.txid)
-                || confirmed_inputs
-                    .as_ref()
-                    .is_some_and(|coins| coins.iter().any(|(confirmed, _)| *confirmed == point))
-            {
-                continue;
-            }
-            if let Some(ancestor) = positions.get(&point.txid)
-                && eligible(ancestor)
-                && missing.insert(point.txid)
-            {
-                if missing.len() >= limit {
-                    return Ok(missing);
-                }
-                stack.push(ancestor.tx.as_ref());
-            }
-        }
-        if let Some(descendants) = children.and_then(|children| children.get(&tx.txid())) {
-            for id in descendants {
-                check_deadline(deadline)?;
-                if !gateway.read().contains_txid(id)
-                    && let Some(child) = positions.get(id)
-                    && eligible(child)
-                    && missing.insert(*id)
-                {
-                    if missing.len() >= limit {
-                        return Ok(missing);
-                    }
-                    stack.push(child.tx.as_ref());
-                }
-            }
-        }
-    }
-    Ok(missing)
+// Saved input references fix one immutable family partition for this restore.
+// Current confirmation cannot erase a historical fee-sharing association;
+// the gateway alone decides whether each candidate subset remains admissible.
+struct RestoreGraph {
+    neighbors: HashMap<Txid, Vec<Txid>>,
+    confirmed: hashbrown::HashSet<Txid>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep bounded dependency retries and gateway publication together"
-)]
+fn build_restore_graph(
+    snapshot: &Snapshot,
+    positions: &HashMap<Txid, &SavedTransaction>,
+    chain: &dyn AdmissionChain,
+    deadline: Instant,
+) -> io::Result<RestoreGraph> {
+    let mut graph = RestoreGraph {
+        neighbors: HashMap::new(),
+        confirmed: hashbrown::HashSet::new(),
+    };
+    for row in &snapshot.transactions {
+        check_deadline(deadline)?;
+        let view = chain.snapshot(&row.tx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "snapshot admission chain facts unavailable",
+            )
+        })?;
+        if view.confirmed {
+            graph.confirmed.insert(row.txid);
+        }
+        for input in &row.tx.inputs {
+            check_deadline(deadline)?;
+            let point = input.previous_output;
+            if positions.contains_key(&point.txid) {
+                graph
+                    .neighbors
+                    .entry(row.txid)
+                    .or_default()
+                    .push(point.txid);
+                graph
+                    .neighbors
+                    .entry(point.txid)
+                    .or_default()
+                    .push(row.txid);
+            }
+        }
+    }
+    Ok(graph)
+}
+
+// The extra member is an overflow sentinel. Never admit a truncated family.
+fn collect_saved_family(
+    root: Txid,
+    graph: &RestoreGraph,
+    deadline: Instant,
+) -> io::Result<hashbrown::HashSet<Txid>> {
+    let mut members = hashbrown::HashSet::new();
+    members.insert(root);
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        check_deadline(deadline)?;
+        for neighbor in graph.neighbors.get(&id).into_iter().flatten() {
+            check_deadline(deadline)?;
+            if members.insert(*neighbor) {
+                if members.len() > crate::standardness::MAX_PACKAGE_COUNT {
+                    return Ok(members);
+                }
+                pending.push(*neighbor);
+            }
+        }
+    }
+    Ok(members)
+}
+enum FamilyRestore {
+    Accepted(MutationResult),
+    Rejected,
+    Limited,
+}
+
+// Descending cardinality makes the first successful commit maximum-cardinality
+// for this complete family against the unchanged pool and Chainstate. Failed
+// atomic gateway attempts cannot consume a parent's fee contribution.
+fn restore_family(
+    family: &[&SavedTransaction],
+    gateway: &MempoolGateway,
+    chain: &dyn AdmissionChain,
+    deadline: Instant,
+    package_attempts: &mut u64,
+) -> io::Result<FamilyRestore> {
+    let mut attempts = 0;
+    let times: HashMap<_, _> = family.iter().map(|row| (row.txid, row.time)).collect();
+    for count in (1..=family.len()).rev() {
+        let mut subset: Vec<_> = (0..count).collect();
+        loop {
+            check_deadline(deadline)?;
+            if attempts == MAX_SUBSET_ATTEMPTS {
+                return Ok(FamilyRestore::Limited);
+            }
+            attempts += 1;
+            *package_attempts += 1;
+            let package: Vec<_> = subset
+                .iter()
+                .map(|&index| family[index].tx.as_ref().clone())
+                .collect();
+            match gateway.submit_package_with_times(
+                &package,
+                LocalOrigin::Snapshot,
+                None,
+                |tx| times[&tx.txid()],
+                chain,
+            ) {
+                Ok(result) => return Ok(FamilyRestore::Accepted(result)),
+                // Changing fences do not establish rejection of this subset.
+                Err(crate::SubmitError::RetryExhausted) => return Ok(FamilyRestore::Limited),
+                Err(crate::SubmitError::Policy(_) | crate::SubmitError::Consensus) => {}
+            }
+            let Some(position) = (0..count)
+                .rev()
+                .find(|&position| subset[position] < family.len() - count + position)
+            else {
+                break;
+            };
+            subset[position] += 1;
+            for next in position + 1..count {
+                subset[next] = subset[next - 1] + 1;
+            }
+        }
+    }
+    Ok(FamilyRestore::Rejected)
+}
+
 fn restore_candidates(
     snapshot: &Snapshot,
     gateway: &MempoolGateway,
@@ -540,181 +609,91 @@ fn restore_candidates(
             && now - row.time <= MAX_AGE
             && row.sigop_cost <= crate::standardness::MAX_STANDARD_TX_SIGOPS_COST
     };
-    // The decoded overlay is operator state, not optional admission work.
-    // Finish it even if the cooperative transaction budget has expired, so
-    // the next save cannot replace the file with only a prefix of priorities.
+    // Operator state is restored completely before optional admission work.
     // Decode rejects duplicate txids and startup requires an empty overlay.
     for (txid, delta) in &snapshot.deltas {
         gateway
             .prioritise(*txid, *delta)
             .map_err(|_| invalid("snapshot fee delta overflow"))?;
     }
-    let mut timed_out = false;
-    let mut children: HashMap<Txid, Vec<Txid>> = HashMap::new();
-    'dependencies: for row in &snapshot.transactions {
-        for input in &row.tx.inputs {
-            if check_deadline(deadline).is_err() {
-                timed_out = true;
-                break 'dependencies;
+    let mut report = RestoreReport {
+        candidates: snapshot.transactions.len(),
+        restored: 0,
+        skipped: snapshot.transactions.len(),
+        timed_out: false,
+        limited: 0,
+        package_attempts: 0,
+    };
+    let graph = match build_restore_graph(snapshot, &positions, chain, deadline) {
+        Ok(graph) => graph,
+        Err(error) => {
+            if error.kind() == io::ErrorKind::TimedOut {
+                report.timed_out = true;
+            } else {
+                report.limited = report.candidates;
             }
-            if positions.contains_key(&input.previous_output.txid) {
-                children
-                    .entry(input.previous_output.txid)
-                    .or_default()
-                    .push(row.txid);
-            }
+            return Ok(report);
         }
-    }
-    let mut ready = VecDeque::from(order);
-    let mut queued = vec![true; snapshot.transactions.len()];
-    let mut waiting: HashMap<Txid, hashbrown::HashSet<usize>> = HashMap::new();
-    let mut announced = hashbrown::HashSet::new();
-    while let Some(index) = ready.pop_front() {
-        queued[index] = false;
-        if timed_out || check_deadline(deadline).is_err() {
-            timed_out = true;
+    };
+    let mut processed = hashbrown::HashSet::new();
+    for index in order {
+        if check_deadline(deadline).is_err() {
+            report.timed_out = true;
             break;
         }
         let row = &snapshot.transactions[index];
-        if !eligible(row) || gateway.read().contains_txid(&row.txid) {
+        if processed.contains(&row.txid) {
             continue;
         }
-        let Ok(family) = collect_saved_dependencies(
-            &row.tx,
+        let Ok(family) = collect_saved_family(row.txid, &graph, deadline) else {
+            report.timed_out = true;
+            break;
+        };
+        let newly_processed = family
+            .iter()
+            .filter(|&&id| {
+                processed.insert(id) && eligible(positions[&id]) && !graph.confirmed.contains(&id)
+            })
+            .count();
+        if family.len() > crate::standardness::MAX_PACKAGE_COUNT {
+            report.limited += newly_processed;
+            continue;
+        }
+        let mut candidates: Vec<_> = family
+            .iter()
+            .filter(|id| eligible(positions[*id]) && !graph.confirmed.contains(*id))
+            .map(|id| positions[id])
+            .collect();
+        candidates.sort_unstable_by_key(|row| topo_order[&row.txid]);
+        match restore_family(
+            &candidates,
             gateway,
             chain,
-            &positions,
-            Some(&children),
-            eligible,
             deadline,
-        ) else {
-            timed_out = true;
-            break;
-        };
-        let mut family: Vec<_> =
-            if (2..=crate::standardness::MAX_PACKAGE_COUNT).contains(&family.len()) {
-                family.into_iter().collect()
-            } else {
-                Vec::new()
-            };
-        family.sort_unstable_by_key(|id| topo_order[id]);
-        let family: Vec<_> = family
-            .iter()
-            .map(|id| positions[id].tx.as_ref().clone())
-            .collect();
-        if check_deadline(deadline).is_err() {
-            timed_out = true;
-            break;
-        }
-        let restored_family = if family.is_empty() {
-            None
-        } else {
-            gateway
-                .submit_package_with_times(
-                    &family,
-                    LocalOrigin::Snapshot,
-                    None,
-                    |tx| positions[&tx.txid()].time,
-                    chain,
-                )
-                .ok()
-        };
-        if restored_family.is_none() && check_deadline(deadline).is_err() {
-            timed_out = true;
-            break;
-        }
-        let mut result = if let Some(result) = restored_family {
-            Ok(result)
-        } else {
-            gateway
-                .submit_transaction(
-                    Arc::clone(&row.tx),
-                    AdmissionOrigin::Snapshot,
-                    None,
-                    row.time,
-                    chain,
-                )
-                .map(|outcome| match outcome {
-                    crate::SubmitOutcome::Committed(result) => result,
-                    _ => crate::MutationResult::empty(),
-                })
-        };
-        // A native CPFP/ephemeral-dust package may have parents and ancestors
-        // that cannot enter alone. Recursively collect unconfirmed in-snapshot
-        // ancestors in topological order; package validation enforces limits,
-        // scripts and current aggregate fee floors.
-        let mut package = Vec::new();
-        let mut missing = hashbrown::HashSet::new();
-        if result.is_err() {
-            let Ok(ancestors) = collect_saved_dependencies(
-                &row.tx, gateway, chain, &positions, None, eligible, deadline,
-            ) else {
-                timed_out = true;
-                break;
-            };
-            missing = ancestors;
-            if !missing.is_empty() && missing.len() < crate::standardness::MAX_PACKAGE_COUNT {
-                let mut ancestor_ids: Vec<_> = missing.iter().copied().collect();
-                ancestor_ids.sort_by_key(|id| topo_order.get(id).copied().unwrap_or(usize::MAX));
-                for id in ancestor_ids {
-                    package.push(positions[&id].tx.as_ref().clone());
-                }
-                package.push(row.tx.as_ref().clone());
-            }
-        }
-        if !package.is_empty() {
-            if check_deadline(deadline).is_err() {
-                timed_out = true;
-                break;
-            }
-            result = gateway.submit_package_with_times(
-                &package,
-                LocalOrigin::Snapshot,
-                None,
-                |tx| positions[&tx.txid()].time,
-                chain,
-            );
-        }
-        if let Ok(result) = result {
-            for change in result.changes {
-                let id = Txid(change.txid);
-                if let Some(saved) = positions.get(&id)
-                    && saved.unbroadcast
-                {
-                    gateway.restore_unbroadcast(saved.tx.wtxid());
-                }
-                if gateway.read().contains_txid(&id)
-                    && announced.insert(id)
-                    && let Some(children) = waiting.remove(&id)
-                {
-                    let mut children: Vec<_> = children.into_iter().collect();
-                    children.sort_unstable();
-                    for child in children {
-                        if !queued[child] {
-                            queued[child] = true;
-                            ready.push_back(child);
-                        }
+            &mut report.package_attempts,
+        ) {
+            Ok(FamilyRestore::Accepted(result)) => {
+                for change in result.changes {
+                    let id = Txid(change.txid);
+                    if let Some(saved) = positions.get(&id)
+                        && saved.unbroadcast
+                    {
+                        gateway.restore_unbroadcast(saved.tx.wtxid());
                     }
                 }
             }
-        } else {
-            // Each restored parent wakes its failed dependents at most once.
-            // No progress means no retries; total wakes are bounded by saved
-            // dependency edges, in addition to the cooperative time budget.
-            for parent in missing {
-                waiting.entry(parent).or_default().insert(index);
+            Ok(FamilyRestore::Limited) => report.limited += candidates.len(),
+            Ok(FamilyRestore::Rejected) => {}
+            Err(_) => {
+                report.timed_out = true;
+                break;
             }
         }
     }
-    timed_out |= check_deadline(deadline).is_err();
-    let restored = gateway.read().len();
-    Ok(RestoreReport {
-        candidates: snapshot.transactions.len(),
-        restored,
-        skipped: snapshot.transactions.len().saturating_sub(restored),
-        timed_out,
-    })
+    report.timed_out |= check_deadline(deadline).is_err();
+    report.restored = gateway.read().len();
+    report.skipped = report.candidates.saturating_sub(report.restored);
+    Ok(report)
 }
-
 #[cfg(test)]
 mod tests;
