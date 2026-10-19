@@ -147,8 +147,8 @@ pub trait ChainQuery: Send + Sync {
     }
 }
 
-/// Read-only transaction inventory view used by the Inv filter and the
-/// `getdata` tx responder.
+/// Transaction inventory view and successful-getdata acknowledgement seam,
+/// used by the Inv filter and transaction responder.
 ///
 /// Implemented here for the mempool gateway; the p2p crate owns the protocol
 /// adapter while mempool owns admission, orphan, and rejection state.
@@ -169,9 +169,15 @@ pub trait TxInventory: Send + Sync {
     /// Returns the witness transaction body for `wtxid`, or `None` when the
     /// node does not have it. Used to answer BIP339 `getdata` (`WTx`) items.
     fn get_tx_by_wtxid(&self, wtxid: Wtxid) -> Option<Tx>;
+
+    /// Called only after a transaction body was successfully queued for getdata.
+    fn transaction_sent(&self, _wtxid: Wtxid) {}
 }
 
 impl TxInventory for bitcoin_rs_mempool::MempoolGateway {
+    fn transaction_sent(&self, wtxid: Wtxid) {
+        self.mark_broadcast(wtxid);
+    }
     fn have_tx(&self, hash: Hash256, hash_is_wtxid: bool) -> bool {
         Self::have_tx(self, hash, hash_is_wtxid)
     }
@@ -418,12 +424,14 @@ fn serve_getdata(
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let native = Txid::from(Hash256::from_le_bytes(txid.as_byte_array()));
                 if let Some(mut tx) = inv.get_tx(native) {
+                    let wtxid = tx.wtxid();
                     if matches!(item, Inventory::Transaction(_)) {
                         for input in &mut tx.inputs {
                             input.witness.clear();
                         }
                     }
                     send(Message::Tx(tx))?;
+                    inv.transaction_sent(wtxid);
                 } else {
                     not_found.push(*item);
                 }
@@ -432,6 +440,7 @@ fn serve_getdata(
                 let native = Wtxid::from(Hash256::from_le_bytes(wtxid.as_byte_array()));
                 if let Some(tx) = inv.get_tx_by_wtxid(native) {
                     send(Message::Tx(tx))?;
+                    inv.transaction_sent(native);
                 } else {
                     not_found.push(*item);
                 }
@@ -1394,6 +1403,66 @@ mod tests {
             }],
             lock_time: LockTime::ZERO,
         }
+    }
+
+    #[test]
+    fn getdata_completes_initial_broadcast_only_after_successful_send()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::serve_getdata;
+        use bitcoin_rs_consensus::ValidationEngine;
+        use bitcoin_rs_mempool::{
+            AdmissionOrigin, Mempool, MempoolEntry, MempoolGateway, MempoolLimits,
+        };
+        use bitcoin_rs_primitives::Witness;
+        use std::sync::Arc;
+        for kind in 0..3 {
+            let gateway = MempoolGateway::new(
+                Arc::new(parking_lot::RwLock::new(Mempool::new(
+                    MempoolLimits::default(),
+                ))),
+                None,
+                ValidationEngine::Native,
+            );
+            let mut tx = dummy_tx(1);
+            tx.inputs[0].witness = Witness::from_stack(vec![vec![0x51]]);
+            let txid = tx.txid();
+            let wtxid = tx.wtxid();
+            gateway.insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(tx), 100, 1000, 1, 0, 0),
+            )?;
+            let sequence = gateway.read().sequence_number();
+            let item = match kind {
+                0 => Inventory::Transaction(bitcoin::Txid::from_byte_array(*txid.as_bytes())),
+                1 => {
+                    Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(*txid.as_bytes()))
+                }
+                _ => Inventory::WTx(bitcoin::Wtxid::from_byte_array(*wtxid.as_bytes())),
+            };
+            assert!(
+                serve_getdata(None, Some(&gateway), None, &[item], &|| true, &mut |_| Err(
+                    PeerError::Misbehavior("test sink full")
+                ))
+                .is_err()
+            );
+            assert_eq!(gateway.read().unbroadcast_transactions().count(), 1);
+            let mut responses = Vec::new();
+            serve_getdata(
+                None,
+                Some(&gateway),
+                None,
+                &[item],
+                &|| true,
+                &mut |message| {
+                    responses.push(message);
+                    Ok(())
+                },
+            )?;
+            assert!(matches!(responses.as_slice(), [Message::Tx(_)]));
+            assert_eq!(gateway.read().unbroadcast_transactions().count(), 0);
+            assert_eq!(gateway.read().sequence_number(), sequence);
+        }
+        Ok(())
     }
 
     #[test]

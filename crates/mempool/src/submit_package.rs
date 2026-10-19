@@ -51,10 +51,6 @@ impl MempoolGateway {
     /// accepting arbitrary input order. No replacement or capacity eviction;
     /// new members pay the aggregate relay/pressure floor. Resident and
     /// positively confirmed members contribute no fees. RPC/REST is unchanged.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep package capture, verification, stamp revalidation and atomic commit in one auditable owner"
-    )]
     pub fn submit_local_package(
         &self,
         txs: Vec<Tx>,
@@ -64,6 +60,22 @@ impl MempoolGateway {
         chain: &dyn AdmissionChain,
     ) -> Result<MutationResult, SubmitError> {
         let txs = ordered(txs)?;
+        self.submit_package_with_times(&txs, origin, max_rate, |_| time, chain)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep package capture, verification, stamp revalidation and atomic commit in one auditable owner"
+    )]
+    pub(crate) fn submit_package_with_times(
+        &self,
+        txs: &[Tx],
+        origin: LocalOrigin,
+        max_rate: Option<u64>,
+        time: impl Fn(&Tx) -> u64,
+        chain: &dyn AdmissionChain,
+    ) -> Result<MutationResult, SubmitError> {
+        crate::package::check_structure(txs)?;
         let origin = AdmissionOrigin::from(origin);
         'attempt: for _ in 0..MAX_ADMISSION_RETRIES {
             let Some(generation) = self.stable_generation() else {
@@ -98,18 +110,21 @@ impl MempoolGateway {
                     .collect();
                 (pending, sequence, pool.policy_stamp(), inputs)
             };
-            let Some(requests) = batch_requests(
+            let Some(mut requests) = batch_requests(
                 &pending,
                 inputs,
                 chain,
                 max_rate,
-                time,
+                0,
                 origin,
                 (generation, sequence),
                 AdmissionMode::PackageSubmit,
             ) else {
                 continue;
             };
+            for request in &mut requests {
+                request.time = time(&request.tx);
+            }
             // Positive confirmed membership is a chain fact, so revalidate its
             // generation and policy stamp just like both acceptance and refusal.
             let pending: Vec<_> = requests

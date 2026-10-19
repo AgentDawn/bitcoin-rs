@@ -24,6 +24,88 @@ fn auth_debug_redacts_secrets() {
 }
 
 #[test]
+fn mempool_persistence_can_be_disabled_without_changing_other_settings() {
+    assert!(
+        NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest).persist_mempool
+    );
+    let layer = UserConfig {
+        persist_mempool: Some(false),
+        ..Default::default()
+    };
+    let config = resolved(&[&layer]);
+    assert!(!config.persist_mempool);
+    assert_eq!(config.storage.dbcache_mb, 450);
+    let enable = UserConfig {
+        persist_mempool: Some(true),
+        ..Default::default()
+    };
+    assert!(resolved(&[&layer, &enable]).persist_mempool);
+}
+
+#[test]
+fn mempool_snapshot_budget_is_configurable_and_bounded() {
+    let defaults = resolved(&[]);
+    assert_eq!(
+        defaults.mempool_snapshot_max_bytes,
+        bitcoin_rs_mempool::snapshot::DEFAULT_MAX_BYTES
+    );
+    let layer = UserConfig {
+        mempool_snapshot_max_mb: Some(2048),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved(&[&layer]).mempool_snapshot_max_bytes,
+        2048 * 1024 * 1024
+    );
+    for mb in [0, u64::MAX] {
+        let layer = UserConfig {
+            mempool_snapshot_max_mb: Some(mb),
+            ..Default::default()
+        };
+        assert!(super::resolve(&[&layer]).is_err());
+    }
+}
+
+#[test]
+fn mempool_snapshot_restore_timeout_is_configurable_and_scales_with_budget() {
+    let defaults = resolved(&[]);
+    assert_eq!(defaults.mempool_snapshot_restore_timeout_secs, 64);
+
+    let large_budget = UserConfig {
+        mempool_snapshot_max_mb: Some(120),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved(&[&large_budget]).mempool_snapshot_restore_timeout_secs,
+        120
+    );
+
+    let explicit = UserConfig {
+        mempool_snapshot_max_mb: Some(120),
+        mempool_snapshot_restore_timeout_secs: Some(300),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved(&[&explicit]).mempool_snapshot_restore_timeout_secs,
+        300
+    );
+
+    for seconds in [0, u64::MAX] {
+        let invalid = UserConfig {
+            mempool_snapshot_restore_timeout_secs: Some(seconds),
+            ..Default::default()
+        };
+        assert!(super::resolve(&[&invalid]).is_err());
+        let mut config = NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
+        config.mempool_snapshot_restore_timeout_secs = seconds;
+        assert!(
+            config.validate().is_err(),
+            "direct embedding config must also reject {seconds}"
+        );
+    }
+}
+
+#[test]
 fn default_rpc_auth_uses_a_generated_cookie() {
     let layer = UserConfig {
         data_dir: Some(PathBuf::from("test-node")),

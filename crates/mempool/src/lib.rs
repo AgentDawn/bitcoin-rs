@@ -35,6 +35,8 @@ mod pool;
 mod rbf;
 /// Cloneable read-only capability over the mempool.
 mod reader;
+/// Optional, bounded transaction snapshots; membership is always revalidated.
+pub mod snapshot;
 /// Transaction relay standardness policy.
 pub mod standardness;
 mod submit_package;

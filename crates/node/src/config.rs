@@ -210,6 +210,12 @@ pub struct NodeConfig {
     pub network: Network,
     /// Node data directory.
     pub data_dir: PathBuf,
+    /// Save and revalidate the optional mempool snapshot across clean restarts.
+    pub persist_mempool: bool,
+    /// Maximum restart snapshot file size, including metadata and checksum.
+    pub mempool_snapshot_max_bytes: u64,
+    /// Cooperative startup timeout for mempool snapshot revalidation.
+    pub mempool_snapshot_restore_timeout_secs: u64,
     /// Storage settings.
     pub storage: StorageConfig,
     /// P2P settings.
@@ -249,8 +255,18 @@ impl NodeConfig {
         let profile = NetworkProfile::for_selection(selection);
         let mut chainstate_journal = ChainstateJournalConfig::default();
         apply_journal_overrides(&settings.chainstate_journal, &mut chainstate_journal);
+        let mempool_snapshot_max_bytes = settings
+            .mempool_snapshot_max_mb
+            .unwrap_or(bitcoin_rs_mempool::snapshot::DEFAULT_MAX_BYTES / (1024 * 1024))
+            .saturating_mul(1024 * 1024);
+        let mempool_snapshot_restore_timeout_secs = settings
+            .mempool_snapshot_restore_timeout_secs
+            .unwrap_or_else(|| std::cmp::max(60, mempool_snapshot_max_bytes / (1024 * 1024)));
         Self {
             network: selection.consensus_network(),
+            persist_mempool: settings.persist_mempool.unwrap_or(true),
+            mempool_snapshot_max_bytes,
+            mempool_snapshot_restore_timeout_secs,
             data_dir: settings
                 .data_dir
                 .clone()
@@ -318,6 +334,20 @@ impl NodeConfig {
     /// cannot execute is rejected here — before the data directory opens,
     /// chainstate exists, or any worker starts.
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.mempool_snapshot_max_bytes >= 1024 * 1024
+                && self.mempool_snapshot_max_bytes < u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            "mempool-snapshot-max-mb must be positive and fit the platform byte limit"
+        );
+        anyhow::ensure!(
+            self.mempool_snapshot_restore_timeout_secs > 0
+                && std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(
+                        self.mempool_snapshot_restore_timeout_secs
+                    ))
+                    .is_some(),
+            "mempool-snapshot-restore-timeout-secs must be positive and fit the platform clock range"
+        );
         anyhow::ensure!(
             !self.rpc.silent_payments || cfg!(feature = "silent-payments"),
             "--silent-payments requires the silent-payments build feature"

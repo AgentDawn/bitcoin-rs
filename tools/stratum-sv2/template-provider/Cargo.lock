@@ -304,6 +304,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "sha2 0.11.1",
+ "tempfile",
  "thiserror",
  "tracing",
 ]

@@ -21,6 +21,63 @@ fn isolated_config(data_dir: &Path) -> NodeConfig {
 }
 
 #[test]
+fn timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot() -> anyhow::Result<()> {
+    use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits, snapshot};
+    use bitcoin_rs_primitives::{Hash256, Network, Txid};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir()?;
+    let gateway = Arc::new(MempoolGateway::new(
+        Arc::new(parking_lot::RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))),
+        None,
+        ValidationEngine::Native,
+    ));
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+    let worker_gateway = Arc::clone(&gateway);
+    let path = dir.path().to_path_buf();
+    let worker = std::thread::spawn(move || {
+        let staged = snapshot::prepare(
+            &path,
+            &worker_gateway,
+            Network::Regtest,
+            snapshot::DEFAULT_MAX_BYTES,
+            Instant::now() + Duration::from_secs(10),
+        );
+        let _ = ready_tx.send(staged.is_ok());
+        let _ = release_rx.recv();
+        let _ = result_tx.send(staged);
+    });
+    let prepared = ready_rx.recv_timeout(Duration::from_secs(10))?;
+    // Exercise the production timeout path while the old worker is parked.
+    publish_mempool_snapshot(result_rx, Instant::now() + Duration::from_millis(2));
+    gateway.prioritise(Txid(Hash256::from_le_bytes(&[7; 32])), 50)?;
+    snapshot::save(
+        dir.path(),
+        &gateway,
+        Network::Regtest,
+        snapshot::DEFAULT_MAX_BYTES,
+        Instant::now() + Duration::from_secs(10),
+    )?;
+    let file = dir.path().join("mempool-snapshot.dat");
+    let newer = std::fs::read(&file)?;
+    release_tx.send(())?;
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("snapshot worker panicked"))?;
+    assert!(
+        prepared,
+        "the delayed worker must hold a valid old snapshot"
+    );
+    assert_eq!(std::fs::read(&file)?, newer);
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+    Ok(())
+}
+
+#[test]
 fn rpc_network_handles_borrow_p2p_service_state() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let state = NodeState::open(isolated_config(dir.path()), None)?;

@@ -19,10 +19,10 @@ pub(crate) enum FeeEstimation {
 
 impl FeeEstimation {
     /// PRE: `origin` is the admission request's entry origin.
-    /// POST: `Reorg` maps to `Skip`; every other origin maps to `Estimate`.
+    /// POST: reconsidered/restored entries skip fresh confirmation estimates.
     pub(crate) fn from_origin(origin: &AdmissionOrigin) -> Self {
         match origin {
-            AdmissionOrigin::Reorg => Self::Skip,
+            AdmissionOrigin::Reorg | AdmissionOrigin::Snapshot => Self::Skip,
             _ => Self::Estimate,
         }
     }
