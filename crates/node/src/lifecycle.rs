@@ -721,7 +721,13 @@ pub(crate) fn start_node(
     guard.services.rpc_thread = Some(
         std::thread::Builder::new()
             .name("bitcoin-rs-rpc".into())
-            .spawn(move || rpc_server.serve_with_shutdown(rpc_shutdown))?,
+            .spawn(move || {
+                let result = rpc_server.serve_with_shutdown(rpc_shutdown.clone());
+                if !rpc_shutdown.is_triggered() {
+                    tracing::error!(error = ?result.as_ref().err(), "rpc listener exited before shutdown");
+                }
+                result
+            })?,
     );
     let peer_ready: Arc<dyn Fn(bitcoin_rs_p2p::PeerSource) + Send + Sync> =
         Arc::new(move |source: bitcoin_rs_p2p::PeerSource| {
