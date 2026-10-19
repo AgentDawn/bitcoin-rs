@@ -122,7 +122,3 @@ harness = false
 [[bench]]
 name = "evidence"
 harness = true
-
-[[bench]]
-name = "block_dataflow"
-harness = false
