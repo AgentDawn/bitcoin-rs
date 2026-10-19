@@ -28,6 +28,8 @@
 //! The relay queue is bounded. When full, the newest announcement is
 //! **dropped** (the producer never blocks). Later inventory exchanges may
 //! advertise it again; relay stays best-effort and admission never stalls.
+//! Pending local initial broadcasts also retry through this worker in bounded
+//! batches until a successful getdata body response clears the live entry flag.
 //! Per-peer outbound saturation follows the existing
 //! p2p disconnect policy on [`crate::PeerLease::send`]: a peer whose
 //! outbound queue is full is disconnected (its lease is cancelled), never
@@ -57,6 +59,8 @@ pub const DEFAULT_TX_RELAY_QUEUE_CAPACITY: usize = 1024;
 
 /// Drain poll interval when the relay queue is empty.
 const RELAY_POLL: Duration = Duration::from_millis(100);
+const INITIAL_BROADCAST_RETRY: Duration = Duration::from_secs(1);
+const INITIAL_BROADCAST_BATCH: usize = 1024;
 
 /// One accepted transaction awaiting `inv` announcement.
 #[derive(Clone, Copy, Debug)]
@@ -319,6 +323,29 @@ fn transaction_is_live(gateway: &MempoolGateway, request: &RelayRequest) -> bool
         .is_some()
 }
 
+// Pending state belongs to the live mempool entries, not a second relay queue.
+// Retry bounded batches so absent peers or queue saturation cannot consume the
+// only announcement. The existing sink applies peer, fee and inventory rules.
+fn retry_initial_broadcast(gateway: &MempoolGateway, sink: &dyn RelaySink, cursor: &mut usize) {
+    let requests: Vec<_> = gateway
+        .read()
+        .unbroadcast_transactions()
+        .skip(*cursor)
+        .take(INITIAL_BROADCAST_BATCH)
+        .map(|(txid, wtxid, sequence)| RelayRequest::new(txid, wtxid, None, sequence))
+        .collect();
+    *cursor = if requests.len() < INITIAL_BROADCAST_BATCH {
+        0
+    } else {
+        cursor.saturating_add(requests.len())
+    };
+    for request in requests {
+        if transaction_is_live(gateway, &request) {
+            sink.announce_inv(request.txid, request.wtxid, None, request.sequence);
+        }
+    }
+}
+
 /// Synchronously drains every currently-queued relay request into `sink`,
 /// announcing only transactions still resident in `gateway`.
 ///
@@ -380,12 +407,18 @@ pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
     std::thread::Builder::new()
         .name("bitcoin-rs-tx-relay".to_owned())
         .spawn(move || {
+            let mut next_initial = std::time::Instant::now() + INITIAL_BROADCAST_RETRY;
+            let mut initial_cursor = 0;
             while !shutdown.load() {
                 {
                     let Some(gateway) = gateway.upgrade() else {
                         break;
                     };
                     sink.poll(&gateway);
+                    if std::time::Instant::now() >= next_initial {
+                        retry_initial_broadcast(&gateway, &sink, &mut initial_cursor);
+                        next_initial = std::time::Instant::now() + INITIAL_BROADCAST_RETRY;
+                    }
                 }
                 match rx.recv_timeout(RELAY_POLL) {
                     Ok(request) => {
@@ -542,6 +575,37 @@ mod tests {
         assert_eq!(outcome.saturated, 0);
         let locked = sink.peers.lock();
         assert!(locked.iter().all(|p| p.capacity == 63));
+    }
+
+    #[test]
+    fn pending_local_broadcast_survives_absent_peers_and_saturation() {
+        let gateway = relay_identity_gateway();
+        let (local, _) = admit_live_tx(21, &gateway);
+        let mut peer_tx = (*local).clone();
+        peer_tx.inputs[0].previous_output.txid = dummy_txid(22);
+        gateway
+            .insert_entry(
+                relay_identity_peer(),
+                bitcoin_rs_mempool::MempoolEntry::new(Arc::new(peer_tx), 100, 10_000, 1, 0, 0),
+            )
+            .expect("peer member");
+        let sink = FakeSink::new(Vec::new());
+        let mut cursor = 0;
+        retry_initial_broadcast(&gateway, &sink, &mut cursor);
+        assert_eq!(sink.log()[0].2.attempted, 0);
+        let (mut peers, _) = fake_peers(1);
+        peers[0].capacity = 0;
+        *sink.peers.lock() = peers;
+        retry_initial_broadcast(&gateway, &sink, &mut cursor);
+        assert_eq!(sink.log()[1].2.saturated, 1);
+        sink.peers.lock()[0].capacity = 64;
+        retry_initial_broadcast(&gateway, &sink, &mut cursor);
+        assert_eq!(sink.log()[2].2.attempted, 1);
+        assert_eq!(gateway.read().unbroadcast_transactions().count(), 1);
+        assert!(sink.log().iter().all(|row| row.0 == local.txid()));
+        gateway.mark_broadcast(local.wtxid());
+        retry_initial_broadcast(&gateway, &sink, &mut cursor);
+        assert_eq!(sink.log().len(), 3);
     }
 
     #[test]

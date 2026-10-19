@@ -60,7 +60,7 @@ impl Tx {
     /// Computes the transaction id: double-SHA256 of the non-witness serialization.
     #[must_use]
     pub fn txid(&self) -> Txid {
-        let mut engine = Sha256::new();
+        let mut engine: Sha256 = Sha256::new();
         let mut writer = Sha256Sink(&mut engine);
         encode_tx(self, &mut writer, false);
         Txid(finalize_double_sha256(engine))

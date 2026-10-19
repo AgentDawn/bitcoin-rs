@@ -212,6 +212,8 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// Save and revalidate the optional mempool snapshot across clean restarts.
     pub persist_mempool: bool,
+    /// Maximum restart snapshot file size, including metadata and checksum.
+    pub mempool_snapshot_max_bytes: u64,
     /// Storage settings.
     pub storage: StorageConfig,
     /// P2P settings.
@@ -254,6 +256,10 @@ impl NodeConfig {
         Self {
             network: selection.consensus_network(),
             persist_mempool: settings.persist_mempool.unwrap_or(true),
+            mempool_snapshot_max_bytes: settings
+                .mempool_snapshot_max_mb
+                .unwrap_or(bitcoin_rs_mempool::snapshot::DEFAULT_MAX_BYTES / (1024 * 1024))
+                .saturating_mul(1024 * 1024),
             data_dir: settings
                 .data_dir
                 .clone()
@@ -321,6 +327,11 @@ impl NodeConfig {
     /// cannot execute is rejected here — before the data directory opens,
     /// chainstate exists, or any worker starts.
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.mempool_snapshot_max_bytes >= 1024 * 1024
+                && self.mempool_snapshot_max_bytes < u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            "mempool-snapshot-max-mb must be positive and fit the platform byte limit"
+        );
         anyhow::ensure!(
             !self.rpc.silent_payments || cfg!(feature = "silent-payments"),
             "--silent-payments requires the silent-payments build feature"

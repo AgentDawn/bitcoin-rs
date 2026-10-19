@@ -67,11 +67,22 @@ To start with a fresh pool while preserving the snapshot, set
 unknown-version or wrong-network ordinary snapshot is preserved at startup
 and moved intact into a unique `mempool-snapshot-rejected-*` directory when
 the next clean shutdown publishes a fresh snapshot. Snapshots are bounded
-at 64 MiB and 100,000 transactions. Larger pools save complete connected
-families within that budget and log the omitted count; all operator fee deltas
+by a byte budget, defaulting to 64 MiB. Raise it with
+`--mempool-snapshot-max-mb=256`, `BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB=256`, or
+TOML `mempool_snapshot_max_mb = 256`. There is no separate 100,000-transaction
+cap. Choose enough space for serialized transactions and metadata to preserve
+the entire live pool; the same budget applies on read. Raising it also raises
+the possible memory and I/O cost. Larger pools save complete connected
+families until the first family does not fit and log saved/omitted counts; all operator fee deltas
 are retained, or saving fails if those overlays alone exceed the bound.
 Restore has a cooperative
 sixty-second budget and excludes candidates older than fourteen days.
+Locally submitted transactions awaiting initial broadcast retain that status
+across restart if re-admitted. The existing P2P relay worker retries them in
+bounded batches, including after absent peers or queue saturation. A successful
+getdata body response completes initial broadcast; `getmempoolentry.unbroadcast`
+and `getmempoolinfo.unbroadcastcount` report pending status. Other restored
+transactions are not automatically announced.
 Power-loss preservation and Core `savemempool`/`importmempool` compatibility
 are not provided by this initial implementation.
 

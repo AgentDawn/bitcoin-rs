@@ -153,6 +153,29 @@ mod tests {
         );
         assert!(config.persist_mempool);
         assert!(!resolved(&["bitcoin-rs", "--persist-mempool=false"], &[]).persist_mempool);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_max_mb = 128\n",
+            &[],
+            std::iter::empty(),
+        )?;
+        assert_eq!(config.mempool_snapshot_max_bytes, 128 * 1024 * 1024);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_max_mb = 128\n",
+            &[],
+            [(
+                OsString::from("BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB"),
+                OsString::from("256"),
+            )]
+            .into_iter(),
+        )?;
+        assert_eq!(config.mempool_snapshot_max_bytes, 256 * 1024 * 1024);
+        let config = resolved(
+            &["bitcoin-rs", "--mempool-snapshot-max-mb=512"],
+            &[("BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB", "256")],
+        );
+        assert_eq!(config.mempool_snapshot_max_bytes, 512 * 1024 * 1024);
         Ok(())
     }
 

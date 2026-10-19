@@ -476,6 +476,12 @@ macro_rules! option_rows {
                     env["BITCOIN_RS_PERSIST_MEMPOOL", parse_bool]
                     toml native("persist_mempool")
                 }
+                /// Restart snapshot byte budget in MiB; raise to retain a larger pool.
+                mempool_snapshot_max_mb: Option<u64> {
+                    cli[#[arg(long = "mempool-snapshot-max-mb")]]
+                    env["BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB", str::parse]
+                    toml native("mempool_snapshot_max_mb")
+                }
                 /// External notification adapters. `None` means this layer does not
                 /// speak to them.
                 notifications: Option<NotificationConfig> {

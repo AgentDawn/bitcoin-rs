@@ -414,6 +414,7 @@ impl NodeState {
                 config.network,
                 &chain,
                 now,
+                config.mempool_snapshot_max_bytes,
                 started + std::time::Duration::from_secs(60),
             ) {
                 Ok(Some(report)) => tracing::info!(

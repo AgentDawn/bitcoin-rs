@@ -132,9 +132,12 @@ holds the reference pins and the admission-profile evidence.
 `mempool::snapshot` owns the optional `mempool-snapshot.dat` artifact. It is a
 set of admission candidates and operator fee deltas, never a second membership
 or Chainstate authority. Its independent version, genesis identity, checksum,
-64 MiB file bound, 100,000 transaction/fee-delta bounds and 400,000-byte
-transaction bound do not change `CURRENT_SCHEMA`. No cluster/chunk graph,
-computed fee, policy stamp, sequence, orphan or relay state is persisted.
+configurable file-byte bound (64 MiB by default) and 400,000-byte transaction
+bound do not change `CURRENT_SCHEMA`. Record counts are bounded by file bytes
+and the format's u32 count fields, without a separate 100,000-record cap.
+Format version 2 also stores each member's pending initial-broadcast flag.
+No cluster/chunk graph, computed fee, policy stamp, sequence, orphan or
+per-peer relay state is persisted.
 
 Startup revalidates after authoritative recovery and before RPC/P2P workers
 or external mempool observers are exposed. Transactions are considered in
@@ -148,8 +151,13 @@ package retains each member's own saved time. Failed children are retried
 only when a saved missing parent is admitted; each parent wakes dependents
 at most once, bounding retries by saved dependency edges. Fee deltas, including absent-txid
 overlays, retain their operator meaning even when membership is refused.
-Restored transactions do not register fresh estimator samples or unsolicited
-relay announcements. Ordinary gateway sequence assignment and mining wakes
+Restored transactions do not register fresh estimator samples or blanket
+relay announcements. Successfully re-admitted members retain their saved
+initial-broadcast flags; the P2P relay worker retries only pending local bodies
+through its ordinary peer/fee/inventory policy. Fresh local RPC/Esplora commits
+mark the live entry pending before publication; successful getdata body responses
+clear that flag through the gateway without changing membership or its sequence.
+Removal drops the flag with the entry. Ordinary gateway sequence assignment and mining wakes
 still run; fee-estimator history remains a separately owned file.
 
 Saving captures shared transaction handles and scalar metadata under one
@@ -159,6 +167,10 @@ connected families and logs the omitted count. It never saves a CPFP parent
 without its connected paying child. All fee deltas are reserved first; if
 operator overlays alone exceed their bound, saving fails without truncating them.
 The snapshot budget is independent of the live pool's virtual-size limit.
+`mempool_snapshot_max_mb` (CLI `--mempool-snapshot-max-mb`, environment
+`BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB`) raises the shared read/write budget;
+a large enough budget retains every live family, subject to the cooperative
+deadline. Selection stops at the first family that does not fit.
 Clean teardown waits at most ten seconds for a staging worker, which cannot
 touch the live file. The shutdown thread owns publication and completes it
 before returning; abandoning a worker therefore cannot overwrite a later run.
@@ -181,11 +193,16 @@ remain unsupported RPCs; this format makes no Core disk-format claim.
 
 - `crates/mempool/src/snapshot/tests.rs` covers candidate revalidation,
   CPFP/ephemeral dust and dependency-triggered retries, per-member times,
-  whole-family capacity bounds and rejected-file quarantine.
+  whole-family capacity bounds, raised byte budgets, more than 100,000 records,
+  pending initial-broadcast flags and rejected-file quarantine.
+- `tx_relay::tests::pending_local_broadcast_survives_absent_peers_and_saturation`
+  and `dispatch::tests::getdata_completes_initial_broadcast_only_after_successful_send`
+  cover retry and completion through the existing relay/getdata owners.
 - `lifecycle::tests::timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot`
   covers shutdown timeout followed by a newer save and late worker completion.
 - `bin/bitcoin-rs/tests/mempool_restart.rs` drives real daemon shutdowns,
-  restarts, RPC membership/lookup, mining and changed-tip reconciliation.
+  restarts, RPC membership/lookup, mining, changed-tip reconciliation and
+  initial-broadcast continuation over the P2P wire.
 
 - `overhaul_process_harness::replacement_signaling_matches_pinned_core` and
   `policy_cases`: isolated Core/candidate processes, identical funding blocks,

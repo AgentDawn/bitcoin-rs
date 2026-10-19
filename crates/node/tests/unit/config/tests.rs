@@ -43,6 +43,30 @@ fn mempool_persistence_can_be_disabled_without_changing_other_settings() {
 }
 
 #[test]
+fn mempool_snapshot_budget_is_configurable_and_bounded() {
+    let defaults = resolved(&[]);
+    assert_eq!(
+        defaults.mempool_snapshot_max_bytes,
+        bitcoin_rs_mempool::snapshot::DEFAULT_MAX_BYTES
+    );
+    let layer = UserConfig {
+        mempool_snapshot_max_mb: Some(2048),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved(&[&layer]).mempool_snapshot_max_bytes,
+        2048 * 1024 * 1024
+    );
+    for mb in [0, u64::MAX] {
+        let layer = UserConfig {
+            mempool_snapshot_max_mb: Some(mb),
+            ..Default::default()
+        };
+        assert!(super::resolve(&[&layer]).is_err());
+    }
+}
+
+#[test]
 fn default_rpc_auth_uses_a_generated_cookie() {
     let layer = UserConfig {
         data_dir: Some(PathBuf::from("test-node")),

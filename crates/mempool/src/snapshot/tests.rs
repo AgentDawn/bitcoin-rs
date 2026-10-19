@@ -114,11 +114,18 @@ fn restores_dependencies_priorities_and_gateway_publication() -> TestResult {
     let source = gateway(MempoolLimits::default(), None);
     admit(&source, &parent, &chain)?;
     admit(&source, &child, &chain)?;
+    source.mark_broadcast(parent.wtxid());
     source.prioritise(parent.txid(), 500)?;
     let absent = Txid(Hash256::from_le_bytes(&[8; 32]));
     source.prioritise(absent, i64::MIN)?;
     let before_history = source.read().estimator_history();
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let seen = Arc::new(Seen::default());
     let restored = gateway(MempoolLimits::default(), Some(Arc::clone(&seen)));
     crate::fee_history::save(dir.path(), &before_history);
@@ -129,6 +136,7 @@ fn restores_dependencies_priorities_and_gateway_publication() -> TestResult {
         Network::Regtest,
         &chain,
         NOW,
+        DEFAULT_MAX_BYTES,
         deadline(),
     )?
     .ok_or("missing snapshot")?;
@@ -143,6 +151,13 @@ fn restores_dependencies_priorities_and_gateway_publication() -> TestResult {
     );
     let pool = restored.read();
     let entry = pool.entry_by_txid(&child.txid()).ok_or("missing child")?;
+    assert!(entry.unbroadcast);
+    assert!(
+        !pool
+            .entry_by_txid(&parent.txid())
+            .ok_or("missing parent")?
+            .unbroadcast
+    );
     assert_eq!(
         (
             entry.ancestor_fee,
@@ -199,7 +214,13 @@ fn rechecks_spent_coins_maturity_fee_floor_capacity_and_expiry() -> TestResult {
     let source = gateway(MempoolLimits::default(), None);
     admit(&source, &parent, &chain)?;
     admit(&source, &child, &chain)?;
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     for (chain, limits, now) in [
         (
             Coins {
@@ -254,10 +275,19 @@ fn rechecks_spent_coins_maturity_fee_floor_capacity_and_expiry() -> TestResult {
         ),
     ] {
         let pool = gateway(limits, None);
-        let report = restore(dir.path(), &pool, Network::Regtest, &chain, now, deadline())?
-            .ok_or("missing snapshot")?;
+        let report = restore(
+            dir.path(),
+            &pool,
+            Network::Regtest,
+            &chain,
+            now,
+            DEFAULT_MAX_BYTES,
+            deadline(),
+        )?
+        .ok_or("missing snapshot")?;
         assert_eq!(report.restored, 0);
         assert!(pool.read().is_empty());
+        assert_eq!(pool.read().unbroadcast_transactions().count(), 0);
         assert_eq!(pool.orphan_count(), 0);
     }
     // A confirmed parent no longer enters, while its child can use the live coin.
@@ -273,11 +303,11 @@ fn rechecks_spent_coins_maturity_fee_floor_capacity_and_expiry() -> TestResult {
         Network::Regtest,
         &confirmed,
         NOW,
+        DEFAULT_MAX_BYTES,
         deadline(),
     )?
     .ok_or("missing snapshot")?;
     assert_eq!(report.restored, 1);
-    assert!(!pool.read().contains_txid(&parent.txid()));
     assert!(pool.read().contains_txid(&child.txid()));
     Ok(())
 }
@@ -307,17 +337,18 @@ fn restores_cpfp_and_ephemeral_dust_through_atomic_package_admission() -> TestRe
             NOW - 10,
             &chain,
         )?;
-        let mut snapshot = Snapshot::capture(&source, deadline(), MAX_BYTES, MAX_RECORDS)?;
+        let mut snapshot = Snapshot::capture(&source, deadline(), DEFAULT_MAX_BYTES, usize::MAX)?;
         for row in &mut snapshot.transactions {
             row.time = if row.txid == parent.txid() {
                 NOW - 100
             } else {
                 NOW - 10
             };
+            row.unbroadcast = row.txid == child.txid();
         }
         std::fs::write(
             dir.path().join(FILE_NAME),
-            snapshot.encode(Network::Regtest, deadline())?,
+            snapshot.encode(Network::Regtest, DEFAULT_MAX_BYTES, deadline())?,
         )?;
         let seen = Arc::new(Seen::default());
         let target = gateway(MempoolLimits::default(), Some(Arc::clone(&seen)));
@@ -327,10 +358,19 @@ fn restores_cpfp_and_ephemeral_dust_through_atomic_package_admission() -> TestRe
             Network::Regtest,
             &chain,
             NOW,
+            DEFAULT_MAX_BYTES,
             deadline(),
         )?
         .ok_or("missing snapshot")?;
         assert_eq!(report.restored, 2);
+        assert_eq!(
+            target
+                .read()
+                .unbroadcast_transactions()
+                .map(|(txid, _, _)| txid)
+                .collect::<Vec<_>>(),
+            vec![child.txid()]
+        );
         assert_eq!(
             target
                 .read()
@@ -399,7 +439,13 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
         NOW - 10,
         &chain,
     )?;
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let seen = Arc::new(Seen::default());
     let target = gateway(MempoolLimits::default(), Some(Arc::clone(&seen)));
     let report = restore(
@@ -408,6 +454,7 @@ fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
         Network::Regtest,
         &chain,
         NOW,
+        DEFAULT_MAX_BYTES,
         deadline(),
     )?
     .ok_or("snapshot")?;
@@ -447,8 +494,8 @@ fn capacity_limits_save_whole_families_and_all_priorities() -> TestResult {
     let absent = Txid(Hash256::from_le_bytes(&[10; 32]));
     source.prioritise(absent, 50)?;
     let family_bytes =
-        84 + 40 + u64::try_from(parent.total_size())? + u64::try_from(child.total_size())? + 24;
-    for (bytes, count) in [(family_bytes, MAX_RECORDS), (MAX_BYTES, 2)] {
+        84 + 40 + u64::try_from(parent.total_size())? + u64::try_from(child.total_size())? + 26;
+    for (bytes, count) in [(family_bytes, usize::MAX), (DEFAULT_MAX_BYTES, 2)] {
         let snapshot = Snapshot::capture(&source, deadline(), bytes, count)?;
         assert_eq!(snapshot.transactions.len(), 2);
         assert!(
@@ -465,33 +512,94 @@ fn capacity_limits_save_whole_families_and_all_priorities() -> TestResult {
         );
         assert_eq!(snapshot.deltas, vec![(absent, 50)]);
         let dir = tempfile::tempdir()?;
-        let encoded = snapshot.encode(Network::Regtest, deadline())?;
+        let encoded = snapshot.encode(Network::Regtest, DEFAULT_MAX_BYTES, deadline())?;
         assert!(u64::try_from(encoded.len())? <= bytes);
         std::fs::write(dir.path().join(FILE_NAME), encoded)?;
-        let target = gateway(MempoolLimits::default(), None);
-        assert_eq!(
-            restore(
-                dir.path(),
-                &target,
-                Network::Regtest,
-                &chain,
-                NOW,
-                deadline()
-            )?
-            .ok_or("snapshot")?
-            .restored,
-            2
-        );
     }
     assert!(
-        Snapshot::capture(&source, deadline(), family_bytes - 1, MAX_RECORDS)?
+        Snapshot::capture(&source, deadline(), family_bytes - 1, usize::MAX)?
             .transactions
             .is_empty()
     );
     assert!(
-        Snapshot::capture(&source, deadline(), MAX_BYTES, 1)?
+        Snapshot::capture(&source, deadline(), DEFAULT_MAX_BYTES, 1)?
             .transactions
             .is_empty()
+    );
+    // The same public save/read path honors a raised byte budget, retaining
+    // every family rather than a small-budget prefix.
+    let dir = tempfile::tempdir()?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        family_bytes,
+        deadline(),
+    )?;
+    let target = gateway(MempoolLimits::default(), None);
+    assert_eq!(
+        restore(
+            dir.path(),
+            &target,
+            Network::Regtest,
+            &chain,
+            NOW,
+            family_bytes,
+            deadline()
+        )?
+        .ok_or("snapshot")?
+        .candidates,
+        2
+    );
+    let full_bytes = family_bytes + u64::try_from(independent.total_size())? + 13;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        full_bytes,
+        deadline(),
+    )?;
+    let target = gateway(MempoolLimits::default(), None);
+    let report = restore(
+        dir.path(),
+        &target,
+        Network::Regtest,
+        &chain,
+        NOW,
+        full_bytes,
+        deadline(),
+    )?
+    .ok_or("snapshot")?;
+    assert_eq!((report.candidates, report.restored), (3, 3));
+    Ok(())
+}
+
+#[test]
+fn byte_budget_allows_more_than_one_hundred_thousand_records() -> TestResult {
+    let (_, parent, _) = family();
+    let transactions = (0..100_001)
+        .map(|index| {
+            let mut tx = parent.clone();
+            tx.inputs[0].previous_output.vout = index;
+            let txid = tx.txid();
+            SavedTransaction {
+                tx: Arc::new(tx),
+                txid,
+                time: NOW,
+                unbroadcast: false,
+            }
+        })
+        .collect();
+    let snapshot = Snapshot {
+        transactions,
+        deltas: Vec::new(),
+    };
+    let encoded = snapshot.encode(Network::Regtest, DEFAULT_MAX_BYTES, deadline())?;
+    assert_eq!(
+        Snapshot::decode(&encoded, Network::Regtest, DEFAULT_MAX_BYTES, deadline())?
+            .transactions
+            .len(),
+        100_001
     );
     Ok(())
 }
@@ -502,7 +610,13 @@ fn restore_rejects_preexisting_absent_transaction_priorities() -> TestResult {
     let (chain, parent, _) = family();
     let source = gateway(MempoolLimits::default(), None);
     source.prioritise(parent.txid(), 1)?;
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let target = gateway(MempoolLimits::default(), None);
     target.prioritise(parent.txid(), i64::MAX)?;
     assert!(
@@ -512,6 +626,7 @@ fn restore_rejects_preexisting_absent_transaction_priorities() -> TestResult {
             Network::Regtest,
             &chain,
             NOW,
+            DEFAULT_MAX_BYTES,
             deadline()
         )
         .is_err()
@@ -529,8 +644,11 @@ fn rejects_bad_artifacts_without_mutation_or_overwriting_operator_data() -> Test
     let (chain, parent, _) = family();
     let source = gateway(MempoolLimits::default(), None);
     admit(&source, &parent, &chain)?;
-    let valid = Snapshot::capture(&source, deadline(), MAX_BYTES, MAX_RECORDS)?
-        .encode(Network::Regtest, deadline())?;
+    let valid = Snapshot::capture(&source, deadline(), DEFAULT_MAX_BYTES, usize::MAX)?.encode(
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let mut version = valid.clone();
     version[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     reseal(&mut version);
@@ -541,7 +659,7 @@ fn rejects_bad_artifacts_without_mutation_or_overwriting_operator_data() -> Test
     count[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
     reseal(&mut count);
     let mut length = valid.clone();
-    length[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+    length[61..65].copy_from_slice(&u32::MAX.to_le_bytes());
     reseal(&mut length);
     let mut checksum = valid.clone();
     checksum[65] ^= 1;
@@ -559,9 +677,26 @@ fn rejects_bad_artifacts_without_mutation_or_overwriting_operator_data() -> Test
     ] {
         std::fs::write(dir.path().join(FILE_NAME), &bytes)?;
         let pool = gateway(MempoolLimits::default(), None);
-        assert!(restore(dir.path(), &pool, Network::Regtest, &chain, NOW, deadline()).is_err());
+        assert!(
+            restore(
+                dir.path(),
+                &pool,
+                Network::Regtest,
+                &chain,
+                NOW,
+                DEFAULT_MAX_BYTES,
+                deadline()
+            )
+            .is_err()
+        );
         assert!(pool.read().is_empty());
-        save(dir.path(), &source, Network::Regtest, deadline())?;
+        save(
+            dir.path(),
+            &source,
+            Network::Regtest,
+            DEFAULT_MAX_BYTES,
+            deadline(),
+        )?;
         assert_eq!(std::fs::read(dir.path().join(FILE_NAME))?, valid);
         assert!(
             std::fs::read_dir(dir.path())?
@@ -585,7 +720,13 @@ fn interrupted_or_failed_save_preserves_the_complete_live_snapshot() -> TestResu
     let (chain, parent, _) = family();
     let source = gateway(MempoolLimits::default(), None);
     admit(&source, &parent, &chain)?;
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let before = std::fs::read(dir.path().join(FILE_NAME))?;
     let guard = source.pool.write();
     assert!(
@@ -593,6 +734,7 @@ fn interrupted_or_failed_save_preserves_the_complete_live_snapshot() -> TestResu
             dir.path(),
             &source,
             Network::Regtest,
+            DEFAULT_MAX_BYTES,
             Instant::now() + Duration::from_millis(2)
         )
         .is_err()
@@ -608,6 +750,7 @@ fn interrupted_or_failed_save_preserves_the_complete_live_snapshot() -> TestResu
             Network::Regtest,
             &chain,
             NOW,
+            DEFAULT_MAX_BYTES,
             deadline()
         )?
         .ok_or("missing")?
@@ -620,10 +763,25 @@ fn interrupted_or_failed_save_preserves_the_complete_live_snapshot() -> TestResu
     std::fs::create_dir(dir.path().join(INTERRUPTED_STAGE))?;
     let marker = dir.path().join(INTERRUPTED_STAGE).join("operator-data");
     std::fs::write(&marker, b"preserve")?;
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     assert_eq!(std::fs::read(dir.path().join(FILE_NAME))?, before);
     assert_eq!(std::fs::read(marker)?, b"preserve");
-    assert!(save(dir.path(), &source, Network::Regtest, Instant::now()).is_err());
+    assert!(
+        save(
+            dir.path(),
+            &source,
+            Network::Regtest,
+            DEFAULT_MAX_BYTES,
+            Instant::now()
+        )
+        .is_err()
+    );
     assert_eq!(std::fs::read(dir.path().join(FILE_NAME))?, before);
     Ok(())
 }
@@ -636,7 +794,13 @@ fn failed_atomic_replacement_keeps_the_previous_snapshot() -> TestResult {
     let (chain, parent, child) = family();
     let source = gateway(MempoolLimits::default(), None);
     admit(&source, &parent, &chain)?;
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let path = dir.path().join(FILE_NAME);
     let before = std::fs::read(&path)?;
     // Permit reads but deny deletion/rename while the staging file is written.
@@ -645,7 +809,16 @@ fn failed_atomic_replacement_keeps_the_previous_snapshot() -> TestResult {
         .share_mode(1)
         .open(&path)?;
     admit(&source, &child, &chain)?;
-    assert!(save(dir.path(), &source, Network::Regtest, deadline()).is_err());
+    assert!(
+        save(
+            dir.path(),
+            &source,
+            Network::Regtest,
+            DEFAULT_MAX_BYTES,
+            deadline()
+        )
+        .is_err()
+    );
     drop(guard);
     assert_eq!(std::fs::read(&path)?, before);
     assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
@@ -657,26 +830,74 @@ fn missing_oversized_and_non_file_snapshots_fail_safely() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (chain, _, _) = family();
     let pool = gateway(MempoolLimits::default(), None);
-    assert!(restore(dir.path(), &pool, Network::Regtest, &chain, NOW, deadline())?.is_none());
+    assert!(
+        restore(
+            dir.path(),
+            &pool,
+            Network::Regtest,
+            &chain,
+            NOW,
+            DEFAULT_MAX_BYTES,
+            deadline()
+        )?
+        .is_none()
+    );
     let path = dir.path().join(FILE_NAME);
     let file = std::fs::File::create(&path)?;
-    file.set_len(MAX_BYTES + 1)?;
+    file.set_len(DEFAULT_MAX_BYTES + 1)?;
     drop(file);
-    assert!(restore(dir.path(), &pool, Network::Regtest, &chain, NOW, deadline()).is_err());
-    save(dir.path(), &pool, Network::Regtest, deadline())?;
+    assert!(
+        restore(
+            dir.path(),
+            &pool,
+            Network::Regtest,
+            &chain,
+            NOW,
+            DEFAULT_MAX_BYTES,
+            deadline()
+        )
+        .is_err()
+    );
+    save(
+        dir.path(),
+        &pool,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let rejected = std::fs::read_dir(dir.path())?
         .filter_map(Result::ok)
         .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .ok_or("quarantine")?;
     assert_eq!(
         std::fs::metadata(rejected.path().join(FILE_NAME))?.len(),
-        MAX_BYTES + 1
+        DEFAULT_MAX_BYTES + 1
     );
     std::fs::remove_file(&path)?;
     std::fs::create_dir(&path)?;
     std::fs::write(path.join("operator-data"), b"preserve")?;
-    assert!(restore(dir.path(), &pool, Network::Regtest, &chain, NOW, deadline()).is_err());
-    assert!(save(dir.path(), &pool, Network::Regtest, deadline()).is_err());
+    assert!(
+        restore(
+            dir.path(),
+            &pool,
+            Network::Regtest,
+            &chain,
+            NOW,
+            DEFAULT_MAX_BYTES,
+            deadline()
+        )
+        .is_err()
+    );
+    assert!(
+        save(
+            dir.path(),
+            &pool,
+            Network::Regtest,
+            DEFAULT_MAX_BYTES,
+            deadline()
+        )
+        .is_err()
+    );
     assert_eq!(std::fs::read(path.join("operator-data"))?, b"preserve");
     Ok(())
 }
@@ -691,7 +912,13 @@ fn revalidates_witness_standardness_finality_and_only_saves_live_rbf_members() -
     let mut replacement = parent.clone();
     replacement.outputs[0].value = Amount::from_sat(90_000);
     admit(&source, &replacement, &chain)?;
-    save(dir.path(), &source, Network::Regtest, deadline())?;
+    save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?;
     let target = gateway(MempoolLimits::default(), None);
     let report = restore(
         dir.path(),
@@ -699,6 +926,7 @@ fn revalidates_witness_standardness_finality_and_only_saves_live_rbf_members() -
         Network::Regtest,
         &chain,
         NOW,
+        DEFAULT_MAX_BYTES,
         deadline(),
     )?
     .ok_or("missing")?;
@@ -720,12 +948,13 @@ fn revalidates_witness_standardness_finality_and_only_saves_live_rbf_members() -
                 txid: tx.txid(),
                 tx: Arc::new(tx),
                 time: NOW - 10,
+                unbroadcast: false,
             }],
             deltas: vec![],
         };
         std::fs::write(
             dir.path().join(FILE_NAME),
-            snapshot.encode(Network::Regtest, deadline())?,
+            snapshot.encode(Network::Regtest, DEFAULT_MAX_BYTES, deadline())?,
         )?;
         let target = gateway(MempoolLimits::default(), None);
         let report = restore(
@@ -734,6 +963,7 @@ fn revalidates_witness_standardness_finality_and_only_saves_live_rbf_members() -
             Network::Regtest,
             &chain,
             NOW,
+            DEFAULT_MAX_BYTES,
             deadline(),
         )?
         .ok_or("missing")?;
@@ -765,11 +995,23 @@ fn concurrent_admission_and_save_capture_a_coherent_candidate_set() -> TestResul
                     &chain,
                 )
                 .map_err(io::Error::other)?;
-            save(&data_dir, &source, Network::Regtest, deadline())
+            save(
+                &data_dir,
+                &source,
+                Network::Regtest,
+                DEFAULT_MAX_BYTES,
+                deadline(),
+            )
         })
     };
     barrier.wait();
-    let first = save(dir.path(), &source, Network::Regtest, deadline());
+    let first = save(
+        dir.path(),
+        &source,
+        Network::Regtest,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    );
     let second = writer.join().map_err(|_| "admission thread panicked")?;
     assert!(first.is_ok() || second.is_ok());
     // Windows can refuse one overlapping replacement while the other writer's
@@ -790,6 +1032,7 @@ fn concurrent_admission_and_save_capture_a_coherent_candidate_set() -> TestResul
         Network::Regtest,
         &chain,
         NOW,
+        DEFAULT_MAX_BYTES,
         deadline(),
     )?
     .ok_or("missing")?;

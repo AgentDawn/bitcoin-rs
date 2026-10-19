@@ -1,13 +1,19 @@
 //! Real-process mempool restart/reconciliation through public RPC and mining.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::{OutPoint, Sequence, Transaction};
 use bitcoin_rs_e2e::{Kind, ProcessNode, SpawnOptions, helpers};
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[path = "support/wire_peer.rs"]
+mod wire_peer;
 
 fn options(enabled: bool) -> SpawnOptions<'static> {
     SpawnOptions {
@@ -70,6 +76,104 @@ fn assert_membership(node: &mut ProcessNode, transactions: &[&Transaction]) -> T
     for tx in transactions {
         assert!(ids.contains(&tx.compute_txid().to_string().as_str()));
     }
+    Ok(())
+}
+
+fn pending_inventory(
+    node: &ProcessNode,
+    wanted: &Transaction,
+    forbidden: Option<&Transaction>,
+    name: &str,
+) -> Result<(wire_peer::Peer, Inventory), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut peer = wire_peer::Peer::connect(node.p2p_addr, "mempool-restart", name, 0, deadline)?;
+    loop {
+        match peer.recv(deadline)? {
+            NetworkMessage::Ping(nonce) => peer.send(NetworkMessage::Pong(nonce), deadline)?,
+            NetworkMessage::Inv(items) => {
+                let matches = |item: &Inventory, tx: &Transaction| match item {
+                    Inventory::Transaction(id) | Inventory::WitnessTransaction(id) => {
+                        *id == tx.compute_txid()
+                    }
+                    Inventory::WTx(id) => *id == tx.compute_wtxid(),
+                    _ => false,
+                };
+                assert!(
+                    !items
+                        .iter()
+                        .any(|item| forbidden.is_some_and(|tx| matches(item, tx))),
+                    "a completed initial broadcast must not be replayed to a fresh peer"
+                );
+                if let Some(item) = items.into_iter().find(|item| matches(item, wanted)) {
+                    return Ok((peer, item));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn request_body(peer: &mut wire_peer::Peer, item: Inventory, wanted: &Transaction) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    peer.send(NetworkMessage::GetData(vec![item]), deadline)?;
+    loop {
+        match peer.recv(deadline)? {
+            NetworkMessage::Tx(tx) => {
+                assert_eq!(&tx, wanted);
+                return Ok(());
+            }
+            NetworkMessage::Ping(nonce) => peer.send(NetworkMessage::Pong(nonce), deadline)?,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn restart_retries_only_uncompleted_local_initial_broadcasts() -> TestResult {
+    let mut node = ProcessNode::spawn_with(Kind::BitcoinRs, &options(true))?;
+    let (parent, child) = parent_and_child(&mut node)?;
+    assert_eq!(
+        node.rpc("getmempoolinfo", &json!([]))?["unbroadcastcount"],
+        2
+    );
+    let dir = node.stop_keep_datadir()?;
+    let mut node = ProcessNode::spawn_in_datadir(Kind::BitcoinRs, &options(true), dir)?;
+    let (mut peer, item) = pending_inventory(&node, &parent, None, "pending-parent")?;
+    assert_eq!(
+        node.rpc("getmempoolinfo", &json!([]))?["unbroadcastcount"],
+        2,
+        "inventory alone does not complete initial broadcast"
+    );
+    request_body(&mut peer, item, &parent)?;
+    assert_eq!(
+        node.rpc(
+            "getmempoolentry",
+            &json!([parent.compute_txid().to_string()])
+        )?["unbroadcast"],
+        false
+    );
+    assert_eq!(
+        node.rpc(
+            "getmempoolentry",
+            &json!([child.compute_txid().to_string()])
+        )?["unbroadcast"],
+        true
+    );
+    drop(peer);
+    let dir = node.stop_keep_datadir()?;
+    let mut node = ProcessNode::spawn_in_datadir(Kind::BitcoinRs, &options(true), dir)?;
+    assert_eq!(
+        node.rpc("getmempoolinfo", &json!([]))?["unbroadcastcount"],
+        1
+    );
+    let (mut peer, item) = pending_inventory(&node, &child, Some(&parent), "pending-child")?;
+    request_body(&mut peer, item, &child)?;
+    assert_eq!(
+        node.rpc("getmempoolinfo", &json!([]))?["unbroadcastcount"],
+        0
+    );
+    drop(peer);
+    node.stop_keep_datadir()?;
     Ok(())
 }
 

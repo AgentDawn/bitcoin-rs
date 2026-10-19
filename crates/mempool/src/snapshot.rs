@@ -20,9 +20,9 @@ use crate::{AdmissionChain, AdmissionOrigin, LocalOrigin, MempoolGateway};
 /// This artifact is optional and never participates in authoritative recovery.
 const FILE_NAME: &str = "mempool-snapshot.dat";
 const MAGIC: &[u8; 8] = b"BRSMPOOL";
-const VERSION: u32 = 1;
-const MAX_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RECORDS: usize = 100_000;
+const VERSION: u32 = 2;
+/// Default byte budget; operators may raise it for full large-pool preservation.
+pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TX_BYTES: usize = 400_000;
 /// Candidates older than fourteen days are not reconsidered at startup.
 const MAX_AGE: u64 = 14 * 24 * 60 * 60;
@@ -31,6 +31,7 @@ struct SavedTransaction {
     tx: Arc<Tx>,
     txid: Txid,
     time: u64,
+    unbroadcast: bool,
 }
 
 struct Snapshot {
@@ -66,21 +67,21 @@ fn check_deadline(deadline: Instant) -> io::Result<()> {
     }
 }
 
-fn read_file(path: &Path, deadline: Instant) -> io::Result<Option<Vec<u8>>> {
+fn read_file(path: &Path, max_bytes: u64, deadline: Instant) -> io::Result<Option<Vec<u8>>> {
     check_deadline(deadline)?;
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(invalid("snapshot is not an ordinary bounded file"));
     }
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
-        .take(MAX_BYTES + 1)
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(invalid("snapshot exceeds its size limit"));
     }
     check_deadline(deadline)?;
@@ -111,12 +112,11 @@ impl Snapshot {
         // Preserve every operator overlay before allocating the remaining budget
         // to optional transaction candidates. Never silently truncate priorities.
         let deltas = pool.fee_deltas();
-        if deltas.len() > MAX_RECORDS
-            || 84_u64.saturating_add(
-                u64::try_from(deltas.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(40),
-            ) > max_bytes
+        if 84_u64.saturating_add(
+            u64::try_from(deltas.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(40),
+        ) > max_bytes
         {
             return Err(invalid("too many mempool snapshot fee deltas"));
         }
@@ -127,7 +127,7 @@ impl Snapshot {
             check_deadline(deadline)?;
             // Keep complete connected families: a parent-only prefix could
             // discard its paying CPFP child and make the saved parent useless.
-            let cluster_bytes: u64 = cluster.iter().map(|row| u64::from(row.size) + 12).sum();
+            let cluster_bytes: u64 = cluster.iter().map(|row| u64::from(row.size) + 13).sum();
             if transactions.len() + cluster.len() > max_records
                 || bytes.saturating_add(cluster_bytes) > max_bytes
                 || cluster
@@ -142,6 +142,7 @@ impl Snapshot {
                     tx: Arc::clone(&entry.tx),
                     txid: entry.txid,
                     time: entry.time,
+                    unbroadcast: entry.unbroadcast,
                 });
             }
         }
@@ -161,7 +162,7 @@ impl Snapshot {
         })
     }
 
-    fn encode(&self, network: Network, deadline: Instant) -> io::Result<Vec<u8>> {
+    fn encode(&self, network: Network, max_bytes: u64, deadline: Instant) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&VERSION.to_le_bytes());
@@ -179,6 +180,7 @@ impl Snapshot {
         for row in &self.transactions {
             check_deadline(deadline)?;
             bytes.extend_from_slice(&row.time.to_le_bytes());
+            bytes.push(u8::from(row.unbroadcast));
             bytes.extend_from_slice(
                 &u32::try_from(row.tx.consensus_size())
                     .map_err(|_| invalid("transaction too large"))?
@@ -192,14 +194,19 @@ impl Snapshot {
             bytes.extend_from_slice(&delta.to_le_bytes());
         }
         bytes.extend_from_slice(&Sha256::digest(&bytes));
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
             return Err(invalid("snapshot exceeds its size limit"));
         }
         Ok(bytes)
     }
 
-    fn decode(bytes: &[u8], network: Network, deadline: Instant) -> io::Result<Self> {
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES || bytes.len() < 84 {
+    fn decode(
+        bytes: &[u8],
+        network: Network,
+        max_bytes: u64,
+        deadline: Instant,
+    ) -> io::Result<Self> {
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes || bytes.len() < 84 {
             return Err(invalid("invalid snapshot size"));
         }
         let (payload, checksum) = bytes.split_at(bytes.len() - 32);
@@ -220,7 +227,7 @@ impl Snapshot {
             .map_err(|_| invalid("transaction count overflow"))?;
         let delta_count = usize::try_from(u32::from_le_bytes(take(&mut input)?))
             .map_err(|_| invalid("fee delta count overflow"))?;
-        if count > MAX_RECORDS || delta_count > MAX_RECORDS {
+        if count > bytes.len() / 13 || delta_count > bytes.len() / 40 {
             return Err(invalid("snapshot record count exceeds its bound"));
         }
         let mut transactions = Vec::new();
@@ -228,6 +235,11 @@ impl Snapshot {
         for _ in 0..count {
             check_deadline(deadline)?;
             let time = u64::from_le_bytes(take(&mut input)?);
+            let unbroadcast = match take::<1>(&mut input)? {
+                [0] => false,
+                [1] => true,
+                _ => return Err(invalid("invalid initial broadcast flag")),
+            };
             let len = usize::try_from(u32::from_le_bytes(take(&mut input)?))
                 .map_err(|_| invalid("transaction size overflow"))?;
             if len == 0 || len > MAX_TX_BYTES {
@@ -249,6 +261,7 @@ impl Snapshot {
                 tx: Arc::new(tx),
                 txid,
                 time,
+                unbroadcast,
             });
         }
         let mut deltas = Vec::new();
@@ -300,6 +313,7 @@ pub struct PreparedSnapshot {
     file: tempfile::NamedTempFile,
     network: Network,
     deadline: Instant,
+    max_bytes: u64,
 }
 
 impl PreparedSnapshot {
@@ -314,9 +328,9 @@ impl PreparedSnapshot {
             .ok_or_else(|| invalid("missing staging directory"))?
             .to_path_buf();
         let live = data_dir.join(FILE_NAME);
-        let validation = read_file(&live, self.deadline).and_then(|bytes| {
+        let validation = read_file(&live, self.max_bytes, self.deadline).and_then(|bytes| {
             bytes
-                .map(|bytes| Snapshot::decode(&bytes, self.network, self.deadline))
+                .map(|bytes| Snapshot::decode(&bytes, self.network, self.max_bytes, self.deadline))
                 .transpose()
         });
         match validation {
@@ -354,11 +368,17 @@ pub fn prepare(
     data_dir: &Path,
     gateway: &MempoolGateway,
     network: Network,
+    max_bytes: u64,
     deadline: Instant,
 ) -> io::Result<PreparedSnapshot> {
     let started = Instant::now();
-    let snapshot = Snapshot::capture(gateway, deadline, MAX_BYTES, MAX_RECORDS)?;
-    let bytes = snapshot.encode(network, deadline)?;
+    let snapshot = Snapshot::capture(
+        gateway,
+        deadline,
+        max_bytes,
+        usize::try_from(u32::MAX).unwrap_or(usize::MAX),
+    )?;
+    let bytes = snapshot.encode(network, max_bytes, deadline)?;
     // Each writer owns a distinct staging inode. A concurrent save must never
     // rename another writer's unfinished file into the live pathname.
     let mut file = tempfile::Builder::new()
@@ -381,6 +401,7 @@ pub fn prepare(
         file,
         network,
         deadline,
+        max_bytes,
     })
 }
 
@@ -389,9 +410,10 @@ pub fn save(
     data_dir: &Path,
     gateway: &MempoolGateway,
     network: Network,
+    max_bytes: u64,
     deadline: Instant,
 ) -> io::Result<()> {
-    prepare(data_dir, gateway, network, deadline)?.publish()
+    prepare(data_dir, gateway, network, max_bytes, deadline)?.publish()
 }
 
 /// Revalidates candidates before services become ready.
@@ -408,6 +430,7 @@ pub fn restore(
     network: Network,
     chain: &dyn AdmissionChain,
     now: u64,
+    max_bytes: u64,
     deadline: Instant,
 ) -> io::Result<Option<RestoreReport>> {
     {
@@ -416,10 +439,10 @@ pub fn restore(
             return Err(invalid("snapshot restore requires a fresh mempool"));
         }
     }
-    let Some(bytes) = read_file(&data_dir.join(FILE_NAME), deadline)? else {
+    let Some(bytes) = read_file(&data_dir.join(FILE_NAME), max_bytes, deadline)? else {
         return Ok(None);
     };
-    let snapshot = Snapshot::decode(&bytes, network, deadline)?;
+    let snapshot = Snapshot::decode(&bytes, network, max_bytes, deadline)?;
     drop(bytes);
     let order = snapshot.order()?;
     let positions: HashMap<_, _> = snapshot
@@ -501,6 +524,11 @@ pub fn restore(
         if let Ok(result) = result {
             for change in result.changes {
                 let id = Txid(change.txid);
+                if let Some(saved) = positions.get(&id)
+                    && saved.unbroadcast
+                {
+                    gateway.restore_unbroadcast(saved.tx.wtxid());
+                }
                 if gateway.read().contains_txid(&id)
                     && announced.insert(id)
                     && let Some(children) = waiting.remove(&id)

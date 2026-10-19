@@ -1093,6 +1093,14 @@ impl Mempool {
         self.entry(self.entry_id_by_txid(txid)?)
     }
 
+    pub(crate) fn set_unbroadcast(&mut self, wtxid: bitcoin_rs_primitives::Wtxid, pending: bool) {
+        if let Some(&id) = self.derived.by_wtxid.get(&wtxid)
+            && let Some(entry) = self.entry_mut(id)
+        {
+            entry.unbroadcast = pending;
+        }
+    }
+
     /// Returns a clone of the shared `Arc<Tx>` for `txid`, or `None`
     /// if the transaction is not in the pool.
     ///
@@ -1363,6 +1371,16 @@ impl Mempool {
     /// Walks every live entry in slab order.
     pub fn iter_entries(&self) -> impl Iterator<Item = &MempoolEntry> + '_ {
         self.entries.iter().map(|(_id, entry)| entry)
+    }
+
+    /// Pending local initial broadcasts with their current admission epochs.
+    pub fn unbroadcast_transactions(&self) -> impl Iterator<Item = (Txid, Wtxid, u64)> + '_ {
+        self.iter_entries()
+            .filter(|entry| entry.unbroadcast)
+            .filter_map(|entry| {
+                let indexed = self.derived.by_txid.get(&entry.txid)?;
+                Some((entry.txid, entry.wtxid, indexed.admitted_sequence))
+            })
     }
 
     /// Projects complete connected families, walking each live graph entry once.

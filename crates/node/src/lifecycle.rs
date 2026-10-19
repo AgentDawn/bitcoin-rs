@@ -433,12 +433,14 @@ fn save_mempool_snapshot(state: &NodeState) {
     let gateway = state.mempool_gateway();
     let data_dir = state.data_dir().to_path_buf();
     let network = state.config().network;
+    let max_bytes = state.config().mempool_snapshot_max_bytes;
     let (sender, receiver) = crossbeam_channel::bounded(1);
     match std::thread::Builder::new()
         .name("mempool-snapshot".into())
         .spawn(move || {
-            let result =
-                bitcoin_rs_mempool::snapshot::prepare(&data_dir, &gateway, network, deadline);
+            let result = bitcoin_rs_mempool::snapshot::prepare(
+                &data_dir, &gateway, network, max_bytes, deadline,
+            );
             let _ = sender.send(result);
         }) {
         Ok(_) => publish_mempool_snapshot(receiver, deadline),

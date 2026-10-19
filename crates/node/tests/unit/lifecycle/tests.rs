@@ -44,6 +44,7 @@ fn timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot() -> anyhow
             &path,
             &worker_gateway,
             Network::Regtest,
+            snapshot::DEFAULT_MAX_BYTES,
             Instant::now() + Duration::from_secs(10),
         );
         let _ = ready_tx.send(staged.is_ok());
@@ -58,6 +59,7 @@ fn timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot() -> anyhow
         dir.path(),
         &gateway,
         Network::Regtest,
+        snapshot::DEFAULT_MAX_BYTES,
         Instant::now() + Duration::from_secs(10),
     )?;
     let file = dir.path().join("mempool-snapshot.dat");

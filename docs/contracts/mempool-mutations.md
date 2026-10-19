@@ -43,7 +43,9 @@ state (`crates/mempool/src/orphan.rs`).
   the transaction entered the node (`Rpc`, `Esplora`, `Peer`, `Reorg`,
   `Snapshot`, or `Block`). Snapshot restoration uses ordinary admission and
   sequence assignment before external observers are attached; it does not
-  replay saved sequences or relay notifications.
+  replay saved sequences or blanket relay notifications. The existing P2P
+  relay worker separately resumes saved pending initial broadcasts for
+  successfully re-admitted entries.
   Proof: `snapshot::tests::restores_dependencies_priorities_and_gateway_publication`
   and `tx_relay::tests::local_tx_relay_uses_committed_wtxid_and_ignores_peer_and_removed_entries` cover restored
   publication and the Snapshot origin's relay suppression.
