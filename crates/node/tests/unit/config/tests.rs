@@ -67,6 +67,37 @@ fn mempool_snapshot_budget_is_configurable_and_bounded() {
 }
 
 #[test]
+fn mempool_snapshot_restore_timeout_is_configurable_and_scales_with_budget() {
+    let defaults = resolved(&[]);
+    assert_eq!(defaults.mempool_snapshot_restore_timeout_secs, 64);
+
+    let large_budget = UserConfig {
+        mempool_snapshot_max_mb: Some(120),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved(&[&large_budget]).mempool_snapshot_restore_timeout_secs,
+        120
+    );
+
+    let explicit = UserConfig {
+        mempool_snapshot_max_mb: Some(120),
+        mempool_snapshot_restore_timeout_secs: Some(300),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolved(&[&explicit]).mempool_snapshot_restore_timeout_secs,
+        300
+    );
+
+    let invalid = UserConfig {
+        mempool_snapshot_restore_timeout_secs: Some(0),
+        ..Default::default()
+    };
+    assert!(super::resolve(&[&invalid]).is_err());
+}
+
+#[test]
 fn default_rpc_auth_uses_a_generated_cookie() {
     let layer = UserConfig {
         data_dir: Some(PathBuf::from("test-node")),

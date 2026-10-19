@@ -494,7 +494,7 @@ fn capacity_limits_save_whole_families_and_all_priorities() -> TestResult {
     let absent = Txid(Hash256::from_le_bytes(&[10; 32]));
     source.prioritise(absent, 50)?;
     let family_bytes =
-        84 + 40 + u64::try_from(parent.total_size())? + u64::try_from(child.total_size())? + 26;
+        84 + 40 + u64::try_from(parent.total_size())? + u64::try_from(child.total_size())? + 34;
     for (bytes, count) in [(family_bytes, usize::MAX), (DEFAULT_MAX_BYTES, 2)] {
         let snapshot = Snapshot::capture(&source, deadline(), bytes, count)?;
         assert_eq!(snapshot.transactions.len(), 2);
@@ -551,7 +551,7 @@ fn capacity_limits_save_whole_families_and_all_priorities() -> TestResult {
         .candidates,
         2
     );
-    let full_bytes = family_bytes + u64::try_from(independent.total_size())? + 13;
+    let full_bytes = family_bytes + u64::try_from(independent.total_size())? + 17;
     save(
         dir.path(),
         &source,
@@ -587,6 +587,7 @@ fn byte_budget_allows_more_than_one_hundred_thousand_records() -> TestResult {
                 txid,
                 time: NOW,
                 unbroadcast: false,
+                sigop_cost: 0,
             }
         })
         .collect();
@@ -949,6 +950,7 @@ fn revalidates_witness_standardness_finality_and_only_saves_live_rbf_members() -
                 tx: Arc::new(tx),
                 time: NOW - 10,
                 unbroadcast: false,
+                sigop_cost: 0,
             }],
             deltas: vec![],
         };
@@ -1039,5 +1041,91 @@ fn concurrent_admission_and_save_capture_a_coherent_candidate_set() -> TestResul
     assert!((1..=2).contains(&report.candidates));
     assert_eq!(report.restored, report.candidates);
     assert!(target.read().contains_txid(&parent.txid()));
+    Ok(())
+}
+
+#[test]
+fn restores_multi_generational_cpfp_package() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let point = OutPoint::new(Txid(Hash256::from_le_bytes(&[12; 32])), 0);
+    let grandparent = spend(point, 100_000);
+    let parent = spend(OutPoint::new(grandparent.txid(), 0), 100_000);
+    let child = spend(OutPoint::new(parent.txid(), 0), 90_000);
+    let chain = Coins {
+        outputs: vec![(point, output(100_000))],
+        height: 100,
+        coinbase: true,
+    };
+    let snapshot = Snapshot {
+        transactions: vec![
+            SavedTransaction {
+                tx: Arc::new(grandparent.clone()),
+                txid: grandparent.txid(),
+                time: NOW - 30,
+                unbroadcast: false,
+                sigop_cost: 0,
+            },
+            SavedTransaction {
+                tx: Arc::new(parent.clone()),
+                txid: parent.txid(),
+                time: NOW - 20,
+                unbroadcast: false,
+                sigop_cost: 0,
+            },
+            SavedTransaction {
+                tx: Arc::new(child.clone()),
+                txid: child.txid(),
+                time: NOW - 10,
+                unbroadcast: true,
+                sigop_cost: 0,
+            },
+        ],
+        deltas: vec![],
+    };
+    std::fs::write(
+        dir.path().join(FILE_NAME),
+        snapshot.encode(Network::Regtest, DEFAULT_MAX_BYTES, deadline())?,
+    )?;
+    let target = gateway(MempoolLimits::default(), None);
+    let report = restore(
+        dir.path(),
+        &target,
+        Network::Regtest,
+        &chain,
+        NOW,
+        DEFAULT_MAX_BYTES,
+        deadline(),
+    )?
+    .ok_or("missing snapshot")?;
+    assert_eq!((report.candidates, report.restored, report.skipped), (3, 3, 0));
+    assert!(target.read().contains_txid(&grandparent.txid()));
+    assert!(target.read().contains_txid(&parent.txid()));
+    assert!(target.read().contains_txid(&child.txid()));
+    assert_eq!(
+        target
+            .read()
+            .unbroadcast_transactions()
+            .map(|(txid, _, _)| txid)
+            .collect::<Vec<_>>(),
+        vec![child.txid()]
+    );
+    Ok(())
+}
+
+#[test]
+fn snapshot_decode_rejects_excessive_sigop_cost() -> TestResult {
+    let (_, parent, _) = family();
+    let snapshot = Snapshot {
+        transactions: vec![SavedTransaction {
+            tx: Arc::new(parent.clone()),
+            txid: parent.txid(),
+            time: NOW,
+            unbroadcast: false,
+            sigop_cost: crate::standardness::MAX_STANDARD_TX_SIGOPS_COST + 1,
+        }],
+        deltas: Vec::new(),
+    };
+    let encoded = snapshot.encode(Network::Regtest, DEFAULT_MAX_BYTES, deadline())?;
+    assert!(Snapshot::decode(&encoded, Network::Regtest, DEFAULT_MAX_BYTES, deadline()).is_err());
     Ok(())
 }

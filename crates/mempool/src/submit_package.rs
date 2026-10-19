@@ -59,7 +59,8 @@ impl MempoolGateway {
         time: u64,
         chain: &dyn AdmissionChain,
     ) -> Result<MutationResult, SubmitError> {
-        self.submit_package_with_times(txs, origin, max_rate, |_| time, chain)
+        let txs = ordered(txs)?;
+        self.submit_package_with_times(&txs, origin, max_rate, |_| time, chain)
     }
 
     #[expect(
@@ -68,13 +69,13 @@ impl MempoolGateway {
     )]
     pub(crate) fn submit_package_with_times(
         &self,
-        txs: Vec<Tx>,
+        txs: &[Tx],
         origin: LocalOrigin,
         max_rate: Option<u64>,
         time: impl Fn(&Tx) -> u64,
         chain: &dyn AdmissionChain,
     ) -> Result<MutationResult, SubmitError> {
-        let txs = ordered(txs)?;
+        crate::package::check_structure(txs)?;
         let origin = AdmissionOrigin::from(origin);
         'attempt: for _ in 0..MAX_ADMISSION_RETRIES {
             let Some(generation) = self.stable_generation() else {

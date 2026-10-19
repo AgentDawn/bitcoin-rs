@@ -415,21 +415,32 @@ impl NodeState {
                 &chain,
                 now,
                 config.mempool_snapshot_max_bytes,
-                started + std::time::Duration::from_secs(60),
+                started + std::time::Duration::from_secs(config.mempool_snapshot_restore_timeout_secs),
             ) {
-                Ok(Some(report)) => tracing::info!(
-                    candidates = report.candidates,
-                    restored = report.restored,
-                    skipped = report.skipped,
-                    timed_out = report.timed_out,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    status = if report.skipped == 0 && !report.timed_out {
-                        "restored"
-                    } else {
-                        "partially_restored"
-                    },
-                    "mempool snapshot revalidation finished"
-                ),
+                Ok(Some(report)) => {
+                    if report.timed_out {
+                        tracing::warn!(
+                            candidates = report.candidates,
+                            restored = report.restored,
+                            skipped = report.skipped,
+                            timeout_secs = config.mempool_snapshot_restore_timeout_secs,
+                            "mempool snapshot restore timed out before validating all candidates; consider raising --mempool-snapshot-restore-timeout-secs"
+                        );
+                    }
+                    tracing::info!(
+                        candidates = report.candidates,
+                        restored = report.restored,
+                        skipped = report.skipped,
+                        timed_out = report.timed_out,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        status = if report.skipped == 0 && !report.timed_out {
+                            "restored"
+                        } else {
+                            "partially_restored"
+                        },
+                        "mempool snapshot revalidation finished"
+                    );
+                }
                 Ok(None) => tracing::info!(
                     status = "missing",
                     "no mempool snapshot; starting with an empty pool"

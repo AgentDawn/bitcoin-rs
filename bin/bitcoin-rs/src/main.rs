@@ -176,6 +176,29 @@ mod tests {
             &[("BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB", "256")],
         );
         assert_eq!(config.mempool_snapshot_max_bytes, 512 * 1024 * 1024);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_restore_timeout_secs = 120\n",
+            &[],
+            std::iter::empty(),
+        )?;
+        assert_eq!(config.mempool_snapshot_restore_timeout_secs, 120);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_restore_timeout_secs = 120\n",
+            &[],
+            [(
+                OsString::from("BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS"),
+                OsString::from("180"),
+            )]
+            .into_iter(),
+        )?;
+        assert_eq!(config.mempool_snapshot_restore_timeout_secs, 180);
+        let config = resolved(
+            &["bitcoin-rs", "--mempool-snapshot-restore-timeout-secs=240"],
+            &[("BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS", "180")],
+        );
+        assert_eq!(config.mempool_snapshot_restore_timeout_secs, 240);
         Ok(())
     }
 

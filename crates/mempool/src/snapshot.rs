@@ -32,6 +32,7 @@ struct SavedTransaction {
     txid: Txid,
     time: u64,
     unbroadcast: bool,
+    sigop_cost: u32,
 }
 
 struct Snapshot {
@@ -127,7 +128,7 @@ impl Snapshot {
             check_deadline(deadline)?;
             // Keep complete connected families: a parent-only prefix could
             // discard its paying CPFP child and make the saved parent useless.
-            let cluster_bytes: u64 = cluster.iter().map(|row| u64::from(row.size) + 13).sum();
+            let cluster_bytes: u64 = cluster.iter().map(|row| u64::from(row.size) + 17).sum();
             if transactions.len() + cluster.len() > max_records
                 || bytes.saturating_add(cluster_bytes) > max_bytes
                 || cluster
@@ -143,6 +144,7 @@ impl Snapshot {
                     txid: entry.txid,
                     time: entry.time,
                     unbroadcast: entry.unbroadcast,
+                    sigop_cost: entry.sigop_cost,
                 });
             }
         }
@@ -181,6 +183,7 @@ impl Snapshot {
             check_deadline(deadline)?;
             bytes.extend_from_slice(&row.time.to_le_bytes());
             bytes.push(u8::from(row.unbroadcast));
+            bytes.extend_from_slice(&row.sigop_cost.to_le_bytes());
             bytes.extend_from_slice(
                 &u32::try_from(row.tx.consensus_size())
                     .map_err(|_| invalid("transaction too large"))?
@@ -227,7 +230,7 @@ impl Snapshot {
             .map_err(|_| invalid("transaction count overflow"))?;
         let delta_count = usize::try_from(u32::from_le_bytes(take(&mut input)?))
             .map_err(|_| invalid("fee delta count overflow"))?;
-        if count > bytes.len() / 13 || delta_count > bytes.len() / 40 {
+        if count > bytes.len() / 17 || delta_count > bytes.len() / 40 {
             return Err(invalid("snapshot record count exceeds its bound"));
         }
         let mut transactions = Vec::new();
@@ -240,6 +243,10 @@ impl Snapshot {
                 [1] => true,
                 _ => return Err(invalid("invalid initial broadcast flag")),
             };
+            let sigop_cost = u32::from_le_bytes(take(&mut input)?);
+            if sigop_cost > crate::standardness::MAX_STANDARD_TX_SIGOPS_COST {
+                return Err(invalid("snapshot transaction exceeds standard sigop cost"));
+            }
             let len = usize::try_from(u32::from_le_bytes(take(&mut input)?))
                 .map_err(|_| invalid("transaction size overflow"))?;
             if len == 0 || len > MAX_TX_BYTES {
@@ -262,6 +269,7 @@ impl Snapshot {
                 txid,
                 time,
                 unbroadcast,
+                sigop_cost,
             });
         }
         let mut deltas = Vec::new();
@@ -445,12 +453,21 @@ pub fn restore(
     let snapshot = Snapshot::decode(&bytes, network, max_bytes, deadline)?;
     drop(bytes);
     let order = snapshot.order()?;
+    let topo_order: HashMap<Txid, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(topo, &idx)| (snapshot.transactions[idx].txid, topo))
+        .collect();
     let positions: HashMap<_, _> = snapshot
         .transactions
         .iter()
         .map(|row| (row.txid, row))
         .collect();
-    let eligible = |row: &SavedTransaction| row.time <= now && now - row.time <= MAX_AGE;
+    let eligible = |row: &SavedTransaction| {
+        row.time <= now
+            && now - row.time <= MAX_AGE
+            && row.sigop_cost <= crate::standardness::MAX_STANDARD_TX_SIGOPS_COST
+    };
     let mut timed_out = false;
     for (txid, delta) in &snapshot.deltas {
         if check_deadline(deadline).is_err() {
@@ -487,34 +504,54 @@ pub fn restore(
                 crate::SubmitOutcome::Committed(result) => result,
                 _ => crate::MutationResult::empty(),
             });
-        // A native CPFP/ephemeral-dust package may have a parent that cannot
-        // enter alone. Reuse the existing child-with-independent-parents owner;
-        // it enforces package limits, scripts and current aggregate fee floors.
+        // A native CPFP/ephemeral-dust package may have parents and ancestors
+        // that cannot enter alone. Recursively collect unconfirmed in-snapshot
+        // ancestors in topological order; package validation enforces limits,
+        // scripts and current aggregate fee floors.
         let mut package = Vec::new();
         let mut missing = hashbrown::HashSet::new();
         if result.is_err() {
+            let mut stack = Vec::new();
+            let mut visited = hashbrown::HashSet::new();
             for input in &row.tx.inputs {
-                if gateway.read().contains_txid(&input.previous_output.txid) {
+                if !gateway.read().contains_txid(&input.previous_output.txid) {
+                    stack.push(input.previous_output.txid);
+                }
+            }
+            while let Some(ancestor_id) = stack.pop() {
+                if !visited.insert(ancestor_id) {
                     continue;
                 }
-                if let Some(parent) = positions.get(&input.previous_output.txid)
-                    && eligible(parent)
-                    && missing.insert(parent.txid)
+                if gateway.read().contains_txid(&ancestor_id) {
+                    continue;
+                }
+                if let Some(ancestor) = positions.get(&ancestor_id)
+                    && eligible(ancestor)
                 {
-                    if package.len() < crate::standardness::MAX_PACKAGE_COUNT {
-                        package.push(parent.tx.as_ref().clone());
+                    missing.insert(ancestor_id);
+                    for input in &ancestor.tx.inputs {
+                        if !gateway.read().contains_txid(&input.previous_output.txid) {
+                            stack.push(input.previous_output.txid);
+                        }
                     }
                 }
             }
+            if !missing.is_empty() && missing.len() < crate::standardness::MAX_PACKAGE_COUNT {
+                let mut ancestor_ids: Vec<_> = missing.iter().copied().collect();
+                ancestor_ids.sort_by_key(|id| topo_order.get(id).copied().unwrap_or(usize::MAX));
+                for id in ancestor_ids {
+                    package.push(positions[&id].tx.as_ref().clone());
+                }
+                package.push(row.tx.as_ref().clone());
+            }
         }
-        if !package.is_empty() && package.len() < crate::standardness::MAX_PACKAGE_COUNT {
+        if !package.is_empty() {
             if check_deadline(deadline).is_err() {
                 timed_out = true;
                 break;
             }
-            package.push(row.tx.as_ref().clone());
             result = gateway.submit_package_with_times(
-                package,
+                &package,
                 LocalOrigin::Snapshot,
                 None,
                 |tx| positions[&tx.txid()].time,

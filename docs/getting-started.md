@@ -75,8 +75,16 @@ the entire live pool; the same budget applies on read. Raising it also raises
 the possible memory and I/O cost. Larger pools save complete connected
 families until the first family does not fit and log saved/omitted counts; all operator fee deltas
 are retained, or saving fails if those overlays alone exceed the bound.
-Restore has a cooperative
-sixty-second budget and excludes candidates older than fourteen days.
+Restore excludes candidates older than fourteen days and runs within a cooperative
+timeout, defaulting to at least 60 seconds and scaling dynamically with the configured byte budget
+(`max(60, mempool_snapshot_max_mb)`). Raise it with `--mempool-snapshot-restore-timeout-secs=180`,
+`BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS=180`, or TOML
+`mempool_snapshot_restore_timeout_secs = 180`. Multi-generational CPFP packages (e.g.
+grandparent, parent, child) are restored atomically in topological order within package
+standardness limits. Candidate records persist precomputed BIP16/BIP141 SigOp costs
+(version 2 format), validated upfront against standardness limits before script execution.
+Note that mempool persistence is an operational optimization for clean shutdowns;
+abrupt termination (power loss, crash, kill) does not record a snapshot.
 Locally submitted transactions awaiting initial broadcast retain that status
 across restart if re-admitted. The existing P2P relay worker retries them in
 bounded batches, including after absent peers or queue saturation. A successful

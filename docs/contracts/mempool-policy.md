@@ -171,19 +171,31 @@ The snapshot budget is independent of the live pool's virtual-size limit.
 `BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB`) raises the shared read/write budget;
 a large enough budget retains every live family, subject to the cooperative
 deadline. Selection stops at the first family that does not fit.
+`mempool_snapshot_restore_timeout_secs` (CLI `--mempool-snapshot-restore-timeout-secs`,
+environment `BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS`) configures the
+startup restore deadline in seconds. It scales dynamically with the configured byte budget
+(`max(60, mempool_snapshot_max_mb)`), ensuring large or complex snapshot revalidation
+does not prematurely time out.
+
 Clean teardown waits at most ten seconds for a staging worker, which cannot
-touch the live file. The shutdown thread owns publication and completes it
+touch the live file. Mempool persistence applies exclusively to clean, graceful
+shutdowns (`TeardownMode::CleanShutdown`); abrupt termination (power failure, crash,
+SIGKILL) does not record a snapshot. The shutdown thread owns publication and completes it
 before returning; abandoning a worker therefore cannot overwrite a later run.
 Deadline checks are cooperative: individual OS calls, including publication,
 cannot be preempted. A synced staging file is renamed before syncing the
 directory where supported. Incompatible/corrupt ordinary live files are moved
 intact into a unique `mempool-snapshot-rejected-*` directory before publishing
 a fresh snapshot. Unreadable files, directories and symlinks are not replaced.
-Interrupted staging files are never loaded. Restore has a sixty-second
-cooperative budget and reports missing, restored, partially restored or
-rejected status; it does not retry indefinitely. Successfully re-admitted
-entries survive budget exhaustion, and the next clean shutdown snapshots the
-then-current pool. Startup aborts and failed clean checkpoints do not save.
+Interrupted staging files are never loaded. Restore runs within the configured
+cooperative deadline and reports missing, restored, partially restored or
+rejected status; it does not retry indefinitely. Multi-generational CPFP dependency
+families (e.g., grandparent, parent, child) are restored atomically in topological order
+within standard package limits (`MAX_PACKAGE_COUNT`). Each candidate record persists
+precomputed BIP16/BIP141 `sigop_cost` in format version 2, validated upfront against standardness
+limits before script execution. Successfully re-admitted entries survive budget exhaustion,
+and the next clean shutdown snapshots the then-current pool. Startup aborts and failed
+clean checkpoints do not save.
 
 `persist_mempool=false` disables both load and save and leaves existing files
 untouched. There is no periodic writer. `savemempool` and `importmempool`
@@ -192,7 +204,8 @@ remain unsupported RPCs; this format makes no Core disk-format claim.
 ## Proven by
 
 - `crates/mempool/src/snapshot/tests.rs` covers candidate revalidation,
-  CPFP/ephemeral dust and dependency-triggered retries, per-member times,
+  CPFP/ephemeral dust and dependency-triggered retries, multi-generational CPFP
+  package restoration, upfront sigop standardness validation, per-member times,
   whole-family capacity bounds, raised byte budgets, more than 100,000 records,
   pending initial-broadcast flags and rejected-file quarantine.
 - `tx_relay::tests::pending_local_broadcast_survives_absent_peers_and_saturation`
