@@ -415,7 +415,8 @@ impl NodeState {
                 &chain,
                 now,
                 config.mempool_snapshot_max_bytes,
-                started + std::time::Duration::from_secs(config.mempool_snapshot_restore_timeout_secs),
+                started
+                    + std::time::Duration::from_secs(config.mempool_snapshot_restore_timeout_secs),
             ) {
                 Ok(Some(report)) => {
                     if report.timed_out {

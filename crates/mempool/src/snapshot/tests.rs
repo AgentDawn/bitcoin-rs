@@ -1097,7 +1097,10 @@ fn restores_multi_generational_cpfp_package() -> TestResult {
         deadline(),
     )?
     .ok_or("missing snapshot")?;
-    assert_eq!((report.candidates, report.restored, report.skipped), (3, 3, 0));
+    assert_eq!(
+        (report.candidates, report.restored, report.skipped),
+        (3, 3, 0)
+    );
     assert!(target.read().contains_txid(&grandparent.txid()));
     assert!(target.read().contains_txid(&parent.txid()));
     assert!(target.read().contains_txid(&child.txid()));

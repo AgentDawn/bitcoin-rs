@@ -261,9 +261,7 @@ impl NodeConfig {
             .saturating_mul(1024 * 1024);
         let mempool_snapshot_restore_timeout_secs = settings
             .mempool_snapshot_restore_timeout_secs
-            .unwrap_or_else(|| {
-                std::cmp::max(60, mempool_snapshot_max_bytes / (1024 * 1024))
-            });
+            .unwrap_or_else(|| std::cmp::max(60, mempool_snapshot_max_bytes / (1024 * 1024)));
         Self {
             network: selection.consensus_network(),
             persist_mempool: settings.persist_mempool.unwrap_or(true),
