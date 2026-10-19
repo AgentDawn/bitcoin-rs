@@ -101,6 +101,13 @@ The `Cold` path is for a datadir with the current marker and no committed durabl
 
 ## Schema history
 
+The optional mempool restart snapshot has its own mempool-owned format
+version and genesis/checksum identity. It contains admission candidates, not
+authoritative membership. Rejected files stay in place and do not prevent
+Chainstate startup; saving must not overwrite them. The gateway revalidates
+candidates against recovered Chainstate. This artifact is independent of the
+fee-estimator history and does not change `CURRENT_SCHEMA`.
+
 | Epoch | Change | Status |
 | --- | --- | --- |
 | `0` | Initial baseline format. Unmarked non-empty datadirs are implicit epoch `0` and are refused. | retired |

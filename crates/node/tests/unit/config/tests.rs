@@ -24,6 +24,25 @@ fn auth_debug_redacts_secrets() {
 }
 
 #[test]
+fn mempool_persistence_can_be_disabled_without_changing_other_settings() {
+    assert!(
+        NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest).persist_mempool
+    );
+    let layer = UserConfig {
+        persist_mempool: Some(false),
+        ..Default::default()
+    };
+    let config = resolved(&[&layer]);
+    assert!(!config.persist_mempool);
+    assert_eq!(config.storage.dbcache_mb, 450);
+    let enable = UserConfig {
+        persist_mempool: Some(true),
+        ..Default::default()
+    };
+    assert!(resolved(&[&layer, &enable]).persist_mempool);
+}
+
+#[test]
 fn default_rpc_auth_uses_a_generated_cookie() {
     let layer = UserConfig {
         data_dir: Some(PathBuf::from("test-node")),

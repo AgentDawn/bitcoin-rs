@@ -52,6 +52,23 @@ export BITCOIN_RS_STORAGE_BACKEND=fjall
 
 RocksDB is a non-default backend used as a shipped alternative and comparison engine.
 
+Clean shutdown saves eligible mempool transactions to
+`mempool-snapshot.dat` in the node data directory. Startup rechecks those
+candidates against recovered Chainstate and current policy before serving
+requests. Admission ages and operator fee deltas are retained; membership,
+derived fees and dependencies are recomputed. Startup logs distinguish no
+file, full/partial restore and a rejected file.
+
+To start with a fresh pool while preserving the snapshot, set
+`--persist-mempool=false`, `BITCOIN_RS_PERSIST_MEMPOOL=false`, or
+`persist_mempool = false` in TOML. This disables saving as well. A corrupt,
+unknown-version or wrong-network snapshot is left in place, including at
+shutdown; explicitly move it aside to allow a new snapshot. Snapshots are
+bounded at 64 MiB and 100,000 transactions; restore has a cooperative
+sixty-second budget and excludes candidates older than fourteen days.
+Power-loss preservation and Core `savemempool`/`importmempool` compatibility
+are not provided by this initial implementation.
+
 ## Start the node
 
 ```sh

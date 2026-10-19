@@ -128,6 +128,35 @@ mod tests {
     }
 
     #[test]
+    fn mempool_persistence_resolves_toml_environment_and_cli() -> anyhow::Result<()> {
+        let config = load_file(
+            "--config",
+            "persist_mempool = false\n",
+            &[],
+            std::iter::empty(),
+        )?;
+        assert!(!config.persist_mempool);
+        let config = load_file(
+            "--config",
+            "persist_mempool = true\n",
+            &[],
+            [(
+                OsString::from("BITCOIN_RS_PERSIST_MEMPOOL"),
+                OsString::from("false"),
+            )]
+            .into_iter(),
+        )?;
+        assert!(!config.persist_mempool);
+        let config = resolved(
+            &["bitcoin-rs", "--persist-mempool=true"],
+            &[("BITCOIN_RS_PERSIST_MEMPOOL", "false")],
+        );
+        assert!(config.persist_mempool);
+        assert!(!resolved(&["bitcoin-rs", "--persist-mempool=false"], &[]).persist_mempool);
+        Ok(())
+    }
+
+    #[test]
     fn bitcoin_conf_is_overridden_by_cli() {
         let config = load_file(
             "--bitcoin-conf",

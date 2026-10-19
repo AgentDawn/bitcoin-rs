@@ -1519,15 +1519,19 @@ impl Mempool {
     /// Returns every stored fee-delta overlay, including txids not in the pool.
     #[must_use]
     pub fn prioritised_transactions(&self) -> Vec<PrioritisedTransaction> {
-        self.fee_deltas
-            .iter()
-            .map(|(&txid, &fee_delta)| PrioritisedTransaction {
+        self.fee_deltas()
+            .map(|(txid, fee_delta)| PrioritisedTransaction {
                 txid,
                 fee_delta,
                 in_mempool: self.derived.by_txid.contains_key(&txid),
                 modified_fee: self.entry_by_txid(&txid).map(MempoolEntry::modified_fee),
             })
             .collect()
+    }
+
+    /// Borrow the overlay for bounded snapshot capture without an unbounded copy.
+    pub(crate) fn fee_deltas(&self) -> impl ExactSizeIterator<Item = (Txid, i64)> + '_ {
+        self.fee_deltas.iter().map(|(&txid, &delta)| (txid, delta))
     }
 
     /// Reason-carrying core for composite mutations that remove an entry and

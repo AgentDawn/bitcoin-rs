@@ -341,27 +341,13 @@ impl NodeState {
         // attaches as an extra named leg. Admission/relay legs attach after
         // construction.
         let mempool_gateway = {
-            let publisher = Arc::clone(&zmq_publisher);
             let cloned_mining = Arc::clone(&mining_generation);
             let mining_leg: Arc<dyn bitcoin_rs_mempool::MempoolObserver> = cloned_mining;
-            let gateway = Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
+            Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
                 Arc::clone(&mempool),
                 Some(mining_leg),
                 config.validation.engine,
-            ));
-            if publisher.wants_notifications() {
-                gateway
-                    .attach_observer_leg(
-                        "sequence",
-                        Arc::new(bitcoin_rs_rpc::zmq::MempoolSequenceObserver::new(publisher)),
-                    )
-                    .map_err(anyhow::Error::msg)?;
-            } else if let Some(observer) = mempool_observer.cloned() {
-                gateway
-                    .attach_observer_leg("test", observer)
-                    .map_err(anyhow::Error::msg)?;
-            }
-            gateway
+            ))
         };
         // Construct followers before Chainstate so capture policy has one owner.
         let (block_announce_queue, block_announce_rx) = bitcoin_rs_p2p::BlockAnnounceQueue::new();
@@ -409,6 +395,64 @@ impl NodeState {
             Err(error) => return Err(anyhow::Error::new(error)),
         }
         let chainstate = Arc::new(chainstate);
+        // Authoritative recovery is settled. No RPC/P2P admission or external
+        // mempool observer is exposed until revalidation has finished.
+        if config.persist_mempool {
+            let started = std::time::Instant::now();
+            let chain = bitcoin_rs_rpc::context::ChainAdmissionView::new(
+                chainstate.utxo_reader(),
+                chainstate.applied_tip_reader(),
+                chainstate.block_tree_reader(),
+                config.network,
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            match bitcoin_rs_mempool::snapshot::restore(
+                &config.data_dir,
+                &mempool_gateway,
+                config.network,
+                &chain,
+                now,
+                started + std::time::Duration::from_secs(60),
+            ) {
+                Ok(Some(report)) => tracing::info!(
+                    candidates = report.candidates,
+                    restored = report.restored,
+                    skipped = report.skipped,
+                    timed_out = report.timed_out,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    status = if report.skipped == 0 && !report.timed_out {
+                        "restored"
+                    } else {
+                        "partially_restored"
+                    },
+                    "mempool snapshot revalidation finished"
+                ),
+                Ok(None) => tracing::info!(
+                    status = "missing",
+                    "no mempool snapshot; starting with an empty pool"
+                ),
+                Err(error) => tracing::warn!(%error, status = "rejected",
+                    "mempool snapshot rejected; leaving the file in place and starting with an empty pool"),
+            }
+        } else {
+            tracing::info!(status = "disabled", "mempool snapshot persistence disabled");
+        }
+        if zmq_publisher.wants_notifications() {
+            mempool_gateway
+                .attach_observer_leg(
+                    "sequence",
+                    Arc::new(bitcoin_rs_rpc::zmq::MempoolSequenceObserver::new(
+                        Arc::clone(&zmq_publisher),
+                    )),
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else if let Some(observer) = mempool_observer.cloned() {
+            mempool_gateway
+                .attach_observer_leg("test", observer)
+                .map_err(anyhow::Error::msg)?;
+        }
         // One chain-owned latch for the whole process: the chainstate builds
         // it once, and the block-download executor, the RPC context, and the
         // P2P listener all hold this same `Arc`, so `initialblockdownload`,

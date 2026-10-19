@@ -127,7 +127,52 @@ holds the reference pins and the admission-profile evidence.
   `allowed` value or fee. Generic script-detail and numeric-error differences
   are listed in the manifest.
 
+## Restart snapshots
+
+`mempool::snapshot` owns the optional `mempool-snapshot.dat` artifact. It is a
+set of admission candidates and operator fee deltas, never a second membership
+or Chainstate authority. Its independent version, genesis identity, checksum,
+64 MiB file bound, 100,000 transaction/fee-delta bounds and 400,000-byte
+transaction bound do not change `CURRENT_SCHEMA`. No cluster/chunk graph,
+computed fee, policy stamp, sequence, orphan or relay state is persisted.
+
+Startup revalidates after authoritative recovery and before RPC/P2P workers
+or external mempool observers are exposed. Transactions are considered in
+deterministic parent-first order through ordinary gateway admission; a CPFP
+or ephemeral-dust family uses the existing atomic child-with-parents path.
+Current fees, limits, scripts, TRUC, maturity and next-block finality apply.
+Confirmed/spent, missing-parent, expired and newly refused candidates are not
+forced back into the pool. Ages use saved wall-clock admission seconds;
+future-dated or more-than-fourteen-day-old candidates are skipped. A restored
+package uses its oldest member's time. Fee deltas, including absent-txid
+overlays, retain their operator meaning even when membership is refused.
+Restored transactions do not register fresh estimator samples or unsolicited
+relay announcements. Ordinary gateway sequence assignment and mining wakes
+still run; fee-estimator history remains a separately owned file.
+
+Saving captures shared transaction handles and scalar metadata under one
+bounded read, then encodes and writes without the pool lock. Clean teardown
+waits at most ten seconds for the save worker. The owner checks its deadline
+between operations and before replacing the live file; individual OS calls
+cannot be preempted. A synced staging file is renamed before syncing the
+directory where supported. Incompatible/corrupt live files are preserved,
+including at shutdown, until the operator explicitly moves them aside.
+Interrupted staging files are never loaded. Restore has a sixty-second
+cooperative budget and reports missing, restored, partially restored or
+rejected status; it does not retry indefinitely. Successfully re-admitted
+entries survive budget exhaustion, and the next clean shutdown snapshots the
+then-current pool. Startup aborts and failed clean checkpoints do not save.
+
+`persist_mempool=false` disables both load and save and leaves existing files
+untouched. There is no periodic writer. `savemempool` and `importmempool`
+remain unsupported RPCs; this format makes no Core disk-format claim.
+
 ## Proven by
+
+- `crates/mempool/src/snapshot/tests.rs` covers candidate revalidation,
+  CPFP/ephemeral dust, publication, bounds and rejected-file preservation.
+- `bin/bitcoin-rs/tests/mempool_restart.rs` drives real daemon shutdowns,
+  restarts, RPC membership/lookup, mining and changed-tip reconciliation.
 
 - `overhaul_process_harness::replacement_signaling_matches_pinned_core` and
   `policy_cases`: isolated Core/candidate processes, identical funding blocks,

@@ -210,6 +210,8 @@ pub struct NodeConfig {
     pub network: Network,
     /// Node data directory.
     pub data_dir: PathBuf,
+    /// Save and revalidate the optional mempool snapshot across clean restarts.
+    pub persist_mempool: bool,
     /// Storage settings.
     pub storage: StorageConfig,
     /// P2P settings.
@@ -251,6 +253,7 @@ impl NodeConfig {
         apply_journal_overrides(&settings.chainstate_journal, &mut chainstate_journal);
         Self {
             network: selection.consensus_network(),
+            persist_mempool: settings.persist_mempool.unwrap_or(true),
             data_dir: settings
                 .data_dir
                 .clone()

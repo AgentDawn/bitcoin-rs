@@ -301,6 +301,12 @@ impl NodeServices {
         if let Some(state) = state {
             let history = state.mempool_reader().read().estimator_history();
             bitcoin_rs_mempool::fee_history::save(state.data_dir(), &history);
+            if state.config().persist_mempool
+                && matches!(mode, TeardownMode::CleanShutdown)
+                && first_error.is_none()
+            {
+                save_mempool_snapshot(state);
+            }
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -416,6 +422,36 @@ impl NodeServices {
                 set_first_error(first_error, error);
             }
         }
+    }
+}
+
+// Bound the shutdown wait even when an OS filesystem call stalls. The worker
+// owns its inputs and checks the same deadline before publishing the live file.
+fn save_mempool_snapshot(state: &NodeState) {
+    let budget = Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + budget;
+    let gateway = state.mempool_gateway();
+    let data_dir = state.data_dir().to_path_buf();
+    let network = state.config().network;
+    let (sender, receiver) = crossbeam_channel::bounded(1);
+    match std::thread::Builder::new()
+        .name("mempool-snapshot".into())
+        .spawn(move || {
+            let result = bitcoin_rs_mempool::snapshot::save(&data_dir, &gateway, network, deadline);
+            let _ = sender.send(result);
+        }) {
+        Ok(_) => match receiver
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "mempool snapshot save failed; preserving the previous file");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "mempool snapshot save did not finish within the shutdown budget");
+            }
+        },
+        Err(error) => tracing::warn!(%error, "could not start mempool snapshot save"),
     }
 }
 

@@ -836,6 +836,7 @@ mod tests {
             (2, AdmissionOrigin::Reorg, true),
             (4, AdmissionOrigin::Esplora, true),
             (5, AdmissionOrigin::Block, false),
+            (6, AdmissionOrigin::Snapshot, false),
             (
                 3,
                 AdmissionOrigin::Peer(PeerToken {

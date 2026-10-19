@@ -40,7 +40,10 @@ state (`crates/mempool/src/orphan.rs`).
   still sees a gap-free, ordered stream.
 - The observer receives a `&MutationEnvelope` — the committed
   `MutationResult` paired with the `AdmissionOrigin` that identifies how
-  the transaction entered the node (`Rpc`, `Esplora`, `Peer`, `Reorg`, or `Block`).
+  the transaction entered the node (`Rpc`, `Esplora`, `Peer`, `Reorg`,
+  `Snapshot`, or `Block`). Snapshot restoration uses ordinary admission and
+  sequence assignment before external observers are attached; it does not
+  replay saved sequences or relay notifications.
   The gateway clones one `MutationResult` into the envelope for each
   committed non-empty batch that has an observer attached, so it can both
   enqueue publication and return the original result to the caller.

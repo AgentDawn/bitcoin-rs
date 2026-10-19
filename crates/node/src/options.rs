@@ -470,6 +470,12 @@ macro_rules! option_rows {
                     env["BITCOIN_RS_DATA_DIR", parse_path]
                     toml native("data_dir")
                 }
+                /// Save eligible mempool transactions on clean shutdown and revalidate them on startup.
+                persist_mempool: Option<bool> {
+                    cli[#[arg(long = "persist-mempool")]]
+                    env["BITCOIN_RS_PERSIST_MEMPOOL", parse_bool]
+                    toml native("persist_mempool")
+                }
                 /// External notification adapters. `None` means this layer does not
                 /// speak to them.
                 notifications: Option<NotificationConfig> {

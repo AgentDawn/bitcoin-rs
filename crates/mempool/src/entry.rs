@@ -43,7 +43,7 @@ pub struct MempoolEntry {
     pub descendant_fee: u64,
     /// Total signed fee adjustment of this entry and all unconfirmed descendants.
     pub descendant_fee_delta: i128,
-    /// Mempool acceptance time in monotonically increasing seconds.
+    /// Mempool acceptance time in wall-clock seconds since the Unix epoch.
     pub time: u64,
     /// Chain height at acceptance.
     pub height: u32,
