@@ -308,8 +308,12 @@ header/checkpoint replies retain
 only commitments. Requests are bounded to 1,000 filters, 2,000 hashes, or 100,000
 checkpoint headers (below the 4 MB envelope). If the tip changes during streaming,
 already-sent filters still belong to the captured stop chain. A completed range
-is not replayed; an interrupted prefix closes the connection instead of silently
-abandoning the tail. Disabled, unavailable, unknown, non-basic and oversized requests
+is not replayed. A pass that only the outbound send-headroom gate stops after a
+prefix was sent parks the remainder, which starts after the last sent filter,
+keeps the stop height the prefix was computed against, and resumes without
+repeating a filter. Any other interrupted prefix, or a resumed range whose stop
+height has moved, closes the connection instead of silently abandoning the tail.
+Disabled, unavailable, unknown, non-basic and oversized requests
 receive no filter answer.
 For decoded non-basic types, unknown/unapplied stops, inverted ranges and
 oversized ranges, bitcoin-rs deliberately keeps the connection open without
@@ -320,7 +324,9 @@ discouragement; Core 31.1 disconnects these requests. Proof:
 outcome are recorded separately).
 To bridge a just-announced tip and asynchronous publication, a valid P2P request
 can be deferred for up to five seconds while publication or send headroom is
-pending. The existing socket poll retries one pending request per connection, so inbound traffic, ping
+pending; time the node's aggregate outbound budget refused the request is not
+counted toward the five seconds, and time the index or the connection's own
+queue took is. The existing socket poll retries one pending request per connection, so inbound traffic, ping
 and cancellation remain responsive. A second pending filter request or an expired
 deadline closes the connection. No response is replayed after streaming a payload;
 chain validation never waits and filters are never generated synchronously.

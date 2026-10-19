@@ -96,7 +96,6 @@ use crossbeam_channel::unbounded;
 use evidence::{Cell, Interval, IntervalKind, LEDGER_SCHEMA, Ledger, Sample};
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot::RwLock;
-use serde::Serialize as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 use tempfile::TempDir;
 
@@ -618,7 +617,7 @@ fn open_pruned_regtest_state() -> (TempDir, NodeState) {
 struct SyncFixture {
     sync: BlockSync,
     inbound_blocks_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>,
-    outbound_rxs: Vec<crossbeam_channel::Receiver<Message>>,
+    outbound_rxs: Vec<crossbeam_channel::Receiver<bitcoin_rs_p2p::QueuedFrame>>,
     peer_table: Arc<bitcoin_rs_p2p::PeerTable>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     blocks: Vec<Block>,
@@ -776,6 +775,7 @@ impl SyncFixture {
             .unwrap_or_else(|| panic!("missing primary outbound receiver"))
             .try_recv()
             .unwrap_or_else(|error| panic!("expected getdata: {error}"))
+            .into_message()
         {
             Message::GetData(inventory) => inventory.len(),
             other => panic!("expected getdata, got {other:?}"),
@@ -786,6 +786,7 @@ impl SyncFixture {
             .first()
             .unwrap_or_else(|| panic!("missing primary outbound receiver"))
             .try_recv()
+            .map(bitcoin_rs_p2p::QueuedFrame::into_message)
         {
             Ok(other) => panic!("expected no getheaders, got {other:?}"),
             Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -848,6 +849,7 @@ impl SyncFixture {
             .unwrap_or_else(|| panic!("missing primary outbound receiver"))
             .try_recv()
             .unwrap_or_else(|error| panic!("expected scan-path getdata: {error}"))
+            .into_message()
         {
             Message::GetData(inventory) => inventory
                 .into_iter()
@@ -872,6 +874,7 @@ impl SyncFixture {
             .unwrap_or_else(|| panic!("missing overflow outbound receiver"))
             .try_recv()
             .unwrap_or_else(|error| panic!("expected overflow scan getdata: {error}"))
+            .into_message()
         {
             Message::GetData(inventory) => inventory
                 .into_iter()
@@ -900,6 +903,7 @@ impl SyncFixture {
             .unwrap_or_else(|| panic!("missing primary outbound receiver"))
             .try_recv()
             .unwrap_or_else(|error| panic!("expected getdata: {error}"))
+            .into_message()
         {
             Message::GetData(inventory) => inventory.len(),
             other => panic!("expected getdata, got {other:?}"),
@@ -934,7 +938,7 @@ impl SyncFixture {
 struct ProductionStateSyncFixture {
     _dir: TempDir,
     state: NodeState,
-    outbound_rxs: Vec<crossbeam_channel::Receiver<Message>>,
+    outbound_rxs: Vec<crossbeam_channel::Receiver<bitcoin_rs_p2p::QueuedFrame>>,
     blocks: Vec<Block>,
     /// Inbound payloads pre-cloned and pre-serialized during (untimed) setup for
     /// the `run` scenario, in send order (heights `2..=N` reversed, then height
@@ -1133,6 +1137,7 @@ impl ProductionStateSyncFixture {
             match rx
                 .try_recv()
                 .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
+                .into_message()
             {
                 Message::GetData(inventory) => break inventory.len(),
                 Message::GetHeaders(_) => {
@@ -1248,13 +1253,13 @@ fn populate_header_chain_from_blocks(tree: &mut BlockTree, blocks: &[Block]) {
 fn install_synthetic_peers(
     peer_table: &Arc<bitcoin_rs_p2p::PeerTable>,
     peer_count: usize,
-) -> Vec<crossbeam_channel::Receiver<Message>> {
+) -> Vec<crossbeam_channel::Receiver<bitcoin_rs_p2p::QueuedFrame>> {
     let mut outbound_rxs = Vec::with_capacity(peer_count);
     for index in 0..peer_count {
         let port = u16::try_from(8_333_usize.saturating_add(index))
             .unwrap_or_else(|error| panic!("invalid synthetic peer port: {error}"));
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let (outbound_tx, outbound_rx) = unbounded::<Message>();
+        let (outbound_tx, outbound_rx) = unbounded::<bitcoin_rs_p2p::QueuedFrame>();
         peer_table.register(addr, bitcoin_rs_p2p::PeerLease::new(outbound_tx));
         outbound_rxs.push(outbound_rx);
     }
@@ -1746,7 +1751,7 @@ fn child_signed_spend_fanout_block(
         ));
     }
     // Same bytes as before: identical coinbase, spends, header, commitment,
-    // and mining sequence as the inlined assembly above.
+    // and mining sequence as child_signed_target_block.
     child_signed_target_block(parent, height, keys, spends)
 }
 
@@ -4291,30 +4296,30 @@ fn print_mrp_node_identity(
         .iter()
         .map(|block| block.block_hash().0.to_string_be())
         .collect();
-    let mut serializer =
-        sonic_rs::Serializer::new(b"mrp-verify: node_identity ".to_vec()).sort_map_keys();
-    json!({
-        "block_to_template_baseline": {
-            "engine": engine,
-            "tips": tips,
-            "pool_txs": unit.pool_live,
-            "background_txs": unit.background_len,
-            "pool_at_template": unit.pool_at_template,
-            "block_txs": unit.block_txs,
-            "block_noncoinbase": unit.block_noncoinbase,
-        },
-        "template_render_baseline": {
-            "engine": engine,
-            "tip": setup.tip.hash.to_string_be(),
-            "tip_height": setup.tip.height,
-            "pool_txs": setup.pool_live,
-            "background_txs": setup.background_len,
-            "pool_at_template": setup.pool_live,
-        },
-    })
-    .serialize(&mut serializer)
+    let mut line = b"mrp-verify: node_identity ".to_vec();
+    serde_json::to_writer(
+        &mut line,
+        &serde_json::json!({
+            "block_to_template_baseline": {
+                "background_txs": unit.background_len,
+                "block_noncoinbase": unit.block_noncoinbase,
+                "block_txs": unit.block_txs,
+                "engine": engine,
+                "pool_at_template": unit.pool_at_template,
+                "pool_txs": unit.pool_live,
+                "tips": tips,
+            },
+            "template_render_baseline": {
+                "background_txs": setup.background_len,
+                "engine": engine,
+                "pool_at_template": setup.pool_live,
+                "pool_txs": setup.pool_live,
+                "tip": setup.tip.hash.to_string_be(),
+                "tip_height": setup.tip.height,
+            },
+        }),
+    )
     .unwrap_or_else(|error| panic!("render node identity pins: {error}"));
-    let mut line = serializer.into_inner();
     line.push(b'\n');
     std::io::stdout()
         .lock()

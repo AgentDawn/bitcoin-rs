@@ -21,8 +21,9 @@ The probe requires Linux/x86 because it exercises the runner's
 
 It loads the two scripts under test (SUT) and exercises their REAL validation,
 parsing and analysis functions plus their launch-nothing CLIs (`validate`,
-`plan`, analyzer) on synthetic fixtures. It NEVER calls `run` or
-`execute_case` and never launches a workload process.
+`plan`, analyzer) on synthetic fixtures. It never launches a workload
+process; the one `cmd_run` exit-code check below stubs `execute_case` with
+synthetic records so no case process ever starts.
 
 Everything is synthetic and explicitly NOT a campaign registration or sample:
 source trees, benches, locks, "executables", receipts and evidence are stub
@@ -43,9 +44,11 @@ Exit code 0 iff every check passes; failures are listed as FAIL lines.
 """
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import statistics
@@ -111,6 +114,10 @@ BENCH_FILES = {
     # the three owning bench files. Part of the exact bench-source
     # fingerprint inventory; identical hash across all five roots.
     "measured_samples": "tools/benchmark-support/measured_samples.rs",
+    # Shared snapshot-order module: deduplicated chunk-order fingerprint and
+    # topological assertion shared by insert_fill and candidate. Same
+    # identical-bytes inclusion and fingerprint membership as the sampler.
+    "snapshot_order": "tools/benchmark-support/snapshot_order.rs",
 }
 LOCK_FILES = [
     "Cargo.lock",
@@ -674,24 +681,49 @@ def build_fixture(
         {f"candidate/{s[3]}" for _t, s in ALL_ROWS}
         | {f"control_{t}/{s[3]}" for t, s in ALL_ROWS}
     )
+    candidate_commit = "a" * 40
+    control_transforms = {
+        "control_T1": (
+            "synthetic single-lever control_T1: disable maintained "
+            "cluster-order upkeep"
+        ),
+        "control_T2": (
+            "synthetic single-lever control_T2: neutralize staged-tip "
+            "preparation closure"
+        ),
+        "control_T3": (
+            "synthetic single-lever control_T3: empty data_hex plus "
+            "uncached signalling"
+        ),
+        "control_T4": (
+            "synthetic single-lever control_T4: omit per-admission "
+            "SignatureCache"
+        ),
+    }
     for key in keys:
         tree, bench = key.split("/")
         exe = base / "bin" / f"{tree}__{bench}"
         exe.parent.mkdir(parents=True, exist_ok=True)
         exe.write_bytes(binary_bytes(tree, bench, set(same_as_candidate)))
         exe.chmod(0o755)
+        receipt_doc: Json = {
+            "kind": "rbitcoin-mrp-build-receipt",
+            "tree": tree,
+            "bench_target": bench,
+            "source_digest": digest_of(source_fp[tree]),
+            "bench_source_sha256": bench_fp[tree][BENCH_FILES[bench]],
+            "lock_digest": digest_of(lock_fp[tree]),
+            "binary_sha256": sha_of(exe),
+            "synthetic": True,
+        }
+        if tree == "candidate":
+            receipt_doc["source_commit"] = candidate_commit
+        else:
+            receipt_doc["base_commit"] = candidate_commit
+            receipt_doc["transform"] = control_transforms[tree]
         receipt = write_doc(
             base / "receipts" / f"{tree}__{bench}.json",
-            {
-                "kind": "rbitcoin-mrp-build-receipt",
-                "tree": tree,
-                "bench_target": bench,
-                "source_digest": digest_of(source_fp[tree]),
-                "bench_source_sha256": bench_fp[tree][BENCH_FILES[bench]],
-                "lock_digest": digest_of(lock_fp[tree]),
-                "binary_sha256": sha_of(exe),
-                "synthetic": True,
-            },
+            receipt_doc,
         )
         binaries[key] = {"path": str(exe), "sha256": sha_of(exe), "receipt": receipt}
     scripts = {
@@ -845,18 +877,28 @@ def build_campaign(
         vals = [float(value_fn(target, row["id"], arm, visit, j)) for j in range(10)]
         if row["kind"] == "criterion":
             units = int(row["units_per_iter"])
-            sample = case_dir / "sample.json"
-            sample.write_text(
-                json.dumps(
-                    {
-                        "synthetic": True,
-                        "iters": [2000.0] * 10,
-                        "times": [v * 2000.0 * units for v in vals],
-                    }
-                ),
-                encoding="utf-8",
+            payload = json.dumps(
+                {
+                    "synthetic": True,
+                    "iters": [2000.0] * 10,
+                    "times": [v * 2000.0 * units for v in vals],
+                }
             )
-            record.update(sut.run.criterion_case_fields(sample, row))
+            criterion_home = case_dir / "criterion"
+            row_dir = criterion_home / str(row["id"])
+            new_sample = row_dir / "new" / "sample.json"
+            base_sample = row_dir / "base" / "sample.json"
+            new_sample.parent.mkdir(parents=True, exist_ok=True)
+            base_sample.parent.mkdir(parents=True, exist_ok=True)
+            new_sample.write_text(payload, encoding="utf-8")
+            base_sample.write_text(payload, encoding="utf-8")
+            found = sut.run.find_single_sample_json(criterion_home)
+            if found != new_sample:
+                raise SystemExit(
+                    "probe prerequisite violated: find_single_sample_json did not "
+                    f"select new/sample.json for {row['id']}; got {found}"
+                )
+            record.update(sut.run.criterion_case_fields(found, row))
         elif row["kind"] == "counted":
             write_counted_case_stdout(sut, case_dir, row, vals, record)
         else:
@@ -1226,12 +1268,12 @@ def positive_phase(sut: Sut, tmp: Path) -> tuple[Json, list[Json]]:
     camp = tmp / "synth_cli"
     camp.mkdir()
     (camp / "results.json").write_text(json.dumps(records), encoding="utf-8")
-    (camp / "manifest.json").write_text(
-        json.dumps({"algorithm": "sha256", "files": {}}), encoding="utf-8"
-    )
     cli_reg = copy.deepcopy(reg)
     cli_reg["campaign_root"] = str(camp)
     (camp / "reg.json").write_text(json.dumps(cli_reg), encoding="utf-8")
+    (camp / "manifest.json").write_text(
+        json.dumps(manifest_for_dir(camp), indent=2) + "\n", encoding="utf-8"
+    )
     proc = run_cli(
         sut.analyzer_path,
         "--registration",
@@ -1256,12 +1298,22 @@ def positive_phase(sut: Sut, tmp: Path) -> tuple[Json, list[Json]]:
     return reg, records
 
 
+def manifest_for_dir(runs_dir: Path) -> Json:
+    entries: dict[str, str] = {}
+    for path in sorted(runs_dir.rglob("*")):
+        rel = path.relative_to(runs_dir).as_posix()
+        if path.is_file() and rel not in ("manifest.json", "manifest.sha256"):
+            entries[rel] = sha_of(path)
+    return {"algorithm": "sha256", "files": entries}
+
+
 def analyze_with(sut: Sut, reg: Json, records: list[Json]) -> Json:
-    manifest = {"algorithm": "sha256", "files": {}}
+    runs_dir = Path(reg["campaign_root"]).parent
+    manifest = manifest_for_dir(runs_dir)
     return sut.ana.analyze(
         copy.deepcopy(reg),
         copy.deepcopy(records),
-        Path(reg["campaign_root"]).parent,
+        runs_dir,
         manifest,
     )
 
@@ -3277,6 +3329,526 @@ def statistics_adversaries(sut: Sut, reg: Json, tmp: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# Tooling-owned review repairs (PR1642 inline 1,10,12,19,22 plus 42,43/body25
+# Rust/doc companions proven by bench --mrp-verify and compile smoke; the
+# Python probes below cover the runner/analyzer-owned boundary cases).
+# --------------------------------------------------------------------------
+
+
+def tooling_owned_adversaries(sut: Sut, reg: Json, tmp: Path) -> None:
+    probe_dir = tmp / "tooling-owned"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    iso = probe_dir / "iso-cleanup"
+    iso.mkdir(parents=True, exist_ok=True)
+    iso_analyzer = iso / ANALYZER_FILE
+    iso_analyzer.write_bytes(Path(sut.analyzer_path).read_bytes())
+    clean_runner = Path(sut.runner_path).read_bytes()
+    good_runner = iso / RUNNER_FILE
+    good_runner.write_bytes(clean_runner)
+    good_sha = sha_of(good_runner)
+    good_reg = copy.deepcopy(reg)
+    good_reg["scripts"]["runner"] = {"path": str(good_runner), "sha256": good_sha}
+    good_reg["scripts"]["analyzer"] = {
+        "path": str(iso_analyzer),
+        "sha256": sha_of(iso_analyzer),
+    }
+    spec = importlib.util.spec_from_file_location(
+        "mrp_tooling_cleanup_loader", iso_analyzer
+    )
+    if spec is None or spec.loader is None:
+        check_case("tooling-loader-unavailable", False, "cannot load isolated copy")
+        return
+    loader = importlib.util.module_from_spec(spec)
+    sys.modules["mrp_tooling_cleanup_loader"] = loader
+    spec.loader.exec_module(loader)
+    failing = iso / "failing_runner.py"
+    failing.write_bytes(clean_runner + b'\nraise RuntimeError("probe top-level failure")\n')
+    failing_sha = sha_of(failing)
+    bad_reg = copy.deepcopy(good_reg)
+    bad_reg["scripts"]["runner"] = {"path": str(failing), "sha256": failing_sha}
+    saved = sys.modules.get("rbitcoin_mrp_run_validator")
+    sentinel = ModuleType("rbitcoin_mrp_run_validator")
+    sys.modules["rbitcoin_mrp_run_validator"] = sentinel
+    try:
+        runtime_exc: Exception | None = None
+        try:
+            loader._runner(copy.deepcopy(bad_reg))
+        except Exception as exc:  # noqa: BLE001 - probe records any failure shape
+            runtime_exc = exc
+        check_case(
+            "tooling-runner-runtime-error-cleanup",
+            isinstance(runtime_exc, loader.AnalysisError)
+            and sys.modules.get("rbitcoin_mrp_run_validator") is sentinel
+            and loader._RUNNER is None,
+            f"exc={runtime_exc!r} restored={sys.modules.get('rbitcoin_mrp_run_validator') is sentinel}",
+        )
+        interrupt_runner = iso / "interrupt_runner.py"
+        interrupt_runner.write_bytes(clean_runner + b"\nraise KeyboardInterrupt()\n")
+        interrupt_sha = sha_of(interrupt_runner)
+        interrupt_reg = copy.deepcopy(good_reg)
+        interrupt_reg["scripts"]["runner"] = {
+            "path": str(interrupt_runner),
+            "sha256": interrupt_sha,
+        }
+        interrupt_exc: BaseException | None = None
+        try:
+            loader._runner(copy.deepcopy(interrupt_reg))
+        except BaseException as exc:  # noqa: BLE001 - interruption must surface
+            interrupt_exc = exc
+        check_case(
+            "tooling-runner-interrupt-cleanup",
+            isinstance(interrupt_exc, KeyboardInterrupt)
+            and sys.modules.get("rbitcoin_mrp_run_validator") is sentinel
+            and loader._RUNNER is None,
+            f"exc={interrupt_exc!r} restored={sys.modules.get('rbitcoin_mrp_run_validator') is sentinel}",
+        )
+    finally:
+        if saved is None:
+            sys.modules.pop("rbitcoin_mrp_run_validator", None)
+        else:
+            sys.modules["rbitcoin_mrp_run_validator"] = saved
+    first = loader._runner(copy.deepcopy(good_reg))
+    check_case(
+        "tooling-runner-success-caches",
+        first is not None and loader._RUNNER is first,
+        "successful load did not cache",
+    )
+    try:
+        loader._runner(copy.deepcopy(bad_reg))
+        second_failed = False
+    except Exception:  # noqa: BLE001 - failure must preserve the good cache
+        second_failed = True
+    third = loader._runner(copy.deepcopy(good_reg))
+    check_case(
+        "tooling-runner-failure-preserves-cache",
+        second_failed and third is first,
+        "failed load clobbered the verified cache",
+    )
+    search_root = probe_dir / "criterion-search"
+    both_home = search_root / "both"
+    (both_home / "row-a" / "new").mkdir(parents=True, exist_ok=True)
+    (both_home / "row-a" / "base").mkdir(parents=True, exist_ok=True)
+    both_new = both_home / "row-a" / "new" / "sample.json"
+    both_base = both_home / "row-a" / "base" / "sample.json"
+    both_new.write_text(json.dumps({"iters": [1.0] * 10, "times": [1.5e9] * 10}))
+    both_base.write_text(json.dumps({"iters": [1.0] * 10, "times": [1.5e9] * 10}))
+    try:
+        picked = sut.run.find_single_sample_json(both_home)
+        both_ok = picked == both_new
+        both_detail = f"picked={picked}"
+    except Exception as exc:  # noqa: BLE001
+        both_ok = False
+        both_detail = f"raised {exc!r}"
+    check_case("tooling-sample-both-dirs-selects-new", both_ok, both_detail)
+    empty_home = search_root / "empty"
+    empty_home.mkdir(parents=True, exist_ok=True)
+    try:
+        sut.run.find_single_sample_json(empty_home)
+        empty_ok = False
+        empty_detail = "zero matches accepted"
+    except Exception as exc:  # noqa: BLE001
+        empty_ok = "exactly one new/sample.json" in str(exc)
+        empty_detail = str(exc)[:200]
+    check_case("tooling-sample-zero-rejected", empty_ok, empty_detail)
+    multi_home = search_root / "multi"
+    for row in ("row-a", "row-b"):
+        p = multi_home / row / "new" / "sample.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"iters": [1.0], "times": [1.5e9]}))
+    try:
+        sut.run.find_single_sample_json(multi_home)
+        multi_ok = False
+        multi_detail = "multiple matches accepted"
+    except Exception as exc:  # noqa: BLE001
+        multi_ok = "exactly one new/sample.json" in str(exc)
+        multi_detail = str(exc)[:200]
+    check_case("tooling-sample-multiple-new-rejected", multi_ok, multi_detail)
+    base_only_home = search_root / "base-only"
+    (base_only_home / "row-a" / "base").mkdir(parents=True, exist_ok=True)
+    (base_only_home / "row-a" / "base" / "sample.json").write_text(
+        json.dumps({"iters": [1.0], "times": [1.5e9]})
+    )
+    try:
+        sut.run.find_single_sample_json(base_only_home)
+        base_ok = False
+        base_detail = "base-only accepted as new"
+    except Exception as exc:  # noqa: BLE001
+        base_ok = "exactly one new/sample.json" in str(exc)
+        base_detail = str(exc)[:200]
+    check_case("tooling-sample-base-only-rejected", base_ok, base_detail)
+    manifest_probe = probe_dir / "manifest-runs"
+    manifest_probe.mkdir(parents=True, exist_ok=True)
+    (manifest_probe / "results.json").write_text(json.dumps([{"synthetic": True}]))
+    (manifest_probe / "case" / "stdout.log").parent.mkdir(parents=True, exist_ok=True)
+    (manifest_probe / "case" / "stdout.log").write_text("synthetic\n")
+    valid_manifest = manifest_for_dir(manifest_probe)
+    valid_records = build_campaign(sut, reg, tmp, "tooling-manifest-valid", BASE_FN)
+    valid_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, valid_manifest
+    )
+    check_case(
+        "tooling-manifest-valid-passes",
+        valid_reasons == [],
+        f"valid manifest rejected: {valid_reasons[:3]}",
+    )
+    empty_manifest: Json = {"algorithm": "sha256", "files": {}}
+    empty_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, empty_manifest
+    )
+    check_case(
+        "tooling-manifest-empty-rejected",
+        bool(empty_reasons) and any("empty" in r or "missing" in r for r in empty_reasons),
+        f"accepted: {empty_reasons[:2]}",
+    )
+    wrong_algo = copy.deepcopy(valid_manifest)
+    wrong_algo["algorithm"] = "sha512"
+    algo_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, wrong_algo
+    )
+    check_case(
+        "tooling-manifest-algorithm-rejected",
+        bool(algo_reasons) and any("algorithm" in r for r in algo_reasons),
+        f"accepted: {algo_reasons[:2]}",
+    )
+    partial = copy.deepcopy(valid_manifest)
+    partial["files"].pop(next(iter(partial["files"])))
+    partial_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, partial
+    )
+    check_case(
+        "tooling-manifest-partial-rejected",
+        bool(partial_reasons) and any("omits" in r for r in partial_reasons),
+        f"accepted: {partial_reasons[:2]}",
+    )
+    (manifest_probe / "unlisted.txt").write_text("extra\n")
+    extra_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, valid_manifest
+    )
+    check_case(
+        "tooling-manifest-extra-file-rejected",
+        bool(extra_reasons) and any("omits" in r for r in extra_reasons),
+        f"accepted: {extra_reasons[:2]}",
+    )
+    (manifest_probe / "unlisted.txt").unlink()
+    dot_alias = copy.deepcopy(valid_manifest)
+    dot_alias["files"]["./results.json"] = dot_alias["files"].pop("results.json")
+    dot_alias_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, dot_alias
+    )
+    check_case(
+        "tooling-manifest-dot-alias-key-rejected",
+        any("canonical POSIX" in r for r in dot_alias_reasons),
+        f"accepted: {dot_alias_reasons[:3]}",
+    )
+    produced_runs = probe_dir / "manifest-produced"
+    (produced_runs / "case").mkdir(parents=True, exist_ok=True)
+    (produced_runs / "results.json").write_text(json.dumps([{"synthetic": True}]))
+    (produced_runs / "case" / "stdout.log").write_text("synthetic\n")
+    # A regular nested file that shares a reserved name is an ordinary artifact.
+    (produced_runs / "case" / "manifest.json").write_text("nested artifact\n")
+    sut.run.write_manifest(produced_runs)
+    produced = json.loads((produced_runs / "manifest.json").read_text())
+    produced_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), produced_runs, produced
+    )
+    check_case(
+        "tooling-manifest-producer-output-accepted",
+        produced_reasons == []
+        and sorted(produced["files"])
+        == ["case/manifest.json", "case/stdout.log", "results.json"]
+        and produced["files"]["case/manifest.json"]
+        == sha_of(produced_runs / "case" / "manifest.json"),
+        f"producer manifest rejected or wrong keys: {produced_reasons[:3]} {sorted(produced['files'])}",
+    )
+    link_runs = probe_dir / "manifest-symlink-runs"
+    (link_runs / "case").mkdir(parents=True, exist_ok=True)
+    (link_runs / "results.json").write_text(json.dumps([{"synthetic": True}]))
+    (link_runs / "case" / "stdout.log").write_text("synthetic\n")
+    link_clean_manifest = manifest_for_dir(link_runs)
+    (link_runs / "alias.log").symlink_to("results.json")
+    # `manifest_for_dir` follows symlinks, exactly as the old producer did, so
+    # this manifest lists the alias with a matching digest.
+    link_followed_manifest = manifest_for_dir(link_runs)
+    for name, link_manifest in (
+        ("omitted", link_clean_manifest),
+        ("listed", link_followed_manifest),
+    ):
+        link_reasons, _ = sut.ana.validate_all(
+            copy.deepcopy(reg), copy.deepcopy(valid_records), link_runs, link_manifest
+        )
+        check_case(
+            f"tooling-manifest-symlink-artifact-{name}-rejected",
+            any("is a symlink" in r for r in link_reasons),
+            f"accepted: {link_reasons[:3]}",
+        )
+    try:
+        sut.run.write_manifest(link_runs)
+        producer_refused = False
+        producer_detail = "symlinked runs artifact was anchored"
+    except sut.run.RegistrationError as exc:
+        producer_refused = "symlink" in str(exc)
+        producer_detail = str(exc)[:200]
+    check_case(
+        "tooling-manifest-producer-refuses-symlink",
+        producer_refused and not (link_runs / "manifest.json").exists(),
+        producer_detail,
+    )
+    # The reserved-name scenario owns its fixture: it must not depend on what
+    # the producer-refusal case above did or did not leave in `link_runs`.
+    reserved_runs = probe_dir / "manifest-reserved-symlink-runs"
+    (reserved_runs / "case").mkdir(parents=True, exist_ok=True)
+    (reserved_runs / "results.json").write_text(json.dumps([{"synthetic": True}]))
+    (reserved_runs / "case" / "stdout.log").write_text("synthetic\n")
+    reserved_clean_manifest = manifest_for_dir(reserved_runs)
+    (reserved_runs / "manifest.json").symlink_to("results.json")
+    reserved_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg),
+        copy.deepcopy(valid_records),
+        reserved_runs,
+        reserved_clean_manifest,
+    )
+    check_case(
+        "tooling-manifest-reserved-name-symlink-rejected",
+        any("is a symlink" in r for r in reserved_reasons),
+        f"accepted: {reserved_reasons[:3]}",
+    )
+    results_before = (reserved_runs / "results.json").read_bytes()
+    try:
+        sut.run.write_manifest(reserved_runs)
+        reserved_refused = False
+    except sut.run.RegistrationError:
+        reserved_refused = True
+    check_case(
+        "tooling-manifest-producer-never-writes-through-symlink",
+        reserved_refused
+        and (reserved_runs / "results.json").read_bytes() == results_before,
+        "producer wrote through a reserved-name symlink",
+    )
+    escape_manifest = copy.deepcopy(valid_manifest)
+    escape_manifest["files"]["../evil.txt"] = "a" * 64
+    escape_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, escape_manifest
+    )
+    check_case(
+        "tooling-manifest-escape-rejected",
+        bool(escape_reasons) and any("escapes" in r or "malformed" in r for r in escape_reasons),
+        f"accepted: {escape_reasons[:2]}",
+    )
+    absolute_manifest = copy.deepcopy(valid_manifest)
+    absolute_manifest["files"]["/abs/path.txt"] = "b" * 64
+    absolute_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, absolute_manifest
+    )
+    check_case(
+        "tooling-manifest-absolute-rejected",
+        bool(absolute_reasons) and any("malformed" in r for r in absolute_reasons),
+        f"accepted: {absolute_reasons[:2]}",
+    )
+    digest_manifest = copy.deepcopy(valid_manifest)
+    victim_key = next(iter(digest_manifest["files"]))
+    digest_manifest["files"][victim_key] = "ZZZ"
+    digest_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, digest_manifest
+    )
+    check_case(
+        "tooling-manifest-digest-rejected",
+        bool(digest_reasons) and any("digest" in r for r in digest_reasons),
+        f"accepted: {digest_reasons[:2]}",
+    )
+    tamper_target = manifest_probe / victim_key
+    tamper_target.write_bytes(tamper_target.read_bytes() + b"tamper\n")
+    mismatch_reasons, _ = sut.ana.validate_all(
+        copy.deepcopy(reg), copy.deepcopy(valid_records), manifest_probe, valid_manifest
+    )
+    check_case(
+        "tooling-manifest-mismatch-rejected",
+        bool(mismatch_reasons) and any("mismatch" in r for r in mismatch_reasons),
+        f"accepted: {mismatch_reasons[:2]}",
+    )
+    prov_dir = probe_dir / "provenance"
+    prov_dir.mkdir(parents=True, exist_ok=True)
+    prov_counter = [0]
+
+    def prov_swap(entry: Json, doc: Json) -> None:
+        prov_counter[0] += 1
+        entry.update(write_doc(prov_dir / f"prov-{prov_counter[0]}.json", doc))
+
+    def prov_reject(name: str, mutate: Callable[[Json], None], hint: str) -> None:
+        bad = copy.deepcopy(reg)
+        mutate(bad)
+        reasons = sut.run.validate_registration(bad, False)
+        hit = any(hint in r for r in reasons)
+        check_case(
+            f"tooling-provenance-{name}",
+            bool(reasons) and hit,
+            "accepted invalid provenance"
+            if not reasons
+            else f"rejected without {hint!r}: {reasons[:3]}",
+        )
+
+    first_candidate = "candidate/insert_fill"
+    candidate_doc = json.loads(Path(reg["binaries"][first_candidate]["receipt"]["path"]).read_text())
+    def drop_source(b: Json) -> None:
+        doc = {k: v for k, v in candidate_doc.items() if k != "source_commit"}
+        prov_swap(b["binaries"][first_candidate]["receipt"], doc)
+    prov_reject("candidate-missing-source", drop_source, "source_commit must be")
+    def candidate_with_base(b: Json) -> None:
+        doc = dict(candidate_doc)
+        doc["base_commit"] = "b" * 40
+        doc["transform"] = "synthetic control transform"
+        prov_swap(b["binaries"][first_candidate]["receipt"], doc)
+    prov_reject("candidate-with-base", candidate_with_base, "must not carry")
+    first_control = "control_T1/insert_fill"
+    control_doc = json.loads(Path(reg["binaries"][first_control]["receipt"]["path"]).read_text())
+    def drop_base(b: Json) -> None:
+        doc = {k: v for k, v in control_doc.items() if k != "base_commit"}
+        prov_swap(b["binaries"][first_control]["receipt"], doc)
+    prov_reject("control-missing-base", drop_base, "base_commit must be")
+    def drop_transform(b: Json) -> None:
+        doc = {k: v for k, v in control_doc.items() if k != "transform"}
+        prov_swap(b["binaries"][first_control]["receipt"], doc)
+    prov_reject("control-missing-transform", drop_transform, "transform")
+    def control_claims_source(b: Json) -> None:
+        doc = dict(control_doc)
+        doc["source_commit"] = "c" * 40
+        prov_swap(b["binaries"][first_control]["receipt"], doc)
+    prov_reject("control-claims-source", control_claims_source, "must not claim")
+    def control_bad_base(b: Json) -> None:
+        doc = dict(control_doc)
+        doc["base_commit"] = "b" * 40
+        prov_swap(b["binaries"][first_control]["receipt"], doc)
+    prov_reject("control-base-mismatch", control_bad_base, "base_commit")
+    def candidate_disagree(b: Json) -> None:
+        doc = dict(candidate_doc)
+        doc["source_commit"] = "c" * 40
+        prov_swap(b["binaries"][first_candidate]["receipt"], doc)
+    prov_reject("candidate-disagree", candidate_disagree, "disagree")
+    def malformed_commit(b: Json) -> None:
+        doc = dict(candidate_doc)
+        doc["source_commit"] = "ZZZ"
+        prov_swap(b["binaries"][first_candidate]["receipt"], doc)
+    prov_reject("malformed-commit", malformed_commit, "source_commit must be")
+    def empty_transform(b: Json) -> None:
+        doc = dict(control_doc)
+        doc["transform"] = "   "
+        prov_swap(b["binaries"][first_control]["receipt"], doc)
+    prov_reject("empty-transform", empty_transform, "transform")
+    second_control = "control_T2/sync_pipeline"
+    second_control_doc = json.loads(
+        Path(reg["binaries"][second_control]["receipt"]["path"]).read_text()
+    )
+    def duplicate_transform(b: Json) -> None:
+        doc = dict(second_control_doc)
+        doc["transform"] = control_doc["transform"]
+        prov_swap(b["binaries"][second_control]["receipt"], doc)
+    prov_reject(
+        "duplicate-control-transform",
+        duplicate_transform,
+        "distinct per control tree",
+    )
+    def split_transform_within_tree(b: Json) -> None:
+        doc = dict(control_doc)
+        doc["transform"] = control_doc["transform"] + " variant"
+        prov_swap(b["binaries"][first_control]["receipt"], doc)
+    prov_reject(
+        "disagreement-within-one-control-tree",
+        split_transform_within_tree,
+        "disagrees within one control tree",
+    )
+    def all_malformed_commits(b: Json) -> None:
+        for key in sorted(b["binaries"]):
+            entry = b["binaries"][key]
+            tree_name = key.split("/", 1)[0]
+            doc = json.loads(Path(entry["receipt"]["path"]).read_text())
+            if tree_name == "candidate":
+                doc["source_commit"] = "ZZZ"
+            elif tree_name.startswith("control"):
+                doc["base_commit"] = "ZZZ"
+            else:
+                raise SystemExit(
+                    "probe prerequisite violated: unexpected tree "
+                    f"{tree_name!r} in all-malformed-commits"
+                )
+            prov_swap(entry["receipt"], doc)
+    prov_reject(
+        "all-malformed-commits",
+        all_malformed_commits,
+        "lowercase 40- or 64-hex",
+    )
+    cancel_dir = probe_dir / "cancel-exit"
+    cancel_dir.mkdir(parents=True, exist_ok=True)
+    cancel_reg = copy.deepcopy(reg)
+    cancel_reg["campaign_root"] = str(cancel_dir / "runs-cancelled")
+    cancel_live = sut.run.validate_live_registration(
+        copy.deepcopy(cancel_reg), True
+    )
+    if cancel_live:
+        check_case(
+            "tooling-cancel-exit-prerequisite",
+            False,
+            f"synthetic registration rejected by live path: {cancel_live[:3]}",
+        )
+        return
+    cancel_file = cancel_dir / "reg_cancel.json"
+    cancel_file.write_text(json.dumps(cancel_reg), encoding="utf-8")
+    error_reg = copy.deepcopy(reg)
+    error_reg["campaign_root"] = str(cancel_dir / "runs-error")
+    error_file = cancel_dir / "reg_error.json"
+    error_file.write_text(json.dumps(error_reg), encoding="utf-8")
+    scripted: list[Json] = []
+    real_execute = sut.run.execute_case
+
+    def fake_execute(
+        case: Json,
+        _reg: Json,
+        _runs_dir: Path,
+        _cpu: int,
+        _timeout_seconds: float,
+    ) -> Json:
+        record = dict(scripted.pop(0))
+        row = case["row"]
+        record["label"] = (
+            f"{case['target']}-b{case['block']}"
+            f"v{case['visit_index']:02d}-{case['arm']}-{row['id']}"
+        )
+        record["case_index"] = case["case_index"]
+        return record
+
+    sut.run.execute_case = fake_execute  # type: ignore[method-assign]
+    try:
+        scripted.append(
+            {
+                "cancelled": True,
+                "error": "case cancelled; process group killed, no retry",
+                "case_median_ns": 0,
+            }
+        )
+        cancelled_err = io.StringIO()
+        with contextlib.redirect_stderr(cancelled_err):
+            cancelled_code = sut.run.cmd_run(cancel_file)
+        check_case(
+            "tooling-cancelled-error-exits-130",
+            cancelled_code == 130 and "CANCELLED" in cancelled_err.getvalue(),
+            f"exit={cancelled_code} "
+            f"stderr={cancelled_err.getvalue()[:200]!r}",
+        )
+        scripted.append(
+            {
+                "cancelled": False,
+                "error": "synthetic launch failure",
+                "case_median_ns": 0,
+            }
+        )
+        plain_err = io.StringIO()
+        with contextlib.redirect_stderr(plain_err):
+            plain_code = sut.run.cmd_run(error_file)
+        check_case(
+            "tooling-error-without-cancel-exits-1",
+            plain_code == 1 and "STOP" in plain_err.getvalue(),
+            f"exit={plain_code} stderr={plain_err.getvalue()[:200]!r}",
+        )
+    finally:
+        sut.run.execute_case = real_execute  # type: ignore[method-assign]
 
 
 def main() -> int:
@@ -3331,6 +3903,7 @@ def main() -> int:
         parser_adversaries(sut, tmp)
         counted_adversaries(sut, reg, tmp)
         statistics_adversaries(sut, reg, tmp)
+        tooling_owned_adversaries(sut, reg, tmp)
         bad_reg = copy.deepcopy(reg)
         row_of(bad_reg, "T1", "mempool_insert_entry/fill/200")["samples"] = 9
         bad_file = tmp / "reg_bad.json"

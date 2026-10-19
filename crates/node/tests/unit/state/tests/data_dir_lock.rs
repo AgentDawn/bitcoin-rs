@@ -429,6 +429,33 @@ fn wait_for_child_marker(
     Ok(())
 }
 
+/// Owns the lock child. Dropping kills and reaps it, so a failed assertion, a
+/// panic, or an early `?` after the spawn cannot leave the lock-holding
+/// process running; the child's own deadline would only bound the leak.
+struct LockChild(std::process::Child);
+
+impl LockChild {
+    /// Waits for the child to exit by itself and reports its stderr when it
+    /// failed. Reads stderr first: end of file arrives with the exit.
+    fn finish(&mut self) -> anyhow::Result<()> {
+        use std::io::Read as _;
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.0.stderr.take() {
+            pipe.read_to_string(&mut stderr)?;
+        }
+        let status = self.0.wait()?;
+        anyhow::ensure!(status.success(), "lock child failed: {status}: {stderr}");
+        Ok(())
+    }
+}
+
+impl Drop for LockChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The cross-process half of the contract: a second live process is refused
 /// by the same open-file lock while the first holds its node, and succeeds
 /// once that process exits. `File::try_lock` is an open-file lock on every
@@ -448,16 +475,18 @@ fn second_process_is_refused_while_first_holds_its_node() -> anyhow::Result<()> 
         .join("::");
     let exe = std::env::current_exe()?;
 
-    let mut child = std::process::Command::new(&exe)
-        .args(["--exact", &test_name, "--ignored"])
-        .env(CHILD_DIR_ENV, &data_dir)
-        .env(CHILD_KIND_ENV, KIND_NODE)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = LockChild(
+        std::process::Command::new(&exe)
+            .args(["--exact", &test_name, "--ignored"])
+            .env(CHILD_DIR_ENV, &data_dir)
+            .env(CHILD_KIND_ENV, KIND_NODE)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?,
+    );
 
-    wait_for_child_marker(&mut child, &data_dir.join("lock-child-held"), "holding")?;
+    wait_for_child_marker(&mut child.0, &data_dir.join("lock-child-held"), "holding")?;
 
     let Err(error) = NodeState::open(lock_config(&data_dir), None) else {
         panic!("the child process's directory must refuse this open");
@@ -465,12 +494,7 @@ fn second_process_is_refused_while_first_holds_its_node() -> anyhow::Result<()> 
     assert_in_use(&error, &data_dir);
 
     std::fs::write(data_dir.join("lock-parent-done"), b"")?;
-    let output = child.wait_with_output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "lock child failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    child.finish()?;
 
     // The child has exited, so its open-file lock is gone with it.
     drop(NodeState::open(lock_config(&data_dir), None)?);

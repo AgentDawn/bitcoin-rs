@@ -551,6 +551,12 @@ fn prove_window<'a>(
         }
     }
 
+    // Takes are transactional across the window: a failed proof rolls every
+    // taken entry back, so blocks that never commit keep reusable positives.
+    let mut takes = handles
+        .script_cache
+        .as_deref()
+        .map(bitcoin_rs_consensus::WindowCacheTakes::new);
     // One slot per input block, so a skipped unit leaves a hole rather than
     // shifting every later block onto the wrong prepared state.
     let mut skipped = vec![false; prepared.len()];
@@ -595,23 +601,31 @@ fn prove_window<'a>(
                 context.height,
                 unit.view.txids(),
             ) else {
+                if let Some(takes) = takes.take() {
+                    takes.rollback();
+                }
                 return Vec::new();
             };
             unit.view.set_resolved(resolved);
             // This window only feeds commits (`apply_window_admitted` below),
             // so its pre-proof consults the node-owned cache exactly like the
             // single-block commit path; the later commit reuses the proof and
-            // never takes twice. `None` under the kernel engine.
-            match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
+            // never takes twice. `None` under the kernel engine. Takes are
+            // logged across the window and rolled back when the proof fails.
+            if let Ok(checks) = bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
                 &mut unit.view,
                 context.height,
                 context.locktime_cutoff,
                 context.flags,
                 &unit.parsed,
-                handles.script_cache.as_deref(),
+                takes.as_mut(),
             ) {
-                Ok(checks) => units.push(checks),
-                Err(_) => return Vec::new(),
+                units.push(checks);
+            } else {
+                if let Some(takes) = takes.take() {
+                    takes.rollback();
+                }
+                return Vec::new();
             }
         }
         let checks_us = checks_started.elapsed().as_micros();
@@ -629,6 +643,9 @@ fn prove_window<'a>(
             "prove_window: profile"
         );
         if verdict.is_err() {
+            if let Some(takes) = takes.take() {
+                takes.rollback();
+            }
             return Vec::new();
         }
         if !units.is_empty() {

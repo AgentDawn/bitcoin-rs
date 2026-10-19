@@ -62,7 +62,8 @@ attestation) and then runs the runner's static
     which pins the exact
     row/role/argv tables (counted rows carry kind `counted` and the
     `--mrp-counted` argv; the shared sampler source
-    tools/benchmark-support/measured_samples.rs is pinned in the bench
+    tools/benchmark-support/measured_samples.rs and the shared snapshot-order
+    source tools/benchmark-support/snapshot_order.rs are pinned in the bench
     fingerprint inventory), complete source/bench/lock inventories,
     receipt-bound executables, baseline evidence and identity pins against the
     real files. Recorded CPU/model and taskset values are then bound to the
@@ -80,7 +81,7 @@ import json
 import math
 import statistics
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any, Literal
 
@@ -235,11 +236,17 @@ def _runner(reg: dict[str, Any]) -> ModuleType:
         return _RUNNER
     module = ModuleType("rbitcoin_mrp_run_validator")
     module.__file__ = str(runner_path)
+    previous = sys.modules.get(module.__name__)
     sys.modules[module.__name__] = module
     try:
         exec(compile(source, str(runner_path), "exec"), module.__dict__)
-    except (SyntaxError, ImportError, ValueError) as exc:
-        del sys.modules[module.__name__]
+    except BaseException as exc:
+        if previous is None:
+            sys.modules.pop(module.__name__, None)
+        else:
+            sys.modules[module.__name__] = previous
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         raise AnalysisError(
             f"cannot load the registration validator from {runner_path}: {exc}"
         ) from exc
@@ -691,6 +698,127 @@ def _node_pool_ns(
     return pool
 
 
+def _manifest_entry_error(rel: object, digest: object) -> str | None:
+    if not isinstance(rel, str) or not rel or Path(rel).is_absolute():
+        return f"manifest entry {rel!r} is malformed"
+    if PurePosixPath(rel).as_posix() != rel:
+        return (
+            f"manifest entry {rel!r} is not the canonical POSIX relative "
+            "spelling (no ./, .., duplicate or trailing separators)"
+        )
+    if ".." in PurePosixPath(rel).parts:
+        return f"manifest entry {rel!r} escapes the runs directory"
+    if not isinstance(digest, str) or not _is_hex64(digest):
+        return f"manifest entry {rel!r} carries a malformed digest"
+    return None
+
+
+def _hash_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _validate_manifest_files(
+    runs_dir: Path, manifest_files: dict[str, str], reasons: list[str]
+) -> None:
+    for rel, digest in manifest_files.items():
+        problem = _manifest_entry_error(rel, digest)
+        if problem is not None:
+            reasons.append(problem)
+            continue
+        full = runs_dir / rel
+        try:
+            full.resolve().relative_to(runs_dir.resolve())
+        except (OSError, ValueError):
+            reasons.append(f"manifest entry {rel!r} escapes the runs directory")
+            continue
+        if not full.is_file():
+            reasons.append(f"manifest artifact missing: {rel}")
+            continue
+        try:
+            actual = _hash_file(full)
+        except OSError as exc:
+            reasons.append(f"manifest artifact unreadable {rel}: {exc}")
+            continue
+        if actual != digest:
+            reasons.append(f"manifest artifact hash mismatch: {rel}")
+
+
+def _check_manifest_completeness(
+    runner: ModuleType,
+    runs_dir: Path,
+    manifest_files: dict[str, str],
+    reasons: list[str],
+) -> None:
+    """Compare the manifest with the runner's own `runs_inventory`.
+
+    The producer (`write_manifest`) records exactly `runs_inventory`; the
+    analyzer asks the same hash-verified function, so a symlink, a special
+    file, or a reserved-name alias can never be inventoried differently on
+    the two sides.
+    """
+    try:
+        listed, problems = (
+            runner.runs_inventory(runs_dir) if runs_dir.is_dir() else ([], [])
+        )
+    except OSError as exc:
+        reasons.append(f"manifest inventory unreadable under {runs_dir}: {exc}")
+        return
+    actual_files = set(listed)
+    reasons.extend(problems)
+    for rel in sorted(actual_files - set(manifest_files.keys())):
+        reasons.append(f"manifest omits runs artifact: {rel}")
+    for rel in sorted(set(manifest_files.keys()) - actual_files):
+        reasons.append(f"manifest lists non-inventory entry: {rel}")
+
+
+def _check_manifest_receipt(runs_dir: Path, reasons: list[str]) -> None:
+    receipt_path = runs_dir / "manifest.sha256"
+    manifest_path = runs_dir / "manifest.json"
+    if not (receipt_path.is_file() and manifest_path.is_file()):
+        return
+    try:
+        receipt_text = receipt_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        reasons.append(f"manifest receipt unreadable: {exc}")
+        return
+    receipt = receipt_text.strip().split(" ", 1)[0].strip()
+    if not receipt:
+        reasons.append("manifest.sha256 receipt is empty")
+        return
+    try:
+        if _hash_file(manifest_path) != receipt:
+            reasons.append("manifest.sha256 receipt does not match manifest.json")
+    except OSError as exc:
+        reasons.append(f"manifest receipt unreadable: {exc}")
+
+
+def _validate_manifest(
+    runner: ModuleType, runs_dir: Path, manifest: Any, reasons: list[str]
+) -> None:
+    if not isinstance(manifest, dict):
+        reasons.append("manifest is missing the files inventory")
+        return
+    if manifest.get("algorithm") != "sha256":
+        reasons.append(
+            f"manifest algorithm must be exactly 'sha256', got {manifest.get('algorithm')!r}"
+        )
+        return
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        reasons.append("manifest is missing the files inventory")
+        return
+    if not files:
+        reasons.append("manifest files inventory is empty; no artifact is anchored")
+        return
+    _validate_manifest_files(runs_dir, files, reasons)
+    _check_manifest_completeness(runner, runs_dir, files, reasons)
+    _check_manifest_receipt(runs_dir, reasons)
+
+
 def validate_all(
     reg: dict[str, Any],
     records: Any,
@@ -717,30 +845,7 @@ def validate_all(
             [f"expected exactly {len(expected)} records, found {len(records)}"],
             [],
         )
-    manifest_files: dict[str, str] = {}
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
-        reasons.append("manifest is missing the files inventory")
-    else:
-        manifest_files = manifest["files"]  # type: ignore[assignment]
-        for rel, digest in manifest_files.items():
-            if not isinstance(rel, str) or not isinstance(digest, str):
-                reasons.append(f"manifest entry {rel!r} is malformed")
-                continue
-            full = runs_dir / rel
-            if not full.is_file():
-                reasons.append(f"manifest artifact missing: {rel}")
-                continue
-            try:
-                hasher = hashlib.sha256()
-                with full.open("rb") as stream:
-                    while chunk := stream.read(65536):
-                        hasher.update(chunk)
-                actual = hasher.hexdigest()
-            except OSError as exc:
-                reasons.append(f"manifest artifact unreadable {rel}: {exc}")
-                continue
-            if actual != digest:
-                reasons.append(f"manifest artifact hash mismatch: {rel}")
+    _validate_manifest(runner, runs_dir, manifest, reasons)
     typed: list[dict[str, Any]] = []
     for idx, (record, exp) in enumerate(zip(records, expected)):
         if not isinstance(record, dict):

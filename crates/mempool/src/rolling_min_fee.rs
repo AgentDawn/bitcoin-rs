@@ -46,9 +46,9 @@ impl RollingMinFee {
     ///
     /// `incremental` is the incremental relay fee in sat/kvB: half of it is
     /// the reset threshold, and a decayed rate never reads below it. The
-    /// result is already rounded (`llround`) and floored at `incremental`;
-    /// the reset path returns exactly `0`, matching Core, so the pool-level
-    /// caller falls back to its configured min-relay rate.
+    /// result is already rounded (`llround`); only the decayed path floors
+    /// at `incremental`. The reset path returns exactly `0`, matching Core,
+    /// so the pool-level caller falls back to its configured min-relay rate.
     #[must_use]
     #[allow(
         clippy::as_conversions,

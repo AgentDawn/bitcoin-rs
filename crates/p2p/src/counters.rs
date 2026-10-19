@@ -673,10 +673,34 @@ mod tests {
     }
 
     #[test]
-    fn an_untouched_connection_reports_no_activity() {
-        let counters = PeerCounters::default();
-        assert_eq!(counters.bytes_sent(), 0);
-        assert_eq!(counters.last_send(), 0);
+    fn a_zero_byte_read_stamps_nothing_while_a_single_byte_write_counts() {
+        let counters = Arc::new(PeerCounters::default());
+        let mut stream =
+            CountingStream::new(std::io::Cursor::new(Vec::new()), Arc::clone(&counters));
+
+        let mut byte = [0_u8; 1];
+        let read = stream
+            .read(&mut byte)
+            .unwrap_or_else(|error| panic!("read failed: {error}"));
+        assert_eq!(read, 0);
+        assert_eq!(counters.bytes_recv(), 0);
+        assert_eq!(
+            counters.last_recv(),
+            0,
+            "a zero-byte read must not stamp a receive time"
+        );
+
+        let written = stream
+            .write(&[0xA5])
+            .unwrap_or_else(|error| panic!("write failed: {error}"));
+        assert_eq!(written, 1);
+        assert_eq!(counters.bytes_sent(), 1);
+        assert_ne!(
+            counters.last_send(),
+            0,
+            "a counted byte must stamp a send time"
+        );
+        assert_eq!(counters.bytes_recv(), 0);
         assert_eq!(counters.last_recv(), 0);
     }
 

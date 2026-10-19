@@ -69,7 +69,7 @@ The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (
 | `ping` | Answered with `pong` echoing the nonce, ready peers only. No latency telemetry is kept. |
 | `pong` | ignored | No ping RTT accounting exists; the pong body is unused. |
 | `inv` | Missing transaction vectors enter the connection-bound transaction request owner; only the selected eligible source receives `getdata`. P2P's `TxInventory` implementation queries the shared mempool gateway (accepted transactions, resident orphan wtxids, and recent rejects); a resident orphan never suppresses a txid-typed request, because another witness of that txid can still be valid; `MSG_TX` announcements are requested as `MSG_WITNESS_TX` from `NODE_WITNESS` peers and as `MSG_TX` otherwise; `MSG_WTX` requests retain their wtxid and type. While the node is in initial block download, transaction-typed vectors are never requested (Core 31.1 `net_processing.cpp:4401-4404`). Block-typed vectors (`MSG_BLOCK`, `MSG_WITNESS_BLOCK`) are never answered with a body `getdata`: they are announced to header sync against the announcing connection, which credits its best-known block and receives `getheaders` (Core `net_processing.cpp:4370-4410`, `docs/contracts/p2p-wire.md` `P2P-07`). Outbound block announcement uses single-block `inv` (`MSG_BLOCK`) as a compatibility fallback when a peer did not negotiate BIP130 `sendheaders`, when an active-chain anchor cannot be established, or when the anchor's distance from the committed tip exceeds `MAX_BLOCKS_TO_ANNOUNCE` (8). Bound: 50 000 vectors (`MAX_INV_PER_MSG`, Core `MAX_INV_SZ`). |
-| `getdata` | `MSG_BLOCK` streams stripped stored blocks from the applied chain or an eligible stale branch; `MSG_WITNESS_BLOCK` preserves the stored witness serialization (BIP144). For full-relay peers, transaction inventory is served from the mempool, or from the orphan map only for a `MSG_WTX` item whose exact wtxid is resident. For block-relay-only peers, the listener removes transaction vectors before dispatch and drops transaction-only requests without a response. `MSG_TX` receives stripped serialization; `MSG_WITNESS_TX` and `MSG_WTX` receive witness serialization (BIP144/BIP339), without changing the retained body. A `MSG_CMPCT_BLOCK` item is answered with a `cmpctblock` only while the block is within 5 of the applied tip; a deeper one is served as the whole witness-bearing `block`, as Core does (`net_processing.cpp:2705-2721`). Misses among dispatched inventory resolve to one trailing `notfound`. Items are served one at a time in request order. A saturated outbound queue pauses the request instead of disconnecting the peer. The queue is saturated for production when it has no free item slot (4 096 queued messages) or no room for one more worst-case block behind its queued bytes (64 MiB cap). The pause sends nothing for the unserved items: they stay with the connection in request order, and the connection reads nothing from the peer until the queue has room again. The misses found before the pause go out in one `notfound` as soon as the queue can still admit a message (fewer than 4 096 queued messages and fewer than 64 MiB queued bytes), as Core sends its `notfound` at once when it stops at its send-buffer limit and resumes its queued items later (`net_processing.cpp:2766-2833`); a queue that cannot admit even that keeps the misses parked and nothing is sent into it. A request served completely follows the same rule for its trailing `notfound`: when its last item took the last queue slot, the misses stay parked until the queue can admit them. The remaining items are served in order once the writer has drained the queue to the production condition. After a `getdata` that leaves the queue unable to admit a message, the connection also reads nothing further until it can, so the reply to the peer's next request has a slot; Core pauses message processing the same way while its send buffer is full (`net_processing.cpp:5459`), but for every message, whereas only a `getdata` establishes the hold here, and a peer that never sent one keeps the plain saturation policy (a full queue cancels the connection). A request or hold that lasts 20 minutes, or a writer that dies, ends the session. A concurrent sender can still fill the queue between a check and a send; that send cancels the connection as any refused send does. Bound: 50 000 vectors. |
+| `getdata` | `MSG_BLOCK` streams stripped stored blocks from the applied chain or an eligible stale branch; `MSG_WITNESS_BLOCK` preserves the stored witness serialization (BIP144). For full-relay peers, transaction inventory is served from the mempool, or from the orphan map only for a `MSG_WTX` item whose exact wtxid is resident. For block-relay-only peers, the listener removes transaction vectors before dispatch and drops transaction-only requests without a response. `MSG_TX` receives stripped serialization; `MSG_WITNESS_TX` and `MSG_WTX` receive witness serialization (BIP144/BIP339), without changing the retained body. A `MSG_CMPCT_BLOCK` item is answered with a `cmpctblock` only while the block is within 5 of the applied tip; a deeper one is served as the whole witness-bearing `block`, as Core does (`net_processing.cpp:2705-2721`). Misses among dispatched inventory resolve to one trailing `notfound`. Items are served one at a time in request order. A saturated outbound queue pauses the request instead of disconnecting the peer. The queue is saturated for production when it has no free item slot (4 096 queued messages) or no room for one more worst-case block behind its queued bytes (64 MiB cap). The pause sends nothing for the unserved items: they stay with the connection in request order, and the connection reads nothing from the peer while they remain. The misses found before the pause go out in one `notfound` once a reservation for its exact length succeeds against both the connection's own bound and the node's aggregate outbound budget, as Core sends its `notfound` at once when it stops at its send-buffer limit and resumes its queued items later (`net_processing.cpp:2766-2833`); a refusal from either budget keeps the misses parked, the list untaken and unbuilt, and nothing is sent. A request served completely follows the same rule for its trailing `notfound`: when its last item took the last production reservation, the misses stay parked until a reservation for their exact length succeeds against both budgets. The remaining items are served in order once a fresh worst-case production reservation succeeds against both budgets. After a `getdata` that leaves no production reservation available, the connection also reads nothing further until a one-message probe charge succeeds against both budgets; the probe is returned at once and holds no slot, and the next reply is reserved only when it is dispatched, where a refusal still defers it; Core pauses message processing the same way while its send buffer is full (`net_processing.cpp:5459`), but for every message, whereas only a `getdata` establishes the hold here, and a peer that never sent one keeps the plain saturation policy (a full connection-local queue cancels the connection). A request or hold that lasts 20 minutes, or a writer that dies, ends the session; time during which the node's aggregate outbound budget (see "Outbound queue accounting" below) refused the connection is not counted toward the 20 minutes. Every message is queued under a reservation taken before it exists: a body is loaded only while the session holds a reservation for one worst-case frame, and the parked `notfound` is reserved at its exact length before it is built, so no check-then-send race remains. Bound: 50 000 vectors. |
 | `notfound` | transaction fallback | A matching transaction request releases only its actual source and promptly considers retained alternatives; unrelated or unsolicited responses cannot release another connection's ownership. Block entries remain ignored. Decoded with the same inventory bound. |
 | `getheaders` | Answered with `headers` from the active chain: first locator hash on the active chain anchors the walk, total miss anchors after genesis, stop hash truncates inclusively, ≤ 2 000 headers per message (Core's per-message maximum). Locator bound: 101 hashes (Core `MAX_LOCATOR_SZ`). Empty locator + zero stop answers nothing (Core clients always send a locator; unreachable in practice). |
 | `getblocks` | ignored | Legacy locator request; Core answers with an `inv`, we stay silent. Documented deviation. Locator bound identical. |
@@ -84,10 +84,44 @@ The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (
 | `cmpctblock` / `blocktxn` | sink | BIP152 receive path. Like Core, a `cmpctblock` enters reconstruction only when its header earns the mempool scan. The header needs valid proof of work for the network, the block must not be marked invalid, and its parent must be a known block not marked invalid. The header must also pass the contextual checks header admission applies against that parent, including the required nBits, so a header mined at an easier target never earns the scan; as in admission, a header already in the tree is not rechecked. Finally it must either carry more work than the applied chain or answer a body fetch the same connection owns. Any other `cmpctblock` routes only its header to admission. A hash already attempted on that connection within the reconstruction deadline is not scanned again. Admitted, `cmpctblock` starts bounded per-peer reconstruction: the prefilled coinbase/transactions plus short-ID matches against the mempool and the bounded reconstruction extra pool under the identity profile we advertised (`COMPACT_BLOCK_VERSION`) — the extra pool holds at most 100 wtxid-keyed bodies (transactions removed as replaced, peer orphan-held bodies, and peer policy-only rejects below 100 000 serialized bytes; never a coinbase; hint-only, never admitted or relayed by retention; Core `DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN`) — BIP152 identity is directional: our advertised version fixes what a compliant peer sends us, and the peer's recorded version fixes what we serve; version 1 matches by txid and version 2 by wtxid; two witness variants of one txid stay distinct while a pool-resident identity duplicated in the extra pool is one claim, not a collision; missing transactions are requested with `getblocktxn` on the same connection; two distinct hint identities that collide on one short ID retire only that slot, which `getblocktxn` then carries; a duplicate declared short ID, a count mismatch, or a reconstruction that fails the bounds checks falls back to one full-block `getdata`; an entry whose deadline passes is dropped silently and the peer relies on the connection's separate stall/liveness handling — this module sends no deadline-driven `getdata`. `blocktxn` completes a pending reconstruction. Before delivery both completion paths re-verify the assembled body against the header's transaction-ID merkle root and reject a mutated transaction-ID tree (CVE-2012-2459 duplicate-final-transaction collision) and a body without a coinbase that holds a 64-byte transaction (CVE-2017-12842), so a short-ID misguess can never publish a wrong block; a failed check falls back the same way. A verified block enters the ordinary block pipeline like any `block` message — no validation bypass. |
 | `getblocktxn` | served | BIP152. A stored, non-invalid block within 10 of the applied tip is answered with `blocktxn`, including a block that became stale after its compact announcement. The most recently early-announced body also answers from the held bytes before the store carries it. As in Core, this shallow path requires body availability but does not apply the inventory stale-age filter. A deeper request uses full witness-bearing `block` inventory policy, including the stale validation and age restrictions below; depth is checked before past-the-end indexes. Unknown or unavailable blocks stay unanswered. The mutually supported compact serving profile determines transaction witness encoding. On the `blocktxn` path an index past the body is a protocol disconnect; empty or non-increasing indexes are rejected at the inbound boundary regardless of depth. The headroom gate runs before any body load or held-body reply construction. A saturated gate leaves the request unanswered without disconnecting the peer. |
 | `merkleblock` / `filterload` / `filteradd` / `filterclear` | ignored | BIP37. We do not advertise `NODE_BLOOM`, so a default Core peer never sends them; if one does, they are ignored. |
-| `getcfilters` / `getcfheaders` / `getcfcheckpt` | served when enabled and ready | BIP157 basic type 0 only; active-chain stop, at most 1,000 filters / 2,000 hashes; checkpoint headers at positive multiples of 1,000. Filter payloads stream under send headroom from one index snapshot. Unknown, unsupported, unavailable and oversized requests receive no answer. |
+| `getcfilters` / `getcfheaders` / `getcfcheckpt` | served when enabled and ready | BIP157 basic type 0 only; active-chain stop, at most 1,000 filters / 2,000 hashes; checkpoint headers at positive multiples of 1,000. Filter payloads stream under send headroom from one index snapshot. A pass that the outbound budget stops after a prefix was sent parks only the remainder, which resumes from the first unsent filter without replaying one and keeps the stop height the prefix was computed against; any other early stop of a sent prefix, or a resumed range whose stop height has moved, closes the connection. Unknown, unsupported, unavailable and oversized requests receive no answer. |
 | `cfilter` / `cfheaders` / `cfcheckpt` | ignored | The node serves external consumers; it does not synchronize its validated chain through compact filters. |
 | `reject` | Decoded, never sent. Core 31 no longer emits `reject` for transaction acceptance results. |
 | `alert` | Decoded as opaque bytes, ignored. The command is dead in Core. |
+
+Outbound queue accounting. Every queued message is one charge of a message and its
+full wire bytes against two budgets: the connection's own (4 096 messages, 64 MiB)
+and the node's aggregate of queued outbound wire bytes, one strict 64 MiB cap shared
+by every connection of a `P2pService` and never process-global. The aggregate's
+pending total is never above its cap at any instant, with no exemption for a message
+on an empty queue; the connection's own caps keep their rule that a lone oversized
+message is admitted to an empty local queue, and that message is still charged to the
+aggregate. A bulk body reservation must also fit under the cap less one maximum
+frame, so control traffic still flows while bodies are refused. A charge has one owner
+at every moment (the reservation, then the queued frame that carries it, then the
+writer's burst) and returns to both budgets exactly once when that owner drops:
+written, refused, discarded with the channel, or drained when the writer exits.
+
+A refused charge takes nothing and names its cause. The connection's own cap, or a
+writer that has returned, cancels the lease as before. The node aggregate is
+backpressure only: the lease stays live and the sender keeps its intent. A request
+whose reply cannot be reserved (`ping`, `getheaders`, an answerable `getaddr`, and the
+`getblocktxn` or `getdata` follow-up to a `cmpctblock` or `blocktxn`) is deferred: the
+connection reads nothing until the reply can be reserved, dispatches the request
+once, and never produces an unreserved reply. A probe `ping` and an outbound
+`getaddr` stay owed until they can be sent. Time the aggregate refused a connection
+is a stall: it is not silence in either direction for the keepalive, not the age of a
+parked `getdata` tail or deferred request, and not charged to a parked compact-filter
+request's five-second allowance. Local saturation, a dead writer and silence outside
+a stall keep their rules.
+
+Background producers keep their intent when the aggregate refuses them. A
+`getheaders`, block `getdata` or cold-start hedge marks nothing and is planned again
+on the next tick (the hedge tries the next candidate); a transaction `getdata`
+returns its claim to the request owner; a refused `feefilter` restores its schedule;
+a refused relay `inv` returns its requests to the peer's pending queue; and a refused
+block announcement, `sendcmpct` demotion or high-bandwidth rotation leaves the
+selection as it was and is retried.
 
 Block serving resolves each body by its own `(height, hash)`, so stale and winning
 blocks at the same height cannot be confused. Header-chain membership or
@@ -118,7 +152,9 @@ receive `MSG_WITNESS_TX` requests so the returned parent includes its witness;
 other sources receive `MSG_TX`, following
 [BIP144](https://github.com/bitcoin/bips/blob/master/bip-0144.mediawiki#relay). Relay queue
 saturation drops the newest announcement without blocking admission;
-per-peer outbound saturation cancels that connection's lease. Each queued
+a connection's own outbound saturation cancels that connection's lease, while
+a full node aggregate (see "Outbound queue accounting") only defers the send
+and cancels nothing. Each queued
 announcement is checked against the shared mempool immediately before its
 relay send, matched on the admission epoch recorded when the request was
 queued: a transaction that left the pool before the check — or was
@@ -562,6 +598,41 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
   `crates/p2p/src/connection.rs` tests cover the headroom and capacity
   predicates and the budget's wake protocol, and `keepalive_tests` cover the
   receive-silence exemption.
+- **Aggregate outbound budget**: `crates/p2p/src/connection.rs` tests
+  `strict_cap_no_empty_queue_bypass`, `reservation_is_the_admission`,
+  `concurrent_reservations_never_exceed_cap`, `shrink_and_drop_wake_waiters`,
+  `credit_drop_exactly_once`, `bulk_margin_keeps_control_flowing`,
+  `send_with_fails_closed_and_releases_the_credit`,
+  `dead_writer_refuses_charges_and_reclaims_nothing`,
+  `healthy_peer_progresses_beside_a_locally_saturated_peer`, and
+  `aggregate_waiter_resumes_on_another_connections_drain` pin the strict cap,
+  the reservation as the admission, exactly-once release and the wake
+  protocol. `crates/p2p/src/listener.rs` tests
+  `queued_frames_release_on_writer_exit` and `writer_releases_budget_after_write`
+  pin release on every writer exit path.
+  `crates/p2p/src/listener/aggregate_budget_tests.rs` tests
+  `headroom_retains_one_credit`, `parked_misses_reserved_before_build`,
+  `reply_bound_covers_actual_replies`, `request_deferred_not_reply`,
+  `deferred_request_retries_and_keeps_the_existing_local_rules`,
+  `stall_exclusion_removes_only_shared_refusals`, and
+  `a_bulk_tail_parked_on_the_aggregate_leaves_the_margin_for_control` cover
+  deferral, the exact reservations and the stall rule over loopback sockets.
+  `crates/p2p/src/peer.rs` test `filter_deadline_excludes_only_shared`,
+  `crates/p2p/src/dispatch.rs` test
+  `filter_remainder_is_the_parked_requests_only_cursor`, and
+  `crates/p2p/src/chain_query.rs` tests
+  `filter_backpressure_defers_unsent_responses_and_parks_the_remainder_of_a_partial_stream`
+  and `compact_filter_interruptions_that_are_not_backpressure_stay_errors`
+  cover the filter remainder and its deadline.
+  `crates/p2p/src/sync/tests/aggregate_saturation.rs`,
+  `crates/p2p/src/sync/tests.rs`
+  `cold_front_hedge_skips_a_saturated_candidate_without_cancelling_it`,
+  `crates/p2p/src/tx_policy/preferred_tests.rs` `tx_getdata_saturated_unclaims`,
+  `crates/p2p/src/tx_policy/relay.rs` `feefilter_saturated_restores` and
+  `relay_inv_saturated_requeues`, and `crates/p2p/src/block_announce.rs`
+  `announcement_saturated_retried` and
+  `demotion_saturated_keeps_the_selection_and_retries` cover the producers
+  that keep their intent.
 - **Compact receive admission**: two tests in
   `crates/p2p/src/sync/tests/head_sync.rs` together cover each branch of
   `BlockSync::compact_reconstruction_admissible`.

@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::entry::MempoolEntry;
-use crate::pool::Mempool;
+use crate::pool::{Mempool, transaction_heap_usage};
 use bitcoin_rs_consensus::{
     ConsensusError, ScriptExecutionCache, UtxoView, ValidationEngine, transaction_sigop_cost,
     verify_transaction,
@@ -529,10 +529,12 @@ impl MempoolObserver for CompositeObserver {
 /// Transactions kept beyond pool residency for BIP152 reconstruction: Core's
 /// `DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN` (`net_processing.h:47-48`).
 pub(crate) const BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
-/// A rejected transaction of this serialized size or larger is not retained;
-/// Core's `RecursiveDynamicUsage(*ptx) < 100000` gate
-/// (`net_processing.cpp:3400`), measured here on the consensus serialization.
-pub(crate) const EXTRA_TXN_MAX_BYTES: usize = 100_000;
+/// A policy-rejected transaction whose retained heap reaches this bound is
+/// not kept for reconstruction; Core's `RecursiveDynamicUsage(*ptx) < 100000`
+/// gate (`net_processing.cpp:3139`), measured here with the pool's own
+/// `transaction_heap_usage` accounting rather than the consensus
+/// serialization.
+pub(crate) const EXTRA_TXN_MAX_MEMORY_BYTES: usize = 100_000;
 
 /// One retained body with the identities its reconstruction match needs.
 struct ExtraTxn {
@@ -548,10 +550,11 @@ struct ExtraTxn {
 /// Identity is the witness hash, so two witness variants of one txid are two
 /// entries. Re-inserting a resident wtxid changes nothing: the entry keeps its
 /// place, so a repeated body can neither grow the ring nor postpone its own
-/// eviction. A coinbase is never retained. Memory is bounded by
-/// [`BLOCK_RECONSTRUCTION_EXTRA_TXN`] bodies, each already bounded by the
-/// standardness rules that admitted it to the pool or to the orphan pool, or
-/// by [`EXTRA_TXN_MAX_BYTES`] for a policy reject.
+/// eviction. A coinbase is never retained. Entry count is bounded by
+/// [`BLOCK_RECONSTRUCTION_EXTRA_TXN`]. Bodies that reached the ring through
+/// the pool or the orphan pool are already bounded by the standardness rules
+/// that admitted them there; a policy reject is additionally bounded by the
+/// [`EXTRA_TXN_MAX_MEMORY_BYTES`] retained-memory gate.
 ///
 /// The ring is reconstruction-hint state only. It is never consulted for
 /// inventory, `getdata`, relay, admission or any pool query.
@@ -591,14 +594,15 @@ impl ExtraTxnRing {
 }
 
 /// Whether a peer-origin refusal is a policy verdict whose body a block may
-/// still contain: only the typed policy class, below the size gate, and not a
-/// transaction that spends a null or out-of-range outpoint (which no block can
-/// carry). Consensus failures and stale-state retries are never retained.
+/// still contain: only the typed policy class, below the retained-memory gate,
+/// and not a transaction that spends a null or out-of-range outpoint (which no
+/// block can carry). Consensus failures and stale-state retries are never
+/// retained.
 fn retains_rejected_body(pool: &Mempool, tx: &Tx, error: AdmitError) -> bool {
     let AdmitError::Policy(reason) = error else {
         return false;
     };
-    tx.total_size() < EXTRA_TXN_MAX_BYTES
+    transaction_heap_usage(tx) < u64::try_from(EXTRA_TXN_MAX_MEMORY_BYTES).unwrap_or(u64::MAX)
         && !(matches!(
             reason,
             crate::standardness::AcceptanceRejectReason::MissingInputs

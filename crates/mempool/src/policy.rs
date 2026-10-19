@@ -136,17 +136,66 @@ mod tests {
     }
 
     #[test]
-    fn configured_limits_flow_into_the_cluster_projections() {
-        let snapshot = MempoolPolicySnapshot::from_enforced(
-            MempoolLimits {
-                cluster_count: 7,
-                cluster_size_vbytes: 42_000,
-                ..MempoolLimits::default()
-            },
-            StandardnessPolicy::default(),
-        );
-        assert_eq!(snapshot.cluster_count, 7);
-        assert_eq!(snapshot.cluster_size_vbytes, 42_000);
+    fn enforced_cluster_count_rejects_a_joining_transaction() {
+        use alloc::sync::Arc;
+        use alloc::vec::Vec;
+
+        use bitcoin_rs_primitives::{
+            Amount, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
+        };
+
+        use crate::{Mempool, MempoolEntry, MempoolError};
+
+        fn chain_tx(nonce: u32, inputs: Vec<OutPoint>) -> Tx {
+            Tx {
+                version: 2,
+                lock_time: LockTime::from_consensus(nonce),
+                inputs: inputs
+                    .into_iter()
+                    .map(|previous_output| TxIn {
+                        previous_output,
+                        script_sig: Script::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                outputs: alloc::vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: alloc::vec![0x51; 8].into(),
+                }],
+            }
+        }
+
+        fn insert(pool: &mut Mempool, nonce: u32, inputs: Vec<OutPoint>) -> Txid {
+            let tx = chain_tx(nonce, inputs);
+            let txid = tx.txid();
+            pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 800, 0))
+                .expect("fixture insert must pass validation");
+            txid
+        }
+
+        let mut pool = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            min_relay_fee_sat_per_kvb: 0,
+            cluster_count: 2,
+            cluster_size_vbytes: 1_000_000,
+            ..MempoolLimits::default()
+        });
+        let a = insert(&mut pool, 1, Vec::new());
+        let b = insert(&mut pool, 2, alloc::vec![OutPoint::new(a, 0)]);
+
+        let joiner = chain_tx(3, alloc::vec![OutPoint::new(b, 0)]);
+        let joiner_txid = joiner.txid();
+        let error = pool
+            .insert_entry(MempoolEntry::new(Arc::new(joiner), 100, 1_000, 1, 800, 0))
+            .expect_err("a third chained transaction is over the count limit");
+
+        assert!(matches!(
+            error,
+            MempoolError::Policy(PolicyError::ClusterCountLimit)
+        ));
+        assert_eq!(pool.len(), 2, "rejection commits nothing");
+        assert!(!pool.contains_txid(&joiner_txid));
     }
 
     #[test]

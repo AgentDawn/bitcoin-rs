@@ -27,9 +27,9 @@ pub(crate) const MAX_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 /// brute-force deterrent (`httprpc.cpp:215-225`).
 const WRONG_CREDENTIALS_DELAY: Duration = Duration::from_millis(250);
 
-/// How many bytes of an abandoned request body the unauthorized path still
-/// reads after its answer, so the peer sees a clean close instead of a reset
-/// for bytes it already sent.
+/// Most declared body bytes the unauthorized path reads after its answer.
+/// Bytes past this bound stay unread, so a peer that sends more may see a
+/// reset instead of a clean close.
 const MAX_DRAIN_BYTES: usize = 64 * 1_024;
 
 /// How long the drain may keep reading before the connection is closed
@@ -336,7 +336,7 @@ fn serve_connection(
         // the handler, after libevent has buffered the whole body). REST and
         // Esplora stay unauthenticated, and framing errors keep the 400
         // answer, so only the JSON-RPC route defers its body.
-        if authenticate_json_rpc_head(auth, reader.get_mut().socket_mut(), &head)? {
+        if authenticate_json_rpc_head(auth, &mut reader, &head)? {
             return Ok(());
         }
         let request = match read_request_body(&mut reader, REQUEST_BODY_TIMEOUT, head) {
@@ -395,7 +395,7 @@ fn serve_connection(
 /// worker with pipelined requests it never authenticated for.
 fn authenticate_json_rpc_head(
     auth: &Auth,
-    stream: &mut TcpStream,
+    reader: &mut BufReader<RequestDeadlineStream>,
     head: &RequestHead,
 ) -> io::Result<bool> {
     if classify(&head.method, &head.path) != HttpRoute::JsonRpc
@@ -403,22 +403,30 @@ fn authenticate_json_rpc_head(
     {
         return Ok(false);
     }
-    reject_unauthenticated_json_rpc(stream, head)?;
+    reject_unauthenticated_json_rpc(reader, head)?;
     Ok(true)
 }
 
-fn reject_unauthenticated_json_rpc(stream: &mut TcpStream, head: &RequestHead) -> io::Result<()> {
+fn reject_unauthenticated_json_rpc(
+    reader: &mut BufReader<RequestDeadlineStream>,
+    head: &RequestHead,
+) -> io::Result<()> {
     // Present but wrong credentials are slowed before the answer, Core's
     // brute-force deterrent (`httprpc.cpp:215-225`). Absent credentials
     // answer at once: there is no secret to slow down.
     if head.authorization.is_some() {
         thread::sleep(WRONG_CREDENTIALS_DELAY);
     }
-    write_unauthorized(stream)?;
-    // The peer may still be uploading the body it declared. Discard a
-    // bounded amount of it so a well-behaved client sees a clean close
-    // instead of a reset, then close.
-    drain_request(stream)
+    write_unauthorized(reader.get_mut().socket_mut())?;
+    // No declared body means no peer bytes can belong to this request: close
+    // at once instead of holding a bounded-pool worker up to DRAIN_BUDGET.
+    // Otherwise discard only the declared body through the buffered reader,
+    // so a well-behaved client sees a clean close instead of a reset.
+    if head.content_length == 0 {
+        return Ok(());
+    }
+    drain_request(reader, head.content_length);
+    Ok(())
 }
 
 /// Writes the Core-shaped 401: a challenge, an empty HTML-typed body, and a
@@ -434,28 +442,22 @@ fn write_unauthorized(stream: &mut TcpStream) -> io::Result<()> {
     stream.shutdown(std::net::Shutdown::Write)
 }
 
-/// Reads and discards up to [`MAX_DRAIN_BYTES`] from the peer, for at most
-/// [`DRAIN_BUDGET`], and returns at EOF. The peer then sees a clean close
-/// rather than a reset for bytes it already put on the wire.
-fn drain_request(stream: &mut TcpStream) -> io::Result<()> {
-    let deadline = Instant::now() + DRAIN_BUDGET;
-    let mut discarded = 0_usize;
+/// Reads and discards the declared body bytes the peer announced, up to
+/// [`MAX_DRAIN_BYTES`] and for at most [`DRAIN_BUDGET`], then returns at EOF
+/// or on the first read failure. Reads go through the buffered reader, so
+/// body bytes already buffered past the head count toward the declared
+/// length and a fully buffered body costs no wait. The peer then sees a
+/// clean close rather than a reset for the bytes it already put on the wire.
+fn drain_request(reader: &mut BufReader<RequestDeadlineStream>, declared: usize) {
+    reader.get_mut().reset_deadline(DRAIN_BUDGET);
+    let mut remaining = declared.min(MAX_DRAIN_BYTES);
     let mut chunk = [0_u8; BODY_READ_CHUNK];
-    while discarded < MAX_DRAIN_BYTES {
-        // Each read gets only what is left of the budget, so a peer that
-        // drips one byte at a time cannot stretch the drain past it. A zero
-        // timeout is an error to the socket, hence the explicit stop.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        stream.set_read_timeout(Some(remaining))?;
-        match stream.read(&mut chunk) {
+    while remaining > 0 {
+        match reader.read(&mut chunk[..remaining.min(BODY_READ_CHUNK)]) {
             Ok(0) | Err(_) => break,
-            Ok(read) => discarded = discarded.saturating_add(read),
+            Ok(read) => remaining = remaining.saturating_sub(read),
         }
     }
-    Ok(())
 }
 
 fn dispatch_http_request(
@@ -1311,6 +1313,123 @@ mod tests {
         let seen = exchange(&request)?;
         assert_eq!(seen.response, CORE_UNAUTHORIZED);
         assert!(seen.eof);
+        Ok(())
+    }
+
+    /// A 401 witnesses `authenticate_json_rpc_head` on a real loopback pair:
+    /// the one declared byte is prebuffered before the call, the client stays
+    /// open through the drain, and the call consumes the buffer without the
+    /// one-second budget hold before the client sees the 401 and EOF.
+    #[test]
+    fn unauthorized_request_with_buffered_body_returns_without_the_drain_hold() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let (server, _) = listener.accept()?;
+        let mut request = json_rpc_head(None, 1);
+        request.extend_from_slice(b"X");
+        client.write_all(&request)?;
+        let mut reader =
+            BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(30)));
+        let head = match read_request_head(&mut reader, REQUEST_HEAD_TIMEOUT) {
+            Ok(Some(head)) => head,
+            Ok(None) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing head")),
+            Err(RequestReadError::Io(error)) => return Err(error),
+            Err(RequestReadError::RestBodyTooLarge) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "body too large"));
+            }
+        };
+        assert_eq!(head.content_length, 1);
+        reader.get_mut().reset_deadline(REQUEST_HEAD_TIMEOUT);
+        assert_eq!(
+            reader.fill_buf()?,
+            b"X".as_slice(),
+            "declared byte must be prebuffered before the 401"
+        );
+        let started = Instant::now();
+        let handled =
+            authenticate_json_rpc_head(&Auth::basic("alice", "secret"), &mut reader, &head)?;
+        let elapsed = started.elapsed();
+        assert!(handled, "unauthorized head must be handled");
+        assert!(
+            reader.buffer().is_empty(),
+            "drain must consume the prebuffered byte: {:?}",
+            reader.buffer()
+        );
+        assert!(
+            elapsed < DRAIN_BUDGET,
+            "a buffered body must not wait out the drain budget: {elapsed:?}"
+        );
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        assert_eq!(response, CORE_UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// Runs the unauthorized path on the server side of one loopback pair and
+    /// returns the client's view of the response plus the next `take` bytes
+    /// the server reads once the handler returns. The server thread starts
+    /// first and reads while the client writes, so neither side waits on a
+    /// buffer the other has not drained.
+    fn serve_unauthorized(request: &[u8], take: usize) -> io::Result<(String, Vec<u8>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server = thread::spawn(move || -> io::Result<Vec<u8>> {
+            let (stream, _) = listener.accept()?;
+            let mut reader =
+                BufReader::new(RequestDeadlineStream::new(stream, Duration::from_secs(30)));
+            let head = match read_request_head(&mut reader, REQUEST_HEAD_TIMEOUT) {
+                Ok(Some(head)) => head,
+                Ok(None) => {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing head"));
+                }
+                Err(RequestReadError::Io(error)) => return Err(error),
+                Err(RequestReadError::RestBodyTooLarge) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "body too large"));
+                }
+            };
+            let handled =
+                authenticate_json_rpc_head(&Auth::basic("alice", "secret"), &mut reader, &head)?;
+            assert!(handled, "unauthorized head must be handled");
+            let mut next = vec![0_u8; take];
+            reader.read_exact(&mut next)?;
+            Ok(next)
+        });
+        let mut client = TcpStream::connect(addr)?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        client.write_all(request)?;
+        client.shutdown(Shutdown::Write)?;
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        let next = server.join().expect("server thread")?;
+        Ok((response, next))
+    }
+
+    /// The drain consumes exactly the declared body, even at the cap, so the
+    /// bytes pipelined behind it are still on the stream for the next read.
+    #[test]
+    fn unauthorized_drain_consumes_exactly_the_declared_body() -> io::Result<()> {
+        let mut request = json_rpc_head(None, MAX_DRAIN_BYTES);
+        request.extend_from_slice(&vec![b'X'; MAX_DRAIN_BYTES]);
+        request.extend_from_slice(b"NEXT");
+        let (response, next) = serve_unauthorized(&request, 4)?;
+        assert_eq!(response, CORE_UNAUTHORIZED);
+        assert_eq!(next, b"NEXT");
+        Ok(())
+    }
+
+    /// A declared body above the cap is drained only up to the cap: the peer
+    /// still gets the 401 and a clean close, and the bytes past the cap stay
+    /// unread on the stream.
+    #[test]
+    fn unauthorized_drain_stops_at_the_cap_for_an_oversized_body() -> io::Result<()> {
+        const TAIL: usize = 4 * 1_024;
+        let mut request = json_rpc_head(None, MAX_DRAIN_BYTES + TAIL);
+        request.extend_from_slice(&vec![b'X'; MAX_DRAIN_BYTES]);
+        request.extend_from_slice(&vec![b'Y'; TAIL]);
+        let (response, rest) = serve_unauthorized(&request, TAIL)?;
+        assert_eq!(response, CORE_UNAUTHORIZED);
+        assert_eq!(rest, vec![b'Y'; TAIL]);
         Ok(())
     }
 

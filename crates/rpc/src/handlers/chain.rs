@@ -984,6 +984,12 @@ pub(crate) fn invalidateblock(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         Err(ChainControlError::Genesis) => Err(RpcError::InvalidParams(
             "cannot invalidate the genesis block",
         )),
+        Err(ChainControlError::Interrupted) => {
+            Err(RpcError::Misc("Block verification interrupted".to_owned()))
+        }
+        Err(ChainControlError::Unavailable) => Err(RpcError::Misc(
+            "Chainstate is unavailable for verification".to_owned(),
+        )),
         Err(ChainControlError::Failed(message)) => Err(RpcError::Internal(message)),
     }
 }
@@ -1027,17 +1033,42 @@ pub(crate) fn verifychain(
         Err(_) => return Err(RpcError::Misc("JSON integer out of range".to_owned())),
     };
     let level = u8::try_from(checklevel).unwrap_or(4);
+    // A chainstate closed for recovery cannot be declared verified, not even
+    // over an empty window; the verifier enforces the same fail-closed rule
+    // for the startup path and for a closure that lands mid-walk.
+    if ctx.chain.closed_for_recovery.is_triggered() {
+        return Err(RpcError::Misc(
+            "Chainstate is unavailable for verification".to_owned(),
+        ));
+    }
     if ctx.chain.applied_tip.load_full().is_none() {
         return typed_to_sonic(&v31::VerifyChain(true));
     }
     // One owner verifies: the node-owned chain control answers from the
     // shared recent-blocks verifier, so RPC never walks storage itself.
-    // Without that verifier the chain cannot be declared verified.
+    // Without that verifier the chain cannot be declared verified. The
+    // request latch travels with the call so an in-flight cancellation
+    // interrupts the walk instead of passing or failing as damage.
     let verified = ctx
         .chain
         .chain_control
         .as_ref()
-        .is_some_and(|control| control.verify_chain(level, nblocks));
+        .map_or(Ok(false), |control| {
+            control.verify_chain(level, nblocks, cancellation)
+        })
+        .map_err(|error| match error {
+            ChainControlError::Interrupted => {
+                RpcError::Misc("Block verification interrupted".to_owned())
+            }
+            ChainControlError::Unavailable => {
+                RpcError::Misc("Chainstate is unavailable for verification".to_owned())
+            }
+            ChainControlError::UnknownBlock => RpcError::NotFound("block not found"),
+            ChainControlError::Genesis => {
+                RpcError::InvalidParams("cannot invalidate the genesis block")
+            }
+            ChainControlError::Failed(message) => RpcError::Internal(message),
+        })?;
     typed_to_sonic(&v31::VerifyChain(verified))
 }
 

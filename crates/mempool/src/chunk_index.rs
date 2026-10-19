@@ -356,6 +356,14 @@ impl<'a> ChunkView<'a> {
             .map(move |&member| (member, pool.chunk_member(member)))
     }
 
+    /// Whether `id` is confirmed by the staged block in this projected view.
+    /// Live views confirm nothing. Staged-confirmation parents skip the
+    /// selection-dependency check in [`ChunkView::parents_of`], but their
+    /// relative locks still evaluate at the staged confirmation height.
+    pub fn is_staged_confirmed(&self, id: EntryId) -> bool {
+        self.confirmed.is_some_and(|set| set.contains(&id))
+    }
+
     /// The direct in-pool parents of `member` that require in-block
     /// selection, which may sit in this chunk or in an earlier chunk of the
     /// same component. During projection parents the staged block confirms
@@ -573,6 +581,7 @@ impl<'a> ProjectedChunks<'a> {
             touched: &self.touched,
             index: self.pool.chunk_index(),
             live: self.pool.chunk_index().order.iter(),
+            staged_live: StagedLive::Unread,
             pieces: self.pieces.as_slice(),
             order: self.order.as_slice(),
             front: 0,
@@ -604,6 +613,21 @@ impl<'a> ProjectedChunks<'a> {
     }
 }
 
+/// Cached live-head lookahead for the projection merge walk.
+///
+/// Single authoritative cache for the next untouched live key: `Unread` means
+/// the cursor has not been probed since the last consume, `Ready` holds the
+/// staged borrowed key, and `Exhausted` records that the live source holds no
+/// further untouched key. Peeks are `O(1)` once staged; the underlying cursor
+/// advances forward at most once per key, so projected yields never rescan
+/// the touched prefix. No allocation.
+#[derive(Clone, Copy, Debug)]
+enum StagedLive<'s> {
+    Unread,
+    Ready(&'s ChunkKey),
+    Exhausted,
+}
+
 /// Merge iterator over the untouched maintained chunks and the sorted
 /// projected chunks. Holds a forward cursor into each source and yields the
 /// smaller [`ChunkKey`] first, so the walk matches the maintained order.
@@ -613,21 +637,41 @@ struct ProjectedChunksIter<'s> {
     touched: &'s HashSet<u32>,
     index: &'s ChunkIndex,
     live: alloc::collections::btree_set::Iter<'s, ChunkKey>,
+    /// Next live key already advanced past the touched prefix, cached as a
+    /// single authoritative [`StagedLive`] state. The cursor moves forward at
+    /// most once per key, so projected yields never rescan the touched prefix.
+    staged_live: StagedLive<'s>,
     pieces: &'s [ComponentState],
     order: &'s [(ChunkKey, usize, usize)],
     front: usize,
 }
 
 impl<'s> ProjectedChunksIter<'s> {
-    fn next_live(&mut self) -> Option<&'s ChunkKey> {
-        self.live
-            .by_ref()
-            .find(|key| !self.touched.contains(&key.component))
+    fn prime_live(&mut self) -> Option<&'s ChunkKey> {
+        if matches!(self.staged_live, StagedLive::Unread) {
+            match self
+                .live
+                .by_ref()
+                .find(|key| !self.touched.contains(&key.component))
+            {
+                Some(key) => self.staged_live = StagedLive::Ready(key),
+                None => self.staged_live = StagedLive::Exhausted,
+            }
+        }
+        match self.staged_live {
+            StagedLive::Ready(key) => Some(key),
+            StagedLive::Unread | StagedLive::Exhausted => None,
+        }
     }
 
-    fn peek_live(&self) -> Option<&'s ChunkKey> {
-        let mut cursor = self.live.clone();
-        cursor.find(|key| !self.touched.contains(&key.component))
+    fn take_live(&mut self) -> Option<&'s ChunkKey> {
+        match self.staged_live {
+            StagedLive::Ready(key) => {
+                self.staged_live = StagedLive::Unread;
+                Some(key)
+            }
+            StagedLive::Unread | StagedLive::Exhausted => None,
+        }
     }
 
     fn peek_projected(&self) -> Option<&'s (ChunkKey, usize, usize)> {
@@ -657,13 +701,13 @@ impl<'s> Iterator for ProjectedChunksIter<'s> {
     type Item = ChunkView<'s>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let live_key = self.peek_live();
+        let live_key = self.prime_live();
         let projected = self.peek_projected();
         if live_key.is_none() && projected.is_none() {
             return None;
         }
         if projected.is_none() {
-            return self.next_live().map(|key| self.live_view(key));
+            return self.take_live().map(|key| self.live_view(key));
         }
         if live_key.is_none() {
             let entry = self.order.get(self.front)?;
@@ -676,7 +720,7 @@ impl<'s> Iterator for ProjectedChunksIter<'s> {
             self.front += 1;
             return self.projected_view(entry);
         }
-        self.next_live().map(|key| self.live_view(key))
+        self.take_live().map(|key| self.live_view(key))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

@@ -33,6 +33,13 @@ pub struct CandidateContext {
     pub current_time: u32,
     /// BIP113 locktime cutoff already resolved by the caller.
     pub locktime_cutoff: u32,
+    /// Predecessor MTP for parents the tip block confirms (staged
+    /// confirmations in projection): the MTP of the block before the
+    /// candidate's parent tip, copied from the resolved chain context.
+    /// Relative time locks of staged-confirmation parents evaluate against
+    /// this actual value, never against `locktime_cutoff`. Exact except at
+    /// the genesis edge, where it conservatively reads the tip MTP itself.
+    pub staged_parent_mtp: u32,
     pub network: Network,
     pub csv_active: bool,
     pub segwit_active: bool,

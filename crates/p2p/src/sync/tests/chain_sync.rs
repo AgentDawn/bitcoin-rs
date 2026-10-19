@@ -868,7 +868,7 @@ fn a_failed_sweep_probe_restores_the_armed_record() {
     sync.chain.bootstrap_genesis();
 
     let addr = test_addr(9_920, 0).expect("test address");
-    let (tx, rx) = unbounded::<Message>();
+    let (tx, rx) = crate::test_support::message_channel();
     let connected_at = t0
         .checked_sub(MINIMUM_CONNECT_TIME)
         .expect("the test clock predates the connect age");

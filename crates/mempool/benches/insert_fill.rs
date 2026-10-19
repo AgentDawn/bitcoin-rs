@@ -1,8 +1,11 @@
-//! Production-path mempool insert-fill benchmark (`insert_fill`).
+//! Internal pool-insert fill benchmark (`insert_fill`).
 //!
-//! `mempool_insert_entry` is the end-to-end path an attacker actually drives:
-//! `Mempool::insert_entry` accounts the entry through the derived-state owners
-//! and refreshes package metadata incrementally over the affected closure
+//! `mempool_insert_entry` measures the internal pool path, not production
+//! admission: it calls `Mempool::insert_entry` directly with fabricated
+//! entries (no prevouts, standardness, or script checks), which production
+//! only reaches through `MempoolGateway::submit_transaction`. Within that
+//! scope the insert accounts the entry through the derived-state owners and
+//! refreshes package metadata incrementally over the affected closure
 //! (`refresh_metadata`), so an acceptance pays for its neighborhood, not a
 //! full rebuild of the priority index. The full-rebuild pass,
 //! `recompute_all_metadata`, is test-only.
@@ -38,6 +41,9 @@ use criterion::{Criterion, SamplingMode, criterion_group};
 #[path = "../../../tools/benchmark-support/measured_samples.rs"]
 mod measured_samples;
 
+#[path = "../../../tools/benchmark-support/snapshot_order.rs"]
+mod snapshot_order;
+
 /// Counted-sampling row: one untimed 63-member cluster setup, then whole
 /// timed units of only the 63rd member's insert, its success and residency
 /// assertions, with the pool teardown outside the timer.
@@ -68,7 +74,19 @@ fn cluster_fixture() -> (Mempool, MempoolEntry) {
         last_txid = Some(txid);
     }
     assert_eq!(pool.len(), 62, "setup must build exactly 62 members");
+    snapshot_order::assert_snapshot_topological(&pool);
+    let snapshot = pool.mining_snapshot();
     let tip = last_txid.expect("62-chain has a tip");
+    let tip_entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.txid == tip)
+        .expect("62-chain tip stays resident");
+    assert_eq!(
+        tip_entry.ancestors.len(),
+        61,
+        "tip must descend from all 61 predecessors in one connected chain"
+    );
     let child = MempoolEntry::new(
         Arc::new(distinct_tx(62, Some(tip))),
         200,
@@ -261,85 +279,17 @@ fn fill_pool(size: u64) -> Mempool {
     pool
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// FNV-1a over one `u64`: the deterministic fingerprint fold shared by every
-/// `--mrp-verify` line below. Standard-library hashers randomise their keys,
-/// so they cannot serve as cross-arm fingerprints.
-fn fold_u64(state: u64, value: u64) -> u64 {
-    let mut state = state;
-    for byte in value.to_le_bytes() {
-        state ^= u64::from(byte);
-        state = state.wrapping_mul(0x100_0000_01B3);
-    }
-    state
-}
-
-/// FNV-1a over raw bytes.
-fn fold_bytes(state: u64, bytes: &[u8]) -> u64 {
-    let mut state = state;
-    for &byte in bytes {
-        state ^= u64::from(byte);
-        state = state.wrapping_mul(0x100_0000_01B3);
-    }
-    state
-}
-
-/// Deterministic fingerprint of the pool's chunk order as the mining snapshot
-/// exposes it: entry order, fees, overlays, and weights. The snapshot lists
-/// entries in chunk order. The fingerprint is a diagnostic identity signal
-/// only, not a collision-free equality proof: structural assertions
-/// (residency, topological order) carry equivalence; matching fingerprints
-/// are supporting evidence.
-fn snapshot_order_fingerprint(pool: &Mempool) -> u64 {
-    let snapshot = pool.mining_snapshot();
-    let mut state = FNV_OFFSET;
-    state = fold_u64(state, snapshot.sequence);
-    state = fold_u64(state, snapshot.fee_delta_sequence);
-    for entry in &snapshot.entries {
-        state = fold_bytes(state, entry.txid.as_bytes());
-        state = fold_u64(state, entry.fee);
-        state = fold_u64(state, entry.weight);
-        state = fold_u64(state, entry.fee_delta.cast_unsigned());
-        for &ancestor in &entry.ancestors {
-            state = fold_u64(state, u64::from(ancestor));
-        }
-    }
-    state
-}
-
-/// Every ancestor position in the snapshot must precede its entry: the flat
-/// order respects dependency order, the structural half of chunk-order
-/// equivalence.
-fn assert_snapshot_topological(pool: &Mempool) {
-    let snapshot = pool.mining_snapshot();
-    for (index, entry) in snapshot.entries.iter().enumerate() {
-        let index = u32::try_from(index).expect("snapshot fits u32");
-        for &ancestor in &entry.ancestors {
-            assert!(
-                ancestor < index,
-                "ancestor position {ancestor} must precede entry {index}"
-            );
-        }
-    }
-    assert_eq!(
-        snapshot.entries.len(),
-        pool.len(),
-        "the snapshot must name every live entry exactly once"
-    );
-}
-
 fn mrp_verify_cluster() {
     let (mut chain, child) = cluster_fixture();
     chain
         .insert_entry(child)
         .expect("63rd member insert must succeed");
     assert_eq!(chain.len(), 63, "cluster insert must add the 63rd member");
-    assert_snapshot_topological(&chain);
+    snapshot_order::assert_snapshot_topological(&chain);
     println!(
         "mrp_verify fill/63-member-cluster entries={} order_fp={:016x}",
         chain.len(),
-        snapshot_order_fingerprint(&chain)
+        snapshot_order::snapshot_order_fingerprint(&chain)
     );
 }
 
@@ -353,11 +303,11 @@ fn mrp_verify_removal_plan() {
         removals: vec![(victim_id, RemovalReason::BlockInclusion)],
         fee_deltas_cleared: 0,
     };
-    let mut projected_state = FNV_OFFSET;
+    let mut projected_state = snapshot_order::FNV_OFFSET;
     let mut projected_count = 0_usize;
     for chunk in projected_source.chunks_after(&plan).iter() {
         for txid in chunk.txids {
-            projected_state = fold_bytes(projected_state, txid.as_bytes());
+            projected_state = snapshot_order::fold_bytes(projected_state, txid.as_bytes());
             projected_count += 1;
         }
     }
@@ -380,9 +330,9 @@ fn mrp_verify_removal_plan() {
         "the projection must name every surviving entry"
     );
     let live = removed.mining_snapshot();
-    let mut live_state = FNV_OFFSET;
+    let mut live_state = snapshot_order::FNV_OFFSET;
     for entry in &live.entries {
-        live_state = fold_bytes(live_state, entry.txid.as_bytes());
+        live_state = snapshot_order::fold_bytes(live_state, entry.txid.as_bytes());
     }
     assert_eq!(
         live.entries.len(),
@@ -405,11 +355,11 @@ fn mrp_verify_removal_plan() {
 fn mrp_verify() {
     for size in POOL_SIZES {
         let pool = fill_pool(size);
-        assert_snapshot_topological(&pool);
+        snapshot_order::assert_snapshot_topological(&pool);
         println!(
             "mrp_verify fill/{size} entries={} order_fp={:016x}",
             pool.len(),
-            snapshot_order_fingerprint(&pool)
+            snapshot_order::snapshot_order_fingerprint(&pool)
         );
     }
 
@@ -434,11 +384,11 @@ fn mrp_verify() {
             .any(|record| record.txid == target && record.fee_delta == 3_000),
         "the overlay must stay listed"
     );
-    assert_snapshot_topological(&prioritised);
+    snapshot_order::assert_snapshot_topological(&prioritised);
     println!(
         "mrp_verify prioritise/800 entries={} order_fp={:016x}",
         prioritised.len(),
-        snapshot_order_fingerprint(&prioritised)
+        snapshot_order::snapshot_order_fingerprint(&prioritised)
     );
 
     let mut duplicated = fill_pool(200);

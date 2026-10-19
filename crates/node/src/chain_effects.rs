@@ -639,6 +639,47 @@ mod tests {
         Ok(())
     }
 
+    /// Records the committed block receipts the mining wake received.
+    #[derive(Default)]
+    struct ReceiptWake {
+        receipts: Mutex<Vec<(Hash256, usize)>>,
+    }
+
+    impl bitcoin_rs_mining::MempoolSequenceWake for ReceiptWake {
+        fn publish_generation_from(&self, _: u64) {}
+
+        fn stage_tip(&self, _: &TipSnapshot, _: &Block) {}
+
+        fn publish_block_generation(&self, tip_hash: Hash256, removals: &MutationResult) {
+            self.receipts
+                .lock()
+                .push((tip_hash, removals.changes.len()));
+        }
+    }
+
+    /// `RCV-02`: a follower set without an admission gate removed nothing, so a
+    /// committed connect still publishes a truthful, empty receipt for the
+    /// connected tip. A foreground joined on a prepared candidate waits for
+    /// exactly that receipt.
+    #[test]
+    fn gatewayless_connect_publishes_an_empty_receipt_for_the_tip() -> anyhow::Result<()> {
+        let genesis = Network::Regtest.genesis_block();
+        let tip = genesis_tip(&genesis)?;
+        let wake = Arc::new(ReceiptWake::default());
+        let wake_handle: Arc<dyn bitcoin_rs_mining::MempoolSequenceWake> = wake.clone();
+        let followers = ChainFollowers::noop();
+        followers.mining().attach_sequence_wake(&wake_handle);
+        assert!(followers.mempool_gateway().is_none());
+
+        followers.on_connect(&genesis, &connect_outcome(&tip, &genesis));
+        assert_eq!(
+            *wake.receipts.lock(),
+            vec![(tip.hash, 0)],
+            "one receipt for the connected tip, naming no removals"
+        );
+        Ok(())
+    }
+
     #[derive(Default)]
     struct AdmissionCoins {
         prevouts: RwLock<Vec<(OutPoint, TxOut)>>,

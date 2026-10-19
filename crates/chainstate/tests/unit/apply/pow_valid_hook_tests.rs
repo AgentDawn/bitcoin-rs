@@ -107,7 +107,12 @@ fn pow_valid_hook_skips_stale_parent_and_failed_connects() -> Result<(), Box<dyn
         .map_err(|error| format!("regrind overspend block: {error:?}"))?;
     let failed: Result<_, ApplyError> = handles.apply_block(&falling, None);
     assert!(
-        failed.is_err(),
+        matches!(
+            failed,
+            Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::CoinbaseAmount { .. }
+            ))
+        ),
         "an overspent coinbase must fail connect after rules"
     );
     let fired = calls.lock().expect("hook calls").clone();
@@ -121,6 +126,131 @@ fn pow_valid_hook_skips_stale_parent_and_failed_connects() -> Result<(), Box<dyn
         handles.applied_tip_snapshot().ok_or("tip")?.height,
         3,
         "a failed connect leaves the published tip unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn pow_valid_hook_skips_non_final_commit_intent_block() -> Result<(), Box<dyn std::error::Error>> {
+    let handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    let calls: HookCalls = Arc::new(Mutex::new(Vec::new()));
+    handles
+        .set_pow_valid_block(recording_hook(&calls))
+        .map_err(|_| "hook installs once")?;
+    seed_genesis(&handles)?;
+    let tip = handles.applied_tip_snapshot().ok_or("tip")?;
+    // A coinbase timelock with an enabled sequence is non-final at height 1.
+    // Block rules still pass, so only the contextual precheck can refuse it
+    // before the announcement.
+    let mut non_final = mined_child(tip.hash.into(), 1)?;
+    let coinbase = non_final.txs.first_mut().ok_or("coinbase")?;
+    coinbase.lock_time = bitcoin_rs_primitives::LockTime::from_consensus(2);
+    coinbase
+        .inputs
+        .first_mut()
+        .ok_or("coinbase input")?
+        .sequence = bitcoin_rs_primitives::Sequence::from_consensus(0);
+    non_final.header.merkle_root =
+        merkle_root(&non_final.txs).ok_or("merkle root of non-empty block")?;
+    mine_block_to_declared_target(&mut non_final)
+        .map_err(|error| format!("regrind non-final block: {error:?}"))?;
+    let failed: Result<_, ApplyError> = handles.apply_block(&non_final, None);
+    assert!(
+        matches!(
+            failed,
+            Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::Bip { .. }
+            ))
+        ),
+        "a non-final block must fail connect, got {failed:?}"
+    );
+    assert!(
+        calls.lock().expect("hook calls").is_empty(),
+        "a non-final block never announces early"
+    );
+    Ok(())
+}
+
+#[test]
+fn pow_valid_hook_skips_bip34_violating_commit_intent_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    let calls: HookCalls = Arc::new(Mutex::new(Vec::new()));
+    handles
+        .set_pow_valid_block(recording_hook(&calls))
+        .map_err(|_| "hook installs once")?;
+    // Regtest enforces BIP34 from height 500: seed the chain to 499 so the
+    // next child is the first BIP34-gated block.
+    let mut tip_hash = seed_genesis(&handles)?.hash;
+    for height in 1..=499 {
+        let block = mined_child(tip_hash.into(), height)?;
+        handles.apply_block(&block, None)?;
+        tip_hash = Hash256::from(block.block_hash());
+    }
+    assert_eq!(handles.applied_tip_snapshot().ok_or("tip")?.height, 499);
+    calls.lock().expect("hook calls").clear();
+    // A coinbase that does not start with the height push violates BIP34
+    // while passing block rules, so only the contextual precheck can refuse
+    // it before the announcement.
+    let mut violating = mined_child(tip_hash.into(), 500)?;
+    violating
+        .txs
+        .first_mut()
+        .ok_or("coinbase")?
+        .inputs
+        .first_mut()
+        .ok_or("coinbase input")?
+        .script_sig = vec![0x51].into();
+    violating.header.merkle_root =
+        merkle_root(&violating.txs).ok_or("merkle root of non-empty block")?;
+    mine_block_to_declared_target(&mut violating)
+        .map_err(|error| format!("regrind violating block: {error:?}"))?;
+    let failed: Result<_, ApplyError> = handles.apply_block(&violating, None);
+    assert!(
+        matches!(
+            failed,
+            Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::Bip { .. }
+            ))
+        ),
+        "a BIP34-violating block must fail connect, got {failed:?}"
+    );
+    assert!(
+        calls.lock().expect("hook calls").is_empty(),
+        "a BIP34-violating block never announces early"
+    );
+    Ok(())
+}
+
+#[test]
+fn hook_installation_after_a_clone_is_visible_through_both_handles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let handles = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    let shadow = handles.clone();
+    let calls: HookCalls = Arc::new(Mutex::new(Vec::new()));
+    // Install through the pre-install clone: the original must refuse a
+    // second install, and firing through the original must reach the
+    // clone-installed hook.
+    shadow
+        .set_pow_valid_block(recording_hook(&calls))
+        .map_err(|_| "hook installs once")?;
+    assert!(
+        handles.set_pow_valid_block(recording_hook(&calls)).is_err(),
+        "the original must see the clone's install and refuse a second one"
+    );
+    seed_genesis(&handles)?;
+    let tip = handles.applied_tip_snapshot().ok_or("tip")?;
+    let child = mined_child(tip.hash.into(), 1)?;
+    handles.apply_block(&child, None)?;
+    let fired = calls.lock().expect("hook calls").clone();
+    assert_eq!(fired.len(), 1, "the clone-installed hook must announce");
+    assert_eq!(fired[0].0, Hash256::from(child.block_hash()));
+    handles
+        .set_tip_staged(Arc::new(|_, _| {}))
+        .map_err(|_| "hook installs once")?;
+    assert!(
+        shadow.set_tip_staged(Arc::new(|_, _| {})).is_err(),
+        "the clone must see the install and refuse a second one"
     );
     Ok(())
 }

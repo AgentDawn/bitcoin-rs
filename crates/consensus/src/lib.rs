@@ -70,7 +70,7 @@ mod bip113_tests {
 
 pub use block_view::{BlockFacts, BlockView};
 pub use engine::ValidationEngine;
-pub use script_cache::{SCRIPT_EXECUTION_CACHE_ENTRIES, ScriptExecutionCache};
+pub use script_cache::{SCRIPT_EXECUTION_CACHE_ENTRIES, ScriptExecutionCache, WindowCacheTakes};
 pub use signet::check_signet_block_solution;
 pub use sigops::transaction_sigop_cost;
 pub use verify_block::{

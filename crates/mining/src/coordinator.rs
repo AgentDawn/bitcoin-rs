@@ -524,7 +524,10 @@ impl MiningService {
     /// retained-component read, the state update, and the wake share one
     /// coordinator-state critical section, so a concurrent membership
     /// publication cannot interleave between the read and the overwrite and no
-    /// fee component is lost.
+    /// fee component is lost. A delayed callback carrying an older fee
+    /// revision than the key already published for this tip and membership
+    /// is dropped, so it can neither regress the published key nor invalidate
+    /// the newer candidate. No pool lock is taken here.
     pub fn publish_fee_delta_generation(&self, fee_delta_sequence: u64) {
         let mut state = self.state.lock();
         let key = GenerationKey {
@@ -532,6 +535,13 @@ impl MiningService {
             mempool_sequence: state.retained_mempool_sequence(),
             fee_delta_sequence,
         };
+        if let Some(published) = state.published
+            && published.tip_hash == key.tip_hash
+            && published.mempool_sequence == key.mempool_sequence
+            && published.fee_delta_sequence > fee_delta_sequence
+        {
+            return;
+        }
         self.publish_locked(&mut state, key);
     }
 
@@ -1527,6 +1537,7 @@ fn candidate_context_for(
         min_time: chain.min_time,
         current_time: current_time.max(chain.min_time),
         locktime_cutoff: chain.locktime_cutoff(current_time.max(chain.min_time)),
+        staged_parent_mtp: chain.parent_median_time_past,
         network,
         csv_active: chain.csv_active,
         segwit_active: chain.segwit_active,

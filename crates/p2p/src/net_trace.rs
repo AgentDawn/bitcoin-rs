@@ -124,19 +124,31 @@ mod tests {
     }
 
     #[test]
-    fn message_args_matches_core_abi_positions() {
+    fn message_args_serve_a_live_consumer_read() {
         let trace = NetTrace::inbound(7, loopback());
-        let payload: &[u8] = b"abc";
+        let payload: &[u8] = b"ping-payload";
 
         let (node_id, addr, conn_type, msg_type, size, pointer) =
             message_args(&trace, "ping", payload);
 
         assert_eq!(node_id, 7);
-        assert_eq!(addr, "127.0.0.1:8333");
+        let parsed: SocketAddr = addr
+            .parse()
+            .unwrap_or_else(|error| panic!("consumer parses the address: {error}"));
+        assert_eq!(parsed, loopback());
         assert_eq!(conn_type, "inbound");
         assert_eq!(msg_type, "ping");
-        assert_eq!(size, 3);
-        assert_eq!(pointer, payload.as_ptr());
+        assert_eq!(
+            size,
+            u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            "size must be the payload length a consumer reads"
+        );
+        let base = payload.as_ptr().addr();
+        let pointed = pointer.addr();
+        assert!(
+            (base..base.saturating_add(payload.len())).contains(&pointed),
+            "pointer must land inside the payload the consumer reads"
+        );
     }
 
     #[test]

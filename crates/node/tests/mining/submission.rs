@@ -208,6 +208,10 @@ fn signet_submit_reports_bad_signet_blksig_and_proposal_skips_the_solution() -> 
         tip.hash,
         Hash256::from(Network::Signet.genesis_block().block_hash())
     );
+    assert!(
+        fixture.mempool_gateway().stable_generation().is_some(),
+        "a clean block rejection must settle the chain generation"
+    );
     Ok(())
 }
 

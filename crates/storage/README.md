@@ -55,7 +55,8 @@ startup.
 
 Every file-owning store (`FjallStore`, `RocksDbStore`, `RedbStore`, the redb
 transaction index, and `FlatFileBlockStore`) can keep one opaque `StoreGuard`
-through `guarded_by` (a parameter of `open_redb_tx_index_store_with_cache`).
+through `guarded_by` (a builder method; the redb transaction index takes it
+as the `guard` argument of `open_redb_tx_index_store_with_cache`).
 The guard is the store's last field, so it drops only after the engine or file
 handle has closed. The node passes its data-directory lock this way: the lock
 lives exactly as long as the last handle that can still write the directory,

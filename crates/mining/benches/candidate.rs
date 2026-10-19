@@ -10,8 +10,8 @@
 //!   clusters), the rest are independent roots; extending it to 100,000
 //!   entries answers the mature-pool scaling question.
 //! - `chains/depth-25`: 20,000 transactions as 800 explicit 25-deep chains, so
-//!   each 25-member cluster exercises the linearization solver at the cluster
-//!   limit the step 19 template-miss gate reads.
+//!   each 25-member cluster exercises the linearization solver below the
+//!   default 64 cluster limit.
 //!
 //! The `mining_snapshot_operation` rows are the operation baseline for
 //! `mining_snapshot` — the whole-pool copy mining takes per template cache
@@ -57,11 +57,16 @@ use criterion::{BenchmarkId, Criterion, SamplingMode, criterion_group};
 #[path = "../../../tools/benchmark-support/measured_samples.rs"]
 mod measured_samples;
 
+#[path = "../../../tools/benchmark-support/snapshot_order.rs"]
+mod snapshot_order;
+
 /// Independent-transaction pool sizes for the cache-miss scaling question.
 ///
-/// 0, 64, 512, and 2,048 keep the historical curve points (the 2,048 numbers
-/// above are the same workload as before); 20,000, 50,000, and 100,000 pin the
-/// mature-pool medians the step 19 gate reads. Construction is untimed setup.
+/// 0, 64, 512, and 2,048 keep the historical pool sizes, but the methodology
+/// changed: assembly now reads the pool directly, with no per-iteration
+/// snapshot copy, so earlier timings are not comparable. 20,000, 50,000, and
+/// 100,000 pin the mature-pool medians the step 19 gate reads. Construction
+/// is untimed setup.
 const INDEPENDENT_POOL_SIZES: [usize; 7] = [0, 64, 512, 2_048, 20_000, 50_000, 100_000];
 
 /// The 25-deep-chain pool size: 800 chains of 25 transactions.
@@ -77,6 +82,7 @@ fn context() -> CandidateContext {
         min_time: 10,
         current_time: 20,
         locktime_cutoff: 10,
+        staged_parent_mtp: 10,
         network: Network::Regtest,
         csv_active: true,
         segwit_active: true,
@@ -486,84 +492,18 @@ fn verify_chained_snapshot_unit() {
     counted_snapshot_unit(&pool, CHAIN_POOL_CHAINS * CHAIN_DEPTH);
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// FNV-1a over one `u64`. Standard-library hashers randomise their keys, so
-/// they cannot serve as cross-arm fingerprints.
-fn fold_u64(state: u64, value: u64) -> u64 {
-    let mut state = state;
-    for byte in value.to_le_bytes() {
-        state ^= u64::from(byte);
-        state = state.wrapping_mul(0x100_0000_01B3);
-    }
-    state
-}
-
-/// FNV-1a over raw bytes.
-fn fold_bytes(state: u64, bytes: &[u8]) -> u64 {
-    let mut state = state;
-    for &byte in bytes {
-        state ^= u64::from(byte);
-        state = state.wrapping_mul(0x100_0000_01B3);
-    }
-    state
-}
-
-/// Deterministic fingerprint of the pool's chunk order through the mining
-/// snapshot: entry order, fees, overlays, and weights. The snapshot lists
-/// entries in chunk order. The fingerprint is a diagnostic identity signal
-/// only, not a collision-free equality proof: structural assertions
-/// (residency, topological order) carry equivalence; matching fingerprints
-/// are supporting evidence.
-fn snapshot_order_fingerprint(pool: &Mempool) -> u64 {
-    let snapshot = pool.mining_snapshot();
-    let mut state = FNV_OFFSET;
-    state = fold_u64(state, snapshot.sequence);
-    state = fold_u64(state, snapshot.fee_delta_sequence);
-    for entry in &snapshot.entries {
-        state = fold_bytes(state, entry.txid.as_bytes());
-        state = fold_u64(state, entry.fee);
-        state = fold_u64(state, entry.weight);
-        state = fold_u64(state, entry.fee_delta.cast_unsigned());
-        for &ancestor in &entry.ancestors {
-            state = fold_u64(state, u64::from(ancestor));
-        }
-    }
-    state
-}
-
 /// Deterministic fingerprint of a selected body: transaction order and fees.
 fn body_fingerprint(body: &SelectedBody) -> u64 {
-    let mut state = FNV_OFFSET;
+    let mut state = snapshot_order::FNV_OFFSET;
     for tx in &body.transactions {
-        state = fold_bytes(state, tx.txid.as_bytes());
-        state = fold_u64(state, tx.fee);
+        state = snapshot_order::fold_bytes(state, tx.txid.as_bytes());
+        state = snapshot_order::fold_u64(state, tx.fee);
     }
     state
-}
-
-/// Every ancestor position in the snapshot must precede its entry, and the
-/// snapshot must name every live entry exactly once.
-fn assert_snapshot_topological(pool: &Mempool) {
-    let snapshot = pool.mining_snapshot();
-    for (index, entry) in snapshot.entries.iter().enumerate() {
-        let index = u32::try_from(index).expect("snapshot fits u32");
-        for &ancestor in &entry.ancestors {
-            assert!(
-                ancestor < index,
-                "ancestor position {ancestor} must precede entry {index}"
-            );
-        }
-    }
-    assert_eq!(
-        snapshot.entries.len(),
-        pool.len(),
-        "the snapshot must name every live entry exactly once"
-    );
 }
 
 /// Every selected transaction must be resident, and the pool snapshot must
-/// satisfy [`assert_snapshot_topological`].
+/// satisfy [`snapshot_order::assert_snapshot_topological`].
 fn assert_selection_sound(pool: &Mempool, body: &SelectedBody) {
     for tx in &body.transactions {
         assert!(
@@ -571,7 +511,7 @@ fn assert_selection_sound(pool: &Mempool, body: &SelectedBody) {
             "selection must not invent transactions"
         );
     }
-    assert_snapshot_topological(pool);
+    snapshot_order::assert_snapshot_topological(pool);
 }
 
 /// First snapshot entry no pool transaction spends: removing it confirms
@@ -625,7 +565,7 @@ fn mrp_verify_end_to_end(ctx: &CandidateContext, payout: &[u8]) {
         );
         println!(
             "mrp_verify end_to_end/{count} entries={count} order_fp={:016x} body_fp={:016x}",
-            snapshot_order_fingerprint(&pool),
+            snapshot_order::snapshot_order_fingerprint(&pool),
             body_fingerprint(&selected)
         );
     }
@@ -646,7 +586,7 @@ fn mrp_verify_end_to_end(ctx: &CandidateContext, payout: &[u8]) {
     println!(
         "mrp_verify end_to_end/chains/depth-25 entries={} order_fp={:016x} body_fp={:016x}",
         chains.len(),
-        snapshot_order_fingerprint(&chains),
+        snapshot_order::snapshot_order_fingerprint(&chains),
         body_fingerprint(&chained)
     );
 }
@@ -718,10 +658,10 @@ fn mrp_verify() {
         100_000,
         "mature fixture pool must retain every inserted transaction"
     );
-    assert_snapshot_topological(&mature);
+    snapshot_order::assert_snapshot_topological(&mature);
     println!(
         "mrp_verify residency/100000 entries=100000 order_fp={:016x}",
-        snapshot_order_fingerprint(&mature)
+        snapshot_order::snapshot_order_fingerprint(&mature)
     );
 
     mrp_verify_removal_plan(&ctx, &payout);

@@ -82,7 +82,7 @@ impl TemplateState {
             template_id: self.id,
             future_template: true,
             version: c.version as u32,
-            coinbase_tx_version: c.coinbase.version as u32,
+            coinbase_tx_version: c.coinbase.version,
             coinbase_prefix: c.coinbase.inputs[0]
                 .script_sig
                 .as_bytes()

@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use bitcoin_rs_chain::BlockBodySource;
+use bitcoin_rs_chain::{BlockBodySource, LatchReader};
 use bitcoin_rs_chainstate::verify::{
-    CheckLevel, VerifyOutcome, VerifyRequest, verify_recent_blocks,
+    CheckLevel, VerifyError, VerifyOutcome, VerifyRequest, verify_recent_blocks,
 };
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_rpc::{
@@ -121,9 +121,16 @@ impl ChainControl for RpcChainControl {
         Ok(())
     }
 
-    fn verify_chain(&self, check_level: u8, nblocks: u32) -> bool {
-        match verify_recent_blocks(&self.handles, verify_request(check_level, nblocks)) {
-            Ok(VerifyOutcome::Passed { .. }) => true,
+    fn verify_chain(
+        &self,
+        check_level: u8,
+        nblocks: u32,
+        cancellation: &LatchReader,
+    ) -> Result<bool, ChainControlError> {
+        let mut request = verify_request(check_level, nblocks);
+        request.cancellation = Some(cancellation.clone());
+        match verify_recent_blocks(&self.handles, request) {
+            Ok(VerifyOutcome::Passed { .. }) => Ok(true),
             // Core reports a window that reaches blocks it does not hold as
             // `SKIPPED_MISSING_BLOCKS`, which `verifychain` answers false.
             Ok(VerifyOutcome::SkippedNoBlockData { height }) => {
@@ -131,11 +138,13 @@ impl ChainControl for RpcChainControl {
                     height,
                     "verifychain window reaches blocks this node does not hold"
                 );
-                false
+                Ok(false)
             }
+            Err(VerifyError::Interrupted) => Err(ChainControlError::Interrupted),
+            Err(VerifyError::ClosedForRecovery) => Err(ChainControlError::Unavailable),
             Err(error) => {
-                tracing::warn!(%error, "verifychain found a damaged block");
-                false
+                tracing::warn!(%error, "verifychain could not verify a block");
+                Ok(false)
             }
         }
     }
@@ -153,6 +162,7 @@ fn verify_request(check_level: u8, nblocks: u32) -> VerifyRequest {
     VerifyRequest {
         level,
         depth: NonZeroU32::new(nblocks),
+        cancellation: None,
     }
 }
 

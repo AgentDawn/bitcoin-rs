@@ -21,15 +21,22 @@ pub struct FjallStore {
     #[cfg(any(test, feature = "test-seam"))]
     faults: crate::trait_::PersistFaultSlot,
     /// Last field: drops after the engine handles above have closed.
-    _guard: Option<crate::StoreGuard>,
+    guard: Option<crate::StoreGuard>,
 }
 
 impl FjallStore {
     /// Keeps `guard` alive until this store's engine handle is closed.
+    ///
+    /// Panics when a guard is already installed: replacing it would release
+    /// the first guard while the engine handle it protects is still open.
     #[must_use]
     pub fn guarded_by(self, guard: crate::StoreGuard) -> Self {
+        assert!(
+            self.guard.is_none(),
+            "a Fjall store takes exactly one lifetime guard"
+        );
         Self {
-            _guard: Some(guard),
+            guard: Some(guard),
             ..self
         }
     }
@@ -71,7 +78,7 @@ impl FjallStore {
             write_lock: parking_lot::Mutex::new(()),
             #[cfg(any(test, feature = "test-seam"))]
             faults: crate::trait_::PersistFaultSlot::default(),
-            _guard: None,
+            guard: None,
         })
     }
 

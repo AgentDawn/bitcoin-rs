@@ -1,18 +1,26 @@
 //! `verifychain` parameter boundaries and pre-delegation outcomes.
 //!
 //! The handler validates Core's signed parameters, honors handler shutdown,
-//! and relays the node-owned verifier's answer; an empty window and a tip
-//! without a verifier are answered without one. Body rules, damage classes,
-//! and history windows are owned by `chainstate::verify` and the daemon
-//! comparison.
+//! and answers a tip without a verifier as unverified. The node-owned
+//! verifier's answers, including the applied-genesis window, are proven
+//! against the real verifier in `node` (`lifecycle` tests) and in
+//! `chainstate::verify`; the stub control below proves delegation to the
+//! attached verifier, not its answers.
 #![expect(clippy::unwrap_used)]
 
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+
 use super::*;
+use crate::context::{ChainControl, ChainControlError};
 use crate::handlers::Handler;
 
-/// A context whose applied tip is genesis: enough ancestry for the handler
-/// to reach its verifier, with no bodies to read.
+/// A context whose applied tip is genesis, with no chain control attached.
 fn tipped() -> Arc<Context> {
+    Arc::new(tipped_context())
+}
+
+fn tipped_context() -> Context {
     let ctx = Context::new();
     let genesis = Network::Regtest.genesis_block();
     ctx.chain
@@ -27,7 +35,7 @@ fn tipped() -> Arc<Context> {
         ctx.chain.applied_tip.load_full().is_some(),
         "the fixture must apply its tip"
     );
-    Arc::new(ctx)
+    ctx
 }
 
 #[test]
@@ -85,24 +93,18 @@ fn parameters_follow_core_signed_ranges() {
 
 #[test]
 fn cancelled_requests_report_interruption() {
-    let handler = Handler::new(Arc::new(Context::new()));
+    let handler = Handler::new(tipped());
+    // The same request over the same applied tip answers `false` while the
+    // handler runs (no verifier attached), so the error below is the
+    // handler's own pre-dispatch interruption, not a verifier outcome.
+    assert_eq!(
+        handler.dispatch("verifychain", &json!([0, 0])).unwrap(),
+        json!(false)
+    );
     handler.stop();
-    assert_eq!(
-        handler
-            .dispatch("verifychain", &json!([0, 0]))
-            .unwrap_err()
-            .code(),
-        -1
-    );
-}
-
-#[test]
-fn empty_window_is_verified_without_a_verifier() {
-    let handler = Handler::new(Arc::new(Context::new()));
-    assert_eq!(
-        handler.dispatch("verifychain", &json!([3, 6])).unwrap(),
-        json!(true)
-    );
+    let error = handler.dispatch("verifychain", &json!([0, 0])).unwrap_err();
+    assert_eq!(error.code(), -1);
+    assert_eq!(error.to_string(), "Block verification interrupted");
 }
 
 #[test]
@@ -115,4 +117,53 @@ fn tip_without_control_is_not_verified() {
             "level {level} without a verifier"
         );
     }
+}
+
+struct StubControl {
+    calls: AtomicBool,
+    level: AtomicU8,
+    nblocks: AtomicU32,
+}
+
+impl ChainControl for StubControl {
+    fn invalidate_block(
+        &self,
+        _hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), ChainControlError> {
+        Err(ChainControlError::UnknownBlock)
+    }
+
+    fn verify_chain(
+        &self,
+        check_level: u8,
+        nblocks: u32,
+        _cancellation: &bitcoin_rs_chain::LatchReader,
+    ) -> Result<bool, ChainControlError> {
+        self.calls.store(true, Ordering::SeqCst);
+        self.level.store(check_level, Ordering::SeqCst);
+        self.nblocks.store(nblocks, Ordering::SeqCst);
+        Ok(true)
+    }
+}
+
+#[test]
+fn empty_window_through_attached_control_is_verified() {
+    let control = Arc::new(StubControl {
+        calls: AtomicBool::new(false),
+        level: AtomicU8::new(u8::MAX),
+        nblocks: AtomicU32::new(u32::MAX),
+    });
+    let handler = Handler::new(Arc::new(
+        tipped_context().with_chain_control(control.clone()),
+    ));
+    assert_eq!(
+        handler.dispatch("verifychain", &json!([0, 0])).unwrap(),
+        json!(true)
+    );
+    assert!(
+        control.calls.load(Ordering::SeqCst),
+        "the applied tip must consult the attached control, not the no-tip shortcut"
+    );
+    assert_eq!(control.level.load(Ordering::SeqCst), 0);
+    assert_eq!(control.nblocks.load(Ordering::SeqCst), 0);
 }

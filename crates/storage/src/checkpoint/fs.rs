@@ -38,9 +38,14 @@ pub fn ensure_current_schema(data: &Dir) -> io::Result<()> {
                 match entry.file_name().to_str() {
                     Some(name) if name == CURRENT_SCHEMA_TEMP_FILE => stale_temp = true,
                     // A datadir that lost its marker to a crash may still
-                    // carry the node's lifetime lock; it is not evidence of
-                    // an incompatible epoch-0 directory.
-                    Some(name) if name == DATA_DIR_LOCK_FILE => {}
+                    // carry the node's lifetime lock; a regular lock file is
+                    // not evidence of an incompatible epoch-0 directory. Any
+                    // other file type under that name is.
+                    Some(name) if name == DATA_DIR_LOCK_FILE => {
+                        if !entry.file_type()?.is_file() {
+                            has_other_entry = true;
+                        }
+                    }
                     _ => has_other_entry = true,
                 }
             }

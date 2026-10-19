@@ -302,18 +302,24 @@ pub struct ScriptStageTimings {
 /// prevout amounts), post-checks (value balance, sigops), and ordering are
 /// unchanged. `None` under the kernel engine, so the kernel oracle stays
 /// authoritative.
-pub fn verify_block_input_scripts(
-    view: &mut BlockView<'_>,
+pub fn verify_block_input_scripts<'tx, 'checks>(
+    view: &mut BlockView<'tx>,
     height: u32,
     locktime_cutoff: u32,
     flags: VerifyFlags,
     timings: &mut ScriptStageTimings,
-    parsed: &crate::kernel::BlockParse,
+    parsed: &'checks crate::kernel::BlockParse,
     script_cache: Option<&crate::script_cache::ScriptExecutionCache>,
-) -> Result<(), ConsensusError> {
+) -> Result<(), ConsensusError>
+where
+    'tx: 'checks,
+{
     let prepare_started = Instant::now();
+    // The single-block path keeps direct-take semantics: its outcomes commit
+    // or fail as one block, so takes stay consumed either way.
+    let mut takes = script_cache.map(crate::script_cache::WindowCacheTakes::new);
     let unit =
-        prepare_block_script_checks(view, height, locktime_cutoff, flags, parsed, script_cache)?;
+        prepare_block_script_checks(view, height, locktime_cutoff, flags, parsed, takes.as_mut())?;
     timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
 
     let unit_slice = core::slice::from_ref(&unit);
@@ -342,7 +348,8 @@ pub struct BatchScriptFailure {
 /// Resolves one block's order-sensitive transaction state without executing any
 /// script.
 ///
-/// `script_cache` is consulted with the block's precomputed witness ids, or
+/// `script_cache` is consulted with the block's precomputed witness ids,
+/// the derived ids when the facts carry witness but no precomputed ids, or
 /// the txid when the block carries no witness.
 pub fn prepare_block_script_checks<'tx, 'checks>(
     view: &mut BlockView<'tx>,
@@ -350,16 +357,20 @@ pub fn prepare_block_script_checks<'tx, 'checks>(
     locktime_cutoff: u32,
     flags: VerifyFlags,
     parsed: &'checks crate::kernel::BlockParse,
-    script_cache: Option<&crate::script_cache::ScriptExecutionCache>,
+    takes: Option<&mut crate::script_cache::WindowCacheTakes<'_>>,
 ) -> Result<BlockScriptChecks<'checks>, ConsensusError>
 where
     'tx: 'checks,
 {
     // The key vector exists only to serve cache takes; cache-free paths
     // (kernel engine, window proposals, unit tests) allocate nothing here.
-    let wtxids: Vec<Wtxid> = if script_cache.is_some() {
-        match view.facts().wtxids() {
-            Some(wtxids) => wtxids.to_vec(),
+    // The txid fallback is sound only for witness-free bodies, where the
+    // two coincide: a witness-bearing view without precomputed ids derives
+    // the real witness ids instead of keying witness checks by txid.
+    let wtxids: Vec<Wtxid> = if takes.is_some() {
+        match view.facts().wtxids().map(<[Wtxid]>::to_vec) {
+            Some(wtxids) => wtxids,
+            None if view.facts().has_witness() => view.witness_ids().to_vec(),
             None => view.txids().iter().map(|txid| Wtxid(txid.0)).collect(),
         }
     } else {
@@ -372,7 +383,7 @@ where
             actual: resolved.len(),
         });
     }
-    if script_cache.is_some() && txs.len() != wtxids.len() {
+    if takes.is_some() && txs.len() != wtxids.len() {
         return Err(ConsensusError::PrevoutMatrixSize {
             expected: txs.len(),
             actual: wtxids.len(),
@@ -386,7 +397,7 @@ where
         locktime_cutoff,
         flags,
         parsed,
-        script_cache,
+        takes,
     );
     Ok(BlockScriptChecks {
         prepared,
@@ -503,7 +514,7 @@ fn prepare_block_input_checks<'b>(
     locktime_cutoff: u32,
     flags: VerifyFlags,
     parsed: &'b crate::kernel::BlockParse,
-    script_cache: Option<&crate::script_cache::ScriptExecutionCache>,
+    mut takes: Option<&mut crate::script_cache::WindowCacheTakes<'_>>,
 ) -> (Vec<PreparedTx<'b>>, Vec<InputCheck>) {
     let mut prepared = Vec::with_capacity(txs.len());
     let mut checks = Vec::new();
@@ -538,7 +549,10 @@ fn prepare_block_input_checks<'b>(
         // A mempool-verified entry skips script re-execution but keeps every
         // other check: pre-errors already ran above, and the value-balance
         // and sigop post-checks run here with zero script checks attached.
-        if script_cache.is_some_and(|cache| cache.take(wtxids[tx_index], flags)) {
+        if takes
+            .as_mut()
+            .is_some_and(|takes| takes.take(wtxids[tx_index], flags))
+        {
             let post_error = finalize_tx_value_and_sigops(tx, &prep, flags).err();
             let stop_after_tx = post_error.is_some();
             prepared.push(PreparedTx {
@@ -627,7 +641,7 @@ mod tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin_rs_primitives::{
         Amount, Block, CompactTarget, Hash256, Header, LockTime, OutPoint, Script, Sequence, Tx,
-        TxIn, TxOut, Txid, Witness, consensus_bytes, deserialize,
+        TxIn, TxOut, Txid, Witness, Wtxid, consensus_bytes, deserialize,
     };
     #[cfg(not(feature = "kernel"))]
     use bitcoin_rs_primitives::{Sighash, SighashCache};
@@ -1210,7 +1224,7 @@ mod tests {
     #[test]
     fn script_cache_hit_skips_scripts_for_exact_flags_only()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::script_cache::ScriptExecutionCache;
+        use crate::script_cache::{ScriptExecutionCache, WindowCacheTakes};
 
         let txs = vec![
             coinbase_transaction_with_script_sig_len(2),
@@ -1232,22 +1246,30 @@ mod tests {
         // Populate precomputed witness ids so the hit exercises the
         // facts-wtxids key source (identical keys for witness-free bodies).
         let _ = view.witness_ids();
+        let mut takes = WindowCacheTakes::new(&cache);
         let hit =
-            super::prepare_block_script_checks(&mut view, 0, 0, flags, &parsed, Some(&cache))?;
+            super::prepare_block_script_checks(&mut view, 0, 0, flags, &parsed, Some(&mut takes))?;
         assert!(super::verify_prepared_units(core::slice::from_ref(&hit)).is_ok());
 
         let parsed = test_block_parse(&txs);
         let mut view = block_view_for(&txs, resolved.clone());
         let replay =
-            super::prepare_block_script_checks(&mut view, 0, 0, flags, &parsed, Some(&cache))?;
+            super::prepare_block_script_checks(&mut view, 0, 0, flags, &parsed, Some(&mut takes))?;
         assert!(super::verify_prepared_units(core::slice::from_ref(&replay)).is_err());
 
         let other = ScriptExecutionCache::new();
         other.insert(wtxid, VerifyFlags::P2SH);
+        let mut other_takes = WindowCacheTakes::new(&other);
         let parsed = test_block_parse(&txs);
         let mut view = block_view_for(&txs, resolved);
-        let wrong =
-            super::prepare_block_script_checks(&mut view, 0, 0, flags, &parsed, Some(&other))?;
+        let wrong = super::prepare_block_script_checks(
+            &mut view,
+            0,
+            0,
+            flags,
+            &parsed,
+            Some(&mut other_takes),
+        )?;
         assert!(super::verify_prepared_units(core::slice::from_ref(&wrong)).is_err());
         Ok(())
     }
@@ -1304,6 +1326,51 @@ mod tests {
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }
+    }
+
+    /// A witness-bearing variant: the script still mismatches, but the
+    /// wtxid no longer equals the txid, so a txid fallback misses the cache.
+    fn witnessed_mismatch_input(outpoint: OutPoint) -> TxIn {
+        TxIn {
+            witness: Witness::from_stack(vec![vec![0x51]]),
+            ..mismatch_input(outpoint)
+        }
+    }
+
+    /// A witness-bearing body keyed from `from_txids` facts hits the cache
+    /// under its real wtxid: the prepare derives witness ids instead of
+    /// falling back to the txid.
+    #[test]
+    fn script_cache_hit_uses_derived_witness_ids_for_witness_bearing_bodies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::script_cache::{ScriptExecutionCache, WindowCacheTakes};
+
+        let txs = vec![
+            coinbase_transaction_with_script_sig_len(2),
+            spend_tx(vec![witnessed_mismatch_input(outpoint(3))], 50),
+        ];
+        let resolved = vec![vec![], vec![Some(op_equal_txout(50))]];
+        let flags = VerifyFlags::MANDATORY;
+        let wtxid = txs[1].wtxid();
+        assert_ne!(
+            wtxid,
+            Wtxid(txs[1].txid().0),
+            "the fixture must separate wtxid from txid"
+        );
+
+        let cache = ScriptExecutionCache::new();
+        cache.insert(wtxid, flags);
+        let parsed = test_block_parse(&txs);
+        let mut view = block_view_for(&txs, resolved);
+        assert!(
+            view.facts().wtxids().is_none(),
+            "the fixture must carry no precomputed witness ids"
+        );
+        let mut takes = WindowCacheTakes::new(&cache);
+        let hit =
+            super::prepare_block_script_checks(&mut view, 0, 0, flags, &parsed, Some(&mut takes))?;
+        assert!(super::verify_prepared_units(core::slice::from_ref(&hit)).is_ok());
+        Ok(())
     }
 
     fn spend_tx(inputs: Vec<TxIn>, output_value: u64) -> Tx {

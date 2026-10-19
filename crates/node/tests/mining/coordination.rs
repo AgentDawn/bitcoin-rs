@@ -1153,6 +1153,13 @@ fn shutdown_with_staged_work_installs_nothing_and_answers_unavailable() -> Resul
                 .is_none(),
             "shutdown must release prepared waiters with nothing to install"
         );
+        // Commit or refusal stays unasserted, but the staged work itself must
+        // never have published: no template was served in this test, so any
+        // recorded candidate is the staged install leaking through.
+        assert!(
+            mining.mining_info()?.last_candidate.is_none(),
+            "shutdown with staged work held must install nothing"
+        );
         Ok(())
     })
 }

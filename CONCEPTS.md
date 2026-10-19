@@ -17,16 +17,17 @@ request head is parsed, before any body byte is read
 tuple at once; present but wrong credentials are slowed by 250 ms first, so
 a 16 MiB declared body costs the attacker the connection, not the server.
 Core differs: Core reads the whole body (up to 32 MiB) before it checks
-credentials and keeps the connection open after a 401; btcrs answers from
-the head alone and closes the connection.
+credentials and keeps the connection open after a 401; btcrs decides from
+the head alone, then discards at most the declared body (bounded: 64 KiB
+within 1 s) before it closes the connection.
 
 ### Long-poll admission
 A `getblocktemplate` call that waits — a template-mode request with a
 string `longpollid` — holds one of the node's bounded blocking-request
 workers, exactly like an active-tip wait, so a fleet of long-polls cannot
 starve ordinary RPC such as the miner's own `submitblock`. Proposal,
-non-template, and non-string-id shapes answer without waiting and hold no
-worker.
+non-template, and absent-or-null-id shapes answer without waiting and hold
+no worker; any other non-string id fails with InvalidType before waiting.
 Core differs: Core runs a long-poll on one of its `-rpcworkqueue` threads
 with no separate quota; btcrs counts it against the blocking-request quota.
 
@@ -110,22 +111,7 @@ deadline. "Core differs: Core counts every received byte as activity; btcrs
 counts only frames that carry a message."
 
 ### Paused getdata tail
-The unserved remainder of one `getdata` that stopped at the outbound queue's
-production gate (no free item slot, or no room for a worst-case block), kept
-in request order with the misses found before it. The connection reads
-nothing from the peer while it holds them. The misses go out in one
-`notfound` as soon as the queue can admit a message at all, and never into a
-queue that cannot, including the trailing `notfound` of a request whose last
-item took the last slot; the remaining items resume once the writer has
-drained the queue to the production condition. After a `getdata` that leaves
-the queue unable to admit a message, reads stay held until it can, so the
-peer's next reply has a slot. A dead writer, a cancelled lease, or a pause
-past 20 minutes ends the session. "Core differs: Core keeps receiving into its
-buffer while paused and pauses processing of every message while its send
-buffer is full; btcrs stops reading the socket until the tail is served and
-holds reads only after a `getdata`, so any other message keeps the plain
-saturation policy. A concurrent sender can still fill the budget between the
-check and the send; that path cancels the lease as before."
+The unserved remainder of one `getdata` that stopped because the session could not reserve send credit before building the next reply — either against the connection's own bound or against the node's aggregate outbound budget (see "Outbound queue accounting" in `docs/policies/p2p-compatibility.md`) — kept in request order with the misses found before it. The connection reads nothing from the peer while it holds them. The misses go out in one `notfound` once a reservation for its exact length succeeds, and never without one; the remaining items resume once a fresh production reservation succeeds, and reads stay held until they do, so the peer's next reply has a slot. A dead writer, a cancelled lease, or a pause past 20 minutes ends the session. Time the aggregate budget refused the connection counts toward neither the 20 minutes nor the request and receive ages, and shared saturation defers without cancelling; only the connection's own bound keeps cancel-on-refusal. Every reply is built under a reservation taken before it exists, so no check-then-send race remains. "Core differs: Core keeps receiving into its buffer while paused and pauses processing of every message while its send buffer is full; btcrs stops reading the socket until the tail is served and holds reads only after a `getdata`, so any other message keeps the plain saturation policy."
 
 ### Authoritative peer table
 The single owner of live peer connections and their published handshake

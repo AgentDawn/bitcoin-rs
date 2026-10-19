@@ -453,8 +453,11 @@ fn preparation_rejects_swapped_and_foreign_prevout_identities_before_scripts() {
     );
 }
 
+/// The shared cache is verdict-neutral from outside its crate: hits are not
+/// observable here (`SignatureCache::contains` is crate-internal), so this
+/// proves cached and uncached verification agree, never that a hit happened.
 #[test]
-fn native_signature_cache_reuses_positives_without_changing_verdicts() {
+fn native_signature_cache_preserves_verdicts() {
     let (tx, prevouts) = signed_fixture();
     let spent: Vec<_> = tx
         .inputs

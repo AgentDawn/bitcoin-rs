@@ -120,6 +120,10 @@ struct AnnounceState {
     /// same height (reorg race, duplicate connect) or a stale side branch
     /// never re-announces.
     highest_fast_announce: u32,
+    /// Set when a post-commit announcement was refused by the node's
+    /// aggregate outbound budget while its peer was live. The worker replans
+    /// the committed tip on a later poll ([`BlockAnnouncer::process_tip_retry`]).
+    announcement_retry: bool,
 }
 
 #[derive(Clone)]
@@ -273,7 +277,6 @@ impl BlockAnnouncer {
                 let info = session.info.as_ref()?;
                 let announcement = self.peers.announcement_state(source)?;
                 (!session.lease.is_cancelled()
-                    && session.lease.role().relays_transactions()
                     && info.compact_block_relay
                     && announcement.compact_version == Some(COMPACT_BLOCK_VERSION))
                 .then_some((source, announcement.useful_block_sequence))
@@ -292,7 +295,14 @@ impl BlockAnnouncer {
                 send_compact: false,
                 version: COMPACT_BLOCK_VERSION,
             });
-            let send_succeeded = self.peers.send(source, message.clone()).is_ok();
+            let send_succeeded = match self.peers.send(source, message.clone()) {
+                Ok(()) => true,
+                // The node's aggregate budget is full while the peer is live:
+                // leave the selection untouched so the next reconcile retries
+                // the demotion instead of forgetting it.
+                Err(refusal) if refusal.is_saturated() => continue,
+                Err(_) => false,
+            };
             state
                 .high_bandwidth_requested_peers
                 .retain(|candidate| *candidate != source);
@@ -336,8 +346,19 @@ impl BlockAnnouncer {
                     send_compact: false,
                     version: COMPACT_BLOCK_VERSION,
                 });
-                if self.peers.send(demoted, demote.clone()).is_ok() {
-                    sent.push((demoted.addr, demote));
+                match self.peers.send(demoted, demote.clone()) {
+                    Ok(()) => sent.push((demoted.addr, demote)),
+                    // Aggregate budget full: the demotion did not happen, so
+                    // the selection is restored as it was and the next
+                    // reconcile retries the whole rotation.
+                    Err(refusal) if refusal.is_saturated() => {
+                        state
+                            .high_bandwidth_requested_peers
+                            .insert(demote_index, demoted);
+                        self.peers.note_high_bandwidth_selected(demoted, true);
+                        break;
+                    }
+                    Err(_) => {}
                 }
 
                 let promote = Message::SendCmpct(SendCmpct {
@@ -413,7 +434,9 @@ impl BlockAnnouncer {
 
     /// High-bandwidth compact-push candidacy for one ready session: the peer
     /// asked for high-bandwidth compact blocks, is not blocksonly-gated,
-    /// knows the tip's parent, and was not already sent this header. The
+    /// knows the tip's parent, and was not already sent this header. BIP152
+    /// needs no transaction-relay permission, so the peer's relay role is
+    /// not consulted: negotiation plus the node blocksonly gate decide. The
     /// compact body builds lazily through `build`, so ineligible peers cost
     /// no store load and the pre-commit path builds its hand-held body once
     /// for all peers. One rule, two callers.
@@ -433,7 +456,6 @@ impl BlockAnnouncer {
         if peer_state.compact_high_bandwidth != Some(true)
             || peer_state.compact_version != Some(COMPACT_BLOCK_VERSION)
             || self.config.blocksonly
-            || !session.lease.role().relays_transactions()
         {
             return None;
         }
@@ -626,13 +648,20 @@ impl BlockAnnouncer {
         }
         let planned = self.planned_announcements(tip);
         let mut sent = Vec::with_capacity(planned.len());
+        let mut refused_by_node_budget = false;
         for announcement in planned {
-            if self
+            match self
                 .peers
                 .send(announcement.source, announcement.message.clone())
-                .is_err()
             {
-                continue;
+                Ok(()) => {}
+                Err(refusal) => {
+                    // A live peer refused only because the node's aggregate
+                    // budget is full still needs its announcement: the tip is
+                    // replanned on a later poll.
+                    refused_by_node_budget |= refusal.is_saturated();
+                    continue;
+                }
             }
             if announcement.confirms_tip {
                 self.peers
@@ -640,7 +669,29 @@ impl BlockAnnouncer {
             }
             sent.push((announcement.source.addr, announcement.message));
         }
+        if refused_by_node_budget {
+            self.state.lock().announcement_retry = true;
+        }
         sent
+    }
+
+    /// Replans the committed tip once after an announcement was refused by the
+    /// node's aggregate outbound budget.
+    ///
+    /// PRE: none.
+    /// POST: with a retry pending, the pending flag clears and the tip is
+    /// processed again as if it had not been seen: peers that already know it
+    /// are skipped by the planner, and an `inv` fallback may repeat. Without
+    /// one, nothing happens.
+    pub fn process_tip_retry(&self) -> Vec<(SocketAddr, Message)> {
+        {
+            let mut state = self.state.lock();
+            if !std::mem::take(&mut state.announcement_retry) {
+                return Vec::new();
+            }
+            state.last_processed_tip = None;
+        }
+        self.process_tip()
     }
 
     /// Synchronously drains the queue, coalesces to the latest tip, and processes it.
@@ -671,6 +722,7 @@ pub fn spawn_block_announce_worker(
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         announcer.reconcile_high_bandwidth_peers();
+                        announcer.process_tip_retry();
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
@@ -880,8 +932,8 @@ mod tests {
         announcer: &BlockAnnouncer,
         addr: SocketAddr,
         send_headers: bool,
-    ) -> (PeerLease, Receiver<Message>) {
-        let (tx, rx) = crossbeam_channel::unbounded();
+    ) -> (PeerLease, crate::test_support::MessageReceiver) {
+        let (tx, rx) = crate::test_support::message_channel();
         let lease = PeerLease::new(tx);
         table.register(addr, lease.clone());
         let info = test_peer_info(addr, send_headers);
@@ -914,6 +966,288 @@ mod tests {
             table.note_compact_relay(source(table, addr));
             table.note_compact_announcement(source(table, addr), &negotiation);
         }
+    }
+
+    /// An announcement the node aggregate refused was not delivered: the peer
+    /// stays connected and its known tip stays behind, the tip is not
+    /// reprocessed by plain repeats, and one retry announces it.
+    #[test]
+    fn announcement_saturated_retried() {
+        let chain = Arc::new(MockAnnounceChain::new(2));
+        let table = Arc::new(PeerTable::new());
+        let announcer = BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        );
+        let aggregate = Arc::new(crate::connection::SharedOutboundBudget::with_limits(512, 0));
+        let addr = test_addr(1020);
+        let (tx, rx) = crate::test_support::message_channel();
+        let lease = PeerLease::new(tx).with_shared_budget(&aggregate);
+        table.register(addr, lease.clone());
+        table.publish_info(addr, &lease, test_peer_info(addr, true));
+        announcer.on_peer_ready();
+        while rx.try_recv().is_ok() {}
+        mark_known(&table, &announcer, addr, chain.hash_at(0));
+        let hold = crate::test_support::hog(&aggregate, 512);
+
+        assert!(announcer.process_tip().is_empty(), "nothing was queued");
+        assert!(!lease.is_cancelled(), "a full aggregate is not a dead peer");
+        assert_eq!(
+            announcer.peer_known_block(addr),
+            Some(chain.hash_at(0)),
+            "a refused announcement is not recorded as delivered"
+        );
+        assert!(
+            announcer.process_tip().is_empty(),
+            "a repeated tip event stays a no-op"
+        );
+        assert!(rx.is_empty());
+
+        drop(hold);
+        let sent = announcer.process_tip_retry();
+        assert_eq!(sent.len(), 1, "the retry announces the tip once");
+        assert!(matches!(sent[0].1, Message::Headers(_)));
+        assert!(matches!(rx.try_recv(), Ok(Message::Headers(_))));
+        assert_eq!(announcer.peer_known_block(addr), Some(chain.hash_at(1)));
+        assert!(
+            announcer.process_tip_retry().is_empty(),
+            "the retry is spent once it ran"
+        );
+    }
+
+    /// A demotion the node aggregate refused did not happen: the peer stays
+    /// selected, nothing is cancelled, and the next reconcile retries it.
+    #[test]
+    fn demotion_saturated_keeps_the_selection_and_retries() {
+        let chain = Arc::new(MockAnnounceChain::new(2));
+        let table = Arc::new(PeerTable::new());
+        let announcer = BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        );
+        let aggregate = Arc::new(crate::connection::SharedOutboundBudget::with_limits(256, 0));
+        let addr = test_addr(1021);
+        let (tx, rx) = crate::test_support::message_channel();
+        let lease = PeerLease::new(tx).with_shared_budget(&aggregate);
+        table.register(addr, lease.clone());
+        table.publish_info(addr, &lease, test_peer_info(addr, true));
+        note_compact_preference(&table, addr, false, 2);
+        assert_eq!(announcer.reconcile_high_bandwidth_peers().len(), 1);
+        assert_eq!(announcer.high_bandwidth_requested_peers(), vec![addr]);
+        assert!(matches!(rx.try_recv(), Ok(Message::SendCmpct(_))));
+
+        // The peer stops offering compact relay while the aggregate is full.
+        let mut info = test_peer_info(addr, true);
+        info.compact_block_relay = false;
+        table.publish_info(addr, &lease, info);
+        let hold = crate::test_support::hog(&aggregate, 256);
+        assert_eq!(announcer.reconcile_high_bandwidth_peers(), Vec::new());
+        assert_eq!(
+            announcer.high_bandwidth_requested_peers(),
+            vec![addr],
+            "the refused demotion did not happen"
+        );
+        assert!(!lease.is_cancelled());
+        assert!(rx.is_empty());
+
+        drop(hold);
+        let sent = announcer.reconcile_high_bandwidth_peers();
+        assert_eq!(sent.len(), 1, "the next reconcile retries the demotion");
+        assert!(matches!(
+            &sent[0].1,
+            Message::SendCmpct(SendCmpct {
+                send_compact: false,
+                ..
+            })
+        ));
+        assert_eq!(announcer.high_bandwidth_requested_peers(), Vec::new());
+    }
+
+    #[test]
+    fn rotation_saturated_restores_full_selection_in_place_and_retries() {
+        let chain = Arc::new(MockAnnounceChain::new(2));
+        let table = Arc::new(PeerTable::new());
+        let announcer = BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        );
+        let aggregate = Arc::new(crate::connection::SharedOutboundBudget::with_limits(256, 0));
+        let a1 = test_addr(1061);
+        let a2 = test_addr(1062);
+        let a3 = test_addr(1063);
+        let a4 = test_addr(1064);
+        let mut leases = Vec::new();
+        let mut rxs = Vec::new();
+        for addr in [a1, a2, a3] {
+            let (tx, rx) = crate::test_support::message_channel();
+            let lease = PeerLease::new(tx).with_shared_budget(&aggregate);
+            table.register(addr, lease.clone());
+            table.publish_info(addr, &lease, test_peer_info(addr, true));
+            note_compact_preference(&table, addr, false, 2);
+            announcer.reconcile_high_bandwidth_peers();
+            leases.push(lease);
+            rxs.push(rx);
+        }
+        assert_eq!(announcer.high_bandwidth_requested_peers(), vec![a1, a2, a3]);
+        for rx in &rxs {
+            while rx.try_recv().is_ok() {}
+        }
+        let (tx4, rx4) = crate::test_support::message_channel();
+        let lease4 = PeerLease::new(tx4).with_shared_budget(&aggregate);
+        table.register(a4, lease4.clone());
+        table.publish_info(a4, &lease4, test_peer_info(a4, true));
+        note_compact_preference(&table, a4, false, 2);
+        assert_eq!(announcer.reconcile_high_bandwidth_peers(), Vec::new());
+        assert_eq!(announcer.high_bandwidth_requested_peers(), vec![a1, a2, a3]);
+        assert!(table.note_useful_block(leases[1].source(a2)));
+        assert!(table.note_useful_block(leases[2].source(a3)));
+        assert!(table.note_useful_block(lease4.source(a4)));
+        let hold = crate::test_support::hog(&aggregate, 256);
+        assert_eq!(announcer.reconcile_high_bandwidth_peers(), Vec::new());
+        assert_eq!(
+            announcer.high_bandwidth_requested_peers(),
+            vec![a1, a2, a3],
+            "the refused rotation restores the full prior selection in order"
+        );
+        assert!(
+            table
+                .announcement_state(source(&table, a1))
+                .is_some_and(|state| state.selected_high_bandwidth),
+            "the displaced entry stays selected through the refusal"
+        );
+        assert!(!leases[0].is_cancelled());
+        assert!(rxs[0].try_recv().is_err(), "no demotion was queued");
+        assert!(rx4.try_recv().is_err(), "no promotion was queued");
+        drop(hold);
+        let sent = announcer.reconcile_high_bandwidth_peers();
+        assert_eq!(
+            sent.len(),
+            2,
+            "the next reconcile retries demotion plus promotion"
+        );
+        assert_eq!(sent[0].0, a1);
+        assert!(matches!(
+            sent[0].1,
+            Message::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            })
+        ));
+        assert_eq!(sent[1].0, a4);
+        assert!(matches!(
+            sent[1].1,
+            Message::SendCmpct(SendCmpct {
+                send_compact: true,
+                version: 2,
+            })
+        ));
+        assert_eq!(
+            rxs[0].try_recv().expect("the retried demotion is queued"),
+            Message::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            })
+        );
+        assert_eq!(
+            rx4.try_recv().expect("the retried promotion is queued"),
+            Message::SendCmpct(SendCmpct {
+                send_compact: true,
+                version: 2,
+            })
+        );
+        assert_eq!(announcer.high_bandwidth_requested_peers(), vec![a2, a3, a4]);
+    }
+
+    struct WorkerStop {
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        queue: Option<BlockAnnounceQueue>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for WorkerStop {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Release);
+            self.queue.take();
+            if let Some(handle) = self.handle.take() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !handle.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worker_timeout_retries_saturated_announcement_without_new_wake() {
+        let chain = Arc::new(MockAnnounceChain::new(2));
+        let table = Arc::new(PeerTable::new());
+        let announcer = Arc::new(BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        ));
+        let aggregate = Arc::new(crate::connection::SharedOutboundBudget::with_limits(512, 0));
+        let addr = test_addr(1071);
+        let (tx, rx) = crate::test_support::message_channel();
+        let lease = PeerLease::new(tx).with_shared_budget(&aggregate);
+        table.register(addr, lease.clone());
+        table.publish_info(addr, &lease, test_peer_info(addr, true));
+        announcer.on_peer_ready();
+        while rx.try_recv().is_ok() {}
+        mark_known(&table, announcer.as_ref(), addr, chain.hash_at(0));
+        let hold = crate::test_support::hog(&aggregate, 512);
+        let (queue, worker_rx) = BlockAnnounceQueue::new();
+        assert!(queue.wake(), "the wake enqueued the tip");
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker =
+            spawn_block_announce_worker(Arc::clone(&announcer), worker_rx, Arc::clone(&shutdown))
+                .expect("the announce worker spawns");
+        let _stop = WorkerStop {
+            shutdown: Arc::clone(&shutdown),
+            queue: Some(queue),
+            handle: Some(worker),
+        };
+        let armed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if announcer.state.lock().announcement_retry {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < armed_deadline,
+                "the worker took the saturated wake"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!lease.is_cancelled(), "a full aggregate is not a dead peer");
+        assert!(rx.try_recv().is_err(), "nothing was queued while saturated");
+        assert_eq!(
+            announcer.peer_known_block(addr),
+            Some(chain.hash_at(0)),
+            "a refused announcement is not recorded as delivered"
+        );
+        drop(hold);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let received = loop {
+            if let Ok(message) = rx.try_recv() {
+                break message;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker timeout retried the refused tip"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(
+            matches!(received, Message::Headers(_)),
+            "the retried tip announces once, got {received:?}"
+        );
+        assert_eq!(announcer.peer_known_block(addr), Some(chain.hash_at(1)));
     }
 
     #[test]
@@ -1318,7 +1652,7 @@ mod tests {
         );
 
         let addr = test_addr(1008);
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crate::test_support::message_channel();
         let lease = PeerLease::new(tx);
         table.register(addr, lease.clone());
         table.publish_info(addr, &lease, test_peer_info(addr, true));
@@ -1340,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn high_bandwidth_selection_requires_full_relay_and_compact_v2() {
+    fn high_bandwidth_selection_ignores_relay_role_but_requires_compact_v2() {
         let chain = Arc::new(MockAnnounceChain::new(2));
         let table = Arc::new(PeerTable::new());
         let announcer = BlockAnnouncer::new(
@@ -1353,8 +1687,10 @@ mod tests {
         let _v1_peer = setup_peer(&table, &announcer, v1_addr, true);
         note_compact_preference(&table, v1_addr, false, 1);
 
+        // A block-relay-only peer with negotiated v2 compact relay is a
+        // promotion candidate: BIP152 needs no transaction-relay permission.
         let block_only_addr = test_addr(1007);
-        let (block_only_tx, _block_only_rx) = crossbeam_channel::unbounded();
+        let (block_only_tx, block_only_rx) = crate::test_support::message_channel();
         let block_only = PeerLease::new_block_relay(block_only_tx);
         table.register(block_only_addr, block_only.clone());
         table.publish_info(
@@ -1364,8 +1700,50 @@ mod tests {
         );
         note_compact_preference(&table, block_only_addr, false, 2);
 
-        assert_eq!(announcer.reconcile_high_bandwidth_peers(), Vec::new());
-        assert_eq!(announcer.high_bandwidth_requested_peers(), Vec::new());
+        let msgs = announcer.reconcile_high_bandwidth_peers();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, block_only_addr);
+        assert_eq!(
+            msgs[0].1,
+            Message::SendCmpct(SendCmpct {
+                send_compact: true,
+                version: 2,
+            })
+        );
+        assert_eq!(block_only_rx.try_recv(), Ok(msgs[0].1.clone()));
+        assert_eq!(
+            announcer.high_bandwidth_requested_peers(),
+            vec![block_only_addr]
+        );
+    }
+
+    #[test]
+    fn block_relay_only_peer_with_high_bandwidth_receives_compact_push() {
+        let chain = Arc::new(MockAnnounceChain::new(3));
+        let table = Arc::new(PeerTable::new());
+        let announcer = BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        );
+
+        let addr = test_addr(1042);
+        let (tx, _rx) = crate::test_support::message_channel();
+        let lease = PeerLease::new_block_relay(tx);
+        table.register(addr, lease.clone());
+        table.publish_info(addr, &lease, test_peer_info(addr, true));
+        note_compact_preference(&table, addr, true, 2);
+        mark_known(&table, &announcer, addr, chain.hash_at(1));
+
+        let sent = announcer.process_tip();
+        let pushed = sent.iter().find(|(a, _)| *a == addr);
+        let Some((_, message)) = pushed else {
+            panic!("a block-relay-only high-bandwidth peer must receive an announcement");
+        };
+        assert!(
+            matches!(message, Message::CmpctBlock(_)),
+            "expected CmpctBlock for the block-relay-only peer, got {message:?}"
+        );
     }
 
     #[test]
@@ -1378,7 +1756,7 @@ mod tests {
             BlockAnnounceConfig::default(),
         );
         let addr = test_addr(1011);
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crate::test_support::message_channel();
         let lease = PeerLease::new(tx);
         table.register(addr, lease.clone());
         let info = test_peer_info(addr, false);
@@ -1414,7 +1792,7 @@ mod tests {
         let (old, _old_rx) = setup_peer(&table, &announcer, addr, true);
         let old_source = old.source(addr);
 
-        let (replacement_tx, _replacement_rx) = crossbeam_channel::unbounded();
+        let (replacement_tx, _replacement_rx) = crate::test_support::message_channel();
         let replacement = PeerLease::new(replacement_tx);
         table.register(addr, replacement.clone());
         assert!(table.publish_info(addr, &replacement, test_peer_info(addr, true),));
@@ -1493,7 +1871,7 @@ mod tests {
         note_compact_preference(&table, a3, false, 2);
         announcer.reconcile_high_bandwidth_peers();
 
-        let (tx4, rx4) = crossbeam_channel::unbounded();
+        let (tx4, rx4) = crate::test_support::message_channel();
         let lease4 = PeerLease::new(tx4);
         table.register(a4, lease4.clone());
         table.publish_info(a4, &lease4, test_peer_info(a4, true));

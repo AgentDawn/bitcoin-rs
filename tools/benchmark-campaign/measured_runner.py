@@ -18,7 +18,8 @@ accumulating whole semantic units to the 1 s raw floor.
 parse_counted_stdout()/counted_case_fields() parse them and
 validate_counted_samples() is the one authoritative validator (the analyzer
 reuses it on retained records). The shared sampler source
-tools/benchmark-support/measured_samples.rs is pinned in the bench
+tools/benchmark-support/measured_samples.rs and the shared snapshot-order
+source tools/benchmark-support/snapshot_order.rs are pinned in the bench
 fingerprint inventory, identical across all five roots.
 
 validate_registration() below is the static full-schema validator: exact
@@ -118,8 +119,12 @@ BENCH_SOURCES: dict[str, str] = {
 # Shared counted-sampler module: pinned in the bench fingerprint inventory so
 # every tree carries the identical sampler source.
 MEASURED_SAMPLES_MODULE: str = "tools/benchmark-support/measured_samples.rs"
+# Shared snapshot-order module: the deduplicated chunk-order fingerprint and
+# topological assertion shared by the insert_fill and candidate benches.
+SNAPSHOT_ORDER_MODULE: str = "tools/benchmark-support/snapshot_order.rs"
 BENCH_FINGERPRINT_FILES: tuple[str, ...] = tuple(BENCH_SOURCES.values()) + (
     MEASURED_SAMPLES_MODULE,
+    SNAPSHOT_ORDER_MODULE,
 )
 COUNTED_SAMPLE_PREFIX: str = "MRP_COUNTED_SAMPLE "
 COUNTED_FLOOR_NS: int = 1_000_000_000
@@ -344,10 +349,15 @@ class CaseRecord(TypedDict):
 
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+_COMMIT_HEX = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def _is_hex64(value: object) -> bool:
     return isinstance(value, str) and _HEX64.fullmatch(value) is not None
+
+
+def _is_commit_hex(value: object) -> bool:
+    return isinstance(value, str) and _COMMIT_HEX.fullmatch(value) is not None
 
 
 def _is_positive_finite(value: object) -> bool:
@@ -928,6 +938,92 @@ def _check_receipt(
             f"{where}: field(s) {wrong} do not match the registered "
             "tree/bench-target/source/lock/binary identity"
         )
+    _check_receipt_provenance(tree, doc, where, reasons)
+
+
+def _check_receipt_provenance(
+    tree: str, doc: dict[str, Any], where: str, reasons: list[str]
+) -> None:
+    """External source-commit provenance; content hashes stay authoritative.
+
+    Frozen trees remain source-only with no .git; provenance lives here, not
+    in the trees. Candidate (exact export) carries source_commit. Derived
+    controls carry base_commit plus a nonempty transform derivation string
+    and must never claim source_commit for transformed contents.
+    """
+    src = doc.get("source_commit")
+    base = doc.get("base_commit")
+    transform = doc.get("transform")
+    if tree == "candidate":
+        if not _is_commit_hex(src):
+            reasons.append(
+                f"{where}: source_commit must be lowercase 40- or 64-hex "
+                f"git commit, got {src!r}"
+            )
+        if base is not None or transform is not None:
+            reasons.append(
+                f"{where}: candidate receipt must not carry "
+                "base_commit/transform (exact export, not derived)"
+            )
+        return
+    if src is not None:
+        reasons.append(
+            f"{where}: control receipt must not claim source_commit {src!r} "
+            "for transformed contents; use base_commit plus transform"
+        )
+    if not _is_commit_hex(base):
+        reasons.append(
+            f"{where}: base_commit must be lowercase 40- or 64-hex git commit, "
+            f"got {base!r}"
+        )
+    if not isinstance(transform, str) or not transform.strip():
+        reasons.append(
+            f"{where}: transform must be a nonempty single-lever derivation "
+            f"string, got {transform!r}"
+        )
+
+
+def _check_provenance_consistency(
+    receipt_docs: dict[str, dict[str, Any]], reasons: list[str]
+) -> None:
+    """Candidate source versus control base agreement across one registration."""
+    candidates = sorted(k for k in receipt_docs if k.startswith("candidate/"))
+    if not candidates:
+        return
+    commits = {str(receipt_docs[k].get("source_commit")) for k in candidates}
+    if len(commits) != 1 or not _is_commit_hex(next(iter(commits))):
+        reasons.append(
+            "registration: candidate receipts disagree on source_commit; "
+            "every candidate binary shares one exact source tree"
+        )
+        return
+    candidate_commit = next(iter(commits))
+    seen_transforms: dict[str, str] = {}
+    for key in sorted(receipt_docs):
+        if key.startswith("candidate/"):
+            continue
+        tree = key.split("/", 1)[0]
+        doc = receipt_docs[key]
+        if doc.get("base_commit") != candidate_commit:
+            reasons.append(
+                f"registration: binaries[{key!r}].receipt base_commit "
+                f"{doc.get('base_commit')!r} != candidate source_commit "
+                f"{candidate_commit!r}; controls derive from the candidate base"
+            )
+        transform = doc.get("transform")
+        if isinstance(transform, str) and transform.strip():
+            if tree in seen_transforms and seen_transforms[tree] != transform:
+                reasons.append(
+                    f"registration: binaries[{key!r}].receipt transform "
+                    "disagrees within one control tree"
+                )
+            seen_transforms.setdefault(tree, transform)
+    transforms = sorted(set(seen_transforms.values()))
+    if len(transforms) != len(seen_transforms):
+        reasons.append(
+            "registration: control transforms must be distinct per control tree; "
+            "identical derivations confound single-lever attribution"
+        )
 
 
 def _check_binaries(
@@ -969,7 +1065,35 @@ def _check_binaries(
             )
         seen[receipt] = key
         _check_receipt(reg, key, entry["sha256"], receipt, reasons)
+    _check_all_receipt_provenance(reg, reasons)
     return shas
+
+
+def _check_all_receipt_provenance(reg: dict[str, Any], reasons: list[str]) -> None:
+    binaries = reg.get("binaries")
+    if not isinstance(binaries, dict):
+        return
+    docs: dict[str, dict[str, Any]] = {}
+    for key, entry in binaries.items():
+        if not isinstance(entry, dict):
+            continue
+        receipt = entry.get("receipt")
+        if not isinstance(receipt, dict):
+            continue
+        raw_path = receipt.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        path = Path(raw_path)
+        if not path.is_file():
+            continue
+        try:
+            doc: object = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict):
+            docs[str(key)] = doc
+    if docs:
+        _check_provenance_consistency(docs, reasons)
 
 
 def _check_gated_executables(shas: dict[str, str], reasons: list[str]) -> None:
@@ -1379,10 +1503,10 @@ def validate_criterion_sample(
 
 
 def find_single_sample_json(criterion_home: Path) -> Path:
-    found = sorted(criterion_home.glob("**/sample.json"))
+    found = sorted(criterion_home.glob("**/new/sample.json"))
     if len(found) != 1:
         raise RegistrationError(
-            f"expected exactly one sample.json under {criterion_home}, "
+            f"expected exactly one new/sample.json under {criterion_home}, "
             f"found {[str(p) for p in found]}"
         )
     return found[0]
@@ -2280,11 +2404,54 @@ def execute_case(
     return record
 
 
+MANIFEST_RESERVED_NAMES: tuple[str, ...] = ("manifest.json", "manifest.sha256")
+
+
+def runs_inventory(runs_dir: Path) -> tuple[list[str], list[str]]:
+    """The one inventory rule of a campaign runs directory.
+
+    Returns `(files, problems)`. `files` are the sorted canonical POSIX
+    relative paths of every regular file, excluding only the reserved
+    manifest and receipt at the runs root (the two files `write_manifest`
+    generates; a regular `case/manifest.json` is an ordinary artifact and is
+    inventoried). A symlink (even to a regular file, even a reserved
+    name) and any entry that is neither a regular file nor a directory is
+    a problem, never skipped and never recorded. `write_manifest` records
+    exactly `files` and `measured_analyze.py` compares a manifest against
+    the same function through the hash-verified runner module, so producer
+    and consumer cannot disagree about what the inventory is.
+    """
+    files: list[str] = []
+    problems: list[str] = []
+    pending = [runs_dir]
+    while pending:
+        directory = pending.pop()
+        for entry in sorted(directory.iterdir()):
+            rel = entry.relative_to(runs_dir).as_posix()
+            if entry.is_symlink():
+                problems.append(
+                    f"runs artifact {rel!r} is a symlink; the inventory covers "
+                    "regular files only"
+                )
+            elif entry.is_dir():
+                pending.append(entry)
+            elif entry.is_file():
+                if rel not in MANIFEST_RESERVED_NAMES:
+                    files.append(rel)
+            else:
+                problems.append(
+                    f"runs artifact {rel!r} is neither a regular file nor a directory"
+                )
+    return sorted(files), sorted(problems)
+
+
 def write_manifest(runs_dir: Path) -> tuple[Path, Path]:
-    entries: dict[str, str] = {}
-    for path in sorted(runs_dir.rglob("*")):
-        if path.is_file() and path.name not in ("manifest.json", "manifest.sha256"):
-            entries[str(path.relative_to(runs_dir))] = compute_sha256(path)
+    files, problems = runs_inventory(runs_dir)
+    if problems:
+        raise RegistrationError(
+            "refusing to anchor an unsound runs directory: " + "; ".join(problems)
+        )
+    entries = {rel: compute_sha256(runs_dir / rel) for rel in files}
     manifest_path = runs_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps({"algorithm": "sha256", "files": entries}, indent=2) + "\n",
@@ -2293,6 +2460,22 @@ def write_manifest(runs_dir: Path) -> tuple[Path, Path]:
     receipt_path = runs_dir / "manifest.sha256"
     receipt_path.write_text(compute_sha256(manifest_path) + "\n", encoding="utf-8")
     return manifest_path, receipt_path
+
+
+def seal_manifest(runs_dir: Path) -> bool:
+    """`write_manifest` that reports failure instead of raising.
+
+    Stop and cancel paths must still return their own exit code (130 for an
+    interruption), so a refused or unwritable inventory is reported on stderr
+    and returned as `False`; the analyzer then finds no manifest and stays
+    INCONCLUSIVE. Nothing is repaired or skipped.
+    """
+    try:
+        write_manifest(runs_dir)
+    except (OSError, RegistrationError) as exc:
+        print(f"INVALID: manifest not written: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def validate_live_registration(
@@ -2388,23 +2571,24 @@ def cmd_run(reg_path: Path) -> int:
         results_path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
         with results_jl.open("a", encoding="utf-8") as jl_f:
             jl_f.write(json.dumps(record) + "\n")
-        if record["error"] is not None:
-            print(f"STOP {record['label']}: {record['error']}", file=sys.stderr)
-            write_manifest(runs_dir)
-            return 1
         if record["cancelled"]:
             print(f"CANCELLED at {record['label']}", file=sys.stderr)
-            write_manifest(runs_dir)
+            seal_manifest(runs_dir)
             return 130
+        if record["error"] is not None:
+            print(f"STOP {record['label']}: {record['error']}", file=sys.stderr)
+            seal_manifest(runs_dir)
+            return 1
         print(
             f"[{record['case_index'] + 1}/{len(cases)}] {record['label']}: "
             f"case_median_ns={record['case_median_ns']}",
             flush=True,
         )
-    manifest_path, receipt_path = write_manifest(runs_dir)
+    if not seal_manifest(runs_dir):
+        return 1
     print(
-        f"Completed {len(records)} cases. Manifest {manifest_path}, "
-        f"receipt {receipt_path}. No gate verdict here."
+        f"Completed {len(records)} cases. Manifest {runs_dir / 'manifest.json'}, "
+        f"receipt {runs_dir / 'manifest.sha256'}. No gate verdict here."
     )
     return 0
 

@@ -8,7 +8,7 @@ use bitcoin_rs_chain::regtest_fixture::{
 };
 use bitcoin_rs_consensus::{ScriptExecutionCache, UtxoView, ValidationEngine};
 use bitcoin_rs_primitives::{
-    Amount, Hash256, LockTime, Network, OutPoint, Sequence, Tx, TxIn, TxOut, Witness,
+    Amount, BlockHash, Hash256, LockTime, Network, OutPoint, Sequence, Tx, TxIn, TxOut, Witness,
     consensus_bytes,
 };
 use bitcoin_rs_utxo::UtxoSet;
@@ -28,17 +28,17 @@ impl UtxoView for PrevoutMap<'_> {
             .map(|(_, txout)| txout.clone())
     }
 }
-
-/// Window commit consumes a verified script-cache entry exactly once.
-#[test]
-fn window_commit_consumes_verified_script_cache_entry() -> Result<(), Box<dyn std::error::Error>> {
+/// Applies regtest children `1..=101` atop genesis, returning the first two
+/// coinbases both cache tests mature their spends from, plus the tip hash.
+/// Only the funding transactions are retained; every applied block is
+/// dropped after its own commit.
+fn matured_funding(
+    handles: &Chainstate,
+) -> Result<(Tx, Tx, BlockHash), Box<dyn std::error::Error>> {
     let network = Network::Regtest;
-    let mut handles: Chainstate = handles(network, Arc::new(UtxoSet::new()));
-    seed_genesis(&handles).map_err(|error| error.to_string())?;
-
-    // Mature one fixture coinbase for the spend below.
     let mut parent = network.genesis_block().block_hash();
     let mut funded: Option<Tx> = None;
+    let mut funded_next: Option<Tx> = None;
     for height in 1..=101 {
         let block = mined_child(parent, height).map_err(|error| error.to_string())?;
         handles
@@ -47,9 +47,47 @@ fn window_commit_consumes_verified_script_cache_entry() -> Result<(), Box<dyn st
         if height == 1 {
             funded = Some(block.txs[0].clone());
         }
+        if height == 2 {
+            funded_next = Some(block.txs[0].clone());
+        }
         parent = block.block_hash();
     }
-    let funded = funded.ok_or("height-1 coinbase missing")?;
+    Ok((
+        funded.ok_or("height-1 coinbase missing")?,
+        funded_next.ok_or("height-2 coinbase missing")?,
+        parent,
+    ))
+}
+
+/// A spend of `funded`'s first output to an `OP_TRUE` output, differing only
+/// in its unlocking script: both cache tests build their spends from it.
+fn spend_tx(funded: &Tx, script_sig: Vec<u8>) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(funded.txid(), 0),
+            script_sig: script_sig.into(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        outputs: vec![TxOut {
+            value: Amount::from_sat(funded.outputs[0].value.to_sat() - 1_000),
+            script_pubkey: vec![0x51].into(),
+        }],
+    }
+}
+
+/// Window commit consumes a verified script-cache entry exactly once.
+#[test]
+fn window_commit_consumes_verified_script_cache_entry() -> Result<(), Box<dyn std::error::Error>> {
+    let network = Network::Regtest;
+    let mut handles: Chainstate = handles(network, Arc::new(UtxoSet::new()));
+    seed_genesis(&handles).map_err(|error| error.to_string())?;
+
+    // Mature fixture coinbases for the spend below; this test spends only
+    // the first.
+    let (funded, _, parent) = matured_funding(&handles)?;
 
     // Install the node-owned cache after the prefix applies, so the only
     // take in this test is the window pre-proof's.
@@ -59,21 +97,7 @@ fn window_commit_consumes_verified_script_cache_entry() -> Result<(), Box<dyn st
     // `OP_TRUE` against the fixture coinbase's empty script leaves a truthy
     // top element: a genuinely valid spend under every flag set.
     let prevout = OutPoint::new(funded.txid(), 0);
-    let input_value = funded.outputs[0].value.to_sat();
-    let good = Tx {
-        version: 2,
-        lock_time: LockTime::ZERO,
-        inputs: vec![TxIn {
-            previous_output: prevout,
-            script_sig: vec![0x51].into(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        outputs: vec![TxOut {
-            value: Amount::from_sat(input_value - 1_000),
-            script_pubkey: vec![0x51].into(),
-        }],
-    };
+    let good = spend_tx(&funded, vec![0x51]);
     let wtxid = good.wtxid();
     let block = mined_block_with_prev_hash(parent, 102, vec![coinbase(102), good])
         .map_err(|error| error.to_string())?;
@@ -127,6 +151,111 @@ fn window_commit_consumes_verified_script_cache_entry() -> Result<(), Box<dyn st
     assert!(
         !cache.take(wtxid, flags),
         "the window take must have consumed the entry exactly once"
+    );
+    Ok(())
+}
+
+/// A window that fails its proof after taking entries restores them, so the
+/// retry reuses the positives instead of re-verifying scripts.
+#[test]
+fn a_failed_window_restores_the_script_cache_entries_it_took()
+-> Result<(), Box<dyn std::error::Error>> {
+    let network = Network::Regtest;
+    let mut handles: Chainstate = handles(network, Arc::new(UtxoSet::new()));
+    seed_genesis(&handles).map_err(|error| error.to_string())?;
+
+    // Mature two fixture coinbases: the first funds the valid spend, the
+    // second funds the invalid one.
+    let (funded, funded_next, parent) = matured_funding(&handles)?;
+
+    let cache = Arc::new(ScriptExecutionCache::new());
+    handles.script_cache = Some(Arc::clone(&cache));
+
+    // `OP_TRUE` is a genuinely valid spend; `OP_0` leaves a falsy top
+    // element, so its scripts fail while every non-script check still passes.
+    let good = spend_tx(&funded, vec![0x51]);
+    let bad = spend_tx(&funded_next, vec![0x00]);
+    let good_wtxid = good.wtxid();
+
+    let first = mined_block_with_prev_hash(parent, 102, vec![coinbase(102), good])
+        .map_err(|error| error.to_string())?;
+    let second = mined_block_with_prev_hash(first.block_hash(), 103, vec![coinbase(103), bad])
+        .map_err(|error| error.to_string())?;
+    for block in [&first, &second] {
+        handles
+            .block_tree
+            .write()
+            .insert_header(block.header, NodeStatus::HeaderValid)
+            .map_err(|error| error.to_string())?;
+    }
+
+    let applied = handles
+        .applied_tip
+        .load_full()
+        .ok_or("window test needs an applied tip")?;
+    let softfork = {
+        let tree = handles.block_tree.read();
+        bitcoin_rs_chain::softfork_state(&tree, network, Some(applied.tip_id), 102)
+    };
+    let flags = bitcoin_rs_consensus::verify_block::verify_flags(
+        network,
+        102,
+        Hash256::from(first.block_hash()),
+        softfork,
+    );
+    let prevouts = [(OutPoint::new(funded.txid(), 0), funded.outputs[0].clone())];
+    bitcoin_rs_consensus::verify_tx::verify_transaction(
+        &first.txs[1],
+        &PrevoutMap(&prevouts),
+        102,
+        0,
+        flags,
+        ValidationEngine::Native,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    cache.insert(good_wtxid, flags);
+
+    let serialised = [
+        bytes::Bytes::from(consensus_bytes(&first)),
+        bytes::Bytes::from(consensus_bytes(&second)),
+    ];
+    // Rollback witness: bad script at 103 fails the pre-proof after the checks took the entry.
+    let proven = super::prove_window(&handles, &[&first, &second], &serialised);
+    assert!(
+        proven.is_empty(),
+        "bad script at 103 must fail the pre-proof"
+    );
+    assert!(
+        cache.take(good_wtxid, flags),
+        "failed pre-proof must restore taken entries"
+    );
+
+    // Prefix commit: the valid prefix commits and reports how far it got.
+    cache.insert(good_wtxid, flags);
+    let err = handles
+        .apply_window(&[&first, &second], &serialised)
+        .err()
+        .ok_or("the invalid second block must fail the window apply")?;
+    assert_eq!(err.applied, 1, "one block committed before the failure");
+    assert_eq!(err.committed.len(), 1);
+    assert_eq!(err.committed[0].tip.height, 102);
+    assert_eq!(err.committed[0].hash, Hash256::from(first.block_hash()));
+    assert!(
+        matches!(
+            err.source,
+            crate::ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script { .. })
+        ),
+        "failure must be the second block's script verdict"
+    );
+    let tip = handles
+        .applied_tip
+        .load_full()
+        .ok_or("window test needs an applied tip")?;
+    assert_eq!(tip.height, 102, "the valid prefix stays committed");
+    assert!(
+        !cache.take(good_wtxid, flags),
+        "fallback commit consumed the restored entry"
     );
     Ok(())
 }

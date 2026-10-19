@@ -20,6 +20,7 @@ pub(super) fn empty_candidate() -> bitcoin_rs_mining::Candidate {
             min_time: 1,
             current_time: 1,
             locktime_cutoff: 1,
+            staged_parent_mtp: 1,
             network: Network::Regtest,
             csv_active: true,
             segwit_active: true,
@@ -27,7 +28,7 @@ pub(super) fn empty_candidate() -> bitcoin_rs_mining::Candidate {
             max_size: 4_000_000,
             max_sigops: 80_000,
         },
-        &bitcoin_rs_mempool::Mempool::new(Default::default()).mining_snapshot(),
+        &bitcoin_rs_mempool::Mempool::new(Default::default()),
         &[0x51],
     )
     .unwrap()

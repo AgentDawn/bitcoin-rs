@@ -1562,8 +1562,13 @@ impl ChainControl for NodeInvalidator {
 
     // This fixture routes only invalidation through the node; with no block
     // verifier wired, the chain cannot be declared verified.
-    fn verify_chain(&self, _check_level: u8, _nblocks: u32) -> bool {
-        false
+    fn verify_chain(
+        &self,
+        _check_level: u8,
+        _nblocks: u32,
+        _cancellation: &bitcoin_rs_chain::LatchReader,
+    ) -> Result<bool, ChainControlError> {
+        Ok(false)
     }
 }
 

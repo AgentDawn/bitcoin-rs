@@ -37,6 +37,7 @@ fn coinbase_headroom_uses_bytes_for_size_and_weight_units_for_weight() {
             txid: tx.txid(),
             wtxid: tx.wtxid(),
             weight: tx.weight(),
+            data_hex: bitcoin_rs_primitives::encode::hex_encode(&consensus_bytes(&tx)),
             tx: Arc::new(tx),
             fee: 0,
             sigop_cost: 4,

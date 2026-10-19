@@ -854,3 +854,61 @@ fn native_package_member_expires_with_its_stale_parent_and_is_refused_as_full() 
     assert!(removed.contains(&expired(child.txid())));
     Ok(())
 }
+
+// A stale child carried in the package was never admitted here: only its
+// two independent parents are. The expiry pass removes stale roots with
+// their descendants but never ancestors, so the parents survive and the
+// package still succeeds. Only a removed admitted member refuses as full.
+#[test]
+fn native_package_commit_survives_its_stale_resident_expiring() -> TestResult {
+    let seen = Arc::new(Seen::default());
+    let gateway = gateway_observed(Some(seen.clone()));
+    let parent_a = spend(&[coin(824)], &[100_000], false);
+    let parent_b = spend(&[coin(825)], &[100_000], false);
+    let resident = spend(
+        &[
+            OutPoint::new(parent_a.txid(), 0),
+            OutPoint::new(parent_b.txid(), 0),
+        ],
+        &[198_000],
+        true,
+    );
+    let parent_a_txid = parent_a.txid();
+    let parent_b_txid = parent_b.txid();
+    let resident_txid = resident.txid();
+    gateway.insert_entry(AdmissionOrigin::Rpc, stale_entry(&resident)?)?;
+    let chain = Coins(vec![
+        (
+            coin(824),
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            },
+        ),
+        (
+            coin(825),
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            },
+        ),
+    ]);
+
+    let result = gateway.submit_local_package(
+        vec![resident, parent_a, parent_b],
+        crate::LocalOrigin::Rpc,
+        None,
+        unix_time_secs(),
+        &chain,
+    )?;
+
+    assert_eq!(result.len(), 2, "only the two new parents are admitted");
+    let pool = gateway.read();
+    assert!(!pool.contains_txid(&resident_txid));
+    assert!(pool.contains_txid(&parent_a_txid));
+    assert!(pool.contains_txid(&parent_b_txid));
+    let envelopes = seen.0.lock();
+    assert_eq!(envelopes.len(), 3, "stale insert, package commit, expiry");
+    assert_eq!(envelopes[2].result.changes, vec![expired(resident_txid)]);
+    Ok(())
+}

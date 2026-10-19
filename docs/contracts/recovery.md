@@ -213,12 +213,49 @@ coin view publication (step 5), and follower dispatch (step 8). Speculative
 projections never advance `tip` or `DurableHead`. They publish no applied tip,
 advance no durable serials, and expose no candidate before durable commit.
 
+Proof: `crates/node/tests/mining/coordination.rs` test
+`staged_preparation_does_not_publish_before_commit` pins the `PublishMode::Now`
+positive case (the worker finishes the direct tip child while the body sync is
+held) and the no-publish side (the applied tip and ordinary templates still
+reference the old parent); no dedicated test pins the reorg-connect-never-fires
+case;
+`crates/chainstate/tests/unit/apply/window_tx_count_tests.rs` test
+`a_grouped_window_stages_only_its_newest_block_before_the_sync` and
+`crates/chainstate/tests/unit/apply/window_invalidation_tests.rs` test
+`a_failing_window_stages_only_its_last_successful_block` pin the grouped
+newest-block handoff before the sync;
+`crates/chainstate/tests/unit/durable_replay_tests.rs` test
+`replay_of_a_committed_gap_never_fires_the_staged_tip_hook` pins the Replay
+arm. The IBD enqueue gate lives in `crates/node/src/state/open.rs` (the
+`set_tip_staged` closure over the chainstate IBD latch); no dedicated test
+pins that gate.
+
 Cache installation requires an authoritative committed receipt for the exact
 tip, matching txids and removal reasons, and the live full generation key. Any
 mismatch, prioritisation, or failure discards the preparation and falls back to
 lazy assembly. In follower dispatch (step 8), a gatewayless connect publishes a
 truthful empty receipt at the same point. Receipt publication notifies
 foreground waiters, including when the connect has no mempool gateway.
+
+Proof: `crates/mining/src/coordinator/tests.rs` tests
+`empty_preparation_installs_against_matching_receipt`,
+`nonempty_preparation_installs_against_matching_receipt`, and
+`empty_preparation_cannot_install_against_nonempty_receipt` pin exact-receipt
+installation and mismatch fallback;
+`stale_ready_without_a_receipt_serves_lazily_instead_of_parking` pins the
+prioritisation-moved fallback; `crates/node/tests/mining/coordination.rs`
+tests `prepared_candidate_installs_on_commit_with_arc_reuse` and
+`fee_priority_race_discards_stale_preparation` pin commit-time install and
+stale-race discard.
+
+Proof: `crates/node/src/chain_effects.rs` test
+`gatewayless_connect_publishes_an_empty_receipt_for_the_tip` pins the truthful
+empty receipt at the follower-dispatch point;
+`crates/mining/src/coordinator/tests.rs` test
+`ready_preparation_parks_until_the_receipt_and_serves_the_prepared_arc` pins
+receipt publication releasing the parked foreground waiter with the prepared
+candidate; `publish_block_generation_retains_receipt_and_publishes` pins the
+retained receipt carrying stable identities with exact removal reasons.
 
 A failure before stable publication leaves the fence closed until explicit
 recovery. A guard destructor must never quietly reopen the fence after an
@@ -612,9 +649,10 @@ durable.
   - `restart_adopts_persisted_estimator_history`,
     `corrupt_history_file_degrades_to_insufficient_data` (`RCV-11`);
 - `crates/node/tests/mining/coordination.rs`:
-  - `staged_preparation_does_not_publish_before_commit` proves that while the
-    body sync is held, applied tip and templates reference the old parent, and
-    pool spends remain uncommitted (`RCV-02`);
+  - `staged_preparation_does_not_publish_before_commit` proves that the worker
+    finishes the direct tip child while the body sync is held and that, while
+    held, applied tip and templates reference the old parent, and pool spends
+    remain uncommitted (`RCV-02`);
   - `prepared_candidate_installs_on_commit_with_arc_reuse` proves that after
     the durable commit lands, the first template on the new tip installs the
     prepared candidate `Arc` with exact removal survivors (`RCV-02`);
@@ -624,6 +662,35 @@ durable.
   - `shutdown_with_staged_work_installs_nothing_and_answers_unavailable`
     proves shutdown with staged work never installs or publishes speculative
     templates and returns unavailable (`RCV-02`).
+- `crates/mining/src/coordinator/tests.rs`: the cache-installation and
+  foreground-waiter guarantees of the speculative preparation (`RCV-02`):
+  - `publish_block_generation_retains_receipt_and_publishes` proves the
+    committed receipt keeps its tip hash and each removed txid with its exact
+    reason, and the live generation key still publishes;
+  - `empty_preparation_installs_against_matching_receipt` and
+    `nonempty_preparation_installs_against_matching_receipt` prove a
+    preparation installs its candidate only against the receipt whose
+    identities, reasons, and live generation key match its prediction;
+  - `empty_preparation_cannot_install_against_nonempty_receipt` and
+    `fee_moved_preparation_discards_and_serves_live` prove a removal mismatch
+    or a moved fee sequence discards the preparation and serves lazy assembly
+    for the live key;
+  - `matching_foreground_joins_running_preparation_without_duplicate_finish`,
+    `pending_stage_foreground_joins_without_duplicate_finish`, and
+    `ready_preparation_parks_until_the_receipt_and_serves_the_prepared_arc`
+    prove a matching foreground joins a running, pending, or ready
+    preparation without a duplicate lazy finish, parks until the committed
+    receipt arrives, and is served the prepared candidate itself;
+  - `stale_ready_without_a_receipt_serves_lazily_instead_of_parking` proves a
+    foreground whose generation can no longer match is never parked;
+  - `shutdown_releases_a_preparation_waiter` proves shutdown releases a joined
+    waiter with the unavailable error, and
+    `worker_panic_releases_joined_waiter_to_lazy_fallback` proves a worker
+    panic releases a parked waiter into lazy assembly.
+- `crates/node/src/chain_effects.rs`:
+  `gatewayless_connect_publishes_an_empty_receipt_for_the_tip` proves a
+  connect through a follower set with no mempool gateway publishes a receipt
+  for the connected tip that names no removals (`RCV-02`).
 
 ## Vocabulary
 

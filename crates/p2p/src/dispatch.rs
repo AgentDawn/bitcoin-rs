@@ -43,6 +43,48 @@ pub struct InventoryServing {
     pub halted: bool,
 }
 
+/// The single durable record of one compact-filter request across serving
+/// attempts.
+///
+/// The first attempt carries the peer's request unchanged with no expected
+/// end. When a serving pass stops after emitting a prefix of a range
+/// (`getcfilters` only), the remainder is the same request narrowed to start
+/// after the emitted prefix, with `expected_end` pinning the stop height the
+/// emitted prefix was computed against. A later pass recomputes the range and
+/// fails if the chain moved under the cursor, instead of splicing two
+/// different ranges into one reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterRequest {
+    /// The request still to serve: the peer's original message, or its
+    /// narrowed remainder.
+    pub request: Message,
+    /// Height of the last filter the full range ends at, fixed by the first
+    /// pass that emitted a prefix. `None` before anything was emitted.
+    pub expected_end: Option<u32>,
+}
+
+impl FilterRequest {
+    /// Wraps a peer's compact-filter request for its first serving attempt.
+    #[must_use]
+    pub const fn new(request: Message) -> Self {
+        Self {
+            request,
+            expected_end: None,
+        }
+    }
+}
+
+/// Outcome of one compact-filter serving attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilterServing {
+    /// The whole request was answered (or there was nothing to answer).
+    Done,
+    /// Nothing more could be sent now: publication or send headroom is
+    /// pending. The record is the exact remainder; passing it back resumes
+    /// without replaying anything already sent.
+    Pending(FilterRequest),
+}
+
 /// Read-only active-chain view used by server-side P2P responders.
 pub trait ChainQuery: Send + Sync {
     /// Whether the optional filter index currently covers the applied chain.
@@ -50,16 +92,27 @@ pub trait ChainQuery: Send + Sync {
         false
     }
 
-    /// Serves a bounded BIP157 request from persisted filters only. Returns
-    /// false only when publication or send headroom is pending and no response
-    /// has been sent. The caller retains the request until its existing deadline.
+    /// Serves a bounded BIP157 request from persisted filters only.
+    ///
+    /// PRE: `request` is a [`FilterRequest`] built by
+    /// [`FilterRequest::new`] or returned by an earlier
+    /// [`FilterServing::Pending`] of this same request. `headroom` reserves
+    /// (or reuses) the caller's production credit immediately before each
+    /// filter is loaded and returns false when none is available.
+    /// POST: `Done` when every filter in the range was sent. `Pending` with
+    /// the exact remainder when publication or `headroom` stopped serving; a
+    /// pending record never repeats a message already sent, and `Pending`
+    /// carries the input unchanged when nothing was sent. `Err` for a range
+    /// that is interrupted for good (the index stopped early, or the chain
+    /// moved under a resumed cursor) and for send failures.
+    /// INVARIANT: a saturated outbound gate is `Pending`, never an error.
     fn serve_compact_filters(
         &self,
-        _request: &Message,
+        _request: &FilterRequest,
         _headroom: &dyn Fn() -> bool,
         _send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
-    ) -> Result<bool, PeerError> {
-        Ok(true)
+    ) -> Result<FilterServing, PeerError> {
+        Ok(FilterServing::Done)
     }
     /// Returns a bounded contiguous active-chain header response.
     fn headers_after(
@@ -72,7 +125,9 @@ pub trait ChainQuery: Send + Sync {
     /// Serves block inventory one response at a time, in `items` order. For
     /// each block-typed item `headroom` is consulted EXACTLY ONCE,
     /// immediately BEFORE its body load; `false` halts production and sets
-    /// `halted` (I7, I9). Full-block items are served as
+    /// `halted` (I7, I9). `headroom` reserves or reuses the caller's
+    /// worst-case outbound reservation, which the following `serve` spends.
+    /// Full-block items are served as
     /// [`Message::BlockPayload`]; `MSG_CMPCT_BLOCK` items as
     /// [`Message::CmpctBlock`] built at the given BIP152 version — `None`
     /// (peer never negotiated) leaves compact items in `not_found`. Each
@@ -232,7 +287,11 @@ pub fn dispatch_inbound<S>(
 /// Every response is emitted through `send` in the identical order the
 /// former batch form produced (I8); `send` errors abort emission and
 /// propagate. `headroom` gates block-body materialization (I7) and is
-/// evaluated before each load.
+/// evaluated before each load. It reserves the outbound bytes of one
+/// worst-case frame (or reuses a reservation already held) and returns
+/// `false` when the connection or the node cannot take them; the next `send`
+/// spends that reservation, so a body is loaded only while its queue space is
+/// already owned.
 ///
 /// When `tx_inventory` is `Some`, the `inv` arm suppresses `getdata` for
 /// transactions the node already holds (mempool, orphan map, or
@@ -326,11 +385,15 @@ pub fn dispatch_inbound_full<S>(
                 )));
             }
             if let Some(chain) = chain
-                && !chain.serve_compact_filters(message, headroom, send)?
+                && let FilterServing::Pending(remainder) = chain.serve_compact_filters(
+                    &FilterRequest::new(message.clone()),
+                    headroom,
+                    send,
+                )?
             {
-                peer.pending_filter_request = Some((
-                    message.clone(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                peer.pending_filter_request = Some(crate::peer::ParkedFilter::new(
+                    remainder,
+                    std::time::Instant::now(),
                 ));
             }
         }
@@ -438,14 +501,14 @@ fn serve_inbound_getdata<S>(
 /// A `send` or chain error aborts and propagates.
 /// INVARIANT: `headroom` is consulted before every body load, every tx
 /// lookup, and the trailing `notfound` send, so a saturated gate materializes
-/// nothing and queues no message, and a halt neither sends nor disconnects:
-/// this function cannot tell a queue that is out of room for a worst-case
-/// block from one that cannot admit any message, and a send into the latter
-/// would cancel the lease (`PeerLease::send`). The caller, which owns the
-/// budget, reports the kept misses once the queue can admit a message, and
-/// resumes the tail once it has production headroom. At most one decoded
-/// request (`MAX_INV_PER_MSG` items) is ever pending, so the tail and
-/// `not_found` are bounded.
+/// nothing and queues no message, and a halt neither sends nor disconnects.
+/// The reservation `headroom` takes is held across lookups that send nothing
+/// (a miss) and is spent by the next `send`, so a run of misses never takes
+/// a second reservation. The caller, which owns the budget, reports the kept
+/// misses once an exactly sized reply fits, and resumes the tail once it can
+/// reserve production room again. At most one decoded request
+/// (`MAX_INV_PER_MSG` items) is ever pending, so the tail and `not_found`
+/// are bounded.
 pub(crate) fn serve_getdata(
     chain: Option<&dyn ChainQuery>,
     tx_inventory: Option<&dyn TxInventory>,
@@ -638,8 +701,8 @@ mod tests {
     };
 
     use super::{
-        ChainQuery, InventoryServing, MAX_HEADERS_RESPONSE, MAX_LOCATOR_HASHES, TxInventory,
-        dispatch_inbound, dispatch_inbound_full, serve_getdata,
+        ChainQuery, FilterRequest, FilterServing, InventoryServing, MAX_HEADERS_RESPONSE,
+        MAX_LOCATOR_HASHES, TxInventory, dispatch_inbound, dispatch_inbound_full, serve_getdata,
     };
     use crate::connection::{OutboundBudget, PeerLease};
     use crate::inv::MAX_INV_PER_MSG;
@@ -682,11 +745,11 @@ mod tests {
     impl ChainQuery for FakeChain {
         fn serve_compact_filters(
             &self,
-            _: &Message,
+            request: &FilterRequest,
             _: &dyn Fn() -> bool,
             _: &mut dyn FnMut(Message) -> Result<(), PeerError>,
-        ) -> Result<bool, PeerError> {
-            Ok(false)
+        ) -> Result<FilterServing, PeerError> {
+            Ok(FilterServing::Pending(request.clone()))
         }
         fn headers_after(
             &self,
@@ -1304,7 +1367,7 @@ mod tests {
             Some(&chain),
             None,
             &|| true,
-            &|| budget.has_block_production_headroom(),
+            &|| budget.may_reserve_production(),
             &mut |message| {
                 lease
                     .send(message)
@@ -2215,6 +2278,101 @@ mod tests {
             vec![Message::Pong(42)]
         );
         assert!(matches!(dispatch(&mut peer), Err(PeerError::Io(_))));
+        Ok(())
+    }
+
+    /// Serves the first filter of a request and hands back the rest, as a
+    /// serving pass stopped by the outbound budget does.
+    struct NarrowingChain;
+
+    impl ChainQuery for NarrowingChain {
+        fn serve_compact_filters(
+            &self,
+            request: &FilterRequest,
+            _: &dyn Fn() -> bool,
+            send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+        ) -> Result<FilterServing, PeerError> {
+            let Message::GetCFilters(first) = &request.request else {
+                return Ok(FilterServing::Done);
+            };
+            send(Message::Pong(u64::from(first.start_height)))?;
+            Ok(FilterServing::Pending(FilterRequest {
+                request: Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                    filter_type: first.filter_type,
+                    start_height: first.start_height + 1,
+                    stop_hash: first.stop_hash,
+                }),
+                expected_end: Some(9),
+            }))
+        }
+
+        fn headers_after(&self, _: &[BlockHash], _: BlockHash, _: usize) -> Vec<Header> {
+            Vec::new()
+        }
+
+        fn serve_inventory_blocks(
+            &self,
+            _: &[Inventory],
+            _: Option<u64>,
+            _: &dyn Fn() -> bool,
+            _: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+        ) -> Result<InventoryServing, PeerError> {
+            Ok(InventoryServing::default())
+        }
+
+        fn block_transactions(
+            &self,
+            _: &BlockTransactionsRequest,
+            _: Option<u64>,
+            _: &dyn Fn() -> bool,
+        ) -> Result<Option<Message>, PeerError> {
+            Ok(None)
+        }
+    }
+
+    /// The remainder a serving pass returns is the parked request's only
+    /// cursor: the sent prefix is not replayed and the fixed end is kept.
+    #[test]
+    fn filter_remainder_is_the_parked_requests_only_cursor() -> Result<(), PeerError> {
+        let mut peer = ready_peer();
+        let request = Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+            filter_type: 0,
+            start_height: 3,
+            stop_hash: bitcoin::BlockHash::all_zeros(),
+        });
+        let mut sent = Vec::new();
+
+        dispatch_inbound_full(
+            &mut peer,
+            &request,
+            Some(&NarrowingChain),
+            None,
+            &|| true,
+            &|| true,
+            &mut |message| {
+                sent.push(message);
+                Ok(())
+            },
+            &mut |_| {},
+            &mut |_| {},
+        )?;
+
+        assert_eq!(sent, vec![Message::Pong(3)]);
+        let parked = peer
+            .pending_filter_request
+            .as_ref()
+            .ok_or(PeerError::Protocol("the remainder was not parked"))?;
+        assert_eq!(
+            parked.pending,
+            FilterRequest {
+                request: Message::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                    filter_type: 0,
+                    start_height: 4,
+                    stop_hash: bitcoin::BlockHash::all_zeros(),
+                }),
+                expected_end: Some(9),
+            }
+        );
         Ok(())
     }
 

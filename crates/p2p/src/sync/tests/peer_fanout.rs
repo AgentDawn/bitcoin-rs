@@ -66,10 +66,10 @@ fn tick_fans_out_getdata_across_eligible_peers() -> TestResult {
 fn stale_invalid_headers_cannot_evict_or_clear_replacement() -> TestResult {
     let table = Arc::new(PeerTable::new());
     let addr = test_addr(9507, 0)?;
-    let (old_tx, _old_rx) = unbounded::<Message>();
+    let (old_tx, _old_rx) = crate::test_support::message_channel();
     let old = PeerLease::new(old_tx);
     table.register(addr, old.clone());
-    let (new_tx, _new_rx) = unbounded::<Message>();
+    let (new_tx, _new_rx) = crate::test_support::message_channel();
     let new = PeerLease::new(new_tx);
     table.register(addr, new.clone());
     assert!(!table.disconnect_source(old.source(addr)));

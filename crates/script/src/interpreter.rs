@@ -454,10 +454,11 @@ impl<'tx> PreparedTransaction<'tx> {
 
     /// Verifies an input using this transaction's bytes and resolved prevout.
     ///
-    /// `cache` is the admission-local positive signature-result cache for this
-    /// call only. Existing block and uncached callers pass `None`; admission
-    /// passes `Some` to share successful group results across its passes. The
-    /// cache is never stored; every encoding and script check still runs.
+    /// `cache` is the admission-local positive signature-result cache.
+    /// Existing block and uncached callers pass `None`; admission passes
+    /// `Some` to share successful group results across its passes. This
+    /// method keeps no reference to the cache; every encoding and script
+    /// check still runs.
     ///
     /// # Errors
     /// Returns input-index or script errors. Prevout wiring was checked at construction.

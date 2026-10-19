@@ -109,6 +109,49 @@ impl ScriptExecutionCache {
     }
 }
 
+/// Transaction-bound ownership of the script-cache entries one pre-proof
+/// window took.
+///
+/// A window pre-proof takes entries as it skips already-verified scripts,
+/// but a window that later fails its proof or is refused at admission never
+/// commits those blocks. Dropping without [`Self::rollback`] keeps the takes
+/// consumed, exactly like a direct [`ScriptExecutionCache::take`]; rolling
+/// back restores every taken entry, so the failed or refused window's
+/// positives stay reusable and a retry never re-verifies them. Only exact
+/// takes are ever restored: an entry that was never present is never
+/// inserted.
+pub struct WindowCacheTakes<'a> {
+    cache: &'a ScriptExecutionCache,
+    taken: Vec<(Wtxid, VerifyFlags)>,
+}
+
+impl<'a> WindowCacheTakes<'a> {
+    /// Opens one window's take log over `cache`.
+    pub fn new(cache: &'a ScriptExecutionCache) -> Self {
+        Self {
+            cache,
+            taken: Vec::new(),
+        }
+    }
+
+    /// Removes `(wtxid, flags)` through the shared cache, logging the exact
+    /// hits a later [`Self::rollback`] restores.
+    pub fn take(&mut self, wtxid: Wtxid, flags: VerifyFlags) -> bool {
+        let hit = self.cache.take(wtxid, flags);
+        if hit {
+            self.taken.push((wtxid, flags));
+        }
+        hit
+    }
+
+    /// Restores every entry this window took, in take order.
+    pub fn rollback(self) {
+        for (wtxid, flags) in self.taken {
+            self.cache.insert(wtxid, flags);
+        }
+    }
+}
+
 /// Pops FIFO nodes until the oldest live entry is removed. Stale nodes left
 /// behind by [`ScriptExecutionCache::take`] are skipped, so a taken key is
 /// never counted toward eviction. Always terminates: every live key owns one

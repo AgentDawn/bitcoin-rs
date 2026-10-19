@@ -195,6 +195,26 @@ impl BlockBodyStore for BarrierBodies {
         self.inner.load_block_body_bounded(height, hash, max_bytes)
     }
 
+    fn load_block_body_for_verification(
+        &self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.load_block_body_for_verification(height, hash)
+    }
+
+    // Like the verification read above, the bounded verification read has
+    // real backend behavior and must delegate explicitly.
+    fn load_block_body_for_verification_bounded(
+        &self,
+        height: u32,
+        hash: Hash256,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, BoundedReadError> {
+        self.inner
+            .load_block_body_for_verification_bounded(height, hash, max_bytes)
+    }
+
     fn reader(&self) -> Result<Box<dyn BlockBodyReader + '_>, StorageError> {
         self.inner.reader()
     }
@@ -368,4 +388,39 @@ pub(crate) fn seed_fresh_chain(state: &NodeState, count: u32) -> Result<Hash256>
 /// the test; no timing behaviour is asserted.
 pub(crate) fn barrier_bound() -> Duration {
     BARRIER_BOUND
+}
+
+#[test]
+fn barrier_forwards_the_verification_read_past_the_availability_default() {
+    struct CorruptInner;
+    impl BlockBodyStore for CorruptInner {
+        fn persist_block_body(&self, _: u32, _: Hash256, _: &[u8]) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn load_block_body(&self, _: u32, _: Hash256) -> Result<Option<Vec<u8>>, StorageError> {
+            Ok(None)
+        }
+        fn sync(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn load_block_body_for_verification(
+            &self,
+            _: u32,
+            _: Hash256,
+        ) -> Result<Option<Vec<u8>>, StorageError> {
+            Err(StorageError::CorruptBlockFrame("frame"))
+        }
+    }
+    let wrapped = BarrierBodies {
+        inner: Arc::new(CorruptInner),
+        gate: SyncGate::new(),
+    };
+    let hash = Hash256::from_le_bytes(&[0xB4; 32]);
+    assert!(
+        matches!(
+            wrapped.load_block_body_for_verification(1, hash),
+            Err(StorageError::CorruptBlockFrame(_))
+        ),
+        "the barrier must preserve verification corruption like the inner store"
+    );
 }

@@ -514,10 +514,13 @@ fn each_decoy_before_the_version_yields_once() -> TestResult {
 
 /// A pre-version byte stream that releases one sealed decoy per `interval`,
 /// like a socket fed decoys faster than its poll; the version packet is never
-/// released. Outbound bytes are collected and ignored.
+/// released. Outbound bytes are collected and ignored. `consumed` counts the
+/// bytes its reader actually took: staging a decoy proves nothing about the
+/// receiver, consuming it does.
 struct DecoyDribble {
     blobs: Vec<Vec<u8>>,
     released: usize,
+    consumed: usize,
     next_at: Instant,
     interval: Duration,
     pending: VecDeque<u8>,
@@ -529,6 +532,7 @@ impl DecoyDribble {
         let mut dribble = Self {
             blobs,
             released: 0,
+            consumed: 0,
             next_at: Instant::now() + interval,
             interval,
             pending: VecDeque::new(),
@@ -567,6 +571,7 @@ impl Read for DecoyDribble {
         for (slot, byte) in buffer.iter_mut().zip(self.pending.drain(..read)) {
             *slot = byte;
         }
+        self.consumed += read;
         Ok(read)
     }
 }
@@ -598,6 +603,9 @@ fn decoys_never_hold_the_handshake_past_the_deadline() -> TestResult {
     for _ in 0..120 {
         blobs.push(session.send.seal(&[0; 16], &[], true)?);
     }
+    // Terminator plus the first (garbage-AAD) decoy packet, measured before
+    // the dribble takes the blobs.
+    let through_first_decoy = blobs[0].len() + blobs[1].len();
     let mut stream = DecoyDribble::new(blobs, Duration::from_millis(10));
     let lease = PeerLease::new(crossbeam_channel::unbounded().0);
     let started = Instant::now();
@@ -622,6 +630,14 @@ fn decoys_never_hold_the_handshake_past_the_deadline() -> TestResult {
         "decoys must not hold the handshake past its deadline"
     );
     assert!(responder.received_any(), "the decoys did arrive");
+    // The garbage scan never reads past the terminator and each packet is
+    // read exactly, so a byte beyond the first decoy means the responder
+    // consumed that whole packet, yielded, and started the next one.
+    assert!(
+        stream.consumed > through_first_decoy,
+        "the responder must have consumed a complete decoy past the terminator and yielded for the next: consumed {} of the first {through_first_decoy}",
+        stream.consumed
+    );
     Ok(())
 }
 

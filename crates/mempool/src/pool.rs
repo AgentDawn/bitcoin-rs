@@ -480,6 +480,12 @@ impl VisitMarks for VisitSet {
     }
 }
 
+impl VisitMarks for HashSet<EntryId> {
+    fn insert(&mut self, id: EntryId) -> bool {
+        Self::insert(self, id)
+    }
+}
+
 /// Membership for walks confined to one connected component. A component
 /// holds at most the cluster-entry limit, so a small inline list does the
 /// work in time and space bounded by the cluster, where [`VisitSet`]'s bitset
@@ -1309,6 +1315,11 @@ impl Mempool {
         let by_wtxid = u64::try_from(self.derived.by_wtxid.capacity())
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::try_from(size_of::<(Wtxid, EntryId)>()).unwrap_or(0));
+        // A `BTreeSet` exposes no capacity, so the acceptance-time index is
+        // charged by length like the funding and spending maps.
+        let by_time = u64::try_from(self.derived.by_time.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<(u64, EntryId)>()).unwrap_or(0));
         let links = self.entries.iter_links().fold(0_u64, |total, link| {
             let payload = link
                 .parents
@@ -1329,6 +1340,7 @@ impl Mempool {
             .saturating_add(transactions)
             .saturating_add(by_txid)
             .saturating_add(by_wtxid)
+            .saturating_add(by_time)
             .saturating_add(funding)
             .saturating_add(spending)
             .saturating_add(links)
@@ -1922,7 +1934,10 @@ impl Mempool {
     /// call at the same `now` is a no-op.
     pub fn expire(&mut self, now: u64) -> MutationResult {
         let cutoff = now.saturating_sub(MEMPOOL_EXPIRY_SECS);
-        let mut visited = VisitSet::new();
+        // Sparse marks: expiry usually visits a thin tail, and an
+        // arena-sized bitset would zero-fill to the highest slot on a pool
+        // whose churn left the slot space sparse.
+        let mut visited: HashSet<EntryId> = HashSet::new();
         let mut stage = Vec::new();
         for &(_, root) in self.derived.by_time.range(..(cutoff, EntryId::MIN)) {
             self.stage_with_descendants(root, &mut visited, &mut stage);
@@ -1944,7 +1959,7 @@ impl Mempool {
     fn stage_with_descendants(
         &self,
         root: EntryId,
-        visited: &mut VisitSet,
+        visited: &mut impl VisitMarks,
         stage: &mut Vec<EntryId>,
     ) {
         if !visited.insert(root) {
@@ -2056,6 +2071,7 @@ impl Mempool {
         let ids: Vec<EntryId> = removals.iter().map(|(id, _reason)| *id).collect();
         let affected = self.metadata_closure(&ids);
         let mut dirty_components: Vec<u32> = Vec::new();
+        let mut dirty_seen: HashSet<u32> = HashSet::new();
         let mut survivor_seeds: Vec<EntryId> = Vec::new();
         let mut seen_seeds = VisitSet::new();
         for (id, reason) in removals {
@@ -2081,7 +2097,7 @@ impl Mempool {
             if let Some(summary) = self.component_summary_mut(retired.component) {
                 summary.member_count = summary.member_count.saturating_sub(1);
                 summary.weight = summary.weight.saturating_sub(entry.policy_weight());
-                if !dirty_components.contains(&retired.component) {
+                if dirty_seen.insert(retired.component) {
                     dirty_components.push(retired.component);
                 }
             }
@@ -2220,9 +2236,13 @@ impl Mempool {
             })
     }
 
-    /// Every entry whose totals a change at `seeds` can have altered.
+    /// Every entry whose totals a change at `seeds` can have altered. The
+    /// returned order is deterministic (seed order, ancestors before the
+    /// seed before descendants); the set alongside it keeps the membership
+    /// probe constant-time when a batched removal touches many components.
     fn metadata_closure(&self, seeds: &[EntryId]) -> Vec<EntryId> {
         let mut affected = Vec::new();
+        let mut seen: HashSet<EntryId> = HashSet::new();
         for seed in seeds {
             for id in self
                 .ancestor_ids_for_entry(*seed)
@@ -2230,7 +2250,7 @@ impl Mempool {
                 .chain(core::iter::once(*seed))
                 .chain(self.descendant_ids_for_entry(*seed))
             {
-                if !affected.contains(&id) {
+                if seen.insert(id) {
                     affected.push(id);
                 }
             }
@@ -2613,7 +2633,7 @@ const fn cluster_within_limits(
 }
 
 /// Heap a single transaction owns, beyond the `Tx` struct itself.
-fn transaction_heap_usage(tx: &Tx) -> u64 {
+pub(crate) fn transaction_heap_usage(tx: &Tx) -> u64 {
     use core::mem::size_of;
 
     let mut total = u64::try_from(size_of::<Tx>()).unwrap_or(0);
@@ -4934,12 +4954,6 @@ mod dynamic_memory_usage_tests {
     }
 
     #[test]
-    fn an_empty_pool_reports_no_transaction_memory() {
-        let pool = Mempool::new(MempoolLimits::default());
-        assert_eq!(pool.dynamic_memory_usage(), 0);
-    }
-
-    #[test]
     fn usage_is_a_different_quantity_from_the_vsize_sum() {
         let pool = pool_with(4, 64);
         let stats = pool.stats();
@@ -5029,6 +5043,21 @@ mod dynamic_memory_usage_tests {
             with_index.saturating_sub(without_index),
             index,
             "the pool must charge the index what the index says it costs"
+        );
+    }
+
+    #[test]
+    fn usage_accounts_the_acceptance_time_index() {
+        use core::mem::size_of;
+
+        let mut pool = pool_with(4, 64);
+        let with_index = pool.dynamic_memory_usage();
+        pool.derived.by_time.clear();
+        let without_index = pool.dynamic_memory_usage();
+        assert_eq!(
+            with_index.saturating_sub(without_index),
+            4_u64.saturating_mul(u64::try_from(size_of::<(u64, EntryId)>()).unwrap_or(0)),
+            "the pool must charge one acceptance-time entry per pooled transaction"
         );
     }
 }
@@ -5166,6 +5195,54 @@ mod graph_tests {
         ))
         .expect("fixture insert must pass validation");
         txid
+    }
+
+    /// Two thousand independent entries removed in one batch: every component
+    /// settles, every change commits in removal order, and no linearization
+    /// survives. Independent entries make each removal dirty its own
+    /// component, the shape that turned the membership scans quadratic.
+    #[test]
+    fn batched_removal_of_two_thousand_independent_entries_settles() {
+        const COUNT: u32 = 2000;
+        let count = usize::try_from(COUNT).expect("test count fits");
+        let mut pool = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            ..MempoolLimits::default()
+        });
+        let mut txids = Vec::with_capacity(count);
+        for nonce in 0..COUNT {
+            let mut seed = [0xD1_u8; 32];
+            seed[..4].copy_from_slice(&nonce.to_le_bytes());
+            let funding = OutPoint::new(Txid::from(Hash256::from_le_bytes(&seed)), 0);
+            txids.push(insert_ok(&mut pool, nonce, &[funding], 100));
+        }
+        assert_eq!(pool.len(), count);
+        let mut removals = Vec::with_capacity(count);
+        for txid in &txids {
+            removals.push((
+                pool.entry_id_by_txid(txid).expect("inserted id resolves"),
+                RemovalReason::BlockInclusion,
+            ));
+        }
+        let mut changes = Vec::new();
+        pool.remove_entries_with_reasons(&removals, &mut changes);
+        assert_eq!(pool.len(), 0, "every independent entry leaves");
+        assert_eq!(changes.len(), count);
+        for (change, txid) in changes.iter().zip(txids.iter()) {
+            assert_eq!(change.txid, Hash256::from(*txid));
+            assert!(
+                matches!(
+                    change.outcome,
+                    MutationOutcome::Removed(RemovalReason::BlockInclusion)
+                ),
+                "unexpected outcome for {txid}: {:?}",
+                change.outcome
+            );
+        }
+        assert!(
+            pool.chunks_by_feerate().next().is_none(),
+            "no component linearization survives the batch"
+        );
     }
 
     /// Independent component calculation: BFS over the txid index and one

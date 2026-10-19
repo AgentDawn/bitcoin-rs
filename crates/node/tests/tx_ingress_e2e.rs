@@ -285,7 +285,7 @@ fn open_loopback_peer(
     let dialer = TcpStream::connect(listener.local_addr()?)?;
     let (accepted, peer_addr) = listener.accept()?;
 
-    let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<Message>();
+    let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<bitcoin_rs_p2p::QueuedFrame>();
     let lease = PeerLease::new_inbound(outbound_tx);
     let mut wire_out = accepted
         .try_clone()
@@ -309,8 +309,10 @@ fn open_loopback_peer(
             .spawn(move || {
                 while !pump_lease.is_cancelled() {
                     match outbound_rx.recv_timeout(READ_POLL) {
-                        Ok(message) => {
-                            if write_message(&mut wire_out, magic, &message).is_err() {
+                        Ok(frame) => {
+                            // The frame's charge returns when it drops, after
+                            // the write, as in the production writer.
+                            if write_message(&mut wire_out, magic, frame.message()).is_err() {
                                 break;
                             }
                         }

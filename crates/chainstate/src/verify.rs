@@ -3,26 +3,36 @@
 //! One owner serves the `verifychain` RPC and the startup check. The walk
 //! follows parent links from the applied tip, never mutates chain state, and
 //! holds a history lease for the whole walk so a concurrent prune pass cannot
-//! delete rows it is about to read. Data the node never kept or intentionally
-//! no longer keeps ends the walk as [`VerifyOutcome::SkippedNoBlockData`];
-//! data that should exist and does not, or does not check out, is a typed
-//! [`VerifyError`]. The RPC level mapping stops at [`CheckLevel::CheckUndo`]
-//! with Core's context-free scope; startup selects
-//! [`CheckLevel::CheckUndoAndCommitments`], which additionally enforces
-//! header-body binding on data at rest.
+//! delete rows it is about to read. The lease is a bounded optional pin, not
+//! an atomic exclusion around IO: its liveness is re-checked at every
+//! progress boundary, and a withdrawn pin ends the walk as
+//! [`VerifyOutcome::SkippedNoBlockData`] even when the rows are still
+//! readable. A cancelled request ends as [`VerifyError::Interrupted`]; a
+//! chainstate closed for recovery is fail-closed as
+//! [`VerifyError::ClosedForRecovery`], including an empty or genesis-only
+//! chain. Data the node never kept or intentionally no longer keeps ends the
+//! walk as [`VerifyOutcome::SkippedNoBlockData`]; data that should exist and
+//! does not, or does not check out, is a typed [`VerifyError`]. The RPC level
+//! mapping stops at [`CheckLevel::CheckUndo`] with Core's context-free scope;
+//! startup selects [`CheckLevel::CheckUndoAndCommitments`], which additionally
+//! enforces header-body binding on data at rest.
 
 use core::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use bitcoin_rs_chain::{BlockTreeReader, ChainError, NodeId, softfork_state, validate_pow};
+use bitcoin_rs_chain::{
+    BlockTreeReader, ChainError, LatchReader, NodeId, softfork_state, validate_pow,
+};
 use bitcoin_rs_consensus::{
     ConsensusError, check_block_body_binding, verify_block::verify_block_non_contextual,
 };
 use bitcoin_rs_primitives::{Block, DecodeError, Hash256, deserialize};
-use bitcoin_rs_storage::BoundedReadError;
-use bitcoin_rs_storage::block_body::BlockBodyStore;
-use bitcoin_rs_storage::pruning::{HistoryLease, HistoryUnavailable};
+use bitcoin_rs_storage::{
+    BoundedReadError, StorageError,
+    block_body::BlockBodyStore,
+    pruning::{HistoryLease, HistoryUnavailable},
+};
 use bitcoin_rs_utxo::contract::{UndoCodecError, decode_undo_record_for_block};
 
 use crate::block_spends::{MAX_BLOCK_QUERY_BYTES, MAX_UNDO_QUERY_BYTES};
@@ -58,13 +68,18 @@ pub enum CheckLevel {
 }
 
 /// One verification request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct VerifyRequest {
     /// The checks applied to every block in the window.
     pub level: CheckLevel,
     /// How many blocks to check, counted back from the applied tip; `None`
     /// checks every block above genesis.
     pub depth: Option<NonZeroU32>,
+    /// The caller's cancellation latch, observed during the walk and before
+    /// reporting success; `None` when the caller cannot cancel (startup).
+    /// A triggered latch ends the walk as [`VerifyError::Interrupted`],
+    /// never as damage and never as unavailable history.
+    pub cancellation: Option<LatchReader>,
 }
 
 /// How a verification that found no damage ended.
@@ -123,6 +138,19 @@ pub enum VerifyError {
         #[source]
         source: BoundedReadError,
     },
+    /// The stored body frame is malformed or truncated. Corruption the
+    /// verifier observes is damage, never a missing body and never a skip:
+    /// a prune pass deletes rows atomically and never leaves corrupt frames
+    /// behind.
+    #[error("body frame of block {hash} at height {height} is corrupt: {evidence}")]
+    BodyCorrupt {
+        /// Block height.
+        height: u32,
+        /// Block hash the chain names.
+        hash: Hash256,
+        /// The frame evidence.
+        evidence: &'static str,
+    },
     /// The stored body is not the block the tree names.
     #[error("body of block {hash} at height {height} does not decode: {source}")]
     BodyDecode {
@@ -175,6 +203,15 @@ pub enum VerifyError {
         #[source]
         source: BoundedReadError,
     },
+    /// The chainstate closed for recovery: verification refuses to declare
+    /// anything verified from a chain that can no longer admit mutations.
+    /// This names no block; it is fail-closed admission state, not damage.
+    #[error("chainstate is closed for recovery")]
+    ClosedForRecovery,
+    /// The requesting caller cancelled verification. This names no block;
+    /// it is an operator stop, not damage and not unavailable history.
+    #[error("block verification was interrupted")]
+    Interrupted,
     /// The stored undo record does not decode against its block.
     #[error("undo record of block {hash} at height {height} does not decode: {source}")]
     UndoDecode {
@@ -195,18 +232,36 @@ pub enum VerifyError {
 /// ancestor's body and undo record are immutable, and pruning is held off by
 /// the history lease taken here.
 ///
-/// POST: `Passed` means every block in the window satisfied `request.level`.
-/// A block above the data floor that is missing or damaged is an error, even
-/// when the window also reaches data below the floor. A floor is the prune
-/// line the retention owner reports, or one past the snapshot base for an
-/// assumed-valid chainstate.
+/// POST: `Passed` means every block in the window satisfied `request.level`
+/// while the request latch stayed quiet, admission stayed open, and the
+/// history pin stayed live through completion. A block above the data floor
+/// that is missing or damaged is an error, even when the window also reaches
+/// data below the floor. A floor is the prune line the retention owner
+/// reports, or one past the snapshot base for an assumed-valid chainstate.
+/// A cancelled request is [`VerifyError::Interrupted`]; a chainstate closed
+/// for recovery is [`VerifyError::ClosedForRecovery`]; a withdrawn pin is
+/// `SkippedNoBlockData`, even when the rows are still readable.
 ///
 /// INVARIANT: no history is read unpinned, and a read that finds nothing
 /// after the owner withdrew the pin is `SkippedNoBlockData`, never damage.
+/// The pin is also checked at every progress boundary and before reporting
+/// success, so a withdrawal the walk already passed still refuses `Passed`.
+/// None of these checks holds a transition or registry lock across disk IO:
+/// each is one atomic or registry read beside the IO, never around it.
 pub fn verify_recent_blocks(
     chainstate: &Chainstate,
     request: VerifyRequest,
 ) -> Result<VerifyOutcome, VerifyError> {
+    if request
+        .cancellation
+        .as_ref()
+        .is_some_and(LatchReader::is_triggered)
+    {
+        return Err(VerifyError::Interrupted);
+    }
+    if chainstate.is_closed_for_recovery() {
+        return Err(VerifyError::ClosedForRecovery);
+    }
     let Some(tip) = chainstate
         .applied_tip_snapshot()
         .filter(|tip| tip.height > 0)
@@ -229,6 +284,7 @@ pub fn verify_recent_blocks(
         store,
         lease,
         level: request.level,
+        cancellation: request.cancellation,
     };
     match walk.run(tip.tip_id, tip.hash, tip.height, start) {
         Ok(_) if start > requested => Ok(VerifyOutcome::SkippedNoBlockData {
@@ -236,6 +292,7 @@ pub fn verify_recent_blocks(
         }),
         Ok(blocks) => Ok(VerifyOutcome::Passed { blocks }),
         Err(Stop::Skipped { height }) => Ok(VerifyOutcome::SkippedNoBlockData { height }),
+        Err(Stop::Interrupted) => Err(VerifyError::Interrupted),
         Err(Stop::Failed(error)) => Err(error),
     }
 }
@@ -286,6 +343,8 @@ const PIN_ATTEMPTS: usize = 3;
 enum Stop {
     /// The window's data became unavailable at `height`.
     Skipped { height: u32 },
+    /// The requesting caller cancelled verification.
+    Interrupted,
     /// Damage inside the window.
     Failed(VerifyError),
 }
@@ -311,10 +370,14 @@ struct Walk<'a> {
     /// Held until the walk is dropped.
     lease: HistoryLease,
     level: CheckLevel,
+    cancellation: Option<LatchReader>,
 }
 
 impl Walk<'_> {
     /// Checks heights `tip_height` down to `start` and returns how many.
+    /// Cancellation, recovery closure, and pin liveness are polled at every
+    /// progress boundary and once more before reporting success, beside the
+    /// storage reads rather than around them.
     fn run(
         &self,
         tip_id: NodeId,
@@ -326,15 +389,40 @@ impl Walk<'_> {
         let mut next = (tip_id, tip_hash);
         let mut checked = 0_u32;
         for height in (start..=tip_height).rev() {
-            if self.chainstate.shutdown.load(Ordering::Acquire) {
-                return Err(Stop::Skipped { height });
-            }
+            self.poll_boundaries(height)?;
             let ancestor = self.locate(&tree, next.0, height, next.1)?;
             next = (ancestor.parent, ancestor.prev_hash);
             self.check(height, &ancestor)?;
             checked = checked.saturating_add(1);
         }
+        // A withdrawal past the last boundary still refuses success; the pin
+        // covered the whole window, so the tip is the highest height it no
+        // longer protects.
+        self.poll_boundaries(tip_height)?;
         Ok(checked)
+    }
+
+    /// One boundary poll: cancellation first, then fail-closed recovery,
+    /// then process shutdown, then the bounded history pin. A withdrawn pin
+    /// is skipped even when the rows it covered are still readable.
+    fn poll_boundaries(&self, height: u32) -> Result<(), Stop> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(LatchReader::is_triggered)
+        {
+            return Err(Stop::Interrupted);
+        }
+        if self.chainstate.is_closed_for_recovery() {
+            return Err(Stop::Failed(VerifyError::ClosedForRecovery));
+        }
+        if self.chainstate.shutdown.load(Ordering::Acquire) {
+            return Err(Stop::Skipped { height });
+        }
+        if self.lease.floor().is_none() {
+            return Err(Stop::Skipped { height });
+        }
+        Ok(())
     }
 
     /// Reads one ancestor from the tree. A node the tree no longer holds,
@@ -388,12 +476,23 @@ impl Walk<'_> {
     }
 
     fn read_block(&self, height: u32, hash: Hash256) -> Result<Block, Stop> {
-        let bytes = match self
-            .store
-            .load_block_body_bounded(height, hash, MAX_BLOCK_QUERY_BYTES)
-        {
+        // The bounded verification read preserves corrupt referenced frames
+        // instead of mapping them to `None`: corruption surfaces as damage
+        // even without a history floor, where a missing body would skip.
+        let bytes = match self.store.load_block_body_for_verification_bounded(
+            height,
+            hash,
+            MAX_BLOCK_QUERY_BYTES,
+        ) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Err(self.absent(height, VerifyError::BodyMissing { height, hash })),
+            Err(BoundedReadError::Storage(StorageError::CorruptBlockFrame(evidence))) => {
+                return Err(Stop::Failed(VerifyError::BodyCorrupt {
+                    height,
+                    hash,
+                    evidence,
+                }));
+            }
             Err(source) => {
                 return Err(Stop::Failed(VerifyError::BodyRead {
                     height,

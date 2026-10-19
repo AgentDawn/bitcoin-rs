@@ -47,6 +47,7 @@ fn verify_startup_window(
     let request = VerifyRequest {
         level: CheckLevel::CheckUndoAndCommitments,
         depth: Some(STARTUP_VERIFY_DEPTH),
+        cancellation: None,
     };
     match verify_recent_blocks(chainstate, request) {
         Ok(VerifyOutcome::Passed { blocks }) => {

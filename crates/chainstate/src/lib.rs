@@ -480,13 +480,17 @@ pub struct Chainstate {
     /// Early compact-block announce hook, installed once by node composition
     /// after the block announcer exists. `OnceLock` because connect reads it
     /// on every commit while only the node installer ever writes, a single
-    /// time. Unset preserves the pre-early-announce behavior.
-    pub(crate) pow_valid_block: std::sync::OnceLock<PowValidBlockHook>,
+    /// time. The cell is shared across clones, so an install through any
+    /// handle is visible through all of them. Unset preserves the
+    /// pre-early-announce behavior.
+    pub(crate) pow_valid_block: std::sync::Arc<std::sync::OnceLock<PowValidBlockHook>>,
     /// Speculative template-preparation hook, installed once by node
     /// composition after the mining coordinator exists. `OnceLock` because
     /// connect reads it on every commit while only the node installer ever
-    /// writes, a single time. Unset preserves the pre-staging behavior.
-    pub(crate) tip_staged: std::sync::OnceLock<TipStagedHook>,
+    /// writes, a single time. The cell is shared across clones, so an install
+    /// through any handle is visible through all of them. Unset preserves the
+    /// pre-staging behavior.
+    pub(crate) tip_staged: std::sync::Arc<std::sync::OnceLock<TipStagedHook>>,
     /// Chainstate-journal writer, when the journal is enabled (issue #230).
     pub(crate) journal:
         Arc<RwLock<Option<bitcoin_rs_storage::chainstate_journal::SharedJournalWriter>>>,
@@ -681,8 +685,8 @@ impl Chainstate {
             validation_mode: parts.validation_mode,
             validation_engine: parts.validation_engine,
             script_cache: parts.script_cache,
-            pow_valid_block: std::sync::OnceLock::new(),
-            tip_staged: std::sync::OnceLock::new(),
+            pow_valid_block: std::sync::Arc::new(std::sync::OnceLock::new()),
+            tip_staged: std::sync::Arc::new(std::sync::OnceLock::new()),
             journal: Arc::new(RwLock::new(parts.journal)),
             checkpoint_publisher: None,
             capture_rawtx: parts.capture_rawtx,
@@ -897,8 +901,8 @@ impl Chainstate {
             validation_mode: ValidationMode::Full,
             validation_engine: self.validation_engine,
             script_cache: self.script_cache.clone(),
-            pow_valid_block: std::sync::OnceLock::new(),
-            tip_staged: std::sync::OnceLock::new(),
+            pow_valid_block: std::sync::Arc::new(std::sync::OnceLock::new()),
+            tip_staged: std::sync::Arc::new(std::sync::OnceLock::new()),
             journal: Arc::new(RwLock::new(None)),
             checkpoint_publisher: None,
             capture_rawtx: false,
@@ -1269,8 +1273,8 @@ impl Chainstate {
             validation_mode: ValidationMode::AssumeValid,
             validation_engine: bitcoin_rs_consensus::ValidationEngine::Native,
             script_cache: None,
-            pow_valid_block: std::sync::OnceLock::new(),
-            tip_staged: std::sync::OnceLock::new(),
+            pow_valid_block: std::sync::Arc::new(std::sync::OnceLock::new()),
+            tip_staged: std::sync::Arc::new(std::sync::OnceLock::new()),
             journal: Arc::new(RwLock::new(None)),
             checkpoint_publisher: None,
             capture_rawtx: false,
