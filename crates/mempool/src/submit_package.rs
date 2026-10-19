@@ -214,7 +214,10 @@ impl MempoolGateway {
                             cache.insert(wtxid, flags);
                         }
                     }
-                    let admitted: Vec<_> = txs.iter().map(Tx::txid).collect();
+                    // Only the newly submitted members: residents filtered out
+                    // of `pending` above were never admitted here, and expiry
+                    // must not fail the package over them.
+                    let admitted: Vec<_> = pending.iter().map(Tx::txid).collect();
                     self.expire_after_admission(origin, AdmissionFence::Stable, &admitted)?;
                     return Ok(result);
                 }

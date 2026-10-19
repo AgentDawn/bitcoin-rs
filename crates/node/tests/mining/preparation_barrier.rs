@@ -186,6 +186,14 @@ impl BlockBodyStore for BarrierBodies {
         self.inner.load_block_body(height, hash)
     }
 
+    fn load_block_body_for_verification(
+        &self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.load_block_body_for_verification(height, hash)
+    }
+
     fn load_block_body_bounded(
         &self,
         height: u32,
@@ -193,6 +201,18 @@ impl BlockBodyStore for BarrierBodies {
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, BoundedReadError> {
         self.inner.load_block_body_bounded(height, hash, max_bytes)
+    }
+
+    // Like the verification read above, the bounded verification read has
+    // real backend behavior and must delegate explicitly.
+    fn load_block_body_for_verification_bounded(
+        &self,
+        height: u32,
+        hash: Hash256,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, BoundedReadError> {
+        self.inner
+            .load_block_body_for_verification_bounded(height, hash, max_bytes)
     }
 
     fn reader(&self) -> Result<Box<dyn BlockBodyReader + '_>, StorageError> {
@@ -368,4 +388,51 @@ pub(crate) fn seed_fresh_chain(state: &NodeState, count: u32) -> Result<Hash256>
 /// the test; no timing behaviour is asserted.
 pub(crate) fn barrier_bound() -> Duration {
     BARRIER_BOUND
+}
+
+struct DivergentBodies {
+    plain: Vec<u8>,
+    verified: Vec<u8>,
+}
+
+impl BlockBodyStore for DivergentBodies {
+    fn persist_block_body(&self, _: u32, _: Hash256, _: &[u8]) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn load_block_body(&self, _: u32, _: Hash256) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(Some(self.plain.clone()))
+    }
+
+    fn load_block_body_for_verification(
+        &self,
+        _: u32,
+        _: Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(Some(self.verified.clone()))
+    }
+
+    fn sync(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn barrier_bodies_verification_read_uses_the_inner_verification_path() -> Result<()> {
+    // The trait default routes verification reads to `load_block_body`,
+    // which would return `plain` here; the override must surface `verified`.
+    let bodies = BarrierBodies {
+        inner: Arc::new(DivergentBodies {
+            plain: vec![1],
+            verified: vec![2],
+        }),
+        gate: SyncGate::new(),
+    };
+    let hash = Hash256::from_le_bytes(&[0x11; 32]);
+    assert_eq!(bodies.load_block_body(7, hash)?, Some(vec![1]));
+    assert_eq!(
+        bodies.load_block_body_for_verification(7, hash)?,
+        Some(vec![2])
+    );
+    Ok(())
 }

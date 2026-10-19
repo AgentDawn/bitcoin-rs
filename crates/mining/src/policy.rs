@@ -450,8 +450,25 @@ fn member_sequence_locks_final(
     }
     tx.inputs.iter().all(|input| {
         let prev = &input.previous_output.txid;
-        if !pool.contains_txid(prev) {
+        let Some(parent) = pool.entry_id_by_txid(prev) else {
+            // Confirmed on chain: its locks settled at confirmation.
             return true;
+        };
+        if chunk.is_staged_confirmed(parent) {
+            // The staged block confirms the parent one height below the
+            // candidate, so a positive height lock still binds: it is
+            // evaluated at the staged confirmation height, not skipped, and
+            // not evaluated as if the parent confirmed with the candidate.
+            // The predecessor MTP rides the confirmation context, and the
+            // candidate cutoff stays the fail-closed block MTP.
+            return bitcoin_rs_consensus::bip68::sequence_lock_satisfied(
+                tx.version,
+                input.sequence.to_consensus(),
+                context.height.saturating_sub(1),
+                context.staged_parent_mtp,
+                context.height,
+                context.locktime_cutoff,
+            );
         }
         let required = chunk
             .parents_of(member)

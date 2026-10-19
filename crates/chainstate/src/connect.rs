@@ -298,13 +298,23 @@ pub(super) fn apply_block_admitted<'b>(
     {
         bitcoin_rs_consensus::check_signet_block_solution(block, challenge)?;
     }
+    // Contextual relay prechecks (Core `ContextualCheckBlock` before
+    // `NewPoWValidBlock`): absolute finality and BIP34 height gate the early
+    // announcement. Scripts, UTXO spend validity, BIP30, and the durable
+    // commit stay after it, and proposals keep their exact error precedence
+    // (the combined BIP30/BIP34 gate below still runs for every intent).
+    // Witness binding and weight already passed in block rules above.
+    if intent == ApplyIntent::Commit {
+        check_block_finality(block, height, locktime_cutoff)?;
+        check_bip34(handles, block, height)?;
+    }
     // Early compact-block announce: a commit-intent block that passes block
-    // rules and the signet check above is PoW-valid (self-PoW passed above;
-    // proposals never reach this hook), so a signet-invalid block never
-    // announces early. The published-tip match skips reorg connects: the tip
-    // stays the old tip until settlement, so only a true tip child fires. The
-    // hook only hands the block to P2P — no tip is published and no mining
-    // generation advances here.
+    // rules, the signet check, and the contextual prechecks above is PoW-valid
+    // (self-PoW passed above; proposals never reach this hook), so a
+    // contextually invalid block never announces early. The published-tip
+    // match skips reorg connects: the tip stays the old tip until settlement,
+    // so only a true tip child fires. The hook only hands the block to P2P —
+    // no tip is published and no mining generation advances here.
     if intent == ApplyIntent::Commit
         && softfork_state.segwit_active
         && let Some(hook) = handles.pow_valid_block.get()
@@ -914,6 +924,18 @@ fn check_bip30_and_bip34(
     }
     let block_hash = block.block_hash().0;
     bitcoin_rs_consensus::bip30::check_bip30(height, block_hash, has_duplicate)?;
+    check_bip34(handles, block, height)?;
+    Ok(())
+}
+
+/// BIP34 height encoding in the coinbase, standing alone so the early-relay
+/// precheck can run it before the announcement while the combined gate below
+/// still owns the post-commit order.
+fn check_bip34(
+    handles: &Chainstate,
+    block: &Block,
+    height: u32,
+) -> core::result::Result<(), ApplyError> {
     if handles.network.is_bip34_active(height) {
         let coinbase = block
             .txs
@@ -924,6 +946,33 @@ fn check_bip30_and_bip34(
             .first()
             .ok_or(bitcoin_rs_consensus::ConsensusError::MissingCoinbase)?;
         bitcoin_rs_consensus::bip34::check_bip34(height, &coinbase_input.script_sig)?;
+    }
+    Ok(())
+}
+
+/// Absolute finality of every transaction at the connecting height, standing
+/// alone so the early-relay precheck can run it before the announcement.
+/// Uses the same cutoff and error shape as the script-phase finality gate,
+/// so a non-final block fails identically whether it is caught here or
+/// (for proposals) there.
+fn check_block_finality(
+    block: &Block,
+    height: u32,
+    locktime_cutoff: u32,
+) -> core::result::Result<(), ApplyError> {
+    for tx in &block.txs {
+        if !bitcoin_rs_consensus::is_final_tx(tx, height, locktime_cutoff) {
+            return Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::Bip {
+                    bip: "BIP113",
+                    reason: format!(
+                        "non-final transaction at height {height} locktime cutoff \
+                         {locktime_cutoff}: locktime {}",
+                        tx.lock_time,
+                    ),
+                },
+            ));
+        }
     }
     Ok(())
 }

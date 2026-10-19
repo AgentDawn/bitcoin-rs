@@ -21,7 +21,8 @@ Both processes run isolated regtest chains funded by identical block bytes.
 replacement removes victims before publishing acceptance; ordinary insertion
 keeps its accepted-before-capacity-removals event order. Entries strictly older
 than 336 hours and their descendants expire after each committed transaction or
-package admission and reorg re-add; preview never expires. This page does not
+package admission, and during reorg-settlement trim; re-admission itself never
+expires. Preview never expires. This page does not
 define another graph, mutation owner, or commit protocol.
 
 ## 3. Policy matrix
@@ -46,7 +47,7 @@ define another graph, mutation owner, or commit protocol.
 | TRUC sibling eviction | An eligible existing 1-parent/1-child sibling joins the RBF conflict set even without a double-spend. Its fees and diagram remain binding. | Signed weak/strong sibling process cases |
 | Ephemeral dust | At most one dust output; both base and modified fees must be zero. A child spending any output of that unconfirmed parent must spend all its dust. | Process fee rejections; zero-floor gateway spend/overlay/purity tests |
 | Fee floors | Minimum relay uses modified fees and the integer relay charge. The rolling minimum fee follows Core eviction/trim bumps and post-block decay, measured against total virtual size (§5). | Both-RPC floor tests and process prioritisation |
-| Expiry | Entries strictly older than 336 hours and their descendants expire after committed transaction or package admission and reorg re-add; preview never expires. | Expiry unit and gateway tests |
+| Expiry | Entries strictly older than 336 hours and their descendants expire after committed transaction or package admission and during reorg trim; re-admission itself never expires. Preview never expires. Owning rule: `MPL-02` in `docs/contracts/mempool-mutations.md`. | Expiry unit and gateway tests |
 | Sigops | Gateway computes BIP141 cost from resolved outputs; at most 16,000. Policy weight is `max(wire_weight, sigops * 20)`, and policy vsize is its ceiling divided by four. | Independent rust-bitcoin accounting tests and admission boundaries |
 | Finality | Absolute locktime at tip+1; BIP68 uses confirmed height/MTP, unconfirmed parents at the next block, gated on CSV; coinbase depth at least 100. | `policy_contract`, `admission`, gateway tests |
 | Maximum fee | After successful policy/script verification, base fee is compared to the integer charge at the caller rate and actual vsize; a zero charge disables the guard. | Both-RPC precedence tests and signed 1 sat maximum-fee boundary |

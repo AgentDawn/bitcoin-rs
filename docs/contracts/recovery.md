@@ -628,6 +628,35 @@ durable.
   - `shutdown_with_staged_work_installs_nothing_and_answers_unavailable`
     proves shutdown with staged work never installs or publishes speculative
     templates and returns unavailable (`RCV-02`).
+- `crates/mining/src/coordinator/tests.rs`: the cache-installation and
+  foreground-waiter guarantees of the speculative preparation (`RCV-02`):
+  - `publish_block_generation_retains_receipt_and_publishes` proves the
+    committed receipt keeps its tip hash and each removed txid with its exact
+    reason, and the live generation key still publishes;
+  - `empty_preparation_installs_against_matching_receipt` and
+    `nonempty_preparation_installs_against_matching_receipt` prove a
+    preparation installs its candidate only against the receipt whose
+    identities, reasons, and live generation key match its prediction;
+  - `empty_preparation_cannot_install_against_nonempty_receipt` and
+    `fee_moved_preparation_discards_and_serves_live` prove a removal mismatch
+    or a moved fee sequence discards the preparation and serves lazy assembly
+    for the live key;
+  - `matching_foreground_joins_running_preparation_without_duplicate_finish`,
+    `pending_stage_foreground_joins_without_duplicate_finish`, and
+    `ready_preparation_parks_until_the_receipt_and_serves_the_prepared_arc`
+    prove a matching foreground joins a running, pending, or ready
+    preparation without a duplicate lazy finish, parks until the committed
+    receipt arrives, and is served the prepared candidate itself;
+  - `stale_ready_without_a_receipt_serves_lazily_instead_of_parking` proves a
+    foreground whose generation can no longer match is never parked;
+  - `shutdown_releases_a_preparation_waiter` proves shutdown releases a joined
+    waiter with the unavailable error, and
+    `worker_panic_releases_joined_waiter_to_lazy_fallback` proves a worker
+    panic releases a parked waiter into lazy assembly.
+- `crates/node/src/chain_effects.rs`:
+  `gatewayless_connect_publishes_an_empty_receipt_for_the_tip` proves a
+  connect through a follower set with no mempool gateway publishes a receipt
+  for the connected tip that names no removals (`RCV-02`).
 
 ## Vocabulary
 

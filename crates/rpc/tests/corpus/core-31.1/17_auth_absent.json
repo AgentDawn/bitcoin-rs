@@ -1,7 +1,7 @@
 {
   "id": "17_auth_absent",
   "case_ordinal": "17",
-  "description": "No Authorization header. Both nodes answer the head alone with Core's 401 tuple: the WWW-Authenticate challenge, an HTML content type, an empty body, and a close, without reading the declared body.",
+  "description": "No Authorization header. Both nodes answer with Core's 401 tuple: the WWW-Authenticate challenge, an HTML content type, an empty body, and a close. This node decides from the head alone, then discards at most the declared body (bounded: 64 KiB, 1 s) instead of serving it.",
   "provenance": {
     "core_version": "31.1.0",
     "core_source_commit": "9be056a8a72b624dae9623b2f7bded92c2a21c91",

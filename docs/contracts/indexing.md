@@ -225,6 +225,9 @@ unneeded funding record lists when callers only require history records.
     the worker routes to `reset_capabilities` and backfills forward instead of
     executing a long block-by-block rollback
     (`docs/benchmarks/index-rollback-rebuild-cutover.md`).
+  - Proof: `crates/index/src/runtime/recovery_tests.rs` tests
+    `index_ahead_of_restored_tip_is_reported_once_and_rewound` and
+    `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`.
 - **Connect walk**:
   - The worker loads bodies from `BlockBodyStore`, constructs bounded forward
     batches (`PreparedBatchLimits`), and commits row mutations and updated
@@ -272,6 +275,18 @@ unneeded funding record lists when callers only require history records.
     most 256, or 32 MiB plus one body), its in-flight anchors, its prepared
     rows, and the admitted batch are limited independently; this contract
     claims no total resident bound and no bound that depends on script sizes.
+  - Proof (forward-group scheduling, all in
+    `crates/index/src/runtime/recovery_tests.rs`):
+    `absent_prefix_body_holds_back_only_its_own_group`,
+    `shutdown_after_an_absent_body_does_not_run_a_higher_group`,
+    `deferred_history_grant_does_not_run_a_higher_group`,
+    `retained_prefix_commits_before_any_group_switch_and_never_outlives_a_fence_change`,
+    and `run_loop_commits_a_retained_prefix_and_retries_an_absent_body_without_a_wake`.
+  - Proof (undo anchors and admission order):
+    `crates/index/src/runtime/recovery_tests.rs` tests
+    `forward_script_live_follows_undo_present_missing_or_corrupt`,
+    `anchor_failure_outranks_an_earlier_preparation_failure`, and
+    `preparation_failure_keeps_its_height_after_committed_successes`.
 - If a rival reorg or tip extension occurs while a forward batch is being
   prepared, the atomic commit detects the watermark divergence, discards the
   stale prepared batch, and re-plans from the new active tip on the next pass.
@@ -305,7 +320,11 @@ unneeded funding record lists when callers only require history records.
   `shutdown_during_open_reports_abandonment_after_supervisor_exit`, and
   `open_timeout_publishes_error_not_infinite_spin`;
   `crates/index/src/runtime/query_tests.rs` test
-  `unusable_worker_makes_queries_unavailable`.
+  `unusable_worker_makes_queries_unavailable`;
+  `crates/index/src/runtime/recovery_tests.rs` test
+  `undo_read_failure_is_not_a_missing_undo`, which proves a storage-error
+  undo read fails the worker with its own error while an absent record
+  resets and reseeds.
 
 ### Compact-filter data and serving
 
@@ -349,8 +368,12 @@ header/checkpoint replies retain
 only commitments. Requests are bounded to 1,000 filters, 2,000 hashes, or 100,000
 checkpoint headers (below the 4 MB envelope). If the tip changes during streaming,
 already-sent filters still belong to the captured stop chain. A completed range
-is not replayed; an interrupted prefix closes the connection instead of silently
-abandoning the tail. Disabled, unavailable, unknown, non-basic and oversized requests
+is not replayed. A pass that only the outbound send-headroom gate stops after a
+prefix was sent parks the remainder, which starts after the last sent filter,
+keeps the stop height the prefix was computed against, and resumes without
+repeating a filter. Any other interrupted prefix, or a resumed range whose stop
+height has moved, closes the connection instead of silently abandoning the tail.
+Disabled, unavailable, unknown, non-basic and oversized requests
 receive no filter answer.
 For decoded non-basic types, unknown/unapplied stops, inverted ranges and
 oversized ranges, bitcoin-rs deliberately keeps the connection open without
@@ -361,7 +384,9 @@ discouragement; Core 31.1 disconnects these requests. Proof:
 outcome are recorded separately).
 To bridge a just-announced tip and asynchronous publication, a valid P2P request
 can be deferred for up to five seconds while publication or send headroom is
-pending. The existing socket poll retries one pending request per connection, so inbound traffic, ping
+pending; time the node's aggregate outbound budget refused the request is not
+counted toward the five seconds, and time the index or the connection's own
+queue took is counted toward the five seconds. The existing socket poll retries one pending request per connection, so inbound traffic, ping
 and cancellation remain responsive. A second pending filter request or an expired
 deadline closes the connection. No response is replayed after streaming a payload;
 chain validation never waits and filters are never generated synchronously.

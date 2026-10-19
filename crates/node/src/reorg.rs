@@ -81,9 +81,12 @@ impl ReorgObserver for NodeReorgObserver<'_> {
 ///
 /// PRE: the disconnect walk has committed and the resident sweep has run, so
 /// the pool holds exactly the settled resident set.
-/// POST: the pool is at or below its `max_total_bytes` ceiling, or the trim
-/// failed and settlement must be treated as incomplete. A pool already inside
-/// the ceiling is left untouched: no write lock, no empty mutation batch.
+/// POST: entries older than `MEMPOOL_EXPIRY_SECS` expire first, committing
+/// and publishing through the gateway under the reorg fence even when the
+/// pool is already inside its ceiling; then the pool is at or below its
+/// `max_total_bytes` ceiling, or the trim failed and settlement must be
+/// treated as incomplete. A pool already inside the ceiling skips only the
+/// size trim: no size-limit write lock, no empty mutation batch.
 /// INVARIANT: this is the only size trim one reorg performs. Each individual
 /// re-admission defers its own, so the walk cannot shed a transaction whose
 /// parent it has not committed yet. Core skips the size limit on the same

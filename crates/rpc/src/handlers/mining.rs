@@ -898,7 +898,7 @@ mod tests {
     }
 
     fn register_dummy_peer(ctx: &Context) {
-        let (tx, _rx) = crossbeam_channel::bounded::<bitcoin_rs_p2p::Message>(1);
+        let (tx, _rx) = crossbeam_channel::bounded::<bitcoin_rs_p2p::QueuedFrame>(1);
         ctx.network.peer_table.register(
             "127.0.0.1:8333"
                 .parse()

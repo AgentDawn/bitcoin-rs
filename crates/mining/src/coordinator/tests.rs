@@ -439,6 +439,7 @@ impl ChainContextSource for ResolvedChain {
             bits: CompactTarget::from_consensus(0x207f_ffff),
             min_time: 1,
             prev_median_time_past: 0,
+            parent_median_time_past: 0,
             csv_active: false,
             segwit_active: false,
         })
@@ -550,6 +551,39 @@ fn publish_fee_delta_generation_wakes_a_registered_waiter() {
         })
     );
     assert!(waiter.join().is_ok(), "waiter thread panicked");
+}
+
+#[test]
+fn publish_fee_delta_generation_drops_a_stale_fee_revision() {
+    let tip = Hash256::from_le_bytes(&[0x27; 32]);
+    let service = service_with(Some(tip_snapshot(tip)), Arc::new(StaticPool::new(5, 2)));
+    let newer = GenerationKey {
+        tip_hash: tip,
+        mempool_sequence: 5,
+        fee_delta_sequence: 9,
+    };
+    service.publish_fee_delta_generation(9);
+    assert_eq!(service.state.lock().published, Some(newer));
+    service.state.lock().cache_insert(
+        CandidateKey::ordinary(newer),
+        Arc::new(sample_candidate(tip, 5, 9, false, false)),
+    );
+    // A delayed callback carrying the older revision must neither regress
+    // the published key nor invalidate the newer candidate.
+    service.publish_fee_delta_generation(4);
+    assert_eq!(
+        service.state.lock().published,
+        Some(newer),
+        "a stale fee revision must not regress the published key"
+    );
+    assert!(
+        service
+            .state
+            .lock()
+            .cache_get(&CandidateKey::ordinary(newer))
+            .is_some(),
+        "a stale fee revision must not invalidate the newer candidate"
+    );
 }
 
 #[test]
@@ -715,8 +749,10 @@ impl GatedPool {
         self.release_projection.store(true, Ordering::SeqCst);
     }
 
-    /// Arms a panic inside the next projected selection, so the test can
-    /// prove the worker's exit guard releases joined waiters.
+    /// Arms a panic inside the projected selection, so the test can prove
+    /// the worker's exit guard releases joined waiters. Checked on entry
+    /// and again when the projection gate releases, so the panic can land
+    /// while a waiter is already parked.
     fn arm_panic(&self) {
         self.panic_projection.store(true, Ordering::SeqCst);
     }
@@ -771,6 +807,10 @@ impl MempoolSnapshotSource for GatedPool {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            !self.panic_projection.load(Ordering::SeqCst),
+            "adversarial worker panic on projection release"
+        );
         let source_sequences = *self.counters.lock();
         let fixture = Mempool::new(MempoolLimits::default());
         let plan = fixture.plan_block_removals(block);
@@ -826,6 +866,7 @@ impl ChainContextSource for CountingChain {
             bits: CompactTarget::from_consensus(0x207f_ffff),
             min_time: 1,
             prev_median_time_past: 0,
+            parent_median_time_past: 0,
             csv_active: false,
             segwit_active: false,
         })
@@ -1266,12 +1307,12 @@ fn pending_stage_foreground_joins_without_duplicate_finish() {
 #[test]
 fn worker_panic_releases_joined_waiter_to_lazy_fallback() {
     // A panic inside the projected selection unwinds through the worker's
-    // exit guard: the mailbox releases and the joined waiter falls back to
-    // lazy assembly, while the unwind and the join payload are logged.
+    // exit guard: a waiter already parked on the preparation releases and
+    // falls back to lazy assembly, while the unwind and the join payload
+    // are logged. The waiter parks before the panic lands: spawning it
+    // after would only prove the stopped mailbox, not the release.
     let tip_hash = Hash256::from_le_bytes(&[0x73; 32]);
     let pool = Arc::new(GatedPool::new(5, 2));
-    pool.arm_panic();
-    pool.release();
     let service = Arc::new(service_with_source(
         Some(tip_snapshot(tip_hash)),
         pool.clone(),
@@ -1279,24 +1320,27 @@ fn worker_panic_releases_joined_waiter_to_lazy_fallback() {
         Arc::new(AtomicBool::new(false)),
     ));
     service.stage_tip(&tip_snapshot(tip_hash), &Network::Regtest.genesis_block());
-    let deadline = Instant::now() + WAKE_PROOF_TIMEOUT;
-    loop {
-        if service.prep.mailbox().stopped {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the panicking worker did not release the mailbox"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_until_entered(&pool);
     let key = GenerationKey {
         tip_hash,
         mempool_sequence: 5,
         fee_delta_sequence: 2,
     };
     let waiter_service = Arc::clone(&service);
-    let served = std::thread::spawn(move || waiter_service.candidate_for_key(key))
+    let waiter = std::thread::spawn(move || waiter_service.candidate_for_key(key));
+    wait_until_parked(&service);
+    assert_eq!(
+        pool.live_calls.load(Ordering::Relaxed),
+        0,
+        "a parked waiter must not run a duplicate lazy finish"
+    );
+    assert!(
+        !waiter.is_finished(),
+        "the waiter must still be parked when the panic lands"
+    );
+    pool.arm_panic();
+    pool.release();
+    let served = waiter
         .join()
         .unwrap_or_else(|_| panic!("the waiter thread panicked"))
         .unwrap_or_else(|error| {
@@ -1494,11 +1538,17 @@ fn signalling_rules_resolve_once_per_tip_and_height() -> TestResult {
     let chain = Arc::new(CountingChain {
         rules_calls: AtomicUsize::new(0),
     });
-    let tip = tip_snapshot(Hash256::from_le_bytes(&[0x6a; 32]));
-    let service = service_with_source(
-        Some(tip),
+    // One service over a shared tip cell: moving the tip must refresh the
+    // rules through the live path, not through a fresh empty cache.
+    let tip_source = Arc::new(StaticTip(Mutex::new(Some(tip_snapshot(
+        Hash256::from_le_bytes(&[0x6a; 32]),
+    )))));
+    let service = MiningService::new(
+        Network::Regtest,
+        tip_source.clone(),
         Arc::new(StaticPool::new(5, 2)),
         chain.clone(),
+        Vec::new(),
         Arc::new(AtomicBool::new(false)),
     );
     service.get_block_template(None, None)?;
@@ -1513,18 +1563,12 @@ fn signalling_rules_resolve_once_per_tip_and_height() -> TestResult {
         1,
         "the same tip and height must reuse the cached rules"
     );
-    let next_tip = tip_snapshot(Hash256::from_le_bytes(&[0x6b; 32]));
-    let next_service = service_with_source(
-        Some(next_tip),
-        Arc::new(StaticPool::new(5, 2)),
-        chain.clone(),
-        Arc::new(AtomicBool::new(false)),
-    );
-    next_service.get_block_template(None, None)?;
+    tip_source.set(Some(tip_snapshot(Hash256::from_le_bytes(&[0x6b; 32]))));
+    service.get_block_template(None, None)?;
     assert_eq!(
         chain.rules_calls.load(Ordering::Relaxed),
         2,
-        "a new tip resolves its own rules once"
+        "a moved tip resolves its own rules once"
     );
     Ok(())
 }

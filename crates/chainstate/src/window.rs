@@ -201,6 +201,23 @@ impl WindowGroup {
     }
 }
 
+#[derive(Default)]
+struct ProvenWindow<'a, 'h> {
+    proven: Vec<ProvenApply<'a>>,
+    takes: Option<bitcoin_rs_consensus::WindowCacheTakes<'h>>,
+    take_starts: Vec<usize>,
+}
+
+fn restore_uncommitted_takes(
+    takes: Option<bitcoin_rs_consensus::WindowCacheTakes<'_>>,
+    take_starts: &[usize],
+    applied: usize,
+) {
+    if let Some(takes) = takes {
+        takes.rollback_to(take_starts.get(applied).copied().unwrap_or(0));
+    }
+}
+
 #[expect(clippy::result_large_err)]
 pub(super) fn apply_window_admitted(
     handles: &Chainstate,
@@ -220,7 +237,10 @@ pub(super) fn apply_window_admitted(
             invalidated: Box::default(),
         });
     }
-    let mut proven = prove_window(handles, blocks, serialized).into_iter();
+    let window = prove_window(handles, blocks, serialized);
+    let mut proven = window.proven.into_iter();
+    let mut takes = window.takes;
+    let take_starts = window.take_starts;
     let mut group = WindowGroup::default();
     let mut committed: Vec<ConnectOutcome> = Vec::with_capacity(blocks.len());
     for (block, raw) in blocks.iter().zip(serialized) {
@@ -241,6 +261,7 @@ pub(super) fn apply_window_admitted(
                     // Torn or unreconcilable: the staged prefix was never
                     // published, and retrying it here would build on state
                     // recovery has to rebuild first.
+                    restore_uncommitted_takes(takes.take(), &take_starts, committed.len());
                     group.abandon();
                     return Err(WindowApplyError {
                         applied: committed.len(),
@@ -264,6 +285,7 @@ pub(super) fn apply_window_admitted(
                 // of it would publish state recovery cannot certify. Abandon
                 // the group and let restart-time recovery reconcile.
                 if disposition == WindowApplyDisposition::Fatal {
+                    restore_uncommitted_takes(takes.take(), &take_starts, committed.len());
                     group.abandon();
                     return Err(WindowApplyError {
                         applied: committed.len(),
@@ -277,7 +299,11 @@ pub(super) fn apply_window_admitted(
                 // its durable group before reporting, so the durable head
                 // and the published tip keep moving together. A flush
                 // failure is the ambiguous-batch case: fatal, never retried.
-                flush_group(&mut group, handles, &mut committed, blocks)?;
+                if let Err(error) = flush_group(&mut group, handles, &mut committed, blocks) {
+                    restore_uncommitted_takes(takes.take(), &take_starts, error.applied);
+                    return Err(error);
+                }
+                restore_uncommitted_takes(takes.take(), &take_starts, committed.len());
                 return Err(WindowApplyError {
                     applied: committed.len(),
                     committed,
@@ -288,10 +314,16 @@ pub(super) fn apply_window_admitted(
             }
         }
         if group.should_flush() {
-            flush_group(&mut group, handles, &mut committed, blocks)?;
+            if let Err(error) = flush_group(&mut group, handles, &mut committed, blocks) {
+                restore_uncommitted_takes(takes.take(), &take_starts, error.applied);
+                return Err(error);
+            }
         }
     }
-    flush_group(&mut group, handles, &mut committed, blocks)?;
+    if let Err(error) = flush_group(&mut group, handles, &mut committed, blocks) {
+        restore_uncommitted_takes(takes.take(), &take_starts, error.applied);
+        return Err(error);
+    }
     Ok(committed)
 }
 
@@ -412,16 +444,16 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
 /// Prepares consecutive blocks against one overlay and verifies all their input
 /// scripts in a single dispatch.
 #[expect(clippy::too_many_lines)]
-fn prove_window<'a>(
-    handles: &Chainstate,
+fn prove_window<'a, 'h>(
+    handles: &'h Chainstate,
     blocks: &[&'a Block],
     serialized: &[bytes::Bytes],
-) -> Vec<ProvenApply<'a>> {
+) -> ProvenWindow<'a, 'h> {
     if blocks.is_empty() || blocks.len() != serialized.len() {
-        return Vec::new();
+        return ProvenWindow::default();
     }
     let Some(applied) = handles.applied_tip.load_full() else {
-        return Vec::new();
+        return ProvenWindow::default();
     };
 
     // Context is captured before any block applies, because applying inserts
@@ -437,14 +469,14 @@ fn prove_window<'a>(
         for (index, block) in blocks.iter().enumerate() {
             let hash = block.block_hash().0;
             if block.header.prev_blockhash.0 != parent_hash {
-                return Vec::new();
+                return ProvenWindow::default();
             }
             let Some(height) = u32::try_from(index)
                 .ok()
                 .and_then(|offset| applied.height.checked_add(offset))
                 .and_then(|height| height.checked_add(1))
             else {
-                return Vec::new();
+                return ProvenWindow::default();
             };
             let softfork =
                 bitcoin_rs_chain::softfork_state(&tree, handles.network, Some(parent_id), height);
@@ -456,7 +488,7 @@ fn prove_window<'a>(
             // The next block's context needs this one in the tree. Header-first
             // sync put it there; without it there is no window.
             let Some(node_id) = tree.lookup(hash) else {
-                return Vec::new();
+                return ProvenWindow::default();
             };
             contexts.push(BlockValidationContext {
                 hash,
@@ -494,7 +526,7 @@ fn prove_window<'a>(
     let mut prepared = Vec::with_capacity(blocks.len());
     for ((block, parsed), context) in blocks.iter().zip(parsed).zip(&contexts) {
         let Ok((parsed, txids)) = parsed else {
-            return Vec::new();
+            return ProvenWindow::default();
         };
         let tx_plan = plan_block_transactions(block, &txids);
         let facts = parsed.derive_facts(&block.txs, &txids);
@@ -509,7 +541,7 @@ fn prove_window<'a>(
             )
             .is_err()
         {
-            return Vec::new();
+            return ProvenWindow::default();
         }
         prepared.push(PreparedApply {
             parsed,
@@ -528,7 +560,7 @@ fn prove_window<'a>(
         // production walker; comparing the stored root is the same verdict
         // without a second tree walk.
         if !unit.view.merkle_root_matches(block.header.merkle_root) {
-            return Vec::new();
+            return ProvenWindow::default();
         }
         // BIP141 CheckWitnessMalleation window precheck. Under active SegWit a
         // block with witness data must carry a matching BIP141 commitment and a
@@ -546,11 +578,18 @@ fn prove_window<'a>(
                 bitcoin_rs_consensus::verify_block::block_witness_commitment_matches(block, wtxids)
             };
             if !commitment_matches {
-                return Vec::new();
+                return ProvenWindow::default();
             }
         }
     }
 
+    // Takes are transactional across the window: a failed proof rolls every
+    // taken entry back, so blocks that never commit keep reusable positives.
+    let mut takes = handles
+        .script_cache
+        .as_deref()
+        .map(bitcoin_rs_consensus::WindowCacheTakes::new);
+    let mut take_starts = Vec::with_capacity(prepared.len());
     // One slot per input block, so a skipped unit leaves a hole rather than
     // shifting every later block onto the wrong prepared state.
     let mut skipped = vec![false; prepared.len()];
@@ -575,6 +614,9 @@ fn prove_window<'a>(
             .zip(&contexts)
             .enumerate()
         {
+            if let Some(takes) = takes.as_ref() {
+                take_starts.push(takes.checkpoint());
+            }
             // The same predicate the single-block path applies, per block rather
             // than per window, because the anchor height can fall inside a
             // window. Without it the batch prepared and executed every unit
@@ -595,23 +637,31 @@ fn prove_window<'a>(
                 context.height,
                 unit.view.txids(),
             ) else {
-                return Vec::new();
+                if let Some(takes) = takes.take() {
+                    takes.rollback();
+                }
+                return ProvenWindow::default();
             };
             unit.view.set_resolved(resolved);
             // This window only feeds commits (`apply_window_admitted` below),
             // so its pre-proof consults the node-owned cache exactly like the
             // single-block commit path; the later commit reuses the proof and
-            // never takes twice. `None` under the kernel engine.
-            match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
+            // never takes twice. `None` under the kernel engine. Takes are
+            // logged across the window and rolled back when the proof fails.
+            if let Ok(checks) = bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
                 &mut unit.view,
                 context.height,
                 context.locktime_cutoff,
                 context.flags,
                 &unit.parsed,
-                handles.script_cache.as_deref(),
+                takes.as_mut(),
             ) {
-                Ok(checks) => units.push(checks),
-                Err(_) => return Vec::new(),
+                units.push(checks);
+            } else {
+                if let Some(takes) = takes.take() {
+                    takes.rollback();
+                }
+                return ProvenWindow::default();
             }
         }
         let checks_us = checks_started.elapsed().as_micros();
@@ -629,14 +679,17 @@ fn prove_window<'a>(
             "prove_window: profile"
         );
         if verdict.is_err() {
-            return Vec::new();
+            if let Some(takes) = takes.take() {
+                takes.rollback();
+            }
+            return ProvenWindow::default();
         }
         if !units.is_empty() {
             metrics::counter!("node.window.verify_success_total").increment(1);
         }
     }
 
-    prepared
+    let proven = prepared
         .into_iter()
         .zip(contexts)
         .zip(skipped)
@@ -647,7 +700,12 @@ fn prove_window<'a>(
                 ProvenApply::Proven(BlockValidationProof { prepared, context })
             }
         })
-        .collect()
+        .collect();
+    ProvenWindow {
+        proven,
+        takes,
+        take_starts,
+    }
 }
 
 #[cfg(test)]

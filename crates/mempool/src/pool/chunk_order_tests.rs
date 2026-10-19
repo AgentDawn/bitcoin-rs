@@ -28,10 +28,9 @@ use crate::{
 };
 
 /// Nominal output count for `label`: deterministic, so the proptest can name
-/// a plausible vout of a label-derived parent without tracking inserts. The
-/// guess may overshoot the parent's real outputs, which exercises the spend
-/// index's beyond-count path; validity itself is pinned by
-/// `distinct_output_indices_link_by_vout`.
+/// a plausible vout of a tracked parent insert. The guess may overshoot the
+/// parent's real outputs, which exercises the spend index's beyond-count
+/// path; validity itself is pinned by `distinct_output_indices_link_by_vout`.
 fn label_outputs(label: u64) -> u32 {
     u32::try_from(label % 3).map_or(1, |residue| residue + 1)
 }
@@ -557,6 +556,17 @@ proptest! {
         ),
     ) {
         let mut pool = order_pool();
+        // Actually inserted txids by label: recomputing a parent's txid is
+        // unsound because the txid covers the sequence, and inserts signal
+        // RBF while a recompute would use final. Only tracked inserts can
+        // link chained, shared-parent, and bridge-merge components.
+        let mut inserted: HashMap<u64, Txid> = HashMap::new();
+        // A deterministic chained edge up front: label 1 must spend tracked
+        // label 0. Restoring txid recomputation misses this edge and fails
+        // the intended-edge pin below instead of silently losing coverage.
+        let mut actions = actions;
+        actions.insert(0, (1, Some(0), None, 3, 1, 0, 0));
+        actions.insert(0, (0, None, None, 3, 1, 0, 0));
         for (label, parent_a, parent_b, fee_class, outputs, vout, op) in actions {
             let fees = [order_fee(label), 100, 50_000, 150_000, 1_000];
             let fee = fees[fee_class];
@@ -564,74 +574,124 @@ proptest! {
             // through the bridge, exercising the merge path.
             let mut spends = Vec::new();
             for parent_label in [parent_a, parent_b].into_iter().flatten() {
-                let parent_tx = order_tx(
-                    parent_label,
-                    &[],
-                    label_outputs(parent_label),
-                    Sequence::MAX,
-                );
-                let parent_txid = parent_tx.txid();
-                if spends.iter().all(|&(txid, _)| txid != parent_txid)
-                    && pool.contains_txid(&parent_txid)
-                {
+                let Some(parent_txid) = inserted.get(&parent_label) else {
+                    continue;
+                };
+                if spends.iter().all(|&(txid, _)| txid != *parent_txid) {
                     let slots = label_outputs(parent_label);
-                    spends.push((parent_txid, vout % slots));
+                    spends.push((*parent_txid, vout % slots));
                 }
             }
-            let tx = order_tx(label, &spends, outputs, Sequence::ENABLE_RBF_NO_LOCKTIME);
-            let txid = tx.txid();
+            // Every intended resident parent must appear in the spends: a
+            // harness that recomputes parent txids instead of tracking them
+            // silently builds parentless transactions here.
+            for parent_label in [parent_a, parent_b].into_iter().flatten() {
+                if let Some(parent_txid) = inserted.get(&parent_label) {
+                    assert!(
+                        spends.iter().any(|&(txid, _)| txid == *parent_txid),
+                        "tracked resident parent {parent_label} must link into label {label}"
+                    );
+                }
+            }
+            // Every non-insert action targets the resident body actually
+            // tracked for `label`, by its real txid; a label with no
+            // resident has nothing to act on. A freshly reconstructed
+            // transaction (this action's spends and outputs) is never the
+            // resident's identity.
+            let resident = inserted.get(&label).copied();
             match op {
                 0..=4 => {
-                    let inserted = pool
+                    let tx = order_tx(label, &spends, outputs, Sequence::ENABLE_RBF_NO_LOCKTIME);
+                    let txid = tx.txid();
+                    let admitted = pool
                         .insert_entry(MempoolEntry::new(Arc::new(tx), 200, fee, label, 1, 0))
                         .is_ok();
-                    if inserted {
+                    if admitted {
                         assert!(pool.contains_txid(&txid));
+                        inserted.insert(label, txid);
+                        // The pool must hold the intended edges in one
+                        // component, not just the transactions side by side.
+                        if !spends.is_empty() {
+                            let child = pool.entry_id_by_txid(&txid);
+                            for &(parent_txid, _) in &spends {
+                                assert_eq!(
+                                    child.and_then(|id| pool.component_id(id)),
+                                    pool.entry_id_by_txid(&parent_txid)
+                                        .and_then(|id| pool.component_id(id)),
+                                    "admitted spends must join the parent component"
+                                );
+                            }
+                        }
                     }
                 }
                 5..=6 => {
-                    if let Some(id) = pool.entry_id_by_txid(&txid) {
+                    if let Some(txid) = resident
+                        && let Some(id) = pool.entry_id_by_txid(&txid)
+                    {
                         let mut changes = Vec::new();
                         pool.remove_entries_with_reasons(
                             &[(id, RemovalReason::BlockInclusion)],
                             &mut changes,
                         );
+                        assert!(!pool.contains_txid(&txid), "the targeted resident must leave");
                     }
                 }
                 7 => {
-                    let deltas = [-15_000, -1_000, -100, 100, 1_000, 15_000];
-                    let _ = pool.prioritise(txid, deltas[fee_class % deltas.len()]);
+                    if let Some(txid) = resident {
+                        let deltas = [-15_000, -1_000, -100, 100, 1_000, 15_000];
+                        assert!(
+                            pool.prioritise(txid, deltas[fee_class % deltas.len()]).is_ok(),
+                            "an overlay on a resident applies"
+                        );
+                    }
                 }
                 8 => {
-                    if let Some(id) = pool.entry_id_by_txid(&txid)
-                        && let Some(entry) = pool.entry(id)
+                    if let Some(txid) = resident
+                        && let Some(entry) = pool.entry_by_txid(&txid)
                     {
                         let confirmed = entry.tx.clone();
                         let time = entry.time;
                         let _ = pool.remove_for_block(&[confirmed.as_ref()], &[txid], 2, time);
+                        assert!(!pool.contains_txid(&txid), "a confirmed resident must leave");
                     }
                 }
                 _ => {
-                    let winner = order_tx(
-                        label + 1_000,
-                        &spends,
-                        outputs,
-                        Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    );
-                    let _ = pool
-                        .replace_transaction(
-                            &ReplacementCandidate::new(
-                                Arc::new(winner),
-                                200,
-                                fee.saturating_add(50_000),
-                                0,
-                            ),
-                            label,
-                            1,
-                        )
-                        .map_err(crate::RbfError::into_pool_error);
+                    if let Some(txid) = resident
+                        && let Some(entry) = pool.entry_by_txid(&txid)
+                    {
+                        // The winner spends exactly the resident's actual
+                        // inputs, so it conflicts with that body and no other.
+                        let held: Vec<(Txid, u32)> = entry
+                            .tx
+                            .inputs
+                            .iter()
+                            .map(|input| (input.previous_output.txid, input.previous_output.vout))
+                            .collect();
+                        let winner = order_tx(
+                            label + 1_000,
+                            &held,
+                            outputs,
+                            Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        );
+                        let replaced = pool
+                            .replace_transaction(
+                                &ReplacementCandidate::new(
+                                    Arc::new(winner),
+                                    200,
+                                    fee.saturating_add(50_000),
+                                    0,
+                                ),
+                                label,
+                                1,
+                            )
+                            .map_err(crate::RbfError::into_pool_error);
+                        if replaced.is_ok() {
+                            assert!(!pool.contains_txid(&txid), "a replaced resident must leave");
+                        }
+                    }
                 }
             }
+            inserted.retain(|_, txid| pool.contains_txid(txid));
             pool.assert_index_matches_oracle("one random mutation");
         }
         pool.clear();
@@ -756,6 +816,36 @@ fn assert_projection_matches_real(first: &Mempool, second: &mut Mempool, block: 
         );
     }
     second.assert_index_matches_oracle("real removal after projection");
+}
+
+/// A long run of touched chunks before the next untouched one: thirty-two
+/// confirmed parents leave high-fee surviving children, so the merge walks
+/// thirty-two projected pieces while the live cursor skips the whole
+/// touched prefix, then still yields the low-fee untouched chunk exactly.
+#[test]
+fn projected_long_touched_run_still_yields_the_untouched_tail() {
+    const PAIRS: u64 = 32;
+    let (first, mut second) = twin_pools(|pool| {
+        for pair in 0..PAIRS {
+            let parent = 2 * pair + 1;
+            let child = 2 * pair + 2;
+            let parent_txid = insert_ordered(pool, parent, &[], 1, 100);
+            insert_ordered(pool, child, &[(parent_txid, 0)], 1, 50_000);
+        }
+        insert_ordered(pool, 1_000, &[], 1, 100);
+    });
+    let mut block_txs = alloc::vec![coinbase_stub(999_990)];
+    for pair in 0..PAIRS {
+        block_txs.push(order_tx(2 * pair + 1, &[], 1, Sequence::MAX));
+    }
+    let block = test_block(block_txs);
+    let plan = first.plan_block_removals(&block);
+    assert_eq!(
+        plan.removals.len(),
+        usize::try_from(PAIRS).expect("pair count fits"),
+        "every parent confirms"
+    );
+    assert_projection_matches_real(&first, &mut second, &block);
 }
 
 /// An empty plan projects the live order and leaves the pool untouched.
@@ -1006,28 +1096,69 @@ proptest! {
     #[test]
     fn projected_chunks_match_real_remove_for_block(
         actions in prop::collection::vec(
-            (0_u64..16, prop::option::of(0_u64..16), 0_usize..3, 1_u32..3),
+            (
+                0_u64..16,
+                prop::option::of(0_u64..16),
+                0_usize..3,
+                1_u32..3,
+                0_u32..3,
+            ),
             1..24,
         ),
         overlay_picks in prop::collection::vec((0_u64..16, 0_usize..5), 0..4),
         block_picks in prop::collection::vec((0_u64..16, 0_u8..2), 0..6),
     ) {
         const DELTAS: [i64; 5] = [-15_000, -1_000, 100, 1_000, 15_000];
+        // A deterministic chained edge up front: label 1 must spend the
+        // tracked insert of label 0. Recomputing the parent's txid instead
+        // of tracking it drops this edge and fails the intended-edge pin in
+        // `build` rather than silently losing coverage.
+        let mut actions = actions;
+        actions.insert(0, (1, Some(0), 0, 1, 0));
+        actions.insert(0, (0, None, 0, 2, 0));
         let build = |pool: &mut Mempool| {
-            for (label, parent, fee_class, outputs) in &actions {
+            // Actually inserted txids and output counts by label:
+            // recomputing a parent rebuilds a different transaction (the
+            // insert's spends and output count vary per action), so the
+            // rebuilt txid misses and the edge silently skips.
+            let mut inserted: HashMap<u64, (Txid, u32)> = HashMap::new();
+            for (label, parent, fee_class, outputs, vout) in &actions {
                 let fees = [order_fee(*label), 100, 50_000];
                 let fee = fees[*fee_class % fees.len()];
                 let mut spends = Vec::new();
-                if let Some(parent_label) = parent {
-                    let parent_tx = order_tx(*parent_label, &[], label_outputs(*parent_label), Sequence::MAX);
-                    let parent_txid = parent_tx.txid();
-                    if pool.contains_txid(&parent_txid) {
-                        let slots = label_outputs(*parent_label);
-                        spends.push((parent_txid, 0 % slots));
+                let intended_parent = if let Some(parent_label) = parent
+                    && let Some(&(parent_txid, slots)) = inserted.get(parent_label)
+                {
+                    spends.push((parent_txid, vout % slots));
+                    Some(parent_txid)
+                } else {
+                    None
+                };
+                let tx = order_tx(*label, &spends, *outputs, Sequence::MAX);
+                let txid = tx.txid();
+                if pool
+                    .insert_entry(MempoolEntry::new(Arc::new(tx), 200, fee, *label, 1, 0))
+                    .is_ok()
+                {
+                    inserted.insert(*label, (txid, *outputs));
+                    // The intended edge must exist in the pool: the child
+                    // lists its tracked resident parent directly, and a
+                    // parentless build is a harness defect, not a pass.
+                    if let Some(parent_txid) = intended_parent {
+                        let child_id = pool.entry_id_by_txid(&txid);
+                        let parent_id = pool.entry_id_by_txid(&parent_txid);
+                        assert!(
+                            child_id.is_some() && parent_id.is_some(),
+                            "the child and its tracked parent must both be resident"
+                        );
+                        assert!(
+                            child_id.zip(parent_id).is_some_and(|(child, parent)| {
+                                pool.parents_of(child).contains(&parent)
+                            }),
+                            "label {label} must link to its tracked resident parent"
+                        );
                     }
                 }
-                let tx = order_tx(*label, &spends, *outputs, Sequence::MAX);
-                let _ = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 200, fee, *label, 1, 0));
             }
         };
         let (mut first, mut second) = twin_pools(build);

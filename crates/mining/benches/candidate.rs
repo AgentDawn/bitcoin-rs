@@ -10,8 +10,8 @@
 //!   clusters), the rest are independent roots; extending it to 100,000
 //!   entries answers the mature-pool scaling question.
 //! - `chains/depth-25`: 20,000 transactions as 800 explicit 25-deep chains, so
-//!   each 25-member cluster exercises the linearization solver at the cluster
-//!   limit the step 19 template-miss gate reads.
+//!   each 25-member cluster exercises the linearization solver below the
+//!   default 64 cluster limit.
 //!
 //! The `mining_snapshot_operation` group is the operation baseline for
 //! `mining_snapshot` — the whole-pool copy mining takes per template cache
@@ -41,9 +41,11 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 /// Independent-transaction pool sizes for the cache-miss scaling question.
 ///
-/// 0, 64, 512, and 2,048 keep the historical curve points (the 2,048 numbers
-/// above are the same workload as before); 20,000, 50,000, and 100,000 pin the
-/// mature-pool medians the step 19 gate reads. Construction is untimed setup.
+/// 0, 64, 512, and 2,048 keep the historical pool sizes, but the methodology
+/// changed: assembly now reads the pool directly, with no per-iteration
+/// snapshot copy, so earlier timings are not comparable. 20,000, 50,000, and
+/// 100,000 pin the mature-pool medians the step 19 gate reads. Construction
+/// is untimed setup.
 const INDEPENDENT_POOL_SIZES: [usize; 7] = [0, 64, 512, 2_048, 20_000, 50_000, 100_000];
 
 /// The 25-deep-chain pool size: 800 chains of 25 transactions.
@@ -59,6 +61,7 @@ fn context() -> CandidateContext {
         min_time: 10,
         current_time: 20,
         locktime_cutoff: 10,
+        staged_parent_mtp: 10,
         network: Network::Regtest,
         csv_active: true,
         segwit_active: true,

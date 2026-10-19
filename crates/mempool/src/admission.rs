@@ -1063,15 +1063,24 @@ mod tests {
     }
 
     /// A standard-shaped spend of `outpoint` whose output script is
-    /// nonstandard and whose consensus serialization is exactly `size` bytes.
-    /// `size` must exceed 65 535 so the script length prefix is five bytes.
-    fn padded_nonstandard(outpoint: OutPoint, marker: u8, size: usize) -> Tx {
-        const PROBE: usize = 70_000;
-        let mut tx = standard_spend(outpoint, marker);
-        tx.outputs[0].script_pubkey = Script::from_bytes(vec![0x6a; PROBE]);
-        let overhead = tx.total_size() - PROBE;
-        tx.outputs[0].script_pubkey = Script::from_bytes(vec![0x6a; size - overhead]);
-        assert_eq!(tx.total_size(), size);
+    /// nonstandard and whose owned memory, as the pool's own
+    /// `transaction_heap_usage` reports it, is exactly `heap` bytes. The
+    /// padding is derived from that accounting owner, never from struct sizes
+    /// copied into the test.
+    fn nonstandard_with_heap_usage(outpoint: OutPoint, marker: u8, heap: usize) -> Tx {
+        let build = |padding: usize| {
+            let mut tx = standard_spend(outpoint, marker);
+            tx.outputs[0].script_pubkey = Script::from_bytes(vec![0x6a; padding]);
+            tx
+        };
+        let base =
+            usize::try_from(crate::pool::transaction_heap_usage(&build(0))).unwrap_or(usize::MAX);
+        let tx = build(heap.saturating_sub(base));
+        assert_eq!(
+            crate::pool::transaction_heap_usage(&tx),
+            u64::try_from(heap).unwrap_or(u64::MAX),
+            "the fixture must land exactly on the requested heap usage"
+        );
         tx
     }
 
@@ -1266,13 +1275,15 @@ mod tests {
         assert_eq!(gateway.reconstruction_tx_by_txid(offered.txid()), None);
     }
 
-    // BIP152 extras: only the typed policy class below the size gate is kept.
+    // BIP152 extras: only the typed policy class below the owned-memory gate
+    // is kept. The boundary bodies come from the pool's own heap accounting.
     #[test]
-    fn peer_policy_refusal_is_retained_only_below_the_size_gate() {
+    fn peer_policy_refusal_is_retained_only_below_the_memory_gate() {
         let (coin, chain) = funded_coin();
-        for (size, retained) in [(99_999, true), (100_000, false)] {
+        let limit = crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES;
+        for (heap, retained) in [(limit - 1, true), (limit, false)] {
             let gateway = gateway();
-            let tx = Arc::new(padded_nonstandard(coin, 3, size));
+            let tx = Arc::new(nonstandard_with_heap_usage(coin, 3, heap));
             let result = gateway.submit_transaction(
                 Arc::clone(&tx),
                 AdmissionOrigin::Peer(source()),
@@ -1282,15 +1293,144 @@ mod tests {
             );
             assert!(
                 matches!(result, Err(SubmitError::Policy(_))),
-                "size {size}: {result:?}"
+                "heap {heap}: {result:?}"
             );
             assert!(gateway.is_rejected(Hash256::from(tx.wtxid())));
             assert_eq!(
                 gateway.reconstruction_tx_by_wtxid(tx.wtxid()).is_some(),
                 retained,
-                "size {size}"
+                "heap {heap}"
             );
             assert_eq!(gateway.get_tx_by_wtxid(tx.wtxid()), None);
+        }
+    }
+
+    // BIP152 extras: the gate follows owned memory, not wire bytes. Two bodies
+    // with one consensus serialization (one wtxid) fall on opposite sides of
+    // the gate when only the spare capacity of their input vector differs.
+    #[test]
+    fn peer_policy_refusal_gate_follows_owned_memory_not_wire_size() {
+        let (coin, chain) = funded_coin();
+        let limit = u64::try_from(crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES).unwrap_or(u64::MAX);
+        let packed =
+            nonstandard_with_heap_usage(coin, 3, crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES - 1);
+        let mut roomy =
+            nonstandard_with_heap_usage(coin, 3, crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES - 1);
+        let mut inputs = Vec::with_capacity(roomy.inputs.len() + 1);
+        inputs.append(&mut roomy.inputs);
+        roomy.inputs = inputs;
+        assert_eq!(packed.total_size(), roomy.total_size(), "one wire size");
+        assert_eq!(packed.wtxid(), roomy.wtxid(), "one witness identity");
+        assert!(crate::pool::transaction_heap_usage(&packed) < limit);
+        assert!(crate::pool::transaction_heap_usage(&roomy) >= limit);
+
+        for (tx, retained) in [(Arc::new(packed), true), (Arc::new(roomy), false)] {
+            let gateway = gateway();
+            let result = gateway.submit_transaction(
+                Arc::clone(&tx),
+                AdmissionOrigin::Peer(source()),
+                None,
+                1,
+                &chain,
+            );
+            assert!(matches!(result, Err(SubmitError::Policy(_))), "{result:?}");
+            assert_eq!(
+                gateway.reconstruction_tx_by_wtxid(tx.wtxid()).is_some(),
+                retained,
+                "retained {retained}"
+            );
+        }
+    }
+
+    // BIP152 extras: the gate counts reserved script capacity, not just wire
+    // bytes. Bodies with one consensus serialization (one wtxid) fall on
+    // opposite sides of the gate when only spare script capacity differs;
+    // charging length here would retain the roomy bodies.
+    #[test]
+    fn peer_policy_refusal_gate_counts_script_spare_capacity() {
+        let (coin, chain) = funded_coin();
+        let limit = u64::try_from(crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES).unwrap_or(u64::MAX);
+        let packed =
+            nonstandard_with_heap_usage(coin, 3, crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES - 1);
+        let mut roomy_pubkey = packed.clone();
+        let mut bytes = roomy_pubkey.outputs[0].script_pubkey.as_bytes().to_vec();
+        bytes.reserve(64);
+        roomy_pubkey.outputs[0].script_pubkey = Script::from_bytes(bytes);
+        let mut roomy_sig = packed.clone();
+        roomy_sig.inputs[0].script_sig = Script::from_bytes(Vec::with_capacity(64));
+        for roomy in [&roomy_pubkey, &roomy_sig] {
+            assert_eq!(packed.total_size(), roomy.total_size(), "one wire size");
+            assert_eq!(packed.wtxid(), roomy.wtxid(), "one witness identity");
+            assert!(crate::pool::transaction_heap_usage(&packed) < limit);
+            assert!(
+                crate::pool::transaction_heap_usage(roomy) >= limit,
+                "spare script capacity must count"
+            );
+        }
+
+        for (tx, retained) in [
+            (Arc::new(packed), true),
+            (Arc::new(roomy_pubkey), false),
+            (Arc::new(roomy_sig), false),
+        ] {
+            let gateway = gateway();
+            let result = gateway.submit_transaction(
+                Arc::clone(&tx),
+                AdmissionOrigin::Peer(source()),
+                None,
+                1,
+                &chain,
+            );
+            assert!(matches!(result, Err(SubmitError::Policy(_))), "{result:?}");
+            assert_eq!(
+                gateway.reconstruction_tx_by_wtxid(tx.wtxid()).is_some(),
+                retained,
+                "retained {retained}"
+            );
+        }
+    }
+
+    // BIP152 extras: the gate counts reserved witness capacity, outer stack
+    // and items alike. The witness variants carry different bytes than the
+    // control, so only the heap accounting and the retention verdicts are
+    // compared; charging length here would retain both roomy bodies.
+    #[test]
+    fn peer_policy_refusal_gate_counts_witness_spare_capacity() {
+        let (coin, chain) = funded_coin();
+        let limit = u64::try_from(crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES).unwrap_or(u64::MAX);
+        let packed =
+            nonstandard_with_heap_usage(coin, 3, crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES - 100);
+        let mut roomy_outer = packed.clone();
+        roomy_outer.inputs[0].witness = Witness::from_stack(Vec::with_capacity(8));
+        let mut roomy_item = packed.clone();
+        roomy_item.inputs[0].witness = Witness::from_stack(vec![Vec::with_capacity(128)]);
+        for roomy in [&roomy_outer, &roomy_item] {
+            assert!(crate::pool::transaction_heap_usage(&packed) < limit);
+            assert!(
+                crate::pool::transaction_heap_usage(roomy) >= limit,
+                "spare witness capacity must count"
+            );
+        }
+
+        for (tx, retained) in [
+            (Arc::new(packed), true),
+            (Arc::new(roomy_outer), false),
+            (Arc::new(roomy_item), false),
+        ] {
+            let gateway = gateway();
+            let result = gateway.submit_transaction(
+                Arc::clone(&tx),
+                AdmissionOrigin::Peer(source()),
+                None,
+                1,
+                &chain,
+            );
+            assert!(matches!(result, Err(SubmitError::Policy(_))), "{result:?}");
+            assert_eq!(
+                gateway.reconstruction_tx_by_wtxid(tx.wtxid()).is_some(),
+                retained,
+                "retained {retained}"
+            );
         }
     }
 
@@ -1300,7 +1440,12 @@ mod tests {
         let (coin, chain) = funded_coin();
         for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Esplora] {
             let gateway = gateway();
-            let tx = Arc::new(padded_nonstandard(coin, 3, 99_999));
+            // Below the memory gate, so only the origin refuses retention.
+            let tx = Arc::new(nonstandard_with_heap_usage(
+                coin,
+                3,
+                crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES - 1,
+            ));
             let result = gateway.submit_transaction(Arc::clone(&tx), origin, None, 1, &chain);
             assert!(
                 matches!(result, Err(SubmitError::Policy(_))),

@@ -18,9 +18,8 @@ forward write by row count and encoded bytes, and `IndexWriter` is the mutation-
 handle for durable prepared writes. `IndexWatermark` is the durable
 `(height, full block hash)` cursor — encoded as `height || hash`, readable from a snapshot —
 while the `IndexReader` trait captures a point-in-time `TxIndexSnapshot` for bounded
-typed scans (`TxIndexScan`). The datadir-wide `CURRENT_SCHEMA` marker owns the
-compatibility boundary for these rows; an incompatible datadir fails before the index
-store opens. Around the rows sit the stable types (`ScriptHash`, `HashPrefixRow`,
+typed scans (`TxIndexScan`). The index durability marker (`[0x00, b'V']`, currently row-format 5) owns the
+compatibility boundary for these rows; a mismatch refuses open and recovery full-resets for rebuild, while the datadir-wide `CURRENT_SCHEMA` covers only authoritative chainstate bytes. Around the rows sit the stable types (`ScriptHash`, `HashPrefixRow`,
 `ScriptHashRow`, `ScriptLiveRow`, `SpendingPrefixRow`, `TxPosition`) and generic
 script-history resolution.
 

@@ -1,17 +1,18 @@
 //! `verifychain` parameter boundaries and pre-delegation outcomes.
 //!
 //! The handler validates Core's signed parameters, honors handler shutdown,
-//! and relays the node-owned verifier's answer; an empty window and a tip
-//! without a verifier are answered without one. Body rules, damage classes,
-//! and history windows are owned by `chainstate::verify` and the daemon
-//! comparison.
+//! and answers a tip without a verifier as unverified. The node-owned
+//! verifier's answers, including the applied-genesis window, are proven
+//! against the real verifier in `node` (`lifecycle` tests) and in
+//! `chainstate::verify`; no stand-in verifier lives here.
 #![expect(clippy::unwrap_used)]
+
+use alloc::sync::Arc;
 
 use super::*;
 use crate::handlers::Handler;
 
-/// A context whose applied tip is genesis: enough ancestry for the handler
-/// to reach its verifier, with no bodies to read.
+/// A context whose applied tip is genesis, with no chain control attached.
 fn tipped() -> Arc<Context> {
     let ctx = Context::new();
     let genesis = Network::Regtest.genesis_block();
@@ -85,24 +86,18 @@ fn parameters_follow_core_signed_ranges() {
 
 #[test]
 fn cancelled_requests_report_interruption() {
-    let handler = Handler::new(Arc::new(Context::new()));
+    let handler = Handler::new(tipped());
+    // The same request over the same applied tip answers `false` while the
+    // handler runs (no verifier attached), so the error below is the
+    // handler's own pre-dispatch interruption, not a verifier outcome.
+    assert_eq!(
+        handler.dispatch("verifychain", &json!([0, 0])).unwrap(),
+        json!(false)
+    );
     handler.stop();
-    assert_eq!(
-        handler
-            .dispatch("verifychain", &json!([0, 0]))
-            .unwrap_err()
-            .code(),
-        -1
-    );
-}
-
-#[test]
-fn empty_window_is_verified_without_a_verifier() {
-    let handler = Handler::new(Arc::new(Context::new()));
-    assert_eq!(
-        handler.dispatch("verifychain", &json!([3, 6])).unwrap(),
-        json!(true)
-    );
+    let error = handler.dispatch("verifychain", &json!([0, 0])).unwrap_err();
+    assert_eq!(error.code(), -1);
+    assert_eq!(error.to_string(), "Block verification interrupted");
 }
 
 #[test]

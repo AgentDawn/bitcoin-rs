@@ -218,7 +218,7 @@ fn on_peer_ready_sweeps_dead_predecessor_header_request() -> TestResult {
 fn on_peer_ready_sweep_releases_dead_owned_requests_only() -> TestResult {
     let HeaderSyncFixture { sync, .. } = header_sync_with_genesis()?;
     let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-    let (stale_tx, _stale_rx) = unbounded::<Message>();
+    let (stale_tx, _stale_rx) = crate::test_support::message_channel();
     let stale = PeerLease::new(stale_tx);
     sync.peer_table.register(peer_addr, stale.clone());
     register_info(&sync.peer_table, synthetic_peer(peer_addr, 2));
@@ -260,7 +260,7 @@ fn far_future_matching_peer_retries_without_peer_blame() -> TestResult {
         peers,
     } = header_sync_with_genesis()?;
     let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-    let (tx, rx) = unbounded::<Message>();
+    let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
     peers.register(peer_addr, lease.clone());
     peers.publish_info(peer_addr, &lease, synthetic_peer(peer_addr, 8));
@@ -335,7 +335,7 @@ fn same_address_registration_clears_getheaders_gate_and_routes_replacement() -> 
     sync.tick();
     assert!(matches!(old_rx.try_recv()?, Message::GetHeaders(_)));
 
-    let (new_tx, new_rx) = unbounded::<Message>();
+    let (new_tx, new_rx) = crate::test_support::message_channel();
     let new_lease = PeerLease::new(new_tx);
     peers.register(addr, new_lease.clone());
     peers.publish_info(addr, &new_lease, synthetic_peer(addr, 8));
@@ -433,6 +433,6 @@ pub(crate) fn locator_of(message: &Message) -> Option<Vec<[u8; 32]>> {
 }
 
 /// The first `getheaders` locator on `rx`, or `None` if none is queued.
-pub(crate) fn next_locator(rx: &crossbeam_channel::Receiver<Message>) -> Option<Vec<[u8; 32]>> {
+pub(crate) fn next_locator(rx: &crate::test_support::MessageReceiver) -> Option<Vec<[u8; 32]>> {
     rx.try_iter().find_map(|message| locator_of(&message))
 }

@@ -236,11 +236,35 @@ fn gbt_long_poll_counts_toward_the_blocking_quota() {
     assert!(head.contains("Connection: close"));
     assert_eq!(denied["error"]["code"].as_i64(), Some(-1));
     // No mining control is attached here, so the admitted call answers
-    // method-not-found: anything but the quota error proves admission.
-    let (plain_head, plain) = read(send_close(
-        address,
-        &json!({"id":3,"method":"getblocktemplate","params":[{"rules":["segwit"]}]}),
-    ));
+    // method-not-found: anything but the quota error proves admission. The
+    // denied long-poll's EOF can precede its permit release, so a plain call
+    // racing the release is refused with 503: retry the refusal exactly like
+    // `ordinary_rpc` instead of asserting the first answer.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (plain_head, plain) = loop {
+        let mut stream = send_close(
+            address,
+            &json!({"id":3,"method":"getblocktemplate","params":[{"rules":["segwit"]}]}),
+        );
+        let mut wire = String::new();
+        stream
+            .read_to_string(&mut wire)
+            .expect("bounded response and close");
+        let (head, body) = wire.split_once("\r\n\r\n").expect("HTTP head");
+        if !head.contains("503") {
+            let value = if body.is_empty() {
+                Value::new_null()
+            } else {
+                sonic_rs::from_str(body).expect("JSON response")
+            };
+            break (head.to_owned(), value);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection permit must be released"
+        );
+        std::thread::yield_now();
+    };
     assert!(plain_head.contains("Connection: close"));
     assert_eq!(plain["error"]["code"].as_i64(), Some(-32_601));
     shutdown.store(true, Ordering::Release);

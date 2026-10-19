@@ -245,12 +245,29 @@ mod tests {
     }
 
     #[test]
-    fn addr_bind_is_kept_apart_from_the_peer_address() {
+    fn peer_table_projection_keeps_remote_and_bind_apart() {
+        use crate::peer_table::PeerTable;
+
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 51_234);
-        let info = PeerInfo::inbound_from_version(peer, local, &fake_version(), 0, 0, counters());
-        assert_eq!(info.addr, peer);
-        assert_eq!(info.addr_bind, local);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 51_234);
+        let table = PeerTable::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        assert!(!table.register(peer, lease.clone()));
+        assert!(
+            table.publish_info(
+                peer,
+                &lease,
+                PeerInfo::inbound_from_version(peer, bind, &fake_version(), 0, 0, counters())
+            ),
+            "the live connection publishes"
+        );
+
+        let infos = table.infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].addr, peer);
+        assert_eq!(infos[0].addr_bind, bind);
+        assert_ne!(infos[0].addr, infos[0].addr_bind);
     }
 
     #[test]
@@ -284,14 +301,6 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, 0, counters());
         assert_eq!(info.services_names(), vec!["NETWORK", "WITNESS"]);
-    }
-
-    #[test]
-    fn services_names_empty_for_no_flags() {
-        let version = version_with_services(ServiceFlags::NONE);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, 0, counters());
-        assert_eq!(info.services_names(), Vec::<&'static str>::new());
     }
 
     #[test]

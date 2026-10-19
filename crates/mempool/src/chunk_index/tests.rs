@@ -153,9 +153,41 @@ proptest! {
     }
 }
 
-/// Relinearizing a component replaces its chunks; forgetting drops them.
+/// Relinearizing one component with a changed member set replaces its
+/// chunks: the old chunk is gone, not merged alongside the new one.
 #[test]
-fn relinearize_replaces_and_forget_drops() {
+fn relinearize_replaces_the_same_component() {
+    let pool = dummy_pool();
+    let first = weighted_entry(1, 2_000, 800);
+    let second = weighted_entry(2, 3_000, 800);
+    let mut index = ChunkIndex::default();
+    index.relinearize(
+        0,
+        &[MemberFacts {
+            id: 7,
+            entry: &first,
+            parents: &[],
+        }],
+    );
+    index.relinearize(
+        0,
+        &[MemberFacts {
+            id: 9,
+            entry: &second,
+            parents: &[],
+        }],
+    );
+    assert_eq!(index.len(), 1, "replacement must not keep the old chunk");
+    let remaining: Vec<Vec<EntryId>> = index
+        .chunks_descending(&pool)
+        .map(|chunk| chunk.members.to_vec())
+        .collect();
+    assert_eq!(remaining, alloc::vec![alloc::vec![9]]);
+}
+
+/// Forgetting a component drops its chunks and leaves the others.
+#[test]
+fn forget_drops_only_its_component() {
     let pool = dummy_pool();
     let first = weighted_entry(1, 2_000, 800);
     let second = weighted_entry(2, 3_000, 800);

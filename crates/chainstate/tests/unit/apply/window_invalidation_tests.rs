@@ -16,7 +16,7 @@ use bitcoin_rs_utxo::UtxoSet;
 use parking_lot::Mutex;
 
 use super::{ApplyError, AssumeValidGate, Chainstate, WindowApplyDisposition, WindowApplyError};
-use crate::test_fixtures::{handles, seed_genesis};
+use crate::test_fixtures::{StagedFire, handles, seed_genesis, staging_recorder};
 
 /// A solved, empty block: the commit refuses its body with `EmptyBlock`, a
 /// permanent failure, while its header is already in the tree.
@@ -213,37 +213,6 @@ fn window_invalidation_reevaluates_assume_valid() -> Result<(), Box<dyn std::err
         .ok_or("window invalidation must republish the best valid tip")?;
     assert_eq!(tip.hash, Hash256::from(genesis.block_hash()));
     Ok(())
-}
-
-/// What the staged-tip hook observed on a failing window: the staged tip it
-/// was handed, the borrowed block's identity, and the published tip still in
-/// the cell. Only hashes and heights cross the hook boundary.
-struct StagedFire {
-    staged_hash: Hash256,
-    staged_height: u32,
-    block_hash: Hash256,
-    published: Option<(Hash256, u32)>,
-}
-
-fn staging_recorder(
-    chain: &Chainstate,
-    fires: &Arc<Mutex<Vec<StagedFire>>>,
-) -> crate::TipStagedHook {
-    let fires = Arc::clone(fires);
-    let chain = chain.clone();
-    Arc::new(move |staged, block| {
-        // `applied_tip_snapshot` is a lock-free read; the hook takes no
-        // domain write lock and never reenters chainstate mutation.
-        let published = chain
-            .applied_tip_snapshot()
-            .map(|tip| (tip.hash, tip.height));
-        fires.lock().push(StagedFire {
-            staged_hash: staged.hash,
-            staged_height: staged.height,
-            block_hash: Hash256::from(block.block_hash()),
-            published,
-        });
-    })
 }
 
 /// When a later block in a window fails permanently, the failure-prefix flush

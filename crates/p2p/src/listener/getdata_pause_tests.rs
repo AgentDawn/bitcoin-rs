@@ -19,29 +19,29 @@ use bitcoin_rs_primitives::{
 use crossbeam_channel::{Receiver, Sender};
 
 use super::{
-    ConnectionShared, Keepalive, ParkedStep, TIMEOUT_INTERVAL, configure_peer_stream,
+    ConnectionShared, Keepalive, ParkedStep, TIMEOUT_INTERVAL, WriterExit, configure_peer_stream,
     parked_tail_expired, run_message_loop, run_writer_loop, spawn_connection_writer,
     step_parked_getdata, test_shared,
 };
-use crate::connection::OutboundBudget;
+use crate::connection::{OutboundBudget, SharedOutboundBudget};
 use crate::transport::SendTransport;
 use crate::{
     ChainQuery, InventoryServing, Message, Peer, PeerError, PeerLease, PeerState, PeerTable,
     TxInventory,
 };
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const MAGIC: Magic = Magic::BITCOIN;
+pub(super) const MAGIC: Magic = Magic::BITCOIN;
 
 /// Longest any test waits for an event that must happen.
-const FAILSAFE: Duration = Duration::from_secs(20);
+pub(super) const FAILSAFE: Duration = Duration::from_secs(20);
 
 /// Serves the blocks it holds behind the production gate; every other
 /// inventory vector is missing. A block's payload is whatever bytes the
 /// test stored, so a flood test can share one large buffer.
-struct ScriptedChain {
-    blocks: Vec<([u8; 32], bytes::Bytes)>,
+pub(super) struct ScriptedChain {
+    pub(super) blocks: Vec<([u8; 32], bytes::Bytes)>,
 }
 
 impl ChainQuery for ScriptedChain {
@@ -95,28 +95,28 @@ impl ChainQuery for ScriptedChain {
 }
 
 /// A block that differs from its siblings only by header nonce.
-fn block(nonce: u32) -> Block {
+pub(super) fn block(nonce: u32) -> Block {
     let mut block = Block::default();
     block.header.nonce = nonce;
     block
 }
 
-fn hash_of(block: &Block) -> [u8; 32] {
+pub(super) fn hash_of(block: &Block) -> [u8; 32] {
     *block.block_hash().as_bytes()
 }
 
-fn inventory_of(block: &Block) -> Inventory {
+pub(super) fn inventory_of(block: &Block) -> Inventory {
     Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array(hash_of(block)))
 }
 
-fn scripted(block: &Block) -> ([u8; 32], bytes::Bytes) {
+pub(super) fn scripted(block: &Block) -> ([u8; 32], bytes::Bytes) {
     (
         hash_of(block),
         bytes::Bytes::from(bitcoin_rs_primitives::consensus_bytes(block)),
     )
 }
 
-fn wire_len_of(message: &Message) -> Result<usize, PeerError> {
+pub(super) fn wire_len_of(message: &Message) -> Result<usize, PeerError> {
     crate::wire::wire_len(message)
 }
 
@@ -177,7 +177,12 @@ fn tx_inventory_of(tx: &Tx) -> Inventory {
     Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(*tx.txid().as_bytes()))
 }
 
-fn shared_with(chain: ScriptedChain) -> ConnectionShared {
+pub(super) fn shared_with(chain: ScriptedChain) -> ConnectionShared {
+    shared_with_query(chain)
+}
+
+/// Wiring whose chain view is `chain`.
+pub(super) fn shared_with_query(chain: impl ChainQuery + 'static) -> ConnectionShared {
     let mut shared = test_shared(
         Arc::new(PeerTable::new()),
         crossbeam_channel::unbounded().0,
@@ -214,7 +219,7 @@ impl Write for GatedSocketWriter {
 }
 
 /// Which writer drains the connection's queue.
-enum WriterKind {
+pub(super) enum WriterKind {
     /// `run_writer_loop` over a [`GatedSocketWriter`].
     Gated,
     /// The production `spawn_connection_writer` over the socket, whose
@@ -227,10 +232,10 @@ enum WriterKind {
 ///
 /// Dropping it opens the gate, cancels the lease, closes the client, and
 /// joins both threads, so every exit path cleans up.
-struct Served {
-    client: Peer<TcpStream>,
-    lease: PeerLease,
-    budget: Arc<OutboundBudget>,
+pub(super) struct Served {
+    pub(super) client: Peer<TcpStream>,
+    pub(super) lease: PeerLease,
+    pub(super) budget: Arc<OutboundBudget>,
     gate: Option<Sender<()>>,
     outcome: Receiver<Result<(), PeerError>>,
     session: Option<JoinHandle<()>>,
@@ -242,9 +247,19 @@ impl Served {
     ///
     /// Every fallible step precedes the first spawned thread, so a failure
     /// leaves nothing running.
-    fn start(
+    pub(super) fn start(
         shared: ConnectionShared,
         budget: OutboundBudget,
+        writer: &WriterKind,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_on(shared, budget, None, writer)
+    }
+
+    /// [`Served::start`] with the lease also charging the node `aggregate`.
+    pub(super) fn start_on(
+        shared: ConnectionShared,
+        budget: OutboundBudget,
+        aggregate: Option<&Arc<SharedOutboundBudget>>,
         writer: &WriterKind,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
@@ -258,7 +273,10 @@ impl Served {
         }
 
         let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
-        let lease = PeerLease::new_with_budget(outbound_tx, true, budget);
+        let mut lease = PeerLease::new_with_budget(outbound_tx, true, budget);
+        if let Some(aggregate) = aggregate {
+            lease = lease.with_shared_budget(aggregate);
+        }
         let handle = lease.budget_handle();
         let close = lease.close_signal();
 
@@ -267,6 +285,12 @@ impl Served {
                 let (gate_tx, gate_rx) = crossbeam_channel::bounded::<()>(0);
                 let writer_budget = Arc::clone(&handle);
                 let thread = std::thread::spawn(move || {
+                    // The production writer's exit guard: marks the budget
+                    // dead and drops every frame still queued.
+                    let _exit = WriterExit {
+                        budget: writer_budget,
+                        outbound_rx: &outbound_rx,
+                    };
                     let mut gated = GatedSocketWriter {
                         socket: writer_socket,
                         gate: gate_rx,
@@ -274,12 +298,10 @@ impl Served {
                     run_writer_loop(
                         &outbound_rx,
                         close,
-                        &writer_budget,
                         &mut gated,
                         &mut SendTransport::V1(MAGIC),
                         None,
                     );
-                    writer_budget.mark_writer_dead();
                     let _ = gated.socket.shutdown(Shutdown::Both);
                 });
                 (Some(gate_tx), thread)
@@ -321,12 +343,15 @@ impl Served {
     }
 
     /// Lets the gated writer write, now and for good.
-    fn open_gate(&mut self) {
+    pub(super) fn open_gate(&mut self) {
         drop(self.gate.take());
     }
 
     /// Waits up to `within` for the session loop to return.
-    fn session_outcome(&self, within: Duration) -> Result<Result<(), PeerError>, String> {
+    pub(super) fn session_outcome(
+        &self,
+        within: Duration,
+    ) -> Result<Result<(), PeerError>, String> {
         self.outcome
             .recv_timeout(within)
             .map_err(|_| format!("the session loop did not return within {within:?}"))
@@ -347,7 +372,7 @@ impl Drop for Served {
     }
 }
 
-fn wait_until(what: &str, mut condition: impl FnMut() -> bool) -> TestResult {
+pub(super) fn wait_until(what: &str, mut condition: impl FnMut() -> bool) -> TestResult {
     let deadline = Instant::now() + FAILSAFE;
     while !condition() {
         if Instant::now() >= deadline {
@@ -359,7 +384,7 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) -> TestResult {
 }
 
 /// Reads `count` messages from the client end, skipping v1 poll timeouts.
-fn read_messages(
+pub(super) fn read_messages(
     client: &mut Peer<TcpStream>,
     count: usize,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
@@ -483,10 +508,9 @@ fn paused_peer_that_never_reads_ends_on_write_timeout() -> TestResult {
         "the writer's death ends the parked session cleanly: {outcome:?}"
     );
     assert!(served.budget.writer_dead());
-    assert!(
-        served.budget.pending().0 > 0,
-        "the dead writer released nothing: the queue was still saturated"
-    );
+    wait_until("the dead writer's queued frames to release", || {
+        served.budget.pending() == (0, 0)
+    })?;
     Ok(())
 }
 
@@ -534,7 +558,7 @@ fn lease_cancel_ends_a_parked_session() -> TestResult {
 fn tiny_item_flood_pauses_at_the_item_cap_and_drains_in_order() -> TestResult {
     let txs: Vec<Tx> = (1..=5).map(tiny_tx).collect();
     let tx_len = wire_len_of(&Message::Tx(tiny_tx(1)))?;
-    let budget = OutboundBudget::with_block_reserve(3, 1 << 20, 1);
+    let budget = OutboundBudget::with_block_reserve(3, 1 << 20, tx_len);
     let shared = shared_with_txs(
         ScriptedChain { blocks: Vec::new() },
         ScriptedTxs { txs: txs.clone() },
@@ -603,7 +627,7 @@ fn a_getdata_that_fills_the_last_slot_parks_its_trailing_notfound_and_the_next_p
 {
     let txs: Vec<Tx> = (1..=3).map(tiny_tx).collect();
     let tx_len = wire_len_of(&Message::Tx(tiny_tx(1)))?;
-    let budget = OutboundBudget::with_block_reserve(3, 1 << 20, 1);
+    let budget = OutboundBudget::with_block_reserve(3, 1 << 20, tx_len);
     let shared = shared_with_txs(
         ScriptedChain { blocks: Vec::new() },
         ScriptedTxs { txs: txs.clone() },
@@ -661,8 +685,7 @@ fn a_getdata_that_fills_the_last_slot_parks_its_trailing_notfound_and_the_next_p
 /// cannot admit one message, and releases them once it can.
 #[test]
 fn a_drained_getdata_holds_reads_until_the_queue_can_take_a_reply() -> TestResult {
-    let ping_len = wire_len_of(&Message::Ping(1))?;
-    let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+    let (outbound_tx, outbound_rx) = crate::test_support::message_channel();
     let lease = PeerLease::new_with_budget(
         outbound_tx,
         true,
@@ -688,7 +711,11 @@ fn a_drained_getdata_holds_reads_until_the_queue_can_take_a_reply() -> TestResul
     assert!(parked_since.is_some(), "the hold keeps its start");
     assert!(!lease.is_cancelled());
 
-    lease.budget_handle().release(ping_len);
+    assert_eq!(
+        outbound_rx.try_recv(),
+        Ok(Message::Ping(1)),
+        "the writer takes the queued ping, and its slot returns"
+    );
     let released = step_parked_getdata(
         &mut peer,
         &shared,
@@ -699,11 +726,7 @@ fn a_drained_getdata_holds_reads_until_the_queue_can_take_a_reply() -> TestResul
 
     assert_eq!(released, ParkedStep::NotParked, "a slot is free again");
     assert_eq!(parked_since, None, "reads resume and the marker clears");
-    assert_eq!(
-        outbound_rx.try_iter().collect::<Vec<_>>(),
-        vec![Message::Ping(1)],
-        "the hold sends nothing"
-    );
+    assert!(outbound_rx.is_empty(), "the hold sends nothing");
     Ok(())
 }
 
@@ -743,7 +766,7 @@ fn production_writer_marks_the_budget_dead_when_a_write_fails() -> TestResult {
 /// parked, nothing is sent, and the lease stays live; the tail is untouched.
 #[test]
 fn a_full_queue_keeps_the_misses_and_sends_nothing() -> TestResult {
-    let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+    let (outbound_tx, outbound_rx) = crate::test_support::message_channel();
     let lease = PeerLease::new_with_budget(
         outbound_tx,
         true,
@@ -782,7 +805,7 @@ fn a_full_queue_keeps_the_misses_and_sends_nothing() -> TestResult {
     Ok(())
 }
 
-fn parked_peer(tail: Vec<Inventory>) -> Peer<io::Cursor<Vec<u8>>> {
+pub(super) fn parked_peer(tail: Vec<Inventory>) -> Peer<io::Cursor<Vec<u8>>> {
     let mut peer = Peer::new(io::Cursor::new(Vec::new()), MAGIC);
     peer.state = PeerState::Ready;
     peer.pending_getdata = tail;
@@ -862,7 +885,7 @@ fn an_open_queue_resumes_notfound_first_and_reparks_what_the_gate_stops() -> Tes
     let (block_a, block_b) = (block(6), block(7));
     let (entry_a, entry_b) = (scripted(&block_a), scripted(&block_b));
     let block_len = wire_len_of(&Message::BlockPayload(entry_a.1.clone()))?;
-    let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
+    let (outbound_tx, outbound_rx) = crate::test_support::message_channel();
     // Room for the `notfound` and one block, not for a second block.
     let lease = PeerLease::new_with_budget(
         outbound_tx,

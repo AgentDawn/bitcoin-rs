@@ -131,6 +131,12 @@ existing external tool -> generic Bitcoin implementation interface -> Core | bit
   Observability (Core-compatible USDT, bpftrace/BCC, bitcoin-dev-tools);
   Process/component interfaces (optional Core IPC as a narrowly scoped
   adapter).
+- Proof (Stratum V2 adapter surface only): localhost Noise and embedded-Node
+  tests in `tools/stratum-sv2/template-provider` (for example
+  `tight_budget_gets_a_fitting_job_and_budgets_stay_independent`,
+  `partial_noise_frame_survives_a_job_refresh`, and
+  `embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown`)
+  plus the retained functional compose run the owner matrix row names.
 - This matrix is a different axis from
   `crates/rpc/core-compat.toml` (Core reference identity pins) and
   `crates/rpc/src/registry.rs` (per-method Core-schema status): those own

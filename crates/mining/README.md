@@ -28,7 +28,7 @@ The crate owns the domain `Candidate`, [`solve_block`](crate::solve_block),
 and the node-facing mining contract ([`MiningControl`](crate::MiningControl),
 [`BlockTemplate`](crate::BlockTemplate), [`MiningInfo`](crate::MiningInfo),
 [`MiningControl::generate`](crate::MiningControl::generate)).
-BIP22/BIP23 JSON projection follows the [API-07 contract](../../docs/contracts/external-api.md#api-07-bip22bip23-template-extras).
+BIP22/BIP23 JSON projection follows the [API-11 contract](../../docs/contracts/external-api.md#api-11-bip22bip23-template-extras).
 [`MiningService`](crate::MiningService) owns the candidate lifecycle:
 generation keys, the bounded template cache with single-flight assembly, and
 long-poll publication over node-supplied capability sources. Generate assemble-solve-submit, block
@@ -94,9 +94,13 @@ surface never do.
   selection under the budget. The returned `template_id` says which. Nothing is
   promised about how a budgeted body relates to the ordinary one: a greedy walk
   under tighter limits may skip a large early chunk and take different later
-  ones. A budgeted request never assembles an ordinary candidate, never
-  compares a budgeted id against a preparation, and so never discards one.
-  Budgeted assemblies do not update `last_candidate`.
+  ones. A fresh budgeted walk never assembles an ordinary candidate. A
+  budgeted request never compares a budgeted id against a preparation;
+  a budgeted request that tries to reuse the generation's ordinary
+  candidate from a finished preparation checks only the ordinary
+  generation, and a mismatch there discards the stale preparation
+  without serving it.
+  A budgeted assembly that installs under the live generation reports its candidate in `last_candidate`.
 - **Finite owner admission.** At most one budgeted selection walks the pool at a
   time, beside the ordinary single flight, which neither waits for it nor
   displaces it. Publication drops the old generation's cached candidates of

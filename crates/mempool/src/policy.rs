@@ -136,17 +136,76 @@ mod tests {
     }
 
     #[test]
-    fn configured_limits_flow_into_the_cluster_projections() {
-        let snapshot = MempoolPolicySnapshot::from_enforced(
-            MempoolLimits {
-                cluster_count: 7,
-                cluster_size_vbytes: 42_000,
+    fn enforced_cluster_count_rejects_a_joining_transaction() {
+        use alloc::sync::Arc;
+
+        use bitcoin_rs_consensus::ValidationEngine;
+        use bitcoin_rs_primitives::{
+            Amount, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
+        };
+        use parking_lot::RwLock;
+
+        use crate::{AdmissionOrigin, Mempool, MempoolEntry, MempoolError, MempoolGateway};
+
+        fn tx_with(inputs: &[OutPoint], outputs: u32, tag: u64) -> Tx {
+            Tx {
+                version: 2,
+                lock_time: LockTime::ZERO,
+                inputs: inputs
+                    .iter()
+                    .map(|previous_output| TxIn {
+                        previous_output: *previous_output,
+                        script_sig: Script::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                outputs: (0..outputs)
+                    .map(|vout| TxOut {
+                        value: Amount::from_sat(
+                            10_000_u64
+                                .saturating_add(u64::from(vout))
+                                .saturating_add(tag.saturating_mul(1_000)),
+                        ),
+                        script_pubkey: alloc::vec![0x51].into(),
+                    })
+                    .collect(),
+            }
+        }
+
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                cluster_count: 2,
                 ..MempoolLimits::default()
-            },
-            StandardnessPolicy::default(),
+            }))),
+            None,
+            ValidationEngine::Native,
+            None,
         );
-        assert_eq!(snapshot.cluster_count, 7);
-        assert_eq!(snapshot.cluster_size_vbytes, 42_000);
+        let admit = |tx: Tx| {
+            gateway.insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0),
+            )
+        };
+
+        let confirmed = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[9_u8; 32])), 0);
+        let root = tx_with(&[confirmed], 2, 1);
+        let root_txid = root.txid();
+        assert!(admit(root).is_ok(), "the root fits in an empty cluster");
+        assert!(
+            admit(tx_with(&[OutPoint::new(root_txid, 0)], 1, 2)).is_ok(),
+            "the first sibling fits a limit of two"
+        );
+
+        let refused = admit(tx_with(&[OutPoint::new(root_txid, 1)], 1, 3));
+        assert!(
+            matches!(
+                refused,
+                Err(MempoolError::Policy(PolicyError::ClusterCountLimit))
+            ),
+            "the joining child must be refused on cluster count: {refused:?}"
+        );
     }
 
     #[test]

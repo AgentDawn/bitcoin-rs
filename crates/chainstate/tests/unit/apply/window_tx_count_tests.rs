@@ -24,7 +24,7 @@ use bitcoin_rs_storage::{CommitRecords, DurableHead};
 use bitcoin_rs_utxo::UtxoSet;
 use parking_lot::Mutex;
 
-use crate::test_fixtures::{handles, seed_genesis};
+use crate::test_fixtures::{StagedFire, handles, seed_genesis, staging_recorder};
 
 #[test]
 fn a_grouped_window_publishes_each_blocks_own_prefix_count()
@@ -115,37 +115,6 @@ fn a_grouped_window_publishes_each_blocks_own_prefix_count()
         "one receipt certifies the whole committed prefix"
     );
     Ok(())
-}
-
-/// What the staged-tip hook observed: the staged tip it was handed, the
-/// borrowed block's identity, and the published tip still in the cell.
-/// Only hashes and heights cross the hook boundary — never a block clone.
-struct StagedFire {
-    staged_hash: Hash256,
-    staged_height: u32,
-    block_hash: Hash256,
-    published: Option<(Hash256, u32)>,
-}
-
-fn staging_recorder(
-    chain: &crate::Chainstate,
-    fires: &Arc<Mutex<Vec<StagedFire>>>,
-) -> crate::TipStagedHook {
-    let fires = Arc::clone(fires);
-    let chain = chain.clone();
-    Arc::new(move |staged, block| {
-        // `applied_tip_snapshot` is a lock-free read; the hook takes no
-        // domain write lock and never reenters chainstate mutation.
-        let published = chain
-            .applied_tip_snapshot()
-            .map(|tip| (tip.hash, tip.height));
-        fires.lock().push(StagedFire {
-            staged_hash: staged.hash,
-            staged_height: staged.height,
-            block_hash: Hash256::from(block.block_hash()),
-            published,
-        });
-    })
 }
 
 /// A fully successful group hands exactly its newest block to the staged-tip

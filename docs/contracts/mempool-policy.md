@@ -95,9 +95,12 @@ holds the reference pins and the admission-profile evidence.
 - Mining treats every derived fee chunk as indivisible. If its finality,
   weight, serialized-size or sigop check fails, all members are skipped and
   dependent later chunks remain unavailable. The configured candidate limits
-  are inclusive. Selection reads only the pool owner's maintained index under
-  one read guard and copies only the selected transactions, so invalid or
-  cyclic references cannot reach it; there is no snapshot graph to validate.
+  are inclusive. Top-chunk selection reads only the pool owner's maintained
+  index under one read guard (`chunks_by_feerate`). Generate/ordered and RPC
+  mining paths instead take one whole-pool `mining_snapshot` with the lock
+  released and remap ancestors through `snapshot_for_selection`; the snapshot
+  carries the pool's own ancestor topology, so there is no independently
+  solved graph to validate.
   Core 31.1 `node/miner.cpp::addChunks` supplies the independent reference
   for whole-chunk skipping; local configured limits and BIP68 checks follow
   this contract and POL-06.

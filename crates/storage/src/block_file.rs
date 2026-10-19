@@ -119,7 +119,7 @@ pub struct FlatFileBlockStore {
     /// replace `usage` with a directory measurement.
     usage_dirty: AtomicBool,
     /// Last field: drops after the writer's file handle above has closed.
-    _guard: Option<crate::StoreGuard>,
+    guard: Option<crate::StoreGuard>,
 }
 
 struct WriterState {
@@ -144,10 +144,17 @@ struct ReaderState {
 
 impl FlatFileBlockStore {
     /// Keeps `guard` alive until this store's block-file handle is closed.
+    ///
+    /// Panics when a guard is already installed: replacing it would release
+    /// the first guard while the block-file handle it protects is still open.
     #[must_use]
     pub fn guarded_by(self, guard: crate::StoreGuard) -> Self {
+        assert!(
+            self.guard.is_none(),
+            "a flat-file block store takes exactly one lifetime guard"
+        );
         Self {
-            _guard: Some(guard),
+            guard: Some(guard),
             ..self
         }
     }
@@ -548,7 +555,7 @@ impl FlatFileBlockStore {
             }),
             usage,
             usage_dirty: AtomicBool::new(false),
-            _guard: None,
+            guard: None,
         })
     }
 }

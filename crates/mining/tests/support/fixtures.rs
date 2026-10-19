@@ -30,6 +30,7 @@ pub(crate) fn context() -> CandidateContext {
         min_time: 1,
         current_time: 2,
         locktime_cutoff: 1,
+        staged_parent_mtp: 1,
         network: Network::Regtest,
         csv_active: true,
         segwit_active: true,

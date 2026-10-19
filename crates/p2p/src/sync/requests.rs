@@ -199,19 +199,26 @@ impl BlockSync {
         // and the pending stamp under one table authority, so a replacement
         // can never be blamed for — or credited with — this request.
         let mut has_request_capacity = false;
-        if self
-            .peer_table
-            .send_then(source, msg, || {
-                let mut scheduler = self.scheduler.lock();
-                let SchedulerState { window, stager, .. } = &mut *scheduler;
-                has_request_capacity = window.mark_requested(stager, &request, source, now);
-            })
-            .is_err()
-        {
-            tracing::warn!(
-                peer_addr = %source.addr,
-                "block sync: outbound channel disconnected (getdata)"
-            );
+        let sent = self.peer_table.send_then(source, msg, || {
+            let mut scheduler = self.scheduler.lock();
+            let SchedulerState { window, stager, .. } = &mut *scheduler;
+            has_request_capacity = window.mark_requested(stager, &request, source, now);
+        });
+        if let Err(refusal) = sent {
+            // Nothing was queued and nothing was marked, so a refusal by the
+            // node's aggregate budget costs this tick only: the next tick
+            // plans the request again from the window's then-current state.
+            if refusal.is_saturated() {
+                tracing::debug!(
+                    peer_addr = %source.addr,
+                    "block sync: getdata deferred; node outbound budget is full"
+                );
+            } else {
+                tracing::warn!(
+                    peer_addr = %source.addr,
+                    "block sync: outbound channel disconnected (getdata)"
+                );
+            }
             return GetdataRequestOutcome::default();
         }
 
@@ -319,8 +326,8 @@ impl BlockSync {
                     );
                     return Some(source);
                 }
-                Err(returned) => {
-                    message = returned;
+                Err(refusal) => {
+                    message = refusal.into_message();
                 }
             }
         }

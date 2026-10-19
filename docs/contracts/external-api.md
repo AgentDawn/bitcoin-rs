@@ -244,10 +244,18 @@ scanning and wallet interoperability remain unverified.
 - The answer is `true` only when every block in the window was checked and
   passed. Any damaged block or undo record, and any window reaching history
   this node does not hold (pruned, snapshot-only, unreadable or missing
-  bodies), answers `false`: Core's boolean failure. This deliberately differs
-  from upstream's incomplete-verification `-1`, which stays out so the RPC
-  keeps Core's boolean surface and one owner keeps the whole mapping. No
-  requested block is silently passed.
+  bodies), answers `false`: Core's boolean failure for integrity and missing
+  history. Missing history keeps the boolean surface: upstream's
+  incomplete-verification `-1` for unavailable data stays out, and one owner
+  keeps that mapping. Cancellation and recovery closure are the implemented
+  `-1` errors, distinct from that boolean failure: a triggered request latch
+  answers `-1` `Block verification interrupted`, and a chainstate closed for
+  recovery answers `-1` `Chainstate is unavailable for verification`,
+  including a closure that lands mid-walk, on the final read, or over an
+  empty window. The boundary poll order is cancellation, then recovery
+  closure, then process shutdown, then the history pin, so a process shutdown
+  observed mid-walk still skips to `false` where the code takes that branch.
+  No requested block is silently passed.
 
   Proof: `handlers::chain::verifychain_tests::tip_without_control_is_not_verified`
   and `core_compat::chain_state_responses_deserialize_into_pinned_types`, which
@@ -255,15 +263,48 @@ scanning and wallet interoperability remain unverified.
   daemon missing-file case in
   `overhaul_process_harness::verifychain_reports_damaged_native_frames_without_repairing_them`
   asserts `false` under this boolean contract (migrated from upstream's `-1`).
+  Interruption and recovery closure: `handlers::chain::verifychain_tests::cancelled_requests_report_interruption`
+  pins the stopped-handler `-1`; `crates/rpc/tests/handler_smoke.rs::verifychain_maps_control_interruptions_to_core_errors`
+  pins both `-1` messages and codes through dispatch;
+  `node::lifecycle::tests::verify_chain_reports_cancellation_and_recovery_closure`
+  pins the control mapping and `verify_chain_over_applied_genesis_is_answered_by_the_real_verifier`
+  pins closure over the empty window;
+  `chainstate::verify_tests::a_request_cancelled_before_admission_never_reads_or_pins`,
+  `a_request_cancelled_during_the_walk_interrupts_without_success`,
+  `a_request_cancelled_on_the_final_read_interrupts_before_success`,
+  `a_recovery_closed_chainstate_is_unavailable_even_over_an_empty_window`,
+  `closing_for_recovery_during_the_walk_refuses_success` and
+  `closing_for_recovery_on_the_final_read_refuses_success` pin entry, mid-walk
+  and final-read behavior; `shutdown_during_the_walk_skips_instead_of_failing`
+  pins the shutdown-to-skip ordering. Scope: the socket witness
+  (`node::lifecycle::tests::verifychain_socket_cancels_in_flight_walk_on_node_shutdown`)
+  separately requests chainstate shutdown and stops the RPC handler via
+  server-shutdown exit; it does not exercise `Node::shutdown` end to end.
+  `verifychain_socket_reports_recovery_closure` covers the recovery-closure
+  socket path.
 
 - The walk holds no tree or chain-transition guard during body reads, and
   needs none: an applied ancestor's body and undo record are immutable, so
   there is no captured publication for a concurrent transition to invalidate.
-  A request that arrives after the handler stopped reports interruption
-  before touching chain state. The existing blocking-call budget applies.
+  A request that arrives after its RPCHandler stopped reports `-1`
+  `Block verification interrupted` before touching chain state; the same
+  latch is polled at every progress boundary and before reporting success, so
+  a cancellation that lands mid-walk or on the final read still interrupts
+  rather than passing or failing as damage. A chainstate closed for recovery
+  is fail-closed at the same boundaries, including over an empty window, as
+  `-1` `Chainstate is unavailable for verification`. The existing
+  blocking-call budget applies.
 
   Proof: `handlers::chain::verifychain_tests::cancelled_requests_report_interruption`;
-  `state::storage::body_read_tests::stored_body_read_preserves_failure_instead_of_reporting_absence`.
+  `state::storage::body_read_tests::stored_body_read_preserves_failure_instead_of_reporting_absence`;
+  `chainstate::verify_tests::a_request_cancelled_during_the_walk_interrupts_without_success`
+  and `a_request_cancelled_on_the_final_read_interrupts_before_success` pin the
+  mid-walk and final-read latch; `closing_for_recovery_during_the_walk_refuses_success`
+  and `closing_for_recovery_on_the_final_read_refuses_success` pin the same
+  boundaries for recovery closure;
+  `crates/rpc/tests/handler_smoke.rs::verifychain_maps_control_interruptions_to_core_errors`
+  and `node::lifecycle::tests::verify_chain_reports_cancellation_and_recovery_closure`
+  pin the `-1` mapping from control to dispatch.
 
 - This is a read-only integrity check: it never changes the UTXO set, rewrites
   bodies, repairs storage, or advances a durable root. Startup verifies the
@@ -657,7 +698,7 @@ scanning and wallet interoperability remain unverified.
   `GetRejectReason` strings (`bad-cb-missing`, `bad-txnmrklroot`,
   `bad-cb-amount`, `high-hash`, `time-too-old`, …). Operational apply
   refusals (`Shutdown`, journal backpressure) stay `inconclusive`.
-- A body without a coinbase that holds a 64-byte transaction is a mutated
+- A body without a coinbase that holds a 64-byte witness-stripped transaction is a mutated
   body, not an invalid header, and still projects `bad-cb-missing`, as Core's
   first-transaction rule reports it.
 - A signet block whose BIP325 solution fails is `bad-signet-blksig`. The
@@ -1022,8 +1063,9 @@ evidence does not establish mainnet memory or throughput qualifications.
   toward the blocking quota and closes keep-alive like any classified call;
   overload answers the same `-1` quota error, not Core's HTTP `503`, so
   long-poll clients reconnect per poll. A long-poll is not on the RPC
-  cancellation latch. A non-string `longpollid` is neither waiting nor
-  blocking; a malformed string id is blocking but fails fast.
+  cancellation latch. An absent or null `longpollid` uses ordinary template
+  handling; any other non-string value fails with InvalidType before waiting;
+  a string id is blocking-classified, and a malformed string id fails fast.
 - Arity errors retain Core's `-1` but return concise method usage rather than
   its generated help body. These cancellation, overload, transport and help
   differences are declared `Deviation`; no full compatibility promotion is made.

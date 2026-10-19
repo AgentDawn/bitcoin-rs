@@ -11,9 +11,9 @@ use parking_lot::Mutex;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 use super::support::{
-    LongPollId, MEMPOOL_TX_FEE_SATS, PRIORITY_DELTA_SATS, REGTEST_SUBSIDY_SATS, SEED_BLOCKS,
-    WITNESS_RESERVED, admit_to_mempool, apply_genesis, assemble_from_template,
-    assemble_regtest_block, compute_witness_merkle_root, current_tip, gbt_view, live_long_poll_id,
+    LongPollId, MEMPOOL_TX_FEE_SATS, PRIORITY_DELTA_SATS, PROMPT, REGTEST_SUBSIDY_SATS,
+    SEED_BLOCKS, WITNESS_RESERVED, admit_to_mempool, apply_genesis, assemble_from_template,
+    assemble_regtest_block, compute_witness_merkle_root, current_tip, live_long_poll_id,
     mine_regtest_block, mining_handler, open_regtest, p2sh_true_output, p2sh_true_spend_script_sig,
     priority_fixture, required_str, required_u64, seed_chain, seed_coinbase_spend,
     seed_coinbase_spend_with_fee, txid_strings,
@@ -668,11 +668,11 @@ fn getblocktemplate_accepts_the_legacy_longpollid_shape_as_fee_zero() -> Result<
     );
     // A prioritisation moves only the fee component, so the previous legacy
     // id is stale and must resolve at once instead of failing as malformed.
-    // No wait is involved, so the check is synchronous.
     fx.prioritise(&fx.low, PRIORITY_DELTA_SATS)?;
-    let handler = Arc::clone(&fx.wired.handler);
     let legacy = current.long_poll_id;
-    let answered = gbt_view(&handler, Some(&legacy))?;
+    // A legacy id resolves against the fee-zero generation without waiting;
+    // the bound fails the test instead of hanging it if that regresses.
+    let answered = fx.poll(&legacy).collect(PROMPT)??;
     assert_ne!(
         answered.long_poll_id, legacy,
         "a legacy id must resolve against the fee-zero generation, not fail as malformed"

@@ -25,6 +25,7 @@ pub(super) fn empty_candidate(parent: u8) -> Arc<Candidate> {
                 min_time: 1,
                 current_time: 1,
                 locktime_cutoff: 1,
+                staged_parent_mtp: 1,
                 network: Network::Regtest,
                 csv_active: true,
                 segwit_active: true,

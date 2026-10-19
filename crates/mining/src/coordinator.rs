@@ -595,7 +595,10 @@ impl MiningService {
     /// retained-component read, the state update, and the wake share one
     /// coordinator-state critical section, so a concurrent membership
     /// publication cannot interleave between the read and the overwrite and no
-    /// fee component is lost.
+    /// fee component is lost. A delayed callback carrying an older fee
+    /// revision than the key already published for this tip and membership
+    /// is dropped, so it can neither regress the published key nor invalidate
+    /// the newer candidate. No pool lock is taken here.
     pub fn publish_fee_delta_generation(&self, fee_delta_sequence: u64) {
         let mut state = self.state.lock();
         let key = GenerationKey {
@@ -603,6 +606,13 @@ impl MiningService {
             mempool_sequence: state.retained_mempool_sequence(),
             fee_delta_sequence,
         };
+        if let Some(published) = state.published
+            && published.tip_hash == key.tip_hash
+            && published.mempool_sequence == key.mempool_sequence
+            && published.fee_delta_sequence > fee_delta_sequence
+        {
+            return;
+        }
         self.publish_locked(&mut state, key);
     }
 
@@ -1182,9 +1192,11 @@ impl MiningService {
     /// Reuse is a cost optimisation, never a claim about what a budgeted walk
     /// would have chosen: a reused body is the one selector's own output for
     /// this generation that fits the budget, and which of several fitting
-    /// bodies is served is unspecified. A budgeted request never assembles or
-    /// installs an ordinary candidate itself and never compares a budgeted id
-    /// against a preparation, so it cannot discard one.
+    /// bodies is served is unspecified. Reuse installs the ordinary candidate
+    /// it serves (cache, published key, `last_candidate`, slot release),
+    /// exactly like the prepared install; only a fresh budgeted assembly
+    /// installs a budgeted key. A budgeted request never compares a budgeted
+    /// id against a preparation, so it cannot discard one.
     ///
     /// Selection is finite owner admission: one budgeted walk at a time
     /// (`CoordinatorState::budgeted`). A caller behind the slot waits at most
@@ -1246,6 +1258,7 @@ impl MiningService {
             return Err(generation_race());
         }
         state.cache_insert(key, Arc::clone(&assembled));
+        state.last_candidate = Some(last_candidate_info(&assembled));
         Ok(assembled)
     }
 
@@ -1767,6 +1780,7 @@ fn candidate_context_for(
         min_time: chain.min_time,
         current_time: current_time.max(chain.min_time),
         locktime_cutoff: chain.locktime_cutoff(current_time.max(chain.min_time)),
+        staged_parent_mtp: chain.parent_median_time_past,
         network,
         csv_active: chain.csv_active,
         segwit_active: chain.segwit_active,

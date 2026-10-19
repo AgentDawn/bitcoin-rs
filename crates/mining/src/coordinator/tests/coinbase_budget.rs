@@ -138,10 +138,40 @@ fn ordinary_request_is_never_served_a_budgeted_candidate_and_is_unchanged() -> T
     let (source, service) = service_over(pool)?;
     let budgeted = service.get_block_template(None, Some(TIGHT))?.candidate;
     assert_eq!(txids(&budgeted), vec![light]);
-    assert!(
-        service.state.lock().last_candidate.is_none(),
-        "a budgeted assembly must not touch the reported candidate"
+    // A fresh budgeted assembly is the newest candidate the node served, so
+    // the mining-info observation must describe it, not stay absent.
+    let reported = service
+        .state
+        .lock()
+        .last_candidate
+        .ok_or("a budgeted assembly must report the candidate it installed")?;
+    assert_eq!(reported.weight, budgeted.weight);
+    assert_eq!(
+        reported.transactions,
+        u64::try_from(budgeted.transactions.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
     );
+    let info = service.mining_info(0.0, Vec::new(), None)?;
+    assert_eq!(
+        info.last_candidate.map(|known| known.weight),
+        Some(budgeted.weight)
+    );
+
+    // A subsequent stricter budget walks again under a new key and the
+    // observation follows the newest install.
+    let stricter = CoinbaseBudget {
+        additional_size: 100,
+        additional_sigops: 7,
+    };
+    let restrained = service.get_block_template(None, Some(stricter))?.candidate;
+    assert_ne!(restrained.template_id, budgeted.template_id);
+    let reported = service
+        .state
+        .lock()
+        .last_candidate
+        .ok_or("a stricter budgeted assembly must replace the reported candidate")?;
+    assert_eq!(reported.weight, restrained.weight);
 
     let ordinary = service.get_block_template(None, None)?.candidate;
     assert_ne!(ordinary.template_id, budgeted.template_id);
@@ -688,7 +718,7 @@ fn shutdown_ends_a_budgeted_wait() -> TestResult {
     );
     assert_eq!(pool.budgeted_calls(), 1);
     pool.release.store(true, Ordering::SeqCst);
-    let _ = holder.join().map_err(|_| "the holder panicked")?;
+    holder.join().map_err(|_| "the holder panicked")??;
     assert!(service.state.lock().budgeted.is_none());
     Ok(())
 }

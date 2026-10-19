@@ -8,7 +8,7 @@ use super::*;
 /// Returns the next `getheaders` from `rx`, skipping other traffic; fails
 /// when none is queued.
 fn next_getheaders(
-    rx: &crossbeam_channel::Receiver<Message>,
+    rx: &crate::test_support::MessageReceiver,
 ) -> Result<bitcoin::p2p::message_blockdata::GetHeadersMessage, Box<dyn std::error::Error>> {
     while let Ok(message) = rx.try_recv() {
         if let Message::GetHeaders(request) = message {
@@ -1250,7 +1250,7 @@ type CompactGateFixture = (
     SyncHarness,
     Vec<Block>,
     crate::PeerSource,
-    crossbeam_channel::Receiver<crate::Message>,
+    crate::test_support::MessageReceiver,
 );
 
 /// Genesis plus two mined blocks under one connected peer, with nothing

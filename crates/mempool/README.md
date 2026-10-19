@@ -5,7 +5,7 @@ package preview, TRUC and ephemeral dust, orphan parking, relay standardness,
 and the history-based fee-rate estimator.
 
 `Mempool` owns the entry arena plus the txid, funding (keyed by `ScriptHash`, the
-double-SHA256 of a script), spending, and fee-priority indexes; every accepted
+single SHA256 of a script), spending, and fee-priority indexes; every accepted
 transaction becomes a `MempoolEntry` addressed by its slab-index `EntryId`.
 Production admission runs through `MempoolGateway::submit_transaction`, which
 enforces the `MempoolLimits` (including min-relay fee) and returns
@@ -33,7 +33,7 @@ admissions and failed packages never fill — peer, local, and package
 submissions share this rule, and block connect consults it. A hit skips script
 re-execution only; finality, amounts, BIP68 locks, and sigop limits always run,
 and any flag divergence is a miss that re-verifies. No throughput claim is made
-here; consult the step-4 measurement record.
+here.
 ## Contract ownership
 
 Mempool behavioral contracts are defined in `docs/contracts/`:

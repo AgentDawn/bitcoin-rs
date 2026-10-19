@@ -60,6 +60,13 @@ state (`crates/mempool/src/orphan.rs`).
   `publish_fee_delta_generation()`.
   `node` attaches that mining observer at gateway construction and the ZMQ
   sequence observer as an extra named leg on the gateway's `CompositeObserver`.
+- Proof: `gateway::tests::concurrent_mutations_publish_in_sequence_order`
+  in `crates/mempool/src/gateway.rs` publishes 1,500 commit cycles from
+  parallel callers and checks the observed stream is gap-free commit order;
+  `gateway::tests::accepted_and_block_inclusion_events_arrive_in_commit_order`
+  checks accepted-then-removed publication order;
+  `gateway::tests::reentrant_observer_mutation_completes_with_callback_sequence_1_2`
+  checks a nested commit enqueues behind the in-flight callback.
 
 ### `MPL-02`: Atomic mutation records and sequence assignment
 
@@ -72,9 +79,9 @@ state (`crates/mempool/src/orphan.rs`).
 - `RemovalReason::Expiry` records transactions whose insertion timestamp is
   strictly older than 336 hours (`now.saturating_sub(MEMPOOL_EXPIRY_SECS)`),
   removed along with their descendants. Expiry runs after each committed
-  transaction or package admission and reorg re-add; preview operations never
-  expire entries. If expiry removes an admitted member, admission returns a
-  mempool-full error.
+  transaction or package admission and during reorg trim; preview operations
+  never expire entries. If expiry removes an admitted member, admission
+  returns a mempool-full error.
 - `Mempool::sequence_number` advances exactly once per emitted change while
   the write lock is held. A failed insert, a no-op removal, and a clear of
   an empty pool assign nothing.
@@ -84,6 +91,11 @@ state (`crates/mempool/src/orphan.rs`).
   `MutationResult::sequence_of` returns the wrapped value for any
   in-range index. A sequence of `0` is a valid committed value; only an
   empty `MutationResult` carries no sequence.
+- Proof: `gateway::tests::sequence_base_matches_per_change_assignment`
+  in `crates/mempool/src/gateway.rs` checks the reconstructed base against
+  per-change assignment;
+  `gateway::tests::failed_insert_and_noop_remove_publish_nothing` checks a
+  failed insert and a no-op removal assign nothing and publish nothing.
 
 ### `MPL-03`: ZeroMQ sequence event payload mapping
 
@@ -180,6 +192,13 @@ state (`crates/mempool/src/orphan.rs`).
   keeps its existing rejection facts. Refusal changes no membership, sequence,
   fee overlay, estimator or observer output. Four attempts bound stale facts.
   It neither implements package RBF nor changes RPC/REST wire behavior.
+- Proof: `gateway::tests::chain_generation_starts_even_at_zero`,
+  `gateway::tests::explicit_finish_restores_even_generation`, and
+  `gateway::tests::chain_generation_overflow_fails_closed` in
+  `crates/mempool/src/gateway.rs` pin the even/odd/finish lifecycle;
+  `gateway::tests::stale_generation_rejects_without_mutation_or_publication`
+  and `gateway::tests::stale_mempool_sequence_rejects_without_mutation_or_publication`
+  check fenced submissions change nothing and publish nothing.
 - Proof: `package::tests::native_package_aggregates_cpfp_atomically_and_ignores_input_order`
   in `crates/mempool/src/package/tests.rs` checks successful CPFP admission,
   ordered publication and unchanged estimator history;
@@ -418,7 +437,7 @@ state (`crates/mempool/src/orphan.rs`).
   `disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`:
   committed chain changes run the mempool chain-change lifecycle even when the
   pool itself has no removal/insertion.
-- `crates/node/src/tx_ingress.rs` (inline tests):
+- `crates/node/tests/unit/tx_ingress/tests.rs` (unit tests):
   `retry_poll_evicts_an_orphan_after_its_connection_is_gone`.
 - `crates/rpc/src/zmq.rs`:
   `admission_publishes_one_a_frame_with_core_payload_bytes`,

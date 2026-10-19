@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bitcoin_rs_chain::regtest_fixture::{
     merkle_root, mine_header_to_declared_target, mined_regtest_child_at,
 };
-use bitcoin_rs_chain::{TipSnapshot, validate_pow};
+use bitcoin_rs_chain::{LatchReader, TipSnapshot, validate_pow};
 use bitcoin_rs_consensus::ConsensusError;
 use bitcoin_rs_primitives::{
     Block, Hash256, Network, Script, Witness, consensus_bytes, deserialize,
@@ -16,7 +16,7 @@ use bitcoin_rs_storage::{
     UndoStore,
 };
 use bitcoin_rs_utxo::UtxoSet;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use parking_lot::Mutex;
 
 use super::{
@@ -34,10 +34,11 @@ const LEVELS: [CheckLevel; 4] = [
     CheckLevel::CheckUndoAndCommitments,
 ];
 
-/// A body store the tests can damage, empty, or interleave with a read.
+/// A body store the tests can damage, empty, corrupt, or interleave with a read.
 #[derive(Default)]
 struct Bodies {
     rows: Mutex<HashMap<(u32, Hash256), Vec<u8>>>,
+    corrupt: Mutex<HashSet<(u32, Hash256)>>,
     before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -85,9 +86,23 @@ impl BlockBodyStore for Bodies {
         hash: Hash256,
         _max_bytes: usize,
     ) -> std::result::Result<Option<Vec<u8>>, BoundedReadError> {
+        Ok(self.rows.lock().get(&(height, hash)).cloned())
+    }
+
+    fn load_block_body_for_verification_bounded(
+        &self,
+        height: u32,
+        hash: Hash256,
+        _max_bytes: usize,
+    ) -> std::result::Result<Option<Vec<u8>>, BoundedReadError> {
         let hook = self.before_read.lock().take();
         if let Some(hook) = hook {
             hook();
+        }
+        if self.corrupt.lock().contains(&(height, hash)) {
+            return Err(BoundedReadError::Storage(StorageError::CorruptBlockFrame(
+                "fixture corrupt frame",
+            )));
         }
         Ok(self.rows.lock().get(&(height, hash)).cloned())
     }
@@ -152,6 +167,15 @@ impl Fixture {
         Ok(())
     }
 
+    fn corrupt_body(&self, height: u32) -> Result {
+        let index = usize::try_from(height)?;
+        self.bodies
+            .corrupt
+            .lock()
+            .insert((height, self.hash(index)));
+        Ok(())
+    }
+
     fn outcome(&self, level: CheckLevel, depth: Option<u32>) -> Result<VerifyOutcome> {
         Ok(verify_recent_blocks(&self.chain, request(level, depth))?)
     }
@@ -167,6 +191,19 @@ fn request(level: CheckLevel, depth: Option<u32>) -> VerifyRequest {
     VerifyRequest {
         level,
         depth: depth.and_then(NonZeroU32::new),
+        cancellation: None,
+    }
+}
+
+fn cancellable_request(
+    level: CheckLevel,
+    depth: Option<u32>,
+    cancellation: &LatchReader,
+) -> VerifyRequest {
+    VerifyRequest {
+        level,
+        depth: depth.and_then(NonZeroU32::new),
+        cancellation: Some(cancellation.clone()),
     }
 }
 
@@ -203,16 +240,36 @@ fn a_chain_with_no_block_above_genesis_has_nothing_to_check() -> Result {
     let empty = handles(Network::Regtest, Arc::new(UtxoSet::new()));
     let genesis_only = fixture(0)?;
     for level in LEVELS {
-        let request = request(level, None);
         assert_eq!(
-            verify_recent_blocks(&empty, request)?,
+            verify_recent_blocks(&empty, request(level, None))?,
             VerifyOutcome::Passed { blocks: 0 }
         );
         assert_eq!(
-            verify_recent_blocks(&genesis_only.chain, request)?,
+            verify_recent_blocks(&genesis_only.chain, request(level, None))?,
             VerifyOutcome::Passed { blocks: 0 }
         );
     }
+    Ok(())
+}
+
+/// A corrupt referenced frame is damage at every level: never a missing
+/// body, and never a skip, even without a history floor.
+#[test]
+fn a_corrupt_referenced_frame_is_damage_not_missing_or_skipped() -> Result {
+    let f = fixture(4)?;
+    f.corrupt_body(3)?;
+    for level in LEVELS {
+        let error = f.damage(level, None)?;
+        assert!(
+            matches!(error, VerifyError::BodyCorrupt { height: 3, .. }),
+            "{level:?}: {error}"
+        );
+    }
+    assert_eq!(
+        f.retention.active_leases(),
+        0,
+        "the walk must release its history pin"
+    );
     Ok(())
 }
 
@@ -601,11 +658,114 @@ fn shutdown_during_the_walk_skips_instead_of_failing() -> Result {
 }
 
 #[test]
+fn a_request_cancelled_before_admission_never_reads_or_pins() -> Result {
+    let f = fixture(4)?;
+    let flag = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let cancellation = LatchReader::new(Arc::clone(&flag));
+    let error = verify_recent_blocks(
+        &f.chain,
+        cancellable_request(CheckLevel::CheckUndo, None, &cancellation),
+    )
+    .err()
+    .ok_or("a cancelled request must not pass")?;
+    assert!(
+        matches!(error, VerifyError::Interrupted),
+        "cancellation is an operator stop, not damage: {error}"
+    );
+    assert_eq!(f.retention.active_leases(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_request_cancelled_during_the_walk_interrupts_without_success() -> Result {
+    let f = fixture(4)?;
+    let flag = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let cancellation = LatchReader::new(Arc::clone(&flag));
+    let trigger = Arc::clone(&flag);
+    *f.bodies.before_read.lock() = Some(Box::new(move || {
+        trigger.store(true, core::sync::atomic::Ordering::SeqCst);
+    }));
+    let error = verify_recent_blocks(
+        &f.chain,
+        cancellable_request(CheckLevel::CheckUndo, None, &cancellation),
+    )
+    .err()
+    .ok_or("a cancelled walk must not pass")?;
+    assert!(
+        matches!(error, VerifyError::Interrupted),
+        "the mid-walk latch must interrupt, not fail as damage: {error}"
+    );
+    assert_eq!(f.retention.active_leases(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_recovery_closed_chainstate_is_unavailable_even_over_an_empty_window() -> Result {
+    let f = fixture(4)?;
+    f.chain.fail_closed_for_recovery();
+    let error = verify_recent_blocks(&f.chain, request(CheckLevel::CheckUndo, None))
+        .err()
+        .ok_or("a closed chainstate must not verify")?;
+    assert!(
+        matches!(error, VerifyError::ClosedForRecovery),
+        "closure is fail-closed admission state, not damage: {error}"
+    );
+    assert_eq!(
+        f.retention.active_leases(),
+        0,
+        "the refusal must not pin history"
+    );
+    let empty = handles(Network::Regtest, Arc::new(UtxoSet::new()));
+    empty.fail_closed_for_recovery();
+    let error = verify_recent_blocks(&empty, request(CheckLevel::ReadBodies, None))
+        .err()
+        .ok_or("a closed chainstate must not pass an empty window")?;
+    assert!(matches!(error, VerifyError::ClosedForRecovery), "{error}");
+    Ok(())
+}
+
+#[test]
+fn closing_for_recovery_during_the_walk_refuses_success() -> Result {
+    let f = fixture(4)?;
+    let chain = f.chain.clone();
+    *f.bodies.before_read.lock() = Some(Box::new(move || {
+        chain.fail_closed_for_recovery();
+    }));
+    let error = verify_recent_blocks(&f.chain, request(CheckLevel::CheckUndo, None))
+        .err()
+        .ok_or("a walk closed mid-read must not pass")?;
+    assert!(
+        matches!(error, VerifyError::ClosedForRecovery),
+        "the closure must fail closed, not skip or pass: {error}"
+    );
+    assert_eq!(f.retention.active_leases(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_pin_withdrawn_mid_walk_skips_even_when_the_rows_are_still_readable() -> Result {
+    let mut f = fixture(5)?;
+    f.chain.history = HistoryAccess::new(Arc::clone(&f.retention), RetentionBudget::Depth(1));
+    let retention = Arc::clone(&f.retention);
+    *f.bodies.before_read.lock() = Some(Box::new(move || {
+        drop(retention.reserve(5));
+        assert_eq!(retention.retention_floor(), None, "the pin was withdrawn");
+    }));
+    assert_eq!(
+        f.outcome(CheckLevel::ReadBodies, None)?,
+        VerifyOutcome::SkippedNoBlockData { height: 4 },
+        "readable rows under a withdrawn pin are skipped, never passed"
+    );
+    assert_eq!(f.retention.active_leases(), 0);
+    Ok(())
+}
+
+#[test]
 fn rows_a_prune_pass_took_while_the_pin_was_withdrawn_are_not_damage() -> Result {
     let mut f = fixture(5)?;
     // A budget of one block lets the pass below expire the walk's pin.
     f.chain.history = HistoryAccess::new(Arc::clone(&f.retention), RetentionBudget::Depth(1));
-    let (bodies, retention, doomed) = (Arc::clone(&f.bodies), Arc::clone(&f.retention), f.hash(3));
+    let (bodies, retention, doomed) = (Arc::clone(&f.bodies), Arc::clone(&f.retention), f.hash(5));
     *f.bodies.before_read.lock() = Some(Box::new(move || {
         assert_eq!(
             retention.retention_floor(),
@@ -613,14 +773,85 @@ fn rows_a_prune_pass_took_while_the_pin_was_withdrawn_are_not_damage() -> Result
             "the window must be pinned before its first read"
         );
         // The pass reserves a deletion line far above the pin, which expires
-        // it, and then deletes a row the walk has not reached.
+        // it, and then deletes the row under the current read.
         drop(retention.reserve(5));
         assert_eq!(retention.retention_floor(), None, "the pin was withdrawn");
-        bodies.remove(3, doomed);
+        bodies.remove(5, doomed);
     }));
     assert_eq!(
         f.outcome(CheckLevel::ReadBodies, None)?,
-        VerifyOutcome::SkippedNoBlockData { height: 3 }
+        VerifyOutcome::SkippedNoBlockData { height: 5 }
+    );
+    assert_eq!(f.retention.active_leases(), 0);
+    Ok(())
+}
+/// A latch fired on the window's only (hence final) read interrupts before
+/// success: the per-height poll already passed over the quiet latch, so only
+/// the pre-success poll observes it. Removing that poll reports Passed.
+#[test]
+fn a_request_cancelled_on_the_final_read_interrupts_before_success() -> Result {
+    let f = fixture(4)?;
+    let flag = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let cancellation = LatchReader::new(Arc::clone(&flag));
+    let trigger = Arc::clone(&flag);
+    *f.bodies.before_read.lock() = Some(Box::new(move || {
+        trigger.store(true, core::sync::atomic::Ordering::SeqCst);
+    }));
+    let error = verify_recent_blocks(
+        &f.chain,
+        cancellable_request(CheckLevel::CheckUndo, Some(1), &cancellation),
+    )
+    .err()
+    .ok_or("a walk cancelled on its final read must not pass")?;
+    assert!(
+        matches!(error, VerifyError::Interrupted),
+        "the final-read latch must interrupt, not pass as success: {error}"
+    );
+    assert_eq!(f.retention.active_leases(), 0);
+    Ok(())
+}
+
+/// A recovery closure landing on the window's only (hence final) read refuses
+/// success: the per-height poll already passed over the open chainstate, so
+/// only the pre-success poll observes it. Removing that poll reports Passed.
+#[test]
+fn closing_for_recovery_on_the_final_read_refuses_success() -> Result {
+    let f = fixture(4)?;
+    let chain = f.chain.clone();
+    *f.bodies.before_read.lock() = Some(Box::new(move || {
+        chain.fail_closed_for_recovery();
+    }));
+    let error = verify_recent_blocks(&f.chain, request(CheckLevel::CheckUndo, Some(1)))
+        .err()
+        .ok_or("a walk closed on its final read must not pass")?;
+    assert!(
+        matches!(error, VerifyError::ClosedForRecovery),
+        "the final-read closure must fail closed, not pass: {error}"
+    );
+    assert_eq!(f.retention.active_leases(), 0);
+    Ok(())
+}
+
+/// A pin withdrawn on the window's only (hence final) read skips instead of
+/// passing: the per-height poll already passed over the live pin, so only the
+/// pre-success poll observes the withdrawal. Removing that poll reports
+/// Passed over rows the owner no longer protects.
+#[test]
+fn a_pin_withdrawn_on_the_final_read_skips_instead_of_passing() -> Result {
+    let mut f = fixture(5)?;
+    f.chain.history = HistoryAccess::new(Arc::clone(&f.retention), RetentionBudget::Depth(1));
+    let retention = Arc::clone(&f.retention);
+    *f.bodies.before_read.lock() = Some(Box::new(move || {
+        // The lease floors at the tip (5) under a depth-1 budget, so the
+        // pass must claim past 6 to expire it; the mechanics are otherwise
+        // the mid-walk pin test's.
+        drop(retention.reserve(7));
+        assert_eq!(retention.retention_floor(), None, "the pin was withdrawn");
+    }));
+    assert_eq!(
+        f.outcome(CheckLevel::ReadBodies, Some(1))?,
+        VerifyOutcome::SkippedNoBlockData { height: 5 },
+        "a row readable under a withdrawn pin is skipped, never passed"
     );
     assert_eq!(f.retention.active_leases(), 0);
     Ok(())

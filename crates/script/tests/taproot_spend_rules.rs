@@ -284,8 +284,9 @@ fn signature_cache_warmed_still_rejects_mutated_sighash_input() {
         Ok(true),
         "warmup"
     );
-    // The spent amount is committed by the BIP341 digest, so paying one more
-    // satoshi to the same output retargets the message without touching encodings.
+    // The output value is committed by the BIP341 outputs digest
+    // (sha_outputs), so paying one more satoshi to the same output retargets
+    // the message without touching encodings.
     let mut retargeted = tx;
     let paid = retargeted.outputs[0].value.to_sat();
     retargeted.outputs[0].value = bitcoin_rs_primitives::Amount::from_sat(paid + 1);

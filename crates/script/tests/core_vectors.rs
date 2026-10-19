@@ -39,8 +39,8 @@ use bitcoin_rs_primitives::{
     Amount, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness, deserialize,
 };
 use bitcoin_rs_script::{
-    Interpreter, PreparedTransaction, ScriptErrCode, ScriptError, SignatureCache, VerifyFlags,
-    opcode, push_data, push_int,
+    Instruction, Interpreter, PreparedTransaction, ScriptErrCode, ScriptError, SignatureCache,
+    VerifyFlags, instructions, opcode, push_data, push_int,
 };
 
 // Core error names admitted by the corpus parser; verdicts compare acceptance only.
@@ -1679,9 +1679,24 @@ fn sigcache_verify_every_input(
     Ok(true)
 }
 
-/// Flips the first byte of the first non-empty witness item or scriptSig, so a
-/// well-formed signature becomes a cryptographic failure without changing any
-/// encoding shape.
+/// Push template of a script: one entry per instruction, the pushed length
+/// for pushes and `None` for opcodes or decode failures.
+fn push_shape(script: &[u8]) -> Vec<Option<usize>> {
+    instructions(script)
+        .map(|instruction| match instruction {
+            Ok(Instruction::PushBytes(data)) => Some(data.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Flips the first byte of the first non-empty witness item or of the first
+/// non-empty push of a push-only scriptSig, so a well-formed signature
+/// becomes a cryptographic failure without changing any encoding shape.
+/// Byte 0 of a push-based scriptSig is the push opcode itself, so flipping
+/// it would reshape the script instead of mutating the signature; the flip
+/// lands inside the parsed payload, and the before/after push template
+/// proves the shape survived.
 fn sigcache_flip_first_signature_byte(tx: &mut Tx) {
     for input in &mut tx.inputs {
         for item in input.witness.iter_mut() {
@@ -1690,10 +1705,37 @@ fn sigcache_flip_first_signature_byte(tx: &mut Tx) {
                 return;
             }
         }
-        if !input.script_sig.as_bytes().is_empty() {
-            input.script_sig[0] ^= 0x01;
-            return;
+        if input.script_sig.as_bytes().is_empty() {
+            continue;
         }
+        let before = push_shape(input.script_sig.as_bytes());
+        // Locate first, mutate after: the parsed push borrows the script,
+        // so the flip must land once the parse ends.
+        let start = {
+            let bytes = input.script_sig.as_bytes();
+            let mut start = None;
+            for instruction in instructions(bytes) {
+                if let Ok(Instruction::PushBytes(data)) = instruction
+                    && !data.is_empty()
+                {
+                    start = Some(data.as_ptr().addr() - bytes.as_ptr().addr());
+                    break;
+                }
+            }
+            start
+        };
+        let Some(start) = start else {
+            panic!(
+                "a non-empty scriptSig without a data push carries no signature payload to flip"
+            );
+        };
+        input.script_sig[start] ^= 0x01;
+        assert_eq!(
+            push_shape(input.script_sig.as_bytes()),
+            before,
+            "the signature flip must not reshape the scriptSig"
+        );
+        return;
     }
     panic!("adversarial row carries no signature bytes to flip");
 }
@@ -1711,8 +1753,10 @@ fn sigcache_digest_bound_row() -> TxVectorRow {
     };
     let found = rows.into_iter().find(|row| {
         let bound = row.tx.inputs.iter().any(|input| {
-            !input.script_sig.as_bytes().is_empty()
-                || input.witness.iter().any(|item| !item.is_empty())
+            input.witness.iter().any(|item| !item.is_empty())
+                || push_shape(input.script_sig.as_bytes())
+                    .iter()
+                    .any(|push| push.is_some_and(|len| len > 0))
         });
         if !bound {
             return false;

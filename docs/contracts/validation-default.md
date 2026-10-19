@@ -106,7 +106,7 @@
   A CLI override replaces `CMD` wholesale under docker semantics (running
   `bitcoin-rs <args>` instead of the shipped argument list), so it must
   repeat the full `--config --data-dir --p2p-listen` set.
-- The kernel-free default is the C++-free quickstart. Changing the production
+- The kernel-free default keeps `kernel` out of every manifest default; it is not a C++-free claim: the default build compiles bundled ZeroMQ C++ from source and still needs C/C++ compilers plus `ar` (see [getting-started prerequisites](../getting-started.md#prerequisites)). Changing the production
   default engine under `VAL-01` does not add `kernel` to any manifest default.
 
 ## Proven by

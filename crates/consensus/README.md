@@ -19,7 +19,7 @@ block rules, witness-commitment checks, and mining candidate assembly.
 not part of `verify_block_rules`, so the caller that commits a block runs it
 and a proposal does not.
 `is_sixty_four_byte_mutation` names a body without a coinbase that holds a
-64-byte transaction, which `verify_block_rules` and `check_block_body_binding`
+64-byte witness-stripped transaction, which `verify_block_rules` and `check_block_body_binding`
 report as `SixtyFourByteMutation`: the delivered body is mutated, the header is
 not proven invalid, and compact-block reconstruction takes its full-block
 fallback for it.

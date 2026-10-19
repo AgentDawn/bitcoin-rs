@@ -1,8 +1,11 @@
-//! Production-path mempool insert-fill benchmark (`insert_fill`).
+//! Internal pool-insert fill benchmark (`insert_fill`).
 //!
-//! `mempool_insert_entry` is the end-to-end path an attacker actually drives:
-//! `Mempool::insert_entry` accounts the entry through the derived-state owners
-//! and refreshes package metadata incrementally over the affected closure
+//! `mempool_insert_entry` measures the internal pool path, not production
+//! admission: it calls `Mempool::insert_entry` directly with fabricated
+//! entries (no prevouts, standardness, or script checks), which production
+//! only reaches through `MempoolGateway::submit_transaction`. Within that
+//! scope the insert accounts the entry through the derived-state owners and
+//! refreshes package metadata incrementally over the affected closure
 //! (`refresh_metadata`), so an acceptance pays for its neighborhood, not a
 //! full rebuild of the priority index. The full-rebuild pass,
 //! `recompute_all_metadata`, is test-only.
