@@ -120,12 +120,12 @@ impl RpcServer {
                     io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {
                         debug!(%error, "rpc accept interrupted or connection aborted");
                     }
-                    io::ErrorKind::InvalidInput
-                    | io::ErrorKind::Unsupported
-                    | io::ErrorKind::NotConnected => return Err(error),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::NotConnected => return Err(error),
                     _ => {
                         // Resource exhaustion (including EMFILE/ENFILE) and
                         // pending network errors need not invalidate the listener.
+                        // Linux may report EOPNOTSUPP (Unsupported) for a new
+                        // connection, so that kind must also remain retryable.
                         // Back off unknown OS errors too, avoiding a busy loop,
                         // and recheck shutdown before the next accept attempt.
                         warn!(%error, "rpc accept failed; retrying after backoff");
@@ -1325,6 +1325,7 @@ mod tests {
                 io::Error::from(io::ErrorKind::ConnectionAborted),
                 io::Error::from(io::ErrorKind::ConnectionReset),
                 io::Error::from(io::ErrorKind::PermissionDenied),
+                io::Error::from(io::ErrorKind::Unsupported),
                 io::Error::other("pending protocol error"),
             ];
             #[cfg(unix)]
@@ -1332,6 +1333,13 @@ mod tests {
                 io::Error::from_raw_os_error(rustix::io::Errno::MFILE.raw_os_error()),
                 io::Error::from_raw_os_error(rustix::io::Errno::NFILE.raw_os_error()),
             ]);
+            #[cfg(target_os = "linux")]
+            {
+                let error =
+                    io::Error::from_raw_os_error(rustix::io::Errno::OPNOTSUPP.raw_os_error());
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                errors.push(error);
+            }
             #[cfg(windows)]
             errors.push(io::Error::from_raw_os_error(10024)); // WSAEMFILE
             let mut errors = errors.into_iter();
@@ -1381,11 +1389,7 @@ mod tests {
 
     #[test]
     fn invalid_listener_errors_are_returned() -> io::Result<()> {
-        for kind in [
-            io::ErrorKind::InvalidInput,
-            io::ErrorKind::Unsupported,
-            io::ErrorKind::NotConnected,
-        ] {
+        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::NotConnected] {
             let server = accept_test_server()?;
             let shutdown = Arc::new(AtomicBool::new(false));
             let mut attempts = 0;

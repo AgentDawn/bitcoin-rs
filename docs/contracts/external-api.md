@@ -936,8 +936,9 @@ evidence does not establish mainnet memory or throughput qualifications.
   or a reverse proxy share one. Pools below four workers keep no per-source
   share.
   - Interrupted and aborted accepts retry immediately. Other accept errors,
-    including descriptor exhaustion, warn and retry after 100 ms; shutdown is
-    checked before each attempt. Invalid-input, unsupported and not-connected
+    including descriptor exhaustion and Linux's pending-connection `EOPNOTSUPP`
+    (`Unsupported`), warn and retry after 100 ms; shutdown is checked before
+    each attempt. Invalid-input and not-connected
     listener errors remain fatal. Accepted-socket setup failures drop only that
     connection. The node logs a listener exit before shutdown immediately,
     while retaining the I/O result for its normal shutdown join.
