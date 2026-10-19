@@ -163,6 +163,7 @@ dependencies = [
  "bitcoin-rs-primitives",
  "bitcoin-rs-script",
  "hashbrown",
+ "parking_lot",
  "rayon",
  "sha2",
  "thiserror",
