@@ -144,19 +144,29 @@ Current fees, limits, scripts, TRUC, maturity and next-block finality apply.
 Confirmed/spent, missing-parent, expired and newly refused candidates are not
 forced back into the pool. Ages use saved wall-clock admission seconds;
 future-dated or more-than-fourteen-day-old candidates are skipped. A restored
-package uses its oldest member's time. Fee deltas, including absent-txid
+package retains each member's own saved time. Failed children are retried
+only when a saved missing parent is admitted; each parent wakes dependents
+at most once, bounding retries by saved dependency edges. Fee deltas, including absent-txid
 overlays, retain their operator meaning even when membership is refused.
 Restored transactions do not register fresh estimator samples or unsolicited
 relay announcements. Ordinary gateway sequence assignment and mining wakes
 still run; fee-estimator history remains a separately owned file.
 
 Saving captures shared transaction handles and scalar metadata under one
-bounded read, then encodes and writes without the pool lock. Clean teardown
-waits at most ten seconds for the save worker. The owner checks its deadline
-between operations and before replacing the live file; individual OS calls
+bounded read, then encodes and writes without the pool lock. If transaction
+bytes or count exceed the snapshot budget, saving keeps a prefix of complete
+connected families and logs the omitted count. It never saves a CPFP parent
+without its connected paying child. All fee deltas are reserved first; if
+operator overlays alone exceed their bound, saving fails without truncating them.
+The snapshot budget is independent of the live pool's virtual-size limit.
+Clean teardown waits at most ten seconds for a staging worker, which cannot
+touch the live file. The shutdown thread owns publication and completes it
+before returning; abandoning a worker therefore cannot overwrite a later run.
+Deadline checks are cooperative: individual OS calls, including publication,
 cannot be preempted. A synced staging file is renamed before syncing the
-directory where supported. Incompatible/corrupt live files are preserved,
-including at shutdown, until the operator explicitly moves them aside.
+directory where supported. Incompatible/corrupt ordinary live files are moved
+intact into a unique `mempool-snapshot-rejected-*` directory before publishing
+a fresh snapshot. Unreadable files, directories and symlinks are not replaced.
 Interrupted staging files are never loaded. Restore has a sixty-second
 cooperative budget and reports missing, restored, partially restored or
 rejected status; it does not retry indefinitely. Successfully re-admitted
@@ -170,7 +180,10 @@ remain unsupported RPCs; this format makes no Core disk-format claim.
 ## Proven by
 
 - `crates/mempool/src/snapshot/tests.rs` covers candidate revalidation,
-  CPFP/ephemeral dust, publication, bounds and rejected-file preservation.
+  CPFP/ephemeral dust and dependency-triggered retries, per-member times,
+  whole-family capacity bounds and rejected-file quarantine.
+- `lifecycle::tests::timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot`
+  covers shutdown timeout followed by a newer save and late worker completion.
 - `bin/bitcoin-rs/tests/mempool_restart.rs` drives real daemon shutdowns,
   restarts, RPC membership/lookup, mining and changed-tip reconciliation.
 

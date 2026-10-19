@@ -44,6 +44,9 @@ state (`crates/mempool/src/orphan.rs`).
   `Snapshot`, or `Block`). Snapshot restoration uses ordinary admission and
   sequence assignment before external observers are attached; it does not
   replay saved sequences or relay notifications.
+  Proof: `snapshot::tests::restores_dependencies_priorities_and_gateway_publication`
+  and `tx_relay::tests::local_tx_relay_uses_committed_wtxid_and_ignores_peer_and_removed_entries` cover restored
+  publication and the Snapshot origin's relay suppression.
   The gateway clones one `MutationResult` into the envelope for each
   committed non-empty batch that has an observer attached, so it can both
   enqueue publication and return the original result to the caller.

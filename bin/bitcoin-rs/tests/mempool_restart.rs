@@ -114,7 +114,7 @@ fn clean_restart_restores_dependencies_priority_lookup_and_mining() -> TestResul
     assert_membership(&mut node, &[&child])?;
     let dir = node.stop_keep_datadir()?;
 
-    // Rejected payload survives startup and clean shutdown byte-for-byte.
+    // Rejected payload is quarantined intact; later clean shutdowns can save.
     let mut rejected = snapshot;
     rejected[0] ^= 1;
     std::fs::write(&file, &rejected)?;
@@ -122,7 +122,19 @@ fn clean_restart_restores_dependencies_priority_lookup_and_mining() -> TestResul
     assert_eq!(helpers::mempool_txids(&mut node)?, Vec::<String>::new());
     let evidence = node.evidence.clone();
     let _dir = node.stop_keep_datadir()?;
-    assert_eq!(std::fs::read(&file)?, rejected);
+    assert_ne!(std::fs::read(&file)?, rejected);
+    assert!(
+        std::fs::read_dir(file.parent().ok_or("snapshot directory")?)?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("mempool-snapshot-rejected-")
+                    && std::fs::read(entry.path().join("mempool-snapshot.dat"))
+                        .is_ok_and(|bytes| bytes == rejected)
+            })
+    );
     let logs = std::fs::read_to_string(evidence.join("stderr.log"))?;
     assert!(logs.contains("mempool snapshot rejected"));
     Ok(())

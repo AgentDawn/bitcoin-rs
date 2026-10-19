@@ -425,8 +425,8 @@ impl NodeServices {
     }
 }
 
-// Bound the shutdown wait even when an OS filesystem call stalls. The worker
-// owns its inputs and checks the same deadline before publishing the live file.
+// The worker can only stage bytes. Publication belongs to this shutdown thread,
+// so an abandoned worker cannot overwrite a subsequent embedded node's file.
 fn save_mempool_snapshot(state: &NodeState) {
     let budget = Duration::from_secs(10);
     let deadline = std::time::Instant::now() + budget;
@@ -437,22 +437,36 @@ fn save_mempool_snapshot(state: &NodeState) {
     match std::thread::Builder::new()
         .name("mempool-snapshot".into())
         .spawn(move || {
-            let result = bitcoin_rs_mempool::snapshot::save(&data_dir, &gateway, network, deadline);
+            let result =
+                bitcoin_rs_mempool::snapshot::prepare(&data_dir, &gateway, network, deadline);
             let _ = sender.send(result);
         }) {
-        Ok(_) => match receiver
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "mempool snapshot save failed; preserving the previous file");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "mempool snapshot save did not finish within the shutdown budget");
-            }
-        },
+        Ok(_) => publish_mempool_snapshot(receiver, deadline),
         Err(error) => tracing::warn!(%error, "could not start mempool snapshot save"),
     }
+}
+
+fn publish_mempool_snapshot(
+    receiver: crossbeam_channel::Receiver<
+        std::io::Result<bitcoin_rs_mempool::snapshot::PreparedSnapshot>,
+    >,
+    deadline: std::time::Instant,
+) {
+    match receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        Ok(Ok(snapshot)) => {
+            if let Err(error) = snapshot.publish() {
+                tracing::warn!(%error, "mempool snapshot publication failed");
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "mempool snapshot save failed; preserving the previous file");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "mempool snapshot save did not finish within the shutdown budget");
+        }
+    }
+    // Disconnect before returning, so a late staging result is dropped.
+    drop(receiver);
 }
 
 fn publish_clean_checkpoint_if_eligible(

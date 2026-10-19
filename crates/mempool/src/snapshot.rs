@@ -3,6 +3,7 @@
 //! Persist only canonical transactions, admission times and operator fee deltas.
 //! Graphs, fees, admission stamps and sequences are reconstructed by the gateway.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -95,42 +96,62 @@ fn take<const N: usize>(input: &mut &[u8]) -> io::Result<[u8; N]> {
 }
 
 impl Snapshot {
-    fn capture(gateway: &MempoolGateway, deadline: Instant) -> io::Result<Self> {
+    fn capture(
+        gateway: &MempoolGateway,
+        deadline: Instant,
+        max_bytes: u64,
+        max_records: usize,
+    ) -> io::Result<Self> {
         let pool = gateway
             .pool
             .try_read_for(deadline.saturating_duration_since(Instant::now()))
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::TimedOut, "mempool snapshot read lock busy")
             })?;
-        if pool.len() > MAX_RECORDS {
-            return Err(invalid("too many mempool snapshot transactions"));
-        }
-        let mut transactions = Vec::with_capacity(pool.len());
-        let mut bytes = 84_u64;
-        for entry in pool.iter_entries() {
-            check_deadline(deadline)?;
-            bytes = bytes.saturating_add(u64::from(entry.size) + 12);
-            if usize::try_from(entry.size).unwrap_or(usize::MAX) > MAX_TX_BYTES || bytes > MAX_BYTES
-            {
-                return Err(invalid("mempool snapshot exceeds its size limit"));
-            }
-            transactions.push(SavedTransaction {
-                tx: Arc::clone(&entry.tx),
-                txid: entry.txid,
-                time: entry.time,
-            });
-        }
+        // Preserve every operator overlay before allocating the remaining budget
+        // to optional transaction candidates. Never silently truncate priorities.
         let deltas = pool.fee_deltas();
         if deltas.len() > MAX_RECORDS
-            || bytes.saturating_add(
+            || 84_u64.saturating_add(
                 u64::try_from(deltas.len())
                     .unwrap_or(u64::MAX)
                     .saturating_mul(40),
-            ) > MAX_BYTES
+            ) > max_bytes
         {
             return Err(invalid("too many mempool snapshot fee deltas"));
         }
         let mut deltas: Vec<_> = deltas.collect();
+        let mut bytes = 84 + u64::try_from(deltas.len()).unwrap_or(u64::MAX) * 40;
+        let mut transactions = Vec::with_capacity(pool.len().min(max_records));
+        for cluster in pool.iter_clusters() {
+            check_deadline(deadline)?;
+            // Keep complete connected families: a parent-only prefix could
+            // discard its paying CPFP child and make the saved parent useless.
+            let cluster_bytes: u64 = cluster.iter().map(|row| u64::from(row.size) + 12).sum();
+            if transactions.len() + cluster.len() > max_records
+                || bytes.saturating_add(cluster_bytes) > max_bytes
+                || cluster
+                    .iter()
+                    .any(|row| usize::try_from(row.size).unwrap_or(usize::MAX) > MAX_TX_BYTES)
+            {
+                break;
+            }
+            bytes += cluster_bytes;
+            for entry in cluster {
+                transactions.push(SavedTransaction {
+                    tx: Arc::clone(&entry.tx),
+                    txid: entry.txid,
+                    time: entry.time,
+                });
+            }
+        }
+        if transactions.len() < pool.len() {
+            tracing::warn!(
+                saved = transactions.len(),
+                omitted = pool.len() - transactions.len(),
+                "mempool snapshot capacity reached; saving complete families within the budget"
+            );
+        }
         drop(pool);
         transactions.sort_unstable_by_key(|row| row.txid);
         deltas.sort_unstable_by_key(|row| row.0);
@@ -274,23 +295,69 @@ impl Snapshot {
     }
 }
 
-/// Saves a consistent read snapshot, releasing the pool lock before encoding/I/O.
-///
-/// An invalid existing artifact is preserved until an operator moves it aside.
-/// Deadlines are checked between bounded operations and before publication;
-/// an individual OS read/write/fsync cannot be preempted here.
-pub fn save(
+/// A synced staging file. Dropping it abandons the save without publishing.
+pub struct PreparedSnapshot {
+    file: tempfile::NamedTempFile,
+    network: Network,
+    deadline: Instant,
+}
+
+impl PreparedSnapshot {
+    /// Publishes on the caller's thread. OS rename/fsync may exceed the
+    /// cooperative deadline, so this call must complete before teardown returns.
+    pub fn publish(self) -> io::Result<()> {
+        check_deadline(self.deadline)?;
+        let data_dir = self
+            .file
+            .path()
+            .parent()
+            .ok_or_else(|| invalid("missing staging directory"))?
+            .to_path_buf();
+        let live = data_dir.join(FILE_NAME);
+        let validation = read_file(&live, self.deadline).and_then(|bytes| {
+            bytes
+                .map(|bytes| Snapshot::decode(&bytes, self.network, self.deadline))
+                .transpose()
+        });
+        match validation {
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    && std::fs::symlink_metadata(&live)?.is_file() =>
+            {
+                check_deadline(self.deadline)?;
+                // A fresh directory gives rename an unused destination without
+                // overwriting an earlier rejected artifact or copying a huge file.
+                let rejected = tempfile::Builder::new()
+                    .prefix("mempool-snapshot-rejected-")
+                    .tempdir_in(&data_dir)?;
+                std::fs::rename(&live, rejected.path().join(FILE_NAME))?;
+                let path = rejected.keep();
+                tracing::warn!(%error, path = %path.display(), "quarantined rejected mempool snapshot");
+            }
+            Err(error) => return Err(error),
+        }
+        check_deadline(self.deadline)?;
+        self.file.persist(&live).map_err(|error| error.error)?;
+        if let Ok(directory) = std::fs::File::open(&data_dir) {
+            if let Err(error) = directory.sync_all() {
+                tracing::warn!(%error, "mempool snapshot published but directory sync failed; crash durability is uncertain");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Captures and syncs a bounded snapshot without touching the live artifact.
+/// A background worker may call this, but publication belongs to its caller.
+pub fn prepare(
     data_dir: &Path,
     gateway: &MempoolGateway,
     network: Network,
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<PreparedSnapshot> {
     let started = Instant::now();
-    let live = data_dir.join(FILE_NAME);
-    if let Some(bytes) = read_file(&live, deadline)? {
-        Snapshot::decode(&bytes, network, deadline)?;
-    }
-    let snapshot = Snapshot::capture(gateway, deadline)?;
+    let snapshot = Snapshot::capture(gateway, deadline, MAX_BYTES, MAX_RECORDS)?;
     let bytes = snapshot.encode(network, deadline)?;
     // Each writer owns a distinct staging inode. A concurrent save must never
     // rename another writer's unfinished file into the live pathname.
@@ -304,30 +371,37 @@ pub fn save(
     }
     file.as_file().sync_all()?;
     check_deadline(deadline)?;
-    // Recheck a file replaced by an operator during the write as well.
-    if let Some(bytes) = read_file(&live, deadline)? {
-        Snapshot::decode(&bytes, network, deadline)?;
-    }
-    check_deadline(deadline)?;
-    file.persist(&live).map_err(|error| error.error)?;
-    if let Ok(directory) = std::fs::File::open(data_dir) {
-        if let Err(error) = directory.sync_all() {
-            tracing::warn!(%error, "mempool snapshot published but directory sync failed; crash durability is uncertain");
-        }
-    }
     tracing::info!(
         transactions = snapshot.transactions.len(),
         bytes = bytes.len(),
         elapsed_ms = started.elapsed().as_millis(),
-        "saved mempool snapshot"
+        "prepared mempool snapshot"
     );
-    Ok(())
+    Ok(PreparedSnapshot {
+        file,
+        network,
+        deadline,
+    })
+}
+
+/// Saves on the calling thread; rejected ordinary files are quarantined intact.
+pub fn save(
+    data_dir: &Path,
+    gateway: &MempoolGateway,
+    network: Network,
+    deadline: Instant,
+) -> io::Result<()> {
+    prepare(data_dir, gateway, network, deadline)?.publish()
 }
 
 /// Revalidates candidates before services become ready.
 ///
 /// No saved membership, base fee, height or admission token is trusted. A malformed artifact changes
 /// nothing; a budget-limited restore retains only successfully re-admitted rows.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep restore validation, bounded dependency retries and gateway publication together"
+)]
 pub fn restore(
     data_dir: &Path,
     gateway: &MempoolGateway,
@@ -336,8 +410,11 @@ pub fn restore(
     now: u64,
     deadline: Instant,
 ) -> io::Result<Option<RestoreReport>> {
-    if !gateway.read().is_empty() {
-        return Err(invalid("snapshot restore requires a fresh mempool"));
+    {
+        let pool = gateway.read();
+        if !pool.is_empty() || pool.fee_deltas().len() != 0 {
+            return Err(invalid("snapshot restore requires a fresh mempool"));
+        }
     }
     let Some(bytes) = read_file(&data_dir.join(FILE_NAME), deadline)? else {
         return Ok(None);
@@ -361,16 +438,21 @@ pub fn restore(
             .prioritise(*txid, *delta)
             .map_err(|_| invalid("snapshot fee delta overflow"))?;
     }
-    for index in order {
+    let mut ready = VecDeque::from(order);
+    let mut queued = vec![true; snapshot.transactions.len()];
+    let mut waiting: HashMap<Txid, hashbrown::HashSet<usize>> = HashMap::new();
+    let mut announced = hashbrown::HashSet::new();
+    while let Some(index) = ready.pop_front() {
+        queued[index] = false;
         if timed_out || check_deadline(deadline).is_err() {
             timed_out = true;
             break;
         }
         let row = &snapshot.transactions[index];
-        if !eligible(row) {
+        if !eligible(row) || gateway.read().contains_txid(&row.txid) {
             continue;
         }
-        if gateway
+        let mut result = gateway
             .submit_transaction(
                 Arc::clone(&row.tx),
                 AdmissionOrigin::Snapshot,
@@ -378,38 +460,71 @@ pub fn restore(
                 row.time,
                 chain,
             )
-            .is_ok()
-        {
-            continue;
-        }
+            .map(|outcome| match outcome {
+                crate::SubmitOutcome::Committed(result) => result,
+                _ => crate::MutationResult::empty(),
+            });
         // A native CPFP/ephemeral-dust package may have a parent that cannot
         // enter alone. Reuse the existing child-with-independent-parents owner;
         // it enforces package limits, scripts and current aggregate fee floors.
         let mut package = Vec::new();
-        let mut time = row.time;
-        for input in &row.tx.inputs {
-            if gateway.read().contains_txid(&input.previous_output.txid) {
-                continue;
-            }
-            if let Some(parent) = positions.get(&input.previous_output.txid)
-                && eligible(parent)
-                && !package.iter().any(|tx: &Tx| tx.txid() == parent.txid)
-            {
-                package.push(parent.tx.as_ref().clone());
-                time = time.min(parent.time);
-                if package.len() >= crate::standardness::MAX_PACKAGE_COUNT {
-                    break;
+        let mut missing = hashbrown::HashSet::new();
+        if result.is_err() {
+            for input in &row.tx.inputs {
+                if gateway.read().contains_txid(&input.previous_output.txid) {
+                    continue;
+                }
+                if let Some(parent) = positions.get(&input.previous_output.txid)
+                    && eligible(parent)
+                    && missing.insert(parent.txid)
+                {
+                    if package.len() < crate::standardness::MAX_PACKAGE_COUNT {
+                        package.push(parent.tx.as_ref().clone());
+                    }
                 }
             }
         }
-        if !package.is_empty()
-            && package.len() < crate::standardness::MAX_PACKAGE_COUNT
-            && check_deadline(deadline).is_ok()
-        {
+        if !package.is_empty() && package.len() < crate::standardness::MAX_PACKAGE_COUNT {
+            if check_deadline(deadline).is_err() {
+                timed_out = true;
+                break;
+            }
             package.push(row.tx.as_ref().clone());
-            let _ = gateway.submit_local_package(package, LocalOrigin::Snapshot, None, time, chain);
+            result = gateway.submit_package_with_times(
+                package,
+                LocalOrigin::Snapshot,
+                None,
+                |tx| positions[&tx.txid()].time,
+                chain,
+            );
+        }
+        if let Ok(result) = result {
+            for change in result.changes {
+                let id = Txid(change.txid);
+                if gateway.read().contains_txid(&id)
+                    && announced.insert(id)
+                    && let Some(children) = waiting.remove(&id)
+                {
+                    let mut children: Vec<_> = children.into_iter().collect();
+                    children.sort_unstable();
+                    for child in children {
+                        if !queued[child] {
+                            queued[child] = true;
+                            ready.push_back(child);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Each restored parent wakes its failed dependents at most once.
+            // No progress means no retries; total wakes are bounded by saved
+            // dependency edges, in addition to the cooperative time budget.
+            for parent in missing {
+                waiting.entry(parent).or_default().insert(index);
+            }
         }
     }
+    timed_out |= check_deadline(deadline).is_err();
     let restored = gateway.read().len();
     Ok(Some(RestoreReport {
         candidates: snapshot.transactions.len(),

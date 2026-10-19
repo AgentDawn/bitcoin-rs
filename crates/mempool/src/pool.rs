@@ -1365,6 +1365,25 @@ impl Mempool {
         self.entries.iter().map(|(_id, entry)| entry)
     }
 
+    /// Projects complete connected families, walking each live graph entry once.
+    pub(crate) fn iter_clusters(&self) -> impl Iterator<Item = Vec<&MempoolEntry>> + '_ {
+        let mut visited = VisitSet::new();
+        self.entries.iter().filter_map(move |(id, _)| {
+            let id = EntryId::try_from(id).ok()?;
+            if visited.test(id) {
+                return None;
+            }
+            let mut members = Vec::new();
+            self.collect_component_members(id, &mut visited, &mut members);
+            Some(
+                members
+                    .into_iter()
+                    .filter_map(|id| self.entry(id))
+                    .collect(),
+            )
+        })
+    }
+
     /// Returns one ascending `(fee_rate, total_vsize)` pair per distinct
     /// actual rate.
     pub fn fee_rate_histogram(&self) -> impl Iterator<Item = (u64, u64)> + '_ {

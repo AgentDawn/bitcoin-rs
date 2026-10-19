@@ -307,7 +307,18 @@ fn restores_cpfp_and_ephemeral_dust_through_atomic_package_admission() -> TestRe
             NOW - 10,
             &chain,
         )?;
-        save(dir.path(), &source, Network::Regtest, deadline())?;
+        let mut snapshot = Snapshot::capture(&source, deadline(), MAX_BYTES, MAX_RECORDS)?;
+        for row in &mut snapshot.transactions {
+            row.time = if row.txid == parent.txid() {
+                NOW - 100
+            } else {
+                NOW - 10
+            };
+        }
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            snapshot.encode(Network::Regtest, deadline())?,
+        )?;
         let seen = Arc::new(Seen::default());
         let target = gateway(MempoolLimits::default(), Some(Arc::clone(&seen)));
         let report = restore(
@@ -320,6 +331,22 @@ fn restores_cpfp_and_ephemeral_dust_through_atomic_package_admission() -> TestRe
         )?
         .ok_or("missing snapshot")?;
         assert_eq!(report.restored, 2);
+        assert_eq!(
+            target
+                .read()
+                .entry_by_txid(&parent.txid())
+                .ok_or("parent")?
+                .time,
+            NOW - 100
+        );
+        assert_eq!(
+            target
+                .read()
+                .entry_by_txid(&child.txid())
+                .ok_or("child")?
+                .time,
+            NOW - 10
+        );
         let batches = seen.0.lock();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].result.changes.len(), 2);
@@ -334,12 +361,176 @@ fn reseal(bytes: &mut [u8]) {
 }
 
 #[test]
+fn retries_failed_cpfp_only_after_a_missing_parent_is_restored() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (mut chain, mut a, _) = family();
+    a.outputs[0].value = Amount::from_sat(100_000);
+    let funding_b = OutPoint::new(Txid(Hash256::from_le_bytes(&[9; 32])), 0);
+    chain.outputs.push((funding_b, output(100_000)));
+    let mut b = spend(funding_b, 50_000);
+    b.outputs.push(output(50_000));
+    let mut c = spend(OutPoint::new(a.txid(), 0), 150_000);
+    let mut second = c.inputs[0].clone();
+    second.previous_output = OutPoint::new(b.txid(), 0);
+    c.inputs.push(second);
+    let fee = a.vsize() + c.vsize();
+    c.outputs[0].value = Amount::from_sat(150_000 - fee);
+    let mut d = spend(OutPoint::new(b.txid(), 1), 49_000);
+    // Force the problematic deterministic order: both parents, then C, then D.
+    for nonce in 0..10_000 {
+        d.lock_time = LockTime::from_consensus(nonce);
+        if d.txid() > a.txid().max(b.txid()).max(c.txid()) {
+            break;
+        }
+    }
+    assert!(d.txid() > a.txid().max(b.txid()).max(c.txid()));
+    let source = gateway(MempoolLimits::default(), None);
+    source.submit_local_package(
+        vec![b.clone(), d.clone()],
+        LocalOrigin::Rpc,
+        None,
+        NOW - 20,
+        &chain,
+    )?;
+    source.submit_local_package(
+        vec![a.clone(), c.clone()],
+        LocalOrigin::Rpc,
+        None,
+        NOW - 10,
+        &chain,
+    )?;
+    save(dir.path(), &source, Network::Regtest, deadline())?;
+    let seen = Arc::new(Seen::default());
+    let target = gateway(MempoolLimits::default(), Some(Arc::clone(&seen)));
+    let report = restore(
+        dir.path(),
+        &target,
+        Network::Regtest,
+        &chain,
+        NOW,
+        deadline(),
+    )?
+    .ok_or("snapshot")?;
+    assert_eq!((report.restored, report.timed_out), (4, false));
+    for tx in [&a, &b, &c, &d] {
+        assert!(target.read().contains_txid(&tx.txid()));
+    }
+    let batches = seen.0.lock();
+    assert_eq!(batches.len(), 2);
+    assert!(
+        batches[0]
+            .result
+            .changes
+            .iter()
+            .any(|row| row.txid == Hash256::from(d.txid()))
+    );
+    assert!(
+        batches[1]
+            .result
+            .changes
+            .iter()
+            .any(|row| row.txid == Hash256::from(c.txid()))
+    );
+    Ok(())
+}
+
+#[test]
+fn capacity_limits_save_whole_families_and_all_priorities() -> TestResult {
+    let (mut chain, parent, child) = family();
+    let source = gateway(MempoolLimits::default(), None);
+    admit(&source, &parent, &chain)?;
+    admit(&source, &child, &chain)?;
+    let point = OutPoint::new(Txid(Hash256::from_le_bytes(&[9; 32])), 0);
+    chain.outputs.push((point, output(100_000)));
+    let independent = spend(point, 99_000);
+    admit(&source, &independent, &chain)?;
+    let absent = Txid(Hash256::from_le_bytes(&[10; 32]));
+    source.prioritise(absent, 50)?;
+    let family_bytes =
+        84 + 40 + u64::try_from(parent.total_size())? + u64::try_from(child.total_size())? + 24;
+    for (bytes, count) in [(family_bytes, MAX_RECORDS), (MAX_BYTES, 2)] {
+        let snapshot = Snapshot::capture(&source, deadline(), bytes, count)?;
+        assert_eq!(snapshot.transactions.len(), 2);
+        assert!(
+            snapshot
+                .transactions
+                .iter()
+                .any(|row| row.txid == parent.txid())
+        );
+        assert!(
+            snapshot
+                .transactions
+                .iter()
+                .any(|row| row.txid == child.txid())
+        );
+        assert_eq!(snapshot.deltas, vec![(absent, 50)]);
+        let dir = tempfile::tempdir()?;
+        let encoded = snapshot.encode(Network::Regtest, deadline())?;
+        assert!(u64::try_from(encoded.len())? <= bytes);
+        std::fs::write(dir.path().join(FILE_NAME), encoded)?;
+        let target = gateway(MempoolLimits::default(), None);
+        assert_eq!(
+            restore(
+                dir.path(),
+                &target,
+                Network::Regtest,
+                &chain,
+                NOW,
+                deadline()
+            )?
+            .ok_or("snapshot")?
+            .restored,
+            2
+        );
+    }
+    assert!(
+        Snapshot::capture(&source, deadline(), family_bytes - 1, MAX_RECORDS)?
+            .transactions
+            .is_empty()
+    );
+    assert!(
+        Snapshot::capture(&source, deadline(), MAX_BYTES, 1)?
+            .transactions
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn restore_rejects_preexisting_absent_transaction_priorities() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let (chain, parent, _) = family();
+    let source = gateway(MempoolLimits::default(), None);
+    source.prioritise(parent.txid(), 1)?;
+    save(dir.path(), &source, Network::Regtest, deadline())?;
+    let target = gateway(MempoolLimits::default(), None);
+    target.prioritise(parent.txid(), i64::MAX)?;
+    assert!(
+        restore(
+            dir.path(),
+            &target,
+            Network::Regtest,
+            &chain,
+            NOW,
+            deadline()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        target.read().prioritised_transactions()[0].fee_delta,
+        i64::MAX
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_bad_artifacts_without_mutation_or_overwriting_operator_data() -> TestResult {
     let dir = tempfile::tempdir()?;
     let (chain, parent, _) = family();
     let source = gateway(MempoolLimits::default(), None);
     admit(&source, &parent, &chain)?;
-    let valid = Snapshot::capture(&source, deadline())?.encode(Network::Regtest, deadline())?;
+    let valid = Snapshot::capture(&source, deadline(), MAX_BYTES, MAX_RECORDS)?
+        .encode(Network::Regtest, deadline())?;
     let mut version = valid.clone();
     version[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     reseal(&mut version);
@@ -370,8 +561,20 @@ fn rejects_bad_artifacts_without_mutation_or_overwriting_operator_data() -> Test
         let pool = gateway(MempoolLimits::default(), None);
         assert!(restore(dir.path(), &pool, Network::Regtest, &chain, NOW, deadline()).is_err());
         assert!(pool.read().is_empty());
-        assert!(save(dir.path(), &source, Network::Regtest, deadline()).is_err());
-        assert_eq!(std::fs::read(dir.path().join(FILE_NAME))?, bytes);
+        save(dir.path(), &source, Network::Regtest, deadline())?;
+        assert_eq!(std::fs::read(dir.path().join(FILE_NAME))?, valid);
+        assert!(
+            std::fs::read_dir(dir.path())?
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("mempool-snapshot-rejected-")
+                        && std::fs::read(entry.path().join(FILE_NAME))
+                            .is_ok_and(|saved| saved == bytes)
+                })
+        );
     }
     Ok(())
 }
@@ -460,8 +663,15 @@ fn missing_oversized_and_non_file_snapshots_fail_safely() -> TestResult {
     file.set_len(MAX_BYTES + 1)?;
     drop(file);
     assert!(restore(dir.path(), &pool, Network::Regtest, &chain, NOW, deadline()).is_err());
-    assert!(save(dir.path(), &pool, Network::Regtest, deadline()).is_err());
-    assert_eq!(std::fs::metadata(&path)?.len(), MAX_BYTES + 1);
+    save(dir.path(), &pool, Network::Regtest, deadline())?;
+    let rejected = std::fs::read_dir(dir.path())?
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .ok_or("quarantine")?;
+    assert_eq!(
+        std::fs::metadata(rejected.path().join(FILE_NAME))?.len(),
+        MAX_BYTES + 1
+    );
     std::fs::remove_file(&path)?;
     std::fs::create_dir(&path)?;
     std::fs::write(path.join("operator-data"), b"preserve")?;
