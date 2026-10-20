@@ -189,6 +189,93 @@ fn wait_quota_preserves_ordinary_http_and_server_only_shutdown_returns_tip() {
     );
 }
 
+/// A template long-poll holds a blocking worker: with the one slot held it
+/// is refused like any other wait, while the same call without a longpoll
+/// id waits on nothing and is admitted.
+#[test]
+fn gbt_long_poll_counts_toward_the_blocking_quota() {
+    fn send_close(address: SocketAddr, body: &Value) -> TcpStream {
+        let body = sonic_rs::to_string(body).expect("JSON");
+        let mut stream = TcpStream::connect(address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("deadline");
+        write!(
+            stream,
+            "POST / HTTP/1.1\r\nHost: {address}\r\nAuthorization: Basic cGFyaXR5OnBhcml0eQ==\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("send");
+        stream
+    }
+
+    let (ctx, _, observable) = context();
+    let handler = Arc::new(Handler::new(Arc::clone(&ctx)));
+    let server = RpcServer::bind(
+        "127.0.0.1:0",
+        Arc::new(Auth::basic("parity", "parity")),
+        handler,
+        2,
+        Duration::from_secs(3),
+        false,
+    )
+    .expect("bind");
+    let address = server.local_addr().expect("address");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&shutdown);
+    let server_thread = std::thread::spawn(move || server.serve_with_shutdown(signal));
+    let waiting = send(
+        address,
+        &json!({"id":1,"method":"waitforblockheight","params":[1]}),
+    );
+    observable.wait_for_waiters(1);
+    let (head, denied) = read(send(
+        address,
+        &json!({"id":2,"method":"getblocktemplate","params":[{"longpollid":"x"}]}),
+    ));
+    assert!(head.contains("Connection: close"));
+    assert_eq!(denied["error"]["code"].as_i64(), Some(-1));
+    // No mining control is attached here, so the admitted call answers
+    // method-not-found: anything but the quota error proves admission. The
+    // denied long-poll's EOF can precede its permit release, so a plain call
+    // racing the release is refused with 503: retry the refusal exactly like
+    // `ordinary_rpc` instead of asserting the first answer.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (plain_head, plain) = loop {
+        let mut stream = send_close(
+            address,
+            &json!({"id":3,"method":"getblocktemplate","params":[{"rules":["segwit"]}]}),
+        );
+        let mut wire = String::new();
+        stream
+            .read_to_string(&mut wire)
+            .expect("bounded response and close");
+        let (head, body) = wire.split_once("\r\n\r\n").expect("HTTP head");
+        if !head.contains("503") {
+            let value = if body.is_empty() {
+                Value::new_null()
+            } else {
+                sonic_rs::from_str(body).expect("JSON response")
+            };
+            break (head.to_owned(), value);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection permit must be released"
+        );
+        std::thread::yield_now();
+    };
+    assert!(plain_head.contains("Connection: close"));
+    assert_eq!(plain["error"]["code"].as_i64(), Some(-32_601));
+    shutdown.store(true, Ordering::Release);
+    server_thread
+        .join()
+        .expect("server thread")
+        .expect("server exit");
+    let (_, answer) = read(waiting);
+    assert_eq!(answer["result"]["height"].as_u64(), Some(0));
+}
+
 #[test]
 fn mixed_batch_and_notification_waits_share_admission_and_cancellation() {
     for notification_only in [false, true] {

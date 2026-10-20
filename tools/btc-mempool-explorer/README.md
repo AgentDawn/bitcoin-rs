@@ -9,7 +9,7 @@ The stock Mempool frontend proxies `/api/v1` to the Mempool backend and every
 other `/api/` path to electrs. This example mounts `nginx-mempool.conf` to keep
 `/api/v1` on the Mempool backend and send every other `/api/` path to
 bitcoin-rs on `:8332/api/`. That prefix is public electrs (the wallet-facing
-tree; contract WF-02). The Mempool backend uses `ESPLORA_REST_API_URL=http://node:8332/esplora`,
+tree; [contract WF-02](../../docs/contracts/wallet-facing.md#wf-02-operations-a-wallet-actually-issues)). The Mempool backend uses `ESPLORA_REST_API_URL=http://node:8332/esplora`,
 the same electrs routes plus `/internal` and `/block-template`. JSON-RPC keeps
 the listener root. The public explorer port proxies `/api/` as-is; it does not
 need a denylist, because those helpers are not on `/api`.
@@ -46,6 +46,7 @@ The following variables configure the stack:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BITCOIN_RS_NETWORK` | `mainnet` | Shared node and Mempool network. |
+| `BITCOIN_RS_LOG_LEVEL` | `info` | Node log level. |
 | `BITCOIN_RS_RPC_USER` | `mempool` | Node RPC user. |
 | `BITCOIN_RS_RPC_PASSWORD` | required | Node RPC password; Compose refuses to start without it. |
 | `MEMPOOL_DATABASE_PASSWORD` | `change-me` | Mempool database password; set explicitly. |

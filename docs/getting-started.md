@@ -4,6 +4,8 @@
 
 The repository development toolchain is `stable`; the workspace MSRV is Rust `1.99.0`. See [policies/source-compatibility.md](policies/source-compatibility.md).
 
+The default build compiles bundled ZeroMQ from source, so it needs C and C++ compilers plus `ar` (`build-essential` on Debian/Ubuntu); no system ZeroMQ headers, `pkg-config`, `cmake`, or `libsodium` are needed. A C compiler stays required without the `zmq` feature (vendored secp256k1 and mimalloc).
+
 The default binary is kernel-free. Building the optional `kernel` lane also needs CMake and Boost on Debian/Ubuntu:
 
 ```sh
@@ -169,12 +171,16 @@ Example regtest startup:
 ```sh
 ./target/release/bitcoin-rs \
   --network regtest \
+  --p2p-listen 127.0.0.1:18444 \
+  --dns-seeds-enabled=false \
   --scriptindex \
   --data-dir .bitcoin-rs-regtest \
   --rpc-bind 127.0.0.1:18443
 ```
 
 The wallet-facing contract is [contracts/wallet-facing.md](contracts/wallet-facing.md).
+
+A Compose example runs the upstream mempool explorer against these endpoints: [btc-mempool-explorer](../tools/btc-mempool-explorer/README.md).
 
 ### REST
 
@@ -231,7 +237,7 @@ cargo build --release -p bitcoin-rs --features kernel
 ./target/release/bitcoin-rs --data-dir .bitcoin-rs --validation-engine kernel
 ```
 
-Direct `bitcoin-rs-consensus` library callers have no config file, environment, or CLI to set: `kernel::BlockParse::parse(raw, engine)`, `kernel::verify_tx_scripts(tx, spent, flags, engine)`, and `verify_transaction(..., engine)` take a `bitcoin_rs_consensus::ValidationEngine` value at each call. A binary embedder that wants one setting should resolve `ValidationEngine` itself and pass it down exactly as `bitcoin-rs-node` does.
+Direct `bitcoin-rs-consensus` library callers have no config file, environment, or CLI to set: `kernel::BlockParse::parse(raw, engine)` takes a `bitcoin_rs_consensus::ValidationEngine` value, while `kernel::verify_tx_scripts(tx, spent, flags, engine, signature_cache)` and `verify_transaction(..., engine, signature_cache)` take both the engine and a trailing `Option<&bitcoin_rs_script::SignatureCache>`. Pass `None` for uncached calls, or `Some(&cache)` for serial native reuse across multiple passes over the same transaction. When `ValidationEngine::Kernel` is selected, kernel verification ignores the signature cache while running all standard checks, and its behavior is unchanged. Lower-level callers using `PreparedTransaction::verify_input(input_index, flags, signature_cache)` also pass the optional cache reference per call without storing it inside the prepared transaction, keeping `PreparedTransaction` shareable across parallel input checks during block verification. A binary embedder that wants one setting should resolve `ValidationEngine` itself and pass it down exactly as `bitcoin-rs-node` does.
 
 ## Operator migration: validation engine
 
@@ -247,3 +253,5 @@ Direct `bitcoin-rs-consensus` library callers have no config file, environment, 
 - [README.md](README.md): documentation index and release gates
 - [contracts/](contracts/): normative contracts
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): development workflow
+- [Snapshot inspector](../tools/snapshot/README.md): inspect and verify Core snapshot files without starting a node
+- [Validation tooling](validation-tooling.md): evidence lanes behind the interfaces above

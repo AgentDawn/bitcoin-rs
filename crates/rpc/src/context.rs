@@ -185,6 +185,22 @@ pub trait ChainControl: Send + Sync {
         &self,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<(), ChainControlError>;
+
+    /// Verifies the newest applied blocks for `verifychain`.
+    ///
+    /// `check_level` is Core's `0..=4` level and `nblocks` counts back from
+    /// the applied tip, zero meaning the whole chain. The answer is true only
+    /// when every block in the window was checked and passed; a window that
+    /// reaches history this node does not hold, and any damaged block or
+    /// undo record, answer false. A request cancelled through `cancellation`
+    /// answers [`ChainControlError::Interrupted`]; a chainstate closed for
+    /// recovery answers [`ChainControlError::Unavailable`].
+    fn verify_chain(
+        &self,
+        check_level: u8,
+        nblocks: u32,
+        cancellation: &LatchReader,
+    ) -> Result<bool, ChainControlError>;
 }
 
 /// A completed, durable Core snapshot activation.
@@ -256,6 +272,12 @@ pub enum ChainControlError {
     /// The mutation failed after its request was accepted.
     #[error("{0}")]
     Failed(String),
+    /// Verification stopped because the requesting caller cancelled it.
+    #[error("block verification interrupted")]
+    Interrupted,
+    /// Verification refused because the chainstate is closed for recovery.
+    #[error("chainstate is unavailable for verification")]
+    Unavailable,
 }
 
 pub use bitcoin_rs_index::{
@@ -383,10 +405,27 @@ impl AdmissionChain for ChainAdmissionView {
             .and_then(|node| tree.median_time_past_at(node))
             .unwrap_or(0);
         // CSV activation at the next block gates BIP68 relative locks,
-        // matching the block-connect and mining evaluation contexts.
-        let csv_active = tip_node.is_some_and(|node| {
-            softfork_state(&tree, self.network, Some(node), height + 1).csv_active
-        });
+        // matching the block-connect and mining evaluation contexts. The
+        // full next-block softfork state also feeds the script-execution
+        // cache fill: the gateway re-verifies under exactly these flags.
+        let next_softfork =
+            tip_node.map(|node| softfork_state(&tree, self.network, Some(node), height + 1));
+        let csv_active = next_softfork.as_ref().is_some_and(|state| state.csv_active);
+        let next_block_script_flags = {
+            let state = next_softfork.unwrap_or(bitcoin_rs_consensus::SoftforkState {
+                csv_active: false,
+                segwit_active: false,
+            });
+            // The next block's hash is unknowable before it is built; the
+            // zero hash is never the BIP16 exception, so P2SH applies exactly
+            // as connect derives it for every non-exception block.
+            bitcoin_rs_consensus::verify_block::verify_flags(
+                self.network,
+                height + 1,
+                Hash256::default(),
+                state,
+            )
+        };
         // Confirmed coin metadata for BIP68 and coinbase maturity. Height `h`
         // uses the MTP of the block before `h`, the same derivation the
         // block-connect path applies. MTP lookups are cached per height.
@@ -429,6 +468,7 @@ impl AdmissionChain for ChainAdmissionView {
             height,
             locktime_cutoff,
             csv_active,
+            next_block_script_flags,
             confirmed,
         })
     }
@@ -591,6 +631,7 @@ impl Default for MempoolHandles {
                 Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                 None,
                 ValidationEngine::Native,
+                None,
             )),
         }
     }
@@ -660,6 +701,7 @@ impl Context {
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                     Some(observer),
                     ValidationEngine::Native,
+                    None,
                 )),
             },
             ..ContextHandles::default()
@@ -1215,22 +1257,30 @@ mod tests {
         }
     }
 
-    /// The context and every capability group are shareable because the
-    /// compiler derives it, not because a `SAFETY` comment claims it.
-    ///
-    /// A field that is not thread-safe fails this test at compile time and
-    /// names its type, so the fix is a real bound on the owning subsystem
-    /// rather than a new `unsafe impl`.
+    /// One context answers `getblockcount` from eight threads at once, which
+    /// is the behavior the old compile-time bound stood in for: shared
+    /// dispatch, not a trait assertion about the struct.
     #[test]
-    fn context_and_groups_are_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
+    fn eight_threads_share_one_context_for_getblockcount() {
+        use alloc::vec::Vec;
+        use sonic_rs::json;
 
-        assert_send_sync::<Context>();
-        assert_send_sync::<ContextHandles>();
-        assert_send_sync::<ChainHandles>();
-        assert_send_sync::<IndexHandles>();
-        assert_send_sync::<NetworkHandles>();
-        assert_send_sync::<bitcoin_rs_chain::InitialBlockDownload>();
+        use crate::handlers::Handler;
+
+        let handler = Arc::new(Handler::new(Arc::new(Context::new())));
+        let workers: Vec<std::thread::JoinHandle<_>> = (0..8)
+            .map(|_| {
+                let handler = Arc::clone(&handler);
+                std::thread::spawn(move || handler.dispatch("getblockcount", &json!([])))
+            })
+            .collect();
+        for worker in workers {
+            let outcome = worker.join().expect("a worker answers");
+            assert!(
+                outcome.is_ok(),
+                "shared dispatch must answer every worker: {outcome:?}"
+            );
+        }
     }
 
     /// The count travels inside the applied tip: one publication replaces
@@ -1552,6 +1602,7 @@ mod tests {
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                     None,
                     ValidationEngine::Native,
+                    None,
                 )),
             },
             network: NetworkHandles {
@@ -1712,17 +1763,36 @@ mod tests {
         assert_eq!(snapshot.total_amount, 125_000);
     }
 
+    /// Two connected log records resolve their metadata through the height
+    /// read seam with no header bytes, which is what the log stores: the
+    /// tree supplies headers, never the log.
     #[test]
-    fn block_record_from_block_is_metadata_only() {
-        let block = Network::Regtest.genesis_block();
-        let record = BlockRecord::from_block(0, &block);
+    fn connected_log_blocks_resolve_metadata_without_header_bytes() {
+        let genesis = Network::Regtest.genesis_block();
+        let mut child = genesis.clone();
+        child.header.prev_blockhash = genesis.block_hash();
+        child.header.nonce = child.header.nonce.wrapping_add(1);
+        child.header.time = child.header.time.wrapping_add(600);
 
-        assert_eq!(record.hash, block.block_hash());
-        assert_eq!(record.height, 0);
-        assert_eq!(record.body_size, consensus_bytes(&block).len());
-        assert_eq!(record.header, None);
-        assert_eq!(record.tx_count, block.txs.len());
-        assert_eq!(record.time, block.header.time);
+        let ctx = Context::new();
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(1, &child));
+
+        for (height, source) in [(0_u32, &genesis), (1_u32, &child)] {
+            let resolved = ctx
+                .chain
+                .block_by_height(height)
+                .unwrap_or_else(|| panic!("the log resolves height {height}"));
+            assert_eq!(resolved.height, height);
+            assert_eq!(resolved.hash, source.block_hash());
+            assert_eq!(resolved.time, source.header.time);
+            assert_eq!(resolved.body_size, consensus_bytes(source).len());
+            assert_eq!(resolved.tx_count, source.txs.len());
+            assert!(
+                resolved.header_bytes().is_none(),
+                "the log stores no header at height {height}"
+            );
+        }
     }
 
     #[test]
@@ -2120,6 +2190,7 @@ mod tests {
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
                     None,
                     ValidationEngine::Native,
+                    None,
                 )),
             },
             indexes: IndexHandles {
@@ -2299,7 +2370,7 @@ mod admission_chain_tests {
                 connection_id: 1,
             }),
             None,
-            0,
+            unix_time_secs(),
             &ctx.chain.admission_chain(),
         )?;
         assert!(matches!(result, SubmitOutcome::Committed(_)));

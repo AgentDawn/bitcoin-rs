@@ -113,6 +113,19 @@ pub trait BlockBodyStore: Send + Sync {
     ) -> Result<Option<Vec<u8>>, StorageError> {
         self.load_block_body(height, hash)
     }
+    /// Bounded read for integrity verification: the pre-allocation bound of
+    /// `load_block_body_bounded` with the corruption evidence of
+    /// `load_block_body_for_verification`. The default delegates to the
+    /// bounded read and loses corruption evidence: framed backends override
+    /// both bounded paths and keep it.
+    fn load_block_body_for_verification_bounded(
+        &self,
+        height: u32,
+        hash: Hash256,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, crate::BoundedReadError> {
+        self.load_block_body_bounded(height, hash, max_bytes)
+    }
     /// Reads a body only after its stored length fits the owned-copy bound.
     /// Unsupported implementations refuse without calling metadata or the
     /// unbounded body reader. Backend-internal reads are not an owned-copy bound.
@@ -207,8 +220,14 @@ pub trait BlockBodyStore: Send + Sync {
         None
     }
 
-    /// Makes body bytes durable before their checkpoint can be published.
+    /// Syncs flat-file body bytes only; index rows need `flush_index`
+    /// or a following same-store durable batch.
     fn sync(&self) -> Result<(), StorageError>;
+
+    /// Makes deferred index rows durable; the default no-op suits indexless stores only.
+    fn flush_index(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 /// Flat-file bodies addressed by indexed, typed positions.
@@ -374,6 +393,35 @@ impl<S: KvStore> BlockBodyStore for IndexedBlockBodyStore<S> {
         // checked position before allocating the body buffer.
         self.files
             .load(position, height, *hash.as_byte_array())
+            .map_err(Into::into)
+    }
+
+    fn load_block_body_for_verification_bounded(
+        &self,
+        height: u32,
+        hash: Hash256,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, crate::BoundedReadError> {
+        let key = crate::pruning::block_body_key(height, hash);
+        let raw_position = self.index.get_bounded(
+            crate::pruning::BLOCK_DATA_CF,
+            &key,
+            BlockFilePosition::ENCODED_LEN,
+        )?;
+        let Some(position) = decode_body_position(height, raw_position.as_deref())? else {
+            return Ok(None);
+        };
+        let size = usize::try_from(position.len).unwrap_or(usize::MAX);
+        if size > max_bytes {
+            return Err(crate::BoundedReadError::Limit {
+                size,
+                limit: max_bytes,
+            });
+        }
+        // The flat-file verification reader preserves corrupt referenced
+        // frames as errors instead of mapping them to `None`.
+        self.files
+            .load_for_verification(position, height, *hash.as_byte_array())
             .map_err(Into::into)
     }
 
@@ -545,7 +593,10 @@ impl<S: KvStore> BlockBodyStore for IndexedBlockBodyStore<S> {
     }
 
     fn sync(&self) -> Result<(), StorageError> {
-        self.files.sync()?;
+        self.files.sync()
+    }
+
+    fn flush_index(&self) -> Result<(), StorageError> {
         self.index.flush()
     }
 }
@@ -553,6 +604,7 @@ impl<S: KvStore> BlockBodyStore for IndexedBlockBodyStore<S> {
 #[cfg(all(test, feature = "fjall"))]
 mod body_position_prefetch_tests {
     use super::*;
+    use crate::BoundedReadError;
 
     #[test]
     fn verification_distinguishes_corrupt_frames_from_missing_bodies()
@@ -563,7 +615,17 @@ mod body_position_prefetch_tests {
         let store = IndexedBlockBodyStore::new(index, files.clone());
         let hash = Hash256::from_le_bytes(&[7_u8; 32]);
         assert_eq!(store.load_block_body_for_verification(1, hash)?, None);
+        assert_eq!(
+            store.load_block_body_for_verification_bounded(1, hash, 16)?,
+            None
+        );
         store.persist_block_body(1, hash, b"body")?;
+        // A body longer than the requested bound is refused with the
+        // established bounded-read error, before any frame is read.
+        assert!(matches!(
+            store.load_block_body_for_verification_bounded(1, hash, 3),
+            Err(BoundedReadError::Limit { size: 4, limit: 3 })
+        ));
         let path = files.file_path(0);
         let original = std::fs::read(&path)?;
         assert_eq!(
@@ -586,6 +648,14 @@ mod body_position_prefetch_tests {
                 store.load_block_body_for_verification(1, hash),
                 Err(StorageError::CorruptBlockFrame(_))
             ));
+            // The bounded verification read keeps the same corruption
+            // evidence, wrapped as the underlying bounded-read failure.
+            assert!(matches!(
+                store.load_block_body_for_verification_bounded(1, hash, 16),
+                Err(BoundedReadError::Storage(StorageError::CorruptBlockFrame(
+                    _
+                )))
+            ));
             // Existing availability-only reads retain their public contract.
             assert_eq!(store.load_block_body(1, hash)?, None);
             assert_eq!(store.load_block_body_range(1, hash, 0, 1)?, None);
@@ -595,6 +665,10 @@ mod body_position_prefetch_tests {
         }
         std::fs::remove_file(&path)?;
         assert_eq!(store.load_block_body_for_verification(1, hash)?, None);
+        assert_eq!(
+            store.load_block_body_for_verification_bounded(1, hash, 16)?,
+            None
+        );
         std::fs::write(&path, original)?;
         Ok(())
     }

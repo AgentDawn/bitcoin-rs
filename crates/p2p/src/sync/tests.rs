@@ -641,7 +641,7 @@ fn getdata_uses_compact_flavor_only_for_relaying_peers_near_tip() -> TestResult 
             }
         }
     };
-    let first_getdata = |rx: &crossbeam_channel::Receiver<Message>| -> Vec<Inventory> {
+    let first_getdata = |rx: &crate::test_support::MessageReceiver| -> Vec<Inventory> {
         loop {
             match rx.try_recv() {
                 Ok(Message::GetData(inventory)) => return inventory,
@@ -1200,8 +1200,8 @@ fn clean_fast_path_caps_request_at_peer_height() -> TestResult {
 
 struct ExhaustionFixture {
     sync: BlockSync,
-    stalled_rx: crossbeam_channel::Receiver<Message>,
-    healthy_rx: crossbeam_channel::Receiver<Message>,
+    stalled_rx: crate::test_support::MessageReceiver,
+    healthy_rx: crate::test_support::MessageReceiver,
     block1_hash: BlockHash,
     block2_hash: BlockHash,
 }
@@ -1299,7 +1299,7 @@ struct DeterministicProxyFixture {
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     block_tree: Arc<RwLock<BlockTree>>,
     inbound_blocks_tx: crossbeam_channel::Sender<crate::InboundBlock>,
-    outbound_rx: crossbeam_channel::Receiver<Message>,
+    outbound_rx: crate::test_support::MessageReceiver,
     blocks: Vec<Block>,
 }
 
@@ -1963,7 +1963,7 @@ type WedgeFixture = (
     BlockSync,
     Arc<PeerTable>,
     Vec<BlockHash>,
-    Vec<crossbeam_channel::Receiver<Message>>,
+    Vec<crate::test_support::MessageReceiver>,
     InboundBlockSender,
 );
 
@@ -2026,7 +2026,7 @@ fn staged_count_wedge(
 /// Returns the next `getdata` inventory from `rx`, skipping header
 /// traffic; fails when none is queued.
 fn next_getdata(
-    rx: &crossbeam_channel::Receiver<Message>,
+    rx: &crate::test_support::MessageReceiver,
 ) -> Result<Vec<Inventory>, Box<dyn std::error::Error>> {
     while let Ok(message) = rx.try_recv() {
         if let Message::GetData(inventory) = message {
@@ -2037,7 +2037,7 @@ fn next_getdata(
 }
 
 /// Drains `rx`, failing on any `getdata` while ignoring header traffic.
-fn assert_no_getdata(rx: &crossbeam_channel::Receiver<Message>) -> TestResult {
+fn assert_no_getdata(rx: &crate::test_support::MessageReceiver) -> TestResult {
     while let Ok(message) = rx.try_recv() {
         if matches!(message, Message::GetData(_)) {
             return Err(std::io::Error::other("unexpected getdata").into());
@@ -2391,7 +2391,7 @@ fn test_frontier(sync: &BlockSync) -> super::ChainFrontier {
 }
 
 fn register_info(peer_table: &Arc<PeerTable>, info: PeerInfo) {
-    let (tx, _rx) = unbounded::<Message>();
+    let (tx, _rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
     peer_table.register(info.addr, lease.clone());
     peer_table.publish_info(info.addr, &lease, info);
@@ -2443,8 +2443,8 @@ pub(crate) fn test_addr(
 pub(crate) fn connect_peer(
     peer_table: &Arc<PeerTable>,
     info: PeerInfo,
-) -> crossbeam_channel::Receiver<Message> {
-    let (tx, rx) = unbounded::<Message>();
+) -> crate::test_support::MessageReceiver {
+    let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
     peer_table.register(info.addr, lease.clone());
     peer_table.publish_info(info.addr, &lease, info);
@@ -2552,6 +2552,71 @@ fn service_and_range_gate_both_request_paths() -> TestResult {
     Ok(())
 }
 
+/// A candidate whose node aggregate is full refuses the hedge without being
+/// cancelled: with it as the only candidate nothing is sent, and once another
+/// candidate exists the request still goes out to exactly that one.
+#[test]
+fn cold_front_hedge_skips_a_saturated_candidate_without_cancelling_it() -> TestResult {
+    let mut tree = BlockTree::new();
+    let mut parent = None;
+    let mut previous = BlockHash::default();
+    let mut front_hash = None;
+    for height in 0..=300 {
+        let header = regtest_fixture::mined_regtest_header(previous, height)?;
+        previous = header.compute_hash();
+        parent = Some(tree.insert_node(parent, header, NodeStatus::HeaderValid)?);
+        if height == 15 {
+            front_hash = Some(Hash256::from_le_bytes(previous.as_bytes()));
+        }
+    }
+    let front_hash = front_hash.ok_or("missing front header")?;
+    let SyncHarness { sync, peers, .. } = SyncHarness::with_ibd(tree, synced_ibd_latch());
+
+    let owner_addr = test_addr(18_910, 0)?;
+    let _owner_rx = connect_peer(&peers, synthetic_peer(owner_addr, 300));
+    let owner = current_source(&peers, owner_addr);
+
+    let aggregate = Arc::new(crate::connection::SharedOutboundBudget::with_limits(512, 0));
+    let hold = crate::test_support::hog(&aggregate, 512);
+    let saturated_addr = test_addr(18_910, 1)?;
+    let (saturated_tx, saturated_rx) = crate::test_support::message_channel();
+    let saturated_lease = PeerLease::new(saturated_tx).with_shared_budget(&aggregate);
+    peers.register(saturated_addr, saturated_lease.clone());
+    peers.publish_info(
+        saturated_addr,
+        &saturated_lease,
+        synthetic_peer(saturated_addr, 300),
+    );
+    // The saturated peer is the only candidate, so it is certainly asked.
+    assert_eq!(
+        sync.send_cold_front_hedge(owner, front_hash, 15, Instant::now()),
+        None,
+        "the aggregate's refusal sends nothing"
+    );
+    assert!(saturated_rx.is_empty());
+    assert!(
+        !saturated_lease.is_cancelled(),
+        "a full aggregate never cancels a healthy candidate"
+    );
+    assert!(peers.is_connected(saturated_addr));
+
+    // Whichever order the candidates are tried in, the request reaches the
+    // healthy one and the saturated one stays untouched and connected.
+    let healthy_addr = test_addr(18_910, 2)?;
+    let healthy_rx = connect_peer(&peers, synthetic_peer(healthy_addr, 300));
+    let healthy = current_source(&peers, healthy_addr);
+    assert_eq!(
+        sync.send_cold_front_hedge(owner, front_hash, 15, Instant::now()),
+        Some(healthy),
+    );
+    assert!(matches!(healthy_rx.try_recv()?, Message::GetData(_)));
+    assert!(saturated_rx.is_empty());
+    assert!(!saturated_lease.is_cancelled());
+    assert!(peers.is_connected(saturated_addr));
+    drop(hold);
+    Ok(())
+}
+
 #[cfg(test)]
 mod download_frontier;
 
@@ -2592,6 +2657,9 @@ mod window_recovery;
 mod peer_qualification;
 
 #[cfg(test)]
+mod aggregate_saturation;
+
+#[cfg(test)]
 mod witness_staging_gate;
 
 #[cfg(test)]
@@ -2618,7 +2686,7 @@ struct PunishmentFixture {
     source: PeerSource,
     /// The announcing connection's outbound queue, kept alive so a send
     /// failure can never masquerade as a disconnect.
-    _peer_rx: crossbeam_channel::Receiver<Message>,
+    _peer_rx: crate::test_support::MessageReceiver,
 }
 
 fn punishment_fixture() -> Result<PunishmentFixture, Box<dyn std::error::Error>> {

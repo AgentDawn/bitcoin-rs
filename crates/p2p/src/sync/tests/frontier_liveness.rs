@@ -9,7 +9,7 @@ use super::*;
 /// `wire_response` is true for a reply to the node's request and false for
 /// headers forwarded from a delivery; the header gate distinguishes them.
 fn answer_requests(
-    rx: &crossbeam_channel::Receiver<Message>,
+    rx: &crate::test_support::MessageReceiver,
     source: PeerSource,
     headers: &[Header],
     bodies: &HashMap<Hash256, Block>,

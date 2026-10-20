@@ -71,12 +71,12 @@ pub use block_announce::{
     MAX_BLOCKS_TO_ANNOUNCE, MAX_HIGH_BANDWIDTH_PEERS, spawn_block_announce_worker,
 };
 pub(crate) use block_stager::BlockStager;
-pub use chain_query::ActiveChainQuery;
+pub use chain_query::{ActiveChainQuery, RecentBlockSlot};
 pub use compact_blocks::{CompactBlockHints, Reconstruction};
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, PINNED_CORE_VERSION};
-pub use connection::{ConnectionId, PeerLease, PeerSource};
+pub use connection::{ConnectionId, OutboundRefusal, PeerLease, PeerSource, QueuedFrame};
 pub use counters::{CountingStream, PeerCounters};
-pub use dispatch::{ChainQuery, InventoryServing, TxInventory};
+pub use dispatch::{ChainQuery, FilterRequest, FilterServing, InventoryServing, TxInventory};
 pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use inv::request_missing_parents;
 pub use listener::ListenerExtras;

@@ -81,9 +81,12 @@ impl ReorgObserver for NodeReorgObserver<'_> {
 ///
 /// PRE: the disconnect walk has committed and the resident sweep has run, so
 /// the pool holds exactly the settled resident set.
-/// POST: the pool is at or below its `max_total_bytes` ceiling, or the trim
-/// failed and settlement must be treated as incomplete. A pool already inside
-/// the ceiling is left untouched: no write lock, no empty mutation batch.
+/// POST: entries older than `MEMPOOL_EXPIRY_SECS` expire first, committing
+/// and publishing through the gateway under the reorg fence even when the
+/// pool is already inside its ceiling; then the pool is at or below its
+/// `max_total_bytes` ceiling, or the trim failed and settlement must be
+/// treated as incomplete. A pool already inside the ceiling skips only the
+/// size trim: no size-limit write lock, no empty mutation batch.
 /// INVARIANT: this is the only size trim one reorg performs. Each individual
 /// re-admission defers its own, so the walk cannot shed a transaction whose
 /// parent it has not committed yet. Core skips the size limit on the same
@@ -94,6 +97,14 @@ impl ReorgObserver for NodeReorgObserver<'_> {
 fn trim_after_reorg(
     gateway: &bitcoin_rs_mempool::MempoolGateway,
 ) -> Result<(), bitcoin_rs_mempool::MempoolError> {
+    // Expire entries older than MEMPOOL_EXPIRY_SECS before the size check so
+    // a settled branch never retains stale transactions; expiry commits and
+    // publishes through the gateway like any other mutation and runs under
+    // the same reorg fence as the trim below.
+    let _ = gateway.expire(
+        bitcoin_rs_mempool::AdmissionOrigin::Reorg,
+        bitcoin_rs_primitives::unix_time_secs(),
+    );
     let max_bytes = gateway.max_total_bytes();
     if max_bytes == 0 || gateway.read().total_vsize() <= max_bytes {
         return Ok(());

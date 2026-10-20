@@ -118,6 +118,8 @@ pub struct FlatFileBlockStore {
     /// Normal reads remain lock-free. Recovery reads take `writer` once and
     /// replace `usage` with a directory measurement.
     usage_dirty: AtomicBool,
+    /// Last field: drops after the writer's file handle above has closed.
+    guard: Option<crate::StoreGuard>,
 }
 
 struct WriterState {
@@ -141,6 +143,22 @@ struct ReaderState {
 }
 
 impl FlatFileBlockStore {
+    /// Keeps `guard` alive until this store's block-file handle is closed.
+    ///
+    /// Panics when a guard is already installed: replacing it would release
+    /// the first guard while the block-file handle it protects is still open.
+    #[must_use]
+    pub fn guarded_by(self, guard: crate::StoreGuard) -> Self {
+        assert!(
+            self.guard.is_none(),
+            "a flat-file block store takes exactly one lifetime guard"
+        );
+        Self {
+            guard: Some(guard),
+            ..self
+        }
+    }
+
     /// Opens a store with no committed body extent, recovering an incomplete tail.
     ///
     /// A caller with a durable head must use [`Self::open_with_committed_extent`]
@@ -537,6 +555,7 @@ impl FlatFileBlockStore {
             }),
             usage,
             usage_dirty: AtomicBool::new(false),
+            guard: None,
         })
     }
 }

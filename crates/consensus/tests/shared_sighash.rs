@@ -319,6 +319,7 @@ fn verify_block(
         VerifyFlags::MANDATORY,
         &mut ScriptStageTimings::default(),
         &parsed,
+        None,
     )
 }
 
@@ -344,7 +345,7 @@ fn prepared_block_and_transaction_accept_reference_signatures_and_order_failures
                 Ok(true)
             };
             assert_eq!(
-                prepared.verify_input(input_index, VerifyFlags::MANDATORY),
+                prepared.verify_input(input_index, VerifyFlags::MANDATORY, None),
                 expected,
                 "isolated signature substitution at {failed_input}, checking {input_index}"
             );
@@ -364,11 +365,12 @@ fn prepared_block_and_transaction_accept_reference_signatures_and_order_failures
             .map(|(input, output)| (input.previous_output, output.clone()))
             .collect();
         assert_eq!(
-            verify_tx_scripts(&tx, &spent, VerifyFlags::MANDATORY, engine),
+            verify_tx_scripts(&tx, &spent, VerifyFlags::MANDATORY, engine, None),
             Ok(())
         );
         assert_eq!(verify_block(&tx, &prevouts, engine), Ok(()));
-        let sequential = verify_tx_scripts(&changed_tx, &spent, VerifyFlags::MANDATORY, engine);
+        let sequential =
+            verify_tx_scripts(&changed_tx, &spent, VerifyFlags::MANDATORY, engine, None);
         let parallel = verify_block(&changed_tx, &prevouts, engine);
         assert_eq!(parallel, sequential);
         assert!(matches!(
@@ -401,7 +403,7 @@ fn prepared_input_preserves_typed_bounds_and_count_precedence() {
         assert_eq!(
             prepared
                 .expect("ordered prevouts")
-                .verify_input(999, VerifyFlags::MANDATORY),
+                .verify_input(999, VerifyFlags::MANDATORY, None),
             Err(ScriptError::InputIndexOutOfRange {
                 index: 999,
                 inputs: 3
@@ -428,7 +430,10 @@ fn preparation_rejects_swapped_and_foreign_prevout_identities_before_scripts() {
     ] {
         let prepared = prepared.expect("ordered identities");
         for index in 0..tx.inputs.len() {
-            assert_eq!(prepared.verify_input(index, VerifyFlags::NONE), Ok(true));
+            assert_eq!(
+                prepared.verify_input(index, VerifyFlags::NONE, None),
+                Ok(true)
+            );
         }
     }
     let mut swapped = rows.clone();
@@ -447,7 +452,7 @@ fn preparation_rejects_swapped_and_foreign_prevout_identities_before_scripts() {
         // Even an unavailable backend rejects caller wiring before dispatch.
         for engine in [ValidationEngine::Native, ValidationEngine::Kernel] {
             assert_eq!(
-                verify_tx_scripts(&tx, &bad_rows, VerifyFlags::NONE, engine),
+                verify_tx_scripts(&tx, &bad_rows, VerifyFlags::NONE, engine, None),
                 Err(ConsensusError::PrevoutMismatch { input_index })
             );
         }
@@ -468,5 +473,73 @@ fn preparation_rejects_swapped_and_foreign_prevout_identities_before_scripts() {
             input_count: 3,
             prevout_count: 2
         })
+    );
+}
+
+/// The shared cache is verdict-neutral from outside its crate: hits are not
+/// observable here (`SignatureCache::contains` is crate-internal), so this
+/// proves cached and uncached verification agree, never that a hit happened.
+#[test]
+fn native_signature_cache_preserves_verdicts() {
+    let (tx, prevouts) = signed_fixture();
+    let spent: Vec<_> = tx
+        .inputs
+        .iter()
+        .zip(&prevouts)
+        .map(|(input, output)| (input.previous_output, output.clone()))
+        .collect();
+    let cache = bitcoin_rs_script::SignatureCache::new();
+    assert_eq!(
+        verify_tx_scripts(
+            &tx,
+            &spent,
+            VerifyFlags::MANDATORY,
+            ValidationEngine::Native,
+            Some(&cache),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        verify_tx_scripts(
+            &tx,
+            &spent,
+            VerifyFlags::MANDATORY,
+            ValidationEngine::Native,
+            Some(&cache),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        verify_tx_scripts(
+            &tx,
+            &spent,
+            VerifyFlags::MANDATORY,
+            ValidationEngine::Native,
+            None,
+        ),
+        Ok(())
+    );
+    let mut changed = tx.clone();
+    changed.inputs[1].witness[0].clone_from(&tx.inputs[41].witness[0]);
+    let uncached = verify_tx_scripts(
+        &changed,
+        &spent,
+        VerifyFlags::MANDATORY,
+        ValidationEngine::Native,
+        None,
+    );
+    assert!(
+        matches!(uncached, Err(ConsensusError::Script { input_index: 1, .. })),
+        "swapped signature must reject at input 1, got {uncached:?}"
+    );
+    assert_eq!(
+        verify_tx_scripts(
+            &changed,
+            &spent,
+            VerifyFlags::MANDATORY,
+            ValidationEngine::Native,
+            Some(&cache),
+        ),
+        uncached
     );
 }

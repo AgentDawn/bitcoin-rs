@@ -384,6 +384,7 @@ fn getblockchaininfo_reports_the_closed_for_recovery_fact() -> Result<(), Box<dy
 struct RecordingChainControl {
     called: Arc<AtomicBool>,
     error: Option<ChainControlError>,
+    verify_error: Option<ChainControlError>,
 }
 
 impl ChainControl for RecordingChainControl {
@@ -394,6 +395,19 @@ impl ChainControl for RecordingChainControl {
             None => Ok(()),
         }
     }
+
+    // No block verifier is wired, so the chain cannot be declared verified.
+    fn verify_chain(
+        &self,
+        _check_level: u8,
+        _nblocks: u32,
+        _cancellation: &bitcoin_rs_chain::LatchReader,
+    ) -> Result<bool, ChainControlError> {
+        match &self.verify_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(false),
+        }
+    }
 }
 
 #[test]
@@ -402,6 +416,7 @@ fn invalidateblock_delegates_to_node_control_and_returns_null() -> Result<(), Rp
     let control = RecordingChainControl {
         called: Arc::clone(&called),
         error: None,
+        verify_error: None,
     };
     let mut ctx = Context::new().with_chain_control(Arc::new(control));
     ctx.chain.chain_network = Network::Regtest;
@@ -427,6 +442,7 @@ fn invalidateblock_maps_unknown_block_to_core_not_found() {
     let control = RecordingChainControl {
         called: Arc::clone(&called),
         error: Some(ChainControlError::UnknownBlock),
+        verify_error: None,
     };
     let mut ctx = Context::new().with_chain_control(Arc::new(control));
     ctx.chain.chain_network = Network::Regtest;
@@ -439,6 +455,44 @@ fn invalidateblock_maps_unknown_block_to_core_not_found() {
         .expect_err("unknown block should map to an error");
     // Core reports an unknown block as RPC_INVALID_ADDRESS_OR_KEY (-5).
     assert_eq!(err.code(), RpcError::CORE_NOT_FOUND);
+}
+
+#[test]
+fn verifychain_maps_control_interruptions_to_core_errors() {
+    // Cancellation is an operator stop and recovery closure is unavailable
+    // history: neither may answer as a corrupt chain (false) or pass.
+    for (error, message) in [
+        (
+            ChainControlError::Interrupted,
+            "Block verification interrupted",
+        ),
+        (
+            ChainControlError::Unavailable,
+            "Chainstate is unavailable for verification",
+        ),
+    ] {
+        let control = RecordingChainControl {
+            called: Arc::new(AtomicBool::new(false)),
+            error: None,
+            verify_error: Some(error),
+        };
+        let mut ctx = Context::new().with_chain_control(Arc::new(control));
+        ctx.chain.chain_network = Network::Regtest;
+        let tip = TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 42,
+            hash: Hash256::from_le_bytes(&[0xff; 32]),
+            chainwork: ChainWork::default(),
+            chain_tx_count: bitcoin_rs_chain::ChainTxCount::UNKNOWN,
+        };
+        ctx.chain.applied_tip.store(Some(Arc::new(tip)));
+        let handler = Handler::new(Arc::new(ctx));
+        let err = handler
+            .dispatch("verifychain", &json!([3, 6]))
+            .expect_err("control interruption must map to an error");
+        assert_eq!(err.code(), -1);
+        assert_eq!(err.to_string(), message);
+    }
 }
 
 #[test]

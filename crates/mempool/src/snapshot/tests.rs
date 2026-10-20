@@ -61,9 +61,9 @@ fn gateway(limits: MempoolLimits, seen: Option<Arc<Seen>>) -> MempoolGateway {
         Arc::new(RwLock::new(Mempool::new(limits))),
         seen.map(|observer| -> Arc<dyn crate::MempoolObserver> { observer }),
         ValidationEngine::Native,
+        None,
     )
 }
-
 fn output(value: u64) -> TxOut {
     TxOut {
         value: Amount::from_sat(value),

@@ -49,6 +49,22 @@ This page assigns ownership and cites proof under the
 - Parent requests validate the delivering connection and enqueue under the
   same peer-table authority that serializes replacement. Requests from an
   already cancelled lease enqueue nothing.
+- Every queued outbound message is paid for before it exists. A charge takes
+  one message and its full wire bytes from the connection's own budget and the
+  same bytes from the node's aggregate budget (`SharedOutboundBudget`, 64 MiB
+  per `P2pService`, strict: the pending total is never above the cap at any
+  instant). The charge has one owner at every moment (the reservation, then the
+  `QueuedFrame` carrying it through the lease's channel, then the writer's
+  burst) and is released exactly once when that owner drops, whether the frame
+  was written, refused, discarded with the channel, or drained at writer exit.
+  A bulk body reservation must also fit under the cap less one maximum frame.
+- A refused charge takes nothing. A refusal by the connection's own bounds
+  (`Local`) cancels the lease. A refusal by the node aggregate (`Shared`) is
+  backpressure only: the lease stays live, and the sender defers the request,
+  parks the unserved items, returns the claim to its owner, or retries on the
+  next tick. The aggregate never ends a session, and the time it refuses a
+  session is a stall that is not silence for keepalive, not the age of a
+  parked request, and not charged to a compact-filter request's allowance.
 - Scheduler ownership is keyed on connection identity. Every tick runs two
   sweep passes over the peer table's live session set, and a ready event
   from a live connection runs one; a stale ready event runs none. Each
@@ -356,6 +372,11 @@ covers the delivery-path forward.
   Each punishment increments `node.sync.invalid_block_disconnects`. A
   `BodyMutated` or `Operational` settlement failure stays retryable and
   non-punitive, and a `Fatal` settlement halts admission without peer blame.
+  `BodyMutated` names only the delivered bytes, so the header stays valid and
+  the body is fetched again: a Merkle or witness mismatch, and a body without a
+  coinbase that holds a 64-byte witness-stripped transaction (`SixtyFourByteMutation`; inner
+  Merkle nodes posing as transactions, CVE-2017-12842, Core `IsBlockMutated`).
+  Any other body without a coinbase is `Permanent`.
   A body that fails header binding before it can be staged keeps its
   existing delivery-rejection policy.
 - **Unresolved-body quota**: a body staged while the tree cannot resolve its
@@ -372,9 +393,16 @@ test `announced_near_tip_is_direct_fetched_before_tick`;
 `crates/p2p/src/listener.rs` test
 `unsolicited_block_flood_is_bounded_per_source`; `crates/p2p/src/sync/tests.rs`
 tests `permanent_consensus_body_disconnects_delivering_source` and
-`binding_and_operational_failures_do_not_disconnect`; and
+`binding_and_operational_failures_do_not_disconnect`;
 `crates/p2p/src/sync/tests/window_recovery.rs` test
-`reconcile_forgets_window_state_only_when_connection_identity_changes`.
+`reconcile_forgets_window_state_only_when_connection_identity_changes`;
+`crates/p2p/src/compact_blocks.rs` tests
+`sixty_four_byte_transaction_without_coinbase_completion_falls_back` and
+`sixty_four_byte_transaction_completed_by_blocktxn_falls_back`, which prove a
+mutated body takes the full-block fallback with its header intact; and
+`crates/p2p/src/sync/tests/peer_fanout.rs` test
+`mutated_forward_body_preserves_descendant_for_retry`, which proves a mutated
+forward body is retried, never punished.
 
 ### `P2P-08`: Inbound admission and the outbound service gate
 
@@ -649,6 +677,13 @@ default, and `docs/contracts/core-differential.md` CORE-06 owns the live Core
   block encodings against the independent rust-bitcoin envelope, request
   order, retained body immutability, headroom, corruption, and stale reads
   (P2P-01).
+- `crates/p2p/src/connection.rs` tests `strict_cap_no_empty_queue_bypass`,
+  `reservation_is_the_admission`, `concurrent_reservations_never_exceed_cap`,
+  and `credit_drop_exactly_once`, and
+  `crates/p2p/src/listener/aggregate_budget_tests.rs` tests
+  `request_deferred_not_reply` and `stall_exclusion_removes_only_shared_refusals`,
+  cover the strict aggregate, release on every exit path and the
+  no-disconnect-on-aggregate-refusal rule (P2P-02).
 - `crates/p2p/src/inv.rs` test
   `cancelled_missing_parent_source_does_not_enqueue_a_request` and
   `crates/p2p/src/peer_table.rs` test

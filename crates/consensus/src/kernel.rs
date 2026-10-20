@@ -306,7 +306,7 @@ pub(crate) fn verify_prepared_input(
 ) -> Result<(), ConsensusError> {
     match prepared {
         PreparedTx::Native(state) => {
-            crate::verify_tx::verify_input_script_native(state, input_index, flags)
+            crate::verify_tx::verify_input_script_native(state, input_index, flags, None)
         }
         #[cfg(feature = "kernel")]
         PreparedTx::Kernel {
@@ -328,18 +328,26 @@ pub(crate) fn verify_prepared_input(
 ///
 /// `spent_outputs` must pair input outpoints and outputs in input order.
 /// `PrevoutCount`/`PrevoutMismatch` precede backend work; script/setup failures
-/// map to `Script`/`Kernel`.
+/// map to `Script`/`Kernel`. The native signature cache is admission-local;
+/// the kernel branch validates prevouts before dispatch as before and ignores
+/// it without bypassing validation.
 pub fn verify_tx_scripts(
     tx: &Tx,
     spent_outputs: &[(OutPoint, TxOut)],
     flags: VerifyFlags,
     engine: ValidationEngine,
+    signature_cache: Option<&bitcoin_rs_script::SignatureCache>,
 ) -> Result<(), ConsensusError> {
     match engine {
         ValidationEngine::Native => {
             let prepared = bitcoin_rs_script::PreparedTransaction::new(tx, spent_outputs)?;
             for (input_index, _) in spent_outputs.iter().enumerate() {
-                crate::verify_tx::verify_input_script_native(&prepared, input_index, flags)?;
+                crate::verify_tx::verify_input_script_native(
+                    &prepared,
+                    input_index,
+                    flags,
+                    signature_cache,
+                )?;
             }
             Ok(())
         }

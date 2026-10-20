@@ -386,6 +386,11 @@ pub struct P2pService {
     /// A failed start leaves this token asserted; the next start installs a
     /// fresh token so leftover workers cannot be un-cancelled.
     session_cancel: Mutex<Arc<AtomicBool>>,
+    /// Aggregate outbound queued-byte budget for this service's connections.
+    /// Owned here (never process-global) and handed to the connection wiring
+    /// at every start, so inbound, outbound, and manual connections of one
+    /// node draw from one aggregate.
+    shared_outbound: Arc<crate::connection::SharedOutboundBudget>,
 }
 
 impl std::fmt::Debug for P2pService {
@@ -435,7 +440,16 @@ impl P2pService {
             inbound_blocks_tx,
             inbound_blocks_rx: Mutex::new(Some(inbound_blocks_rx)),
             workers: Mutex::new(None),
+            shared_outbound: Arc::new(crate::connection::SharedOutboundBudget::new()),
         }
+    }
+
+    /// Returns the aggregate outbound queued-byte budget this service's
+    /// connections count against.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn shared_outbound_budget(&self) -> Arc<crate::connection::SharedOutboundBudget> {
+        Arc::clone(&self.shared_outbound)
     }
 
     /// Starts listeners, outbound connection draining, and peer bootstrap.
@@ -484,6 +498,7 @@ impl P2pService {
         shared.local_services = self.config.local_services;
         shared.v2_transport = self.config.v2_transport;
         shared.address_book = Some(Arc::clone(&self.address_book));
+        shared = shared.with_shared_outbound(&self.shared_outbound);
 
         let mut listeners = Vec::with_capacity(bound_listeners.len());
         for (listener_addr, listener) in bound_listeners {
@@ -1935,6 +1950,28 @@ mod tests {
             .join()
             .expect("failed start must leave the service joinable");
         drop(occupied);
+    }
+
+    /// Each service owns a distinct aggregate budget: exhausting one leaves
+    /// the other unaffected (no process-global singleton).
+    #[test]
+    fn independent_services_own_independent_aggregate_budgets() {
+        let first = P2pService::new(
+            P2pServiceConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let second = P2pService::new(
+            P2pServiceConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let a = first.shared_outbound_budget();
+        let b = second.shared_outbound_budget();
+        assert!(!Arc::ptr_eq(&a, &b), "services must not share an aggregate");
+        let (queue, _receiver) = crate::test_support::message_channel();
+        let lease = crate::PeerLease::new(queue).with_shared_budget(&a);
+        assert!(lease.send(crate::Message::Ping(1)).is_ok());
+        assert!(a.pending() > 0, "the send counts against its service");
+        assert_eq!(b.pending(), 0, "the other service is unaffected");
     }
 
     #[test]

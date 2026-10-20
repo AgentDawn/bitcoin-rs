@@ -10,8 +10,8 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders() -> TestResult
     } = header_sync_with_genesis()?;
     let invalid_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let other_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-    let (invalid_tx, invalid_rx) = unbounded::<Message>();
-    let (other_tx, other_rx) = unbounded::<Message>();
+    let (invalid_tx, invalid_rx) = crate::test_support::message_channel();
+    let (other_tx, other_rx) = crate::test_support::message_channel();
 
     let invalid_lease = crate::PeerLease::new(invalid_tx);
     peers.register(invalid_peer, invalid_lease.clone());
@@ -122,7 +122,7 @@ fn disconnected_outbound_channel_does_not_mark_blocks_pending() -> TestResult {
     let (sync, peers, block_tree, applied_tip, _expected) = sync_with_header_chain(3)?;
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     register_info(&peers, synthetic_peer(addr, 100));
-    let (tx, rx) = unbounded::<Message>();
+    let (tx, rx) = crate::test_support::message_channel();
     drop(rx);
     peers.register(addr, crate::PeerLease::new(tx));
 
@@ -310,7 +310,7 @@ fn same_address_reconnect_does_not_inherit_stalled_inflight() -> TestResult {
         "the elected winner must hold the deep window in flight"
     );
 
-    let (replacement_tx, replacement_rx) = unbounded::<Message>();
+    let (replacement_tx, replacement_rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(replacement_tx);
     peers.register(winner, lease.clone());
     peers.publish_info(winner, &lease, synthetic_peer(winner, 100));
@@ -387,7 +387,7 @@ fn stall_eviction_does_not_disconnect_replacement_connection() -> TestResult {
             _ => None,
         }
     };
-    let (replacement_tx, _replacement_rx) = unbounded::<Message>();
+    let (replacement_tx, _replacement_rx) = crate::test_support::message_channel();
     let replacement = PeerLease::new(replacement_tx);
     peers.register(staller, replacement.clone());
     peers.publish_info(staller, &replacement, synthetic_peer(staller, 200));

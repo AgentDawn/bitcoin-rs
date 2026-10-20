@@ -867,7 +867,7 @@ fn failed_sweep_probe_requests_headers_from_live_peer_in_same_tick() -> TestResu
     let now = Instant::now();
     let dead = test_addr(9_921, 0)?;
     let live = test_addr(9_921, 1)?;
-    let (tx, dead_rx) = unbounded::<Message>();
+    let (tx, dead_rx) = crate::test_support::message_channel();
     let connected_at = now.checked_sub(MINIMUM_CONNECT_TIME).ok_or("connect age")?;
     let lease = PeerLease::new_connected_at(tx, connected_at);
     peers.register(dead, lease.clone());
@@ -934,7 +934,7 @@ fn failed_sweep_probe_reassigns_fresh_inflight_body_in_same_tick() -> TestResult
     let now = Instant::now();
     let dead = test_addr(9_922, 0)?;
     let live = test_addr(9_922, 1)?;
-    let (tx, dead_rx) = unbounded::<Message>();
+    let (tx, dead_rx) = crate::test_support::message_channel();
     let connected_at = now.checked_sub(MINIMUM_CONNECT_TIME).ok_or("connect age")?;
     let lease = PeerLease::new_connected_at(tx, connected_at);
     peers.register(dead, lease.clone());
@@ -1001,7 +1001,7 @@ fn a_failed_sweep_probe_restores_the_armed_record() {
     sync.chain.bootstrap_genesis();
 
     let addr = test_addr(9_920, 0).expect("test address");
-    let (tx, rx) = unbounded::<Message>();
+    let (tx, rx) = crate::test_support::message_channel();
     let connected_at = t0
         .checked_sub(MINIMUM_CONNECT_TIME)
         .expect("the test clock predates the connect age");

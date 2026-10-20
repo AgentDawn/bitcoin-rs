@@ -840,11 +840,13 @@ mod admin_rpc_tests {
 
     #[test]
     fn setnetworkactive_stores_and_echoes_state() {
-        let ctx = Arc::new(Context::new());
-        let result = setnetworkactive(&ctx, &json!([false]))
-            .unwrap_or_else(|err| panic!("setnetworkactive failed: {err}"));
-        assert_eq!(result.as_bool(), Some(false));
-        assert!(!ctx.network.p2p.network_active());
+        for active in [true, false] {
+            let ctx = Arc::new(Context::new());
+            let result = setnetworkactive(&ctx, &json!([active]))
+                .unwrap_or_else(|err| panic!("setnetworkactive failed: {err}"));
+            assert_eq!(result.as_bool(), Some(active));
+            assert_eq!(ctx.network.p2p.network_active(), active);
+        }
     }
 
     #[test]
@@ -910,14 +912,6 @@ mod admin_rpc_tests {
         let ctx = Arc::new(Context::new());
         let result = setban(&ctx, &json!(["10.0.0.1:8333", "frobnicate"]));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn setnetworkactive_echoes_state() {
-        let ctx = Arc::new(Context::new());
-        let result = setnetworkactive(&ctx, &json!([true]))
-            .unwrap_or_else(|err| panic!("setnetworkactive failed: {err}"));
-        assert_eq!(result.as_bool(), Some(true));
     }
 }
 #[cfg(test)]

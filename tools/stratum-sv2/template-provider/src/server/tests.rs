@@ -1,13 +1,10 @@
 use super::*;
 
-use crate::{EXAMPLE_PRIVATE_KEY_HEX, Network, NodeConfig, RuntimeInputs};
+use crate::{EXAMPLE_PRIVATE_KEY_HEX, Network, NodeConfig, RETAINED_TEMPLATES, RuntimeInputs};
 use bitcoin_rs_mempool::{AdmissionOrigin, MempoolObserver, MutationEnvelope};
-use bitcoin_rs_mining::{
-    BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult, GenerateRequest,
-    GenerateSelection, solve_block,
-};
+use bitcoin_rs_mining::{GenerateRequest, GenerateSelection, GeneratedBlock, solve_block};
 use bitcoin_rs_primitives::{
-    Amount, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
+    Amount, BlockHash, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Witness, consensus_bytes,
 };
 use futures_executor::block_on;
 use std::sync::{
@@ -36,6 +33,11 @@ use tokio::{
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 const DEADLINE: Duration = Duration::from_secs(5);
+/// Room a pool with a few outputs asks for; every test candidate has it to spare.
+const LOOSE: CoinbaseBudget = CoinbaseBudget {
+    additional_size: 1000,
+    additional_sigops: 1,
+};
 
 #[tokio::test]
 async fn transient_accept_error_waits_before_retrying() {
@@ -125,7 +127,8 @@ impl EmbeddedNode {
         }
     }
 
-    fn candidate(&self) -> Arc<bitcoin_rs_mining::Candidate> {
+    /// The unconstrained candidate, as the worker's wake would lead a session to.
+    fn candidate(&self) -> Arc<Candidate> {
         let BlockTemplateResult::Template(template) = self
             .node
             .mining_control()
@@ -135,12 +138,67 @@ impl EmbeddedNode {
                 capabilities: vec![],
                 rules: vec![],
                 long_poll_id: None,
+                coinbase_budget: None,
             })
             .unwrap()
         else {
             panic!("template")
         };
         template.candidate
+    }
+
+    /// Mines `count` blocks to the node's own payout, moving the generation.
+    async fn mine(&self, count: u32) -> Vec<GeneratedBlock> {
+        let payout = self.candidate().coinbase.outputs[0]
+            .script_pubkey
+            .as_bytes()
+            .to_vec();
+        let node = Arc::clone(&self.node);
+        tokio::task::spawn_blocking(move || {
+            node.mining_control().unwrap().generate(GenerateRequest {
+                payout,
+                count,
+                max_tries: 1_000_000,
+                selection: GenerateSelection::Mempool,
+                submit: true,
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Matures a coinbase and pools one spend of it, so the unconstrained
+    /// candidate carries exactly one transaction.
+    async fn pool_one_spend(&self) {
+        let generated = self.mine(101).await;
+        let funding = self
+            .node
+            .block_by_hash(generated[0].hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .txs[0]
+            .clone();
+        let spend = Tx {
+            version: 2,
+            lock_time: bitcoin_rs_primitives::LockTime::ZERO,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(funding.txid(), 0),
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_stack(vec![vec![0x51]]),
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(funding.outputs[0].value.to_sat() - 2000),
+                script_pubkey: funding.outputs[0].script_pubkey.clone(),
+            }],
+        };
+        let node = Arc::clone(&self.node);
+        tokio::task::spawn_blocking(move || block_on(node.broadcast(spend)))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     async fn shutdown(self) {
@@ -153,6 +211,12 @@ impl EmbeddedNode {
     }
 }
 
+fn key() -> Secp256k1SecretKey {
+    Secp256k1SecretKey(
+        secp256k1::SecretKey::from_slice(&hex::decode(EXAMPLE_PRIVATE_KEY_HEX).unwrap()).unwrap(),
+    )
+}
+
 async fn start_session(
     node: Arc<Node>,
     hub: Hub,
@@ -163,9 +227,7 @@ async fn start_session(
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let secret = Secp256k1SecretKey(
-        secp256k1::SecretKey::from_slice(&hex::decode(EXAMPLE_PRIVATE_KEY_HEX).unwrap()).unwrap(),
-    );
+    let secret = key();
     let (stop, cancel) = watch::channel(false);
     let session = Session {
         hub,
@@ -182,14 +244,11 @@ async fn start_session(
 }
 
 async fn connect(address: std::net::SocketAddr) -> NoiseTcpStream {
-    let secret = Secp256k1SecretKey(
-        secp256k1::SecretKey::from_slice(&hex::decode(EXAMPLE_PRIVATE_KEY_HEX).unwrap()).unwrap(),
-    );
     tokio::time::timeout(
         DEADLINE,
         connect_with_noise(
             TcpStream::connect(address).await.unwrap(),
-            Some(Secp256k1PublicKey::from(secret)),
+            Some(Secp256k1PublicKey::from(key())),
         ),
     )
     .await
@@ -197,7 +256,11 @@ async fn connect(address: std::net::SocketAddr) -> NoiseTcpStream {
     .unwrap()
 }
 
-async fn setup(reader: &mut NoiseTcpReadHalf, writer: &mut NoiseTcpWriteHalf) {
+async fn setup(
+    reader: &mut NoiseTcpReadHalf,
+    writer: &mut NoiseTcpWriteHalf,
+    budget: CoinbaseBudget,
+) {
     send(
         writer,
         AnyMessageOwned::Common(CommonMessagesOwned::SetupConnection(SetupConnectionOwned {
@@ -223,12 +286,16 @@ async fn setup(reader: &mut NoiseTcpReadHalf, writer: &mut NoiseTcpWriteHalf) {
         parse_common(&mut frame),
         Some(CommonMessagesOwned::SetupConnectionSuccess(_))
     ));
+    constrain(writer, budget).await;
+}
+
+async fn constrain(writer: &mut NoiseTcpWriteHalf, budget: CoinbaseBudget) {
     send(
         writer,
         AnyMessageOwned::TemplateDistribution(
             TemplateDistributionOwned::CoinbaseOutputConstraints(CoinbaseOutputConstraintsOwned {
-                coinbase_output_max_additional_size: 1000,
-                coinbase_output_max_additional_sigops: 1,
+                coinbase_output_max_additional_size: budget.additional_size,
+                coinbase_output_max_additional_sigops: budget.additional_sigops,
             }),
         ),
     )
@@ -246,20 +313,94 @@ async fn receive(reader: &mut NoiseTcpReadHalf) -> TemplateDistributionOwned {
         .into_owned()
 }
 
-async fn receive_job(reader: &mut NoiseTcpReadHalf, id: u64) {
+/// Reads one complete job and returns its id.
+async fn receive_job(reader: &mut NoiseTcpReadHalf) -> u64 {
+    let TemplateDistributionOwned::NewTemplate(template) = receive(reader).await else {
+        panic!("expected NewTemplate");
+    };
     assert!(
-        matches!(receive(reader).await, TemplateDistributionOwned::NewTemplate(t) if t.template_id == id)
+        matches!(receive(reader).await, TemplateDistributionOwned::SetNewPrevHash(t) if t.template_id == template.template_id)
     );
-    assert!(
-        matches!(receive(reader).await, TemplateDistributionOwned::SetNewPrevHash(t) if t.template_id == id)
-    );
+    template.template_id
+}
+
+/// Asks for a job's transactions: their count, or `Err` for `template-not-found`.
+async fn transaction_count(
+    reader: &mut NoiseTcpReadHalf,
+    writer: &mut NoiseTcpWriteHalf,
+    template_id: u64,
+) -> Result<usize, ()> {
+    send(
+        writer,
+        AnyMessageOwned::TemplateDistribution(TemplateDistributionOwned::RequestTransactionData(
+            RequestTransactionDataOwned { template_id },
+        )),
+    )
+    .await
+    .unwrap();
+    match receive(reader).await {
+        TemplateDistributionOwned::RequestTransactionDataSuccess(success) => {
+            assert_eq!(success.template_id, template_id);
+            Ok(success.transaction_list.into_inner().len())
+        }
+        TemplateDistributionOwned::RequestTransactionDataError(error) => {
+            assert_eq!(error.template_id, template_id);
+            Err(())
+        }
+        other => panic!("unexpected reply {other:?}"),
+    }
+}
+
+/// Solves `job` the way a pool would and returns the solution and the block hash.
+fn solve(job: &TemplateState) -> (SubmitSolutionOwned, BlockHash) {
+    let mut block = job.candidate.into_unsolved_block().unwrap();
+    solve_block(&mut block, 1_000_000).unwrap();
+    let solution = SubmitSolutionOwned {
+        template_id: job.id,
+        version: block.header.version as u32,
+        header_timestamp: block.header.time,
+        header_nonce: block.header.nonce,
+        coinbase_tx: consensus_bytes(&block.txs[0]).try_into().unwrap(),
+    };
+    (solution, block.block_hash())
+}
+
+async fn submit(writer: &mut NoiseTcpWriteHalf, solution: SubmitSolutionOwned) {
+    send(
+        writer,
+        AnyMessageOwned::TemplateDistribution(TemplateDistributionOwned::SubmitSolution(solution)),
+    )
+    .await
+    .unwrap();
+}
+
+/// The largest additional coinbase size, at one sigop, that `candidate` admits.
+fn headroom(candidate: &Candidate) -> u32 {
+    let admits = |additional_size| {
+        candidate
+            .admits(CoinbaseBudget {
+                additional_size,
+                additional_sigops: 1,
+            })
+            .is_ok()
+    };
+    let (mut fits, mut over) = (0, u32::MAX);
+    assert!(admits(fits) && !admits(over));
+    while over - fits > 1 {
+        let middle = fits + (over - fits) / 2;
+        if admits(middle) {
+            fits = middle;
+        } else {
+            over = middle;
+        }
+    }
+    fits
 }
 
 #[tokio::test]
-async fn partial_noise_frame_survives_refresh_and_tight_candidate_closes_session() -> TestResult {
+async fn partial_noise_frame_survives_a_job_refresh() -> TestResult {
     let embedded = EmbeddedNode::start(None).await;
     let hub = Hub::new();
-    hub.publish(embedded.candidate());
     let (address, stop, session) = start_session(Arc::clone(&embedded.node), hub.clone()).await;
     // A byte-transparent TCP proxy gates the remainder of one encrypted frame.
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -302,54 +443,265 @@ async fn partial_noise_frame_survives_refresh_and_tight_candidate_closes_session
         tokio::join!(forward, backward)
     });
     let (mut reader, mut writer) = connect(proxy_address).await.into_split();
-    setup(&mut reader, &mut writer).await;
-    receive_job(&mut reader, 1).await;
+    setup(&mut reader, &mut writer, LOOSE).await;
+    let first = receive_job(&mut reader).await;
     arm.send(()).unwrap();
     tokio::time::timeout(DEADLINE, armed_rx).await??;
     send(
         &mut writer,
         AnyMessageOwned::TemplateDistribution(TemplateDistributionOwned::RequestTransactionData(
-            RequestTransactionDataOwned { template_id: 1 },
+            RequestTransactionDataOwned { template_id: first },
         )),
     )
     .await?;
     tokio::time::timeout(DEADLINE, partial_rx).await??;
     tokio::task::yield_now().await;
-    hub.publish(embedded.candidate());
-    // Observe refresh while the client frame is still incomplete.
-    receive_job(&mut reader, 2).await;
+    embedded.mine(1).await;
+    hub.wake();
+    // Observe the refresh while the client frame is still incomplete.
+    let second = receive_job(&mut reader).await;
+    assert_ne!(second, first);
     release.send(()).unwrap();
+    // The superseded job answers from the shared history.
     assert!(
-        matches!(receive(&mut reader).await, TemplateDistributionOwned::RequestTransactionDataSuccess(t) if t.template_id == 1)
+        matches!(receive(&mut reader).await, TemplateDistributionOwned::RequestTransactionDataSuccess(t) if t.template_id == first)
     );
     // A subsequent complete record also decodes, checking continued alignment.
-    send(
-        &mut writer,
-        AnyMessageOwned::TemplateDistribution(TemplateDistributionOwned::RequestTransactionData(
-            RequestTransactionDataOwned { template_id: 2 },
-        )),
-    )
-    .await?;
-    assert!(
-        matches!(receive(&mut reader).await, TemplateDistributionOwned::RequestTransactionDataSuccess(t) if t.template_id == 2)
-    );
-    let mut tight = crate::tests::empty_candidate();
-    tight.max_weight = tight.weight + (1000 + 109) * 4 - 1;
-    hub.publish(Arc::new(tight));
     assert_eq!(
-        tokio::time::timeout(DEADLINE, session).await??,
-        Err("coinbase constraints exceed candidate headroom".into())
-    );
-    assert!(
-        tokio::time::timeout(DEADLINE, reader.read_frame())
-            .await?
-            .is_err()
+        transaction_count(&mut reader, &mut writer, second).await,
+        Ok(0)
     );
     stop.send_replace(true);
     proxy.abort();
     let _ = proxy.await;
+    tokio::time::timeout(DEADLINE, session).await???;
     embedded.shutdown().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn tight_budget_gets_a_fitting_job_and_budgets_stay_independent() -> TestResult {
+    let embedded = EmbeddedNode::start(None).await;
+    embedded.pool_one_spend().await;
+    let unconstrained = embedded.candidate();
+    assert_eq!(unconstrained.transactions.len(), 1);
+    // One byte beyond what the unconstrained candidate can spare: the case the
+    // provider used to refuse by closing the session.
+    let tight = CoinbaseBudget {
+        additional_size: headroom(&unconstrained) + 1,
+        additional_sigops: 1,
+    };
+    assert!(unconstrained.admits(tight).is_err());
+    let hub = Hub::new();
+    let (address_a, stop_a, session_a) =
+        start_session(Arc::clone(&embedded.node), hub.clone()).await;
+    let (address_b, stop_b, session_b) =
+        start_session(Arc::clone(&embedded.node), hub.clone()).await;
+    let (mut reader_a, mut writer_a) = connect(address_a).await.into_split();
+    let (mut reader_b, mut writer_b) = connect(address_b).await.into_split();
+    setup(&mut reader_a, &mut writer_a, tight).await;
+    setup(&mut reader_b, &mut writer_b, LOOSE).await;
+    let tight_id = receive_job(&mut reader_a).await;
+    let loose_id = receive_job(&mut reader_b).await;
+    assert_ne!(tight_id, loose_id);
+    let tight_job = hub.lookup(tight_id).unwrap();
+    let loose_job = hub.lookup(loose_id).unwrap();
+    assert!(tight_job.candidate.admits(tight).is_ok());
+    assert!(loose_job.candidate.admits(LOOSE).is_ok());
+    // Room for the pool's outputs displaced the pooled spend only for the
+    // budget that needs it.
+    assert!(tight_job.candidate.transactions.is_empty());
+    assert_eq!(loose_job.candidate.transactions.len(), 1);
+    assert_eq!(
+        transaction_count(&mut reader_a, &mut writer_a, tight_id).await,
+        Ok(0)
+    );
+    assert_eq!(
+        transaction_count(&mut reader_b, &mut writer_b, loose_id).await,
+        Ok(1)
+    );
+    // New constraints replace the job. An equal owner identity is the job the
+    // other session already holds, and the earlier job keeps its own meaning.
+    constrain(&mut writer_a, LOOSE).await;
+    assert_eq!(receive_job(&mut reader_a).await, loose_id);
+    assert_eq!(
+        transaction_count(&mut reader_a, &mut writer_a, tight_id).await,
+        Ok(0)
+    );
+    stop_a.send_replace(true);
+    stop_b.send_replace(true);
+    tokio::time::timeout(DEADLINE, session_a).await???;
+    tokio::time::timeout(DEADLINE, session_b).await???;
+    embedded.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_job_outlives_peer_churn_and_evicted_ids_never_substitute() -> TestResult {
+    let embedded = EmbeddedNode::start(None).await;
+    embedded.pool_one_spend().await;
+    let edge = headroom(&embedded.candidate());
+    let hub = Hub::new();
+    let (address_a, stop_a, session_a) =
+        start_session(Arc::clone(&embedded.node), hub.clone()).await;
+    let (address_b, stop_b, session_b) =
+        start_session(Arc::clone(&embedded.node), hub.clone()).await;
+    let (mut reader_a, mut writer_a) = connect(address_a).await.into_split();
+    let (mut reader_b, mut writer_b) = connect(address_b).await.into_split();
+    setup(&mut reader_a, &mut writer_a, LOOSE).await;
+    let pinned = receive_job(&mut reader_a).await;
+    let pinned_job = hub.lookup(pinned).unwrap();
+    // Another pool on tight budgets, each distinct and so each its own owner
+    // identity, issues more jobs than the shared history retains.
+    let churn = u32::try_from(RETAINED_TEMPLATES).unwrap();
+    let tight = |step: u32| CoinbaseBudget {
+        additional_size: edge + step,
+        additional_sigops: 1,
+    };
+    setup(&mut reader_b, &mut writer_b, tight(1)).await;
+    let evicted = receive_job(&mut reader_b).await;
+    let evicted_job = hub.lookup(evicted).unwrap();
+    let mut latest = evicted;
+    for step in 2..=churn + 1 {
+        constrain(&mut writer_b, tight(step)).await;
+        latest = receive_job(&mut reader_b).await;
+    }
+    assert_eq!(hub.issued.lock().unwrap().len(), RETAINED_TEMPLATES);
+    assert!(hub.lookup(pinned).is_none(), "peer churn evicted the job");
+    assert!(hub.lookup(evicted).is_none());
+    // The pool's current job still answers although the history dropped it.
+    assert_eq!(
+        transaction_count(&mut reader_a, &mut writer_a, pinned).await,
+        Ok(1)
+    );
+    // The peer's own superseded job is gone: refused, and a solution for it is
+    // not applied to whichever job is newest.
+    assert_eq!(
+        transaction_count(&mut reader_b, &mut writer_b, evicted).await,
+        Err(())
+    );
+    let height = embedded.node.snapshot().tip_height;
+    submit(&mut writer_b, solve(&evicted_job).0).await;
+    // The session handles messages in order, so this reply follows the solution.
+    assert_eq!(
+        transaction_count(&mut reader_b, &mut writer_b, latest).await,
+        Ok(0)
+    );
+    assert_eq!(embedded.node.snapshot().tip_height, height);
+    // A solution for the pinned job reaches consensus, not a silent drop.
+    let (solution, hash) = solve(&pinned_job);
+    submit(&mut writer_a, solution).await;
+    assert_eq!(
+        transaction_count(&mut reader_a, &mut writer_a, pinned).await,
+        Ok(1)
+    );
+    assert_eq!(embedded.node.snapshot().tip_height, height + 1);
+    assert_eq!(
+        embedded
+            .node
+            .block_by_hash(hash)
+            .await?
+            .unwrap()
+            .block_hash(),
+        hash
+    );
+    stop_a.send_replace(true);
+    stop_b.send_replace(true);
+    tokio::time::timeout(DEADLINE, session_a).await???;
+    tokio::time::timeout(DEADLINE, session_b).await???;
+    embedded.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn infeasible_budget_closes_only_its_session() -> TestResult {
+    let embedded = EmbeddedNode::start(None).await;
+    let hub = Hub::new();
+    let (address_a, stop_a, session_a) =
+        start_session(Arc::clone(&embedded.node), hub.clone()).await;
+    let (address_b, _stop_b, session_b) =
+        start_session(Arc::clone(&embedded.node), hub.clone()).await;
+    let (mut reader_a, mut writer_a) = connect(address_a).await.into_split();
+    let (mut reader_b, mut writer_b) = connect(address_b).await.into_split();
+    setup(&mut reader_a, &mut writer_a, LOOSE).await;
+    setup(&mut reader_b, &mut writer_b, LOOSE).await;
+    let id = receive_job(&mut reader_a).await;
+    // Equal owner identities are one retained job, not two.
+    assert_eq!(receive_job(&mut reader_b).await, id);
+    // No coinbase fits this budget even in an empty block.
+    constrain(
+        &mut writer_b,
+        CoinbaseBudget {
+            additional_size: u32::MAX,
+            additional_sigops: 0,
+        },
+    )
+    .await;
+    let closed = tokio::time::timeout(DEADLINE, session_b).await??;
+    assert!(
+        closed
+            .as_ref()
+            .is_err_and(|error| error.contains("coinbase reservation exhausts")),
+        "{closed:?}"
+    );
+    assert!(
+        tokio::time::timeout(DEADLINE, reader_b.read_frame())
+            .await?
+            .is_err()
+    );
+    // The other pool is untouched and still holds its job.
+    assert!(!session_a.is_finished());
+    assert_eq!(
+        transaction_count(&mut reader_a, &mut writer_a, id).await,
+        Ok(0)
+    );
+    stop_a.send_replace(true);
+    tokio::time::timeout(DEADLINE, session_a).await???;
+    embedded.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_delivery_leaves_the_previous_job_pinned() {
+    let secret = key();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (pool, server) = tokio::join!(connect(address), async {
+        let (stream, _) = listener.accept().await.unwrap();
+        accept_noise_connection(stream, Secp256k1PublicKey::from(secret), secret, 3600)
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap()
+    });
+    let (_reader, mut writer) = server.into_split();
+    let hub = Hub::new();
+    // The pool holds a job in full before it disappears.
+    let mut pin = None;
+    let held = hub.issue(crate::tests::empty_candidate(1));
+    push_template(&mut writer, &mut pin, Arc::clone(&held), LOOSE)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(pin.as_ref().unwrap(), &held));
+    // Some later write must fail. Whichever of a job's two messages it hits,
+    // the pin stays on the last job delivered in full.
+    drop(pool);
+    let mut delivered = held.id;
+    for parent in 2..=65 {
+        let job = hub.issue(crate::tests::empty_candidate(parent));
+        match push_template(&mut writer, &mut pin, Arc::clone(&job), LOOSE).await {
+            Ok(()) => {
+                assert_eq!(pin.as_ref().unwrap().id, job.id);
+                delivered = job.id;
+            }
+            Err(_) => {
+                assert_eq!(pin.as_ref().unwrap().id, delivered);
+                assert_ne!(delivered, job.id);
+                return;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("writes to a vanished pool never failed");
 }
 
 struct SubmissionGate {
@@ -386,67 +738,16 @@ async fn session_shutdown_drains_a_running_native_submission() -> TestResult {
         released: AtomicBool::new(false),
     });
     let embedded = EmbeddedNode::start(Some(gate.clone())).await;
-    let payout = embedded.candidate().coinbase.outputs[0]
-        .script_pubkey
-        .as_bytes()
-        .to_vec();
-    let node = Arc::clone(&embedded.node);
-    let generated = tokio::task::spawn_blocking(move || {
-        node.mining_control().unwrap().generate(GenerateRequest {
-            payout,
-            count: 101,
-            max_tries: 1_000_000,
-            selection: GenerateSelection::Mempool,
-            submit: true,
-        })
-    })
-    .await??;
-    let funding = embedded
-        .node
-        .block_by_hash(generated[0].hash)
-        .await?
-        .unwrap()
-        .txs[0]
-        .clone();
-    let spend = Tx {
-        version: 2,
-        lock_time: bitcoin_rs_primitives::LockTime::ZERO,
-        inputs: vec![TxIn {
-            previous_output: OutPoint::new(funding.txid(), 0),
-            script_sig: Script::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::from_stack(vec![vec![0x51]]),
-        }],
-        outputs: vec![TxOut {
-            value: Amount::from_sat(funding.outputs[0].value.to_sat() - 2000),
-            script_pubkey: funding.outputs[0].script_pubkey.clone(),
-        }],
-    };
-    let node = Arc::clone(&embedded.node);
-    tokio::task::spawn_blocking(move || block_on(node.broadcast(spend))).await??;
-    let candidate = embedded.candidate();
-    assert_eq!(candidate.transactions.len(), 1);
-    let mut block = candidate.into_unsolved_block()?;
-    solve_block(&mut block, 1_000_000)?;
-    let hash = block.block_hash();
-    let solution = SubmitSolutionOwned {
-        template_id: 1,
-        version: block.header.version as u32,
-        header_timestamp: block.header.time,
-        header_nonce: block.header.nonce,
-        coinbase_tx: consensus_bytes(&block.txs[0]).try_into().unwrap(),
-    };
+    embedded.pool_one_spend().await;
     let hub = Hub::new();
-    hub.publish(candidate);
-    let (address, stop, mut session) = start_session(Arc::clone(&embedded.node), hub).await;
+    let (address, stop, mut session) = start_session(Arc::clone(&embedded.node), hub.clone()).await;
     let (mut reader, mut writer) = connect(address).await.into_split();
-    setup(&mut reader, &mut writer).await;
-    receive_job(&mut reader, 1).await;
-    send(
-        &mut writer,
-        AnyMessageOwned::TemplateDistribution(TemplateDistributionOwned::SubmitSolution(solution)),
-    )
-    .await?;
+    setup(&mut reader, &mut writer, LOOSE).await;
+    let id = receive_job(&mut reader).await;
+    let job = hub.lookup(id).unwrap();
+    assert_eq!(job.candidate.transactions.len(), 1);
+    let (solution, hash) = solve(&job);
+    submit(&mut writer, solution).await;
     // This observer runs inside canonical block submission after mempool removal.
     tokio::time::timeout(DEADLINE, entered_rx).await??;
     stop.send_replace(true);

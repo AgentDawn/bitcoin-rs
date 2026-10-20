@@ -541,6 +541,7 @@ pub enum Auth {
     },
     /// New private cookie at `<data_dir>/.cookie`, written when the RPC
     /// listener starts so it always follows the final data directory.
+    /// The file contains `__cookie__:<password>` without a trailing newline.
     GeneratedCookie,
 }
 
@@ -620,7 +621,7 @@ fn generate_rpc_cookie(path: &Path) -> Result<bitcoin_rs_rpc::Auth> {
             Err(error) => return Err(error),
         }
         let mut file = options.open(&temporary)?;
-        writeln!(file, "__cookie__:{password}")?;
+        write!(file, "__cookie__:{password}")?;
         file.sync_all()?;
         // Windows rename cannot replace an existing file. Both operations
         // occur before binding the listener, while the new secret is private.

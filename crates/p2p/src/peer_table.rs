@@ -18,7 +18,7 @@ use bitcoin_rs_primitives::Hash256;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 
-use crate::connection::{ConnectionId, PeerLease, PeerSource};
+use crate::connection::{ConnectionId, OutboundRefusal, PeerLease, PeerSource};
 use crate::counters::PeerCounters;
 use crate::peer::CompactBlockNegotiation;
 use crate::peer_info::PeerInfo;
@@ -956,18 +956,22 @@ impl PeerTable {
 
     /// Sends only to the current, uncancelled connection, holding its
     /// identity through the nonblocking enqueue. A replacement cannot
-    /// register between validation and enqueue; saturation retains the
-    /// lease's cancellation policy.
+    /// register between validation and enqueue.
+    ///
+    /// A source that is not current maps to [`OutboundRefusal::Closed`], as
+    /// does a local refusal that cancelled the lease. A node-wide aggregate
+    /// refusal is [`OutboundRefusal::Saturated`]: the connection is live and
+    /// the caller keeps its intent.
     #[expect(clippy::result_large_err)]
-    pub fn send(&self, source: PeerSource, message: crate::Message) -> Result<(), crate::Message> {
+    pub fn send(&self, source: PeerSource, message: crate::Message) -> Result<(), OutboundRefusal> {
         let entries = self.entries.read();
         let Some(entry) = entries
             .get(&source.addr)
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
-            return Err(message);
+            return Err(OutboundRefusal::Closed(message));
         };
-        entry.lease.send(message).map_err(|error| error.0)
+        entry.lease.send(message)
     }
 
     /// Like [`Self::send`], then runs `published` while the connection's
@@ -980,15 +984,15 @@ impl PeerTable {
         source: PeerSource,
         message: crate::Message,
         published: impl FnOnce(),
-    ) -> Result<(), crate::Message> {
+    ) -> Result<(), OutboundRefusal> {
         let entries = self.entries.read();
         let Some(entry) = entries
             .get(&source.addr)
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
-            return Err(message);
+            return Err(OutboundRefusal::Closed(message));
         };
-        entry.lease.send(message).map_err(|error| error.0)?;
+        entry.lease.send(message)?;
         published();
         Ok(())
     }
@@ -1014,6 +1018,7 @@ impl PeerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::QueuedMessages as _;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -1494,11 +1499,17 @@ mod tests {
             called = true;
         }));
         assert!(called);
-        assert!(matches!(current_rx.try_recv(), Ok(crate::Message::Ping(1))));
+        assert!(matches!(
+            current_rx.try_message(),
+            Ok(crate::Message::Ping(1))
+        ));
         assert!(table.send(stale_source, crate::Message::Ping(1)).is_err());
         assert!(stale_rx.try_recv().is_err());
         assert!(table.send(current_source, crate::Message::Ping(2)).is_ok());
-        assert!(matches!(current_rx.try_recv(), Ok(crate::Message::Ping(2))));
+        assert!(matches!(
+            current_rx.try_message(),
+            Ok(crate::Message::Ping(2))
+        ));
 
         current.cancel();
         assert!(table.send(current_source, crate::Message::Ping(3)).is_err());

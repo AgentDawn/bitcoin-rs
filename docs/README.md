@@ -5,7 +5,10 @@
 | Need | Owner |
 | --- | --- |
 | Build, configure, and run a node | [Getting started](getting-started.md) |
-| Explore Bitcoin one module at a time | [Architecture contract](contracts/architecture.md) and each crate's `README.md` |
+| Explore Bitcoin one module at a time | [Architecture contract](contracts/architecture.md), then the per-layer crate guides below |
+| Trace validation from byte types to consensus | [primitives](../crates/primitives/README.md), [script](../crates/script/README.md), [consensus](../crates/consensus/README.md) |
+| Trace state from storage to the node runtime | [storage](../crates/storage/README.md), [utxo](../crates/utxo/README.md), [chain](../crates/chain/README.md), [node](../crates/node/README.md) |
+| Trace services from wire to API | [p2p](../crates/p2p/README.md), [mempool](../crates/mempool/README.md), [mining](../crates/mining/README.md), [index](../crates/index/README.md), [rpc](../crates/rpc/README.md) |
 | Find a normative clause and its tests | [Contract index](contracts/README.md) |
 | Discover and run validation evidence | [Validation tooling](validation-tooling.md) |
 | Understand project vocabulary | [Concepts](../CONCEPTS.md) |
@@ -16,6 +19,10 @@
 | Evaluate the experimental keyless BIP352 codec | [Silent Payments feasibility](silent-payments.md) |
 | Place instrumentation in the right layer | [Observability boundary](observability.md), [tracing/USDT](tracing.md) |
 | Map process tests to their Core functional references | [Reorg coverage map](../e2e/REORG-COVERAGE.md) |
+| Mine regtest blocks and inspect templates | [Solo-mining generate path](contracts/external-api.md#api-05-solo-mining-generate-path) and [template extras](contracts/external-api.md#api-11-bip22bip23-template-extras) |
+| Inspect a Core snapshot file without starting a node | [Snapshot inspector](../tools/snapshot/README.md) |
+| Watch a running node for stalls | [Runtime stall watchdog](operations/runtime-stall.md) |
+| Review unselected index-design options (historical) | [Index ideation record](ideation/better-tasting-and-efficient-index-design-and-abstractions.md): brainstorm only, not a plan |
 
 The contract index owns the clause/proof map; this page does not maintain a
 second inventory. Contracts take precedence over local source comments,

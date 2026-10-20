@@ -15,7 +15,8 @@ bitcoin-rs-primitives = { path = "../../crates/primitives" }
 bitcoin = { version = ">=0.32.9, <0.33", default-features = false, features = ["std"] }
 lightning = { version = "=0.2.7", default-features = false, features = ["std"] }
 lightning-block-sync = { version = "=0.2.0", default-features = false }
-futures-executor = "=0.3.32"
+# Pin the executor patch used by the standalone LDK verification graph.
+futures-executor = "=0.3.34"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 thiserror = "2"
 

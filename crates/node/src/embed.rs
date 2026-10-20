@@ -46,6 +46,13 @@ pub enum NodeError {
 ///
 /// Explicit shutdown consumes the node and reports failures. Drop stops an
 /// abandoned run through the same lifecycle without a clean-run checkpoint.
+///
+/// The data directory stays locked until the last handle to any of the node's
+/// stores is dropped, not merely until shutdown returns. A detached consumer
+/// that still holds one, such as an idle keep-alive RPC connection (closed at
+/// the RPC idle timeout), keeps the directory locked; opening it meanwhile
+/// fails with [`crate::DataDirLockError::InUse`], never with a storage-backend
+/// lock error.
 pub struct Node {
     pub(crate) state: NodeState,
     pub(crate) services: Option<NodeServices>,
@@ -254,7 +261,8 @@ impl Node {
             .map_err(|error| NodeError::Shutdown(error.to_string()));
         self.services = None;
         // Dropping self releases state and the RPC context's storage clones
-        // before this consuming operation returns, including on error.
+        // before this consuming operation returns, including on error. Clones
+        // a detached consumer still holds keep the data-dir lock; see `Node`.
         result
     }
 }
@@ -439,7 +447,7 @@ mod tests {
         // Control: direct insertion cannot satisfy the gateway-publication test.
         let direct_tx = spending(direct_prevout);
         let vsize = u32::try_from(direct_tx.vsize()).unwrap_or(u32::MAX);
-        let entry = MempoolEntry::new(Arc::new(direct_tx), vsize, 8_000, 0, 1, 0);
+        let entry = MempoolEntry::new(Arc::new(direct_tx), vsize, 8_000, unix_time_secs(), 1, 0);
         node.state
             .mempool()
             .write()
