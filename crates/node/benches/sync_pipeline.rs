@@ -61,7 +61,6 @@ use bitcoin::{
 };
 use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot, regtest_fixture};
 use bitcoin_rs_consensus::compute_merkle_root;
-use bitcoin_rs_index::BlockSource;
 pub mod evidence;
 
 // seam: the shared measured-work sampler for MRP counted rows. The file is
@@ -502,19 +501,6 @@ fn bench_production_state_sync(c: &mut Criterion) {
     );
 }
 
-fn block_source_height_lookup(c: &mut Criterion) {
-    let source = block_source_fixture(SYNC_PROXY_HEADER_HEIGHT);
-    c.bench_function("block_source_height_lookup_tail_4096", |b| {
-        b.iter(|| {
-            black_box(
-                source
-                    .block_at_height(black_box(SYNC_PROXY_HEADER_HEIGHT))
-                    .unwrap_or_else(|| panic!("missing block at tail height")),
-            );
-        });
-    });
-}
-
 fn print_proxy_summary(blocks: &[Block]) {
     let (_dir, state) = open_regtest_state();
     let started = Instant::now();
@@ -569,22 +555,6 @@ fn print_spend_proxy_summary(blocks: &[Block]) {
         bench_engine(),
         applied_height.saturating_add(1),
     );
-}
-
-fn block_source_fixture(max_height: u32) -> BenchBlockSource {
-    let block = Network::Regtest.genesis_block();
-    BenchBlockSource { max_height, block }
-}
-
-struct BenchBlockSource {
-    max_height: u32,
-    block: Block,
-}
-
-impl BlockSource for BenchBlockSource {
-    fn block_at_height(&self, height: u32) -> Option<Block> {
-        (height <= self.max_height).then(|| self.block.clone())
-    }
 }
 
 fn open_regtest_state() -> (TempDir, NodeState) {
@@ -4162,7 +4132,6 @@ criterion_group!(
     targets = sync_pipeline_apply_proxy,
     sync_pipeline_apply_signed_spend_proxy,
     deterministic_initial_sync_proxy,
-    block_source_height_lookup,
     block_to_template_baseline,
     template_render_baseline
 );

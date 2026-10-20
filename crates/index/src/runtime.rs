@@ -22,9 +22,9 @@ use arc_swap::ArcSwap;
 use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, TipReader, TipSnapshot};
 
 use crate::{
-    BlockSource, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
-    IndexWatermarks, IndexWriteFence, PreparedBatch, PreparedBatchLimits, ScriptHash,
-    ScriptLiveScan, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark, IndexWatermarks,
+    IndexWriteFence, PreparedBatch, PreparedBatchLimits, ScriptHash, ScriptLiveScan, TxIndexScan,
+    TxIndexScanRow, TxIndexSnapshot,
     reconcile::{ReconcileLeg, ReconcilePhase},
     types::{TxPosition, TxPositionValue},
     writer::TxIndexWriter,
@@ -32,7 +32,6 @@ use crate::{
 
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, OutPoint, Tx, Txid, deserialize};
 
-use crate::block_log::{BlockLogReader, record_at_height};
 use crate::capabilities::{
     CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
 };

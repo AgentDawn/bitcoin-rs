@@ -69,7 +69,7 @@ fn distinct_row_count(rows: &[PositionedRow]) -> usize {
 /// Calls `emit` once per row key in a sorted slice, with that key's positions.
 ///
 /// Two blocks at one height that share a key merge their positions into one
-/// value. That is safe because the reader validates every position and falls
+/// value. That is safe because the query engine validates every position and falls
 /// back to a full scan on the first one that does not resolve, so a merged value
 /// costs at most a scan — see [`crate::types::TxPositionValue`].
 fn for_each_row_group<F>(rows: &[PositionedRow], mut emit: F)

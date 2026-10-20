@@ -3,51 +3,31 @@
 //! entrypoints retain health, revision, watermark, and chain-transition checks.
 
 use super::{
-    Arc, Block, BlockBodySource, BlockHash, BlockLogReader, BlockSource, BlockTree,
-    DerivedIndexInfo, DerivedIndexQuery, DerivedIndexRuntime, Hash256, IndexCapabilities,
-    IndexCapability, IndexReader, IndexWatermark, MAX_SERIALIZED_BLOCK_BYTES, Ordering, OutPoint,
-    PrefixScanLimit, QUERY_BODY_READ_LIMIT, QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT,
-    QUERY_SCAN_ROW_LIMIT, ScriptHash, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
-    ScriptIndexSnapshot, ScriptLiveScan, SpendingRecord, TipSnapshot, Tx, TxIndexScan,
-    TxIndexScanRow, TxIndexSnapshot, TxPosition, TxPositionValue, TxQueryError, Txid, deserialize,
-    record_at_height,
+    Arc, Block, BlockBodySource, BlockHash, BlockTree, DerivedIndexInfo, DerivedIndexQuery,
+    DerivedIndexRuntime, Hash256, IndexCapabilities, IndexCapability, IndexReader, IndexWatermark,
+    MAX_SERIALIZED_BLOCK_BYTES, Ordering, OutPoint, PrefixScanLimit, QUERY_BODY_READ_LIMIT,
+    QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT, QUERY_SCAN_ROW_LIMIT, ScriptHash,
+    ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, ScriptLiveScan,
+    SpendingRecord, TipSnapshot, Tx, TxIndexScan, TxIndexScanRow, TxIndexSnapshot, TxPosition,
+    TxPositionValue, TxQueryError, Txid, deserialize,
 };
 
 mod filters;
 mod scripts;
 mod transactions;
 
-/// Private index-side `BlockSource`: active-chain identity from the tree,
-/// bodies from the chain body store. Not a node-owned concept.
-#[derive(Clone)]
+/// Index-side access to raw block bodies in the chain body store. Not a
+/// node-owned concept.
+#[derive(Clone, Default)]
 pub struct IndexBlockSource {
-    blocks: BlockLogReader,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
-    block_tree: Option<bitcoin_rs_chain::BlockTreeReader>,
 }
 
 impl IndexBlockSource {
-    /// A source backed only by the log of connected block records.
-    #[must_use]
-    pub fn new(blocks: impl Into<BlockLogReader>) -> Self {
-        Self {
-            blocks: blocks.into(),
-            block_body_source: None,
-            block_tree: None,
-        }
-    }
-
     /// Adds the chain body store used to fetch raw block bodies.
     #[must_use]
     pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
         self.block_body_source = Some(source);
-        self
-    }
-
-    /// Adds the authoritative block tree used for active-chain identity.
-    #[must_use]
-    pub fn with_block_tree(mut self, tree: bitcoin_rs_chain::BlockTreeReader) -> Self {
-        self.block_tree = Some(tree);
         self
     }
 
@@ -60,40 +40,11 @@ impl IndexBlockSource {
             .ok()
             .flatten()
     }
-
-    pub(super) fn resolve_block_by_hash(&self, height: u32, active_hash: Hash256) -> Option<Block> {
-        let bytes = self.block_body_bytes_for(height, BlockHash::from(active_hash))?;
-        let block = deserialize::<Block>(&bytes).ok()?;
-        (block.block_hash() == BlockHash::from(active_hash)).then_some(block)
-    }
 }
 
 impl core::fmt::Debug for IndexBlockSource {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IndexBlockSource").finish_non_exhaustive()
-    }
-}
-
-impl BlockSource for IndexBlockSource {
-    fn block_at_height(&self, height: u32) -> Option<Block> {
-        let active_hash = if let Some(tree) = &self.block_tree {
-            tree.read().active_node_at_height(height)?.hash
-        } else {
-            let guard = self.blocks.read();
-            Hash256::from(record_at_height(&guard, height)?.hash)
-        };
-        self.resolve_block_by_hash(height, active_hash)
-    }
-
-    fn block_bytes_at_height(&self, height: u32, offset: u32, len: u32) -> Option<Vec<u8>> {
-        let source = self.block_body_source.as_ref()?;
-        let hash = if let Some(tree) = &self.block_tree {
-            BlockHash::from(tree.read().active_node_at_height(height)?.hash)
-        } else {
-            let guard = self.blocks.read();
-            record_at_height(&guard, height)?.hash
-        };
-        source.block_body_range(height, hash, offset, len)
     }
 }
 

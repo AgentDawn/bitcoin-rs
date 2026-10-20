@@ -16,8 +16,9 @@ Owners:
 - `DerivedIndexQueryEngine` in `crates/index/src/runtime/query.rs` owns the shared
   snapshot gate and public query entrypoints. Its `query/transactions.rs` and
   `query/scripts.rs` modules own exact transaction resolution and script
-  traversal; `query.rs` itself owns block identity (`IndexBlockSource`) and
-  aggregate work accounting (`QueryBudget`).
+  traversal; `query.rs` itself owns block body access (`IndexBlockSource`) and
+  aggregate work accounting (`QueryBudget`). Active-chain block identity comes
+  from the engine's block tree.
 - Worker supervision and backend opening in `runtime/lifecycle.rs` and
   `runtime/startup.rs`; startup owns generation-checked publication.
 - Durable mutation: `IndexWriter` in `crates/index/src/index/write.rs`;

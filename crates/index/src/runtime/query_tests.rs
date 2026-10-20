@@ -1,7 +1,6 @@
 use crate::TxIndexSnapshot;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::block_log::BlockRecord;
 use crate::types::{TxPosition, TxPositionValue, TxidRow};
 use crate::{HashPrefixRow, IndexCapabilities, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow};
 use arc_swap::ArcSwapOption;
@@ -232,11 +231,6 @@ impl QueryFixture {
                 chain_transition: chain_transition.clone(),
             },
         });
-        let records = if config.retain_body {
-            vec![BlockRecord::from_block(tip.height, &config.block)]
-        } else {
-            Vec::new()
-        };
         let body = config.retain_body.then(|| {
             Arc::new(SingleBlockBody {
                 height: tip.height,
@@ -249,9 +243,7 @@ impl QueryFixture {
             let source: Arc<dyn BlockBodySource> = source.clone();
             source
         });
-        let block_source = IndexBlockSource::new(Arc::new(RwLock::new(
-            records.into_iter().collect::<crate::block_log::BlockLog>(),
-        )));
+        let block_source = IndexBlockSource::default();
         let engine = DerivedIndexQueryEngine::new(
             Arc::clone(&runtime),
             reader,

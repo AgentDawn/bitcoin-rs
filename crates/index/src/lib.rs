@@ -28,11 +28,10 @@ pub use capabilities::{
 };
 pub(crate) use index::NoSpentScripts;
 pub use index::{
-    BasicFilter, BlockSource, ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError,
-    IndexReader, IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriteFence, IndexWriter,
-    Indexer, MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, PreparedBlock,
-    ScriptHistoryEntry, ScriptLiveScan, SpentCoinScripts, TxIndexScan, TxIndexScanRow,
-    TxIndexSnapshot,
+    BasicFilter, ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError, IndexReader,
+    IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriteFence, IndexWriter, Indexer,
+    MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptLiveScan,
+    SpentCoinScripts, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
 };
 pub use query_api::{
     CompactFilterQuery, DerivedIndexInfo, DerivedIndexQuery, RollbackWarningSource,

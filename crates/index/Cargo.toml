@@ -53,10 +53,5 @@ bitcoin-rs-storage = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-chain = { workspace = true, features = ["test-seam"] }
 proptest.workspace = true
 serde_json.workspace = true
-criterion.workspace = true
 tempfile.workspace = true
 
-[[bench]]
-name = "history_resolve"
-harness = false
-required-features = ["rocksdb"]

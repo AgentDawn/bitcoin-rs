@@ -10,7 +10,6 @@
 
 use super::namespace::NAMESPACE_REGISTRY;
 use super::*;
-use crate::block_log::BlockLog;
 use arc_swap::ArcSwap;
 use bitcoin_rs_chain::BlockTree;
 use std::sync::Arc;
@@ -59,8 +58,7 @@ fn build_worker_inputs(dir: &std::path::Path, epoch: u64) -> WorkerInputs {
     let applied_tip = Arc::new(arc_swap::ArcSwapOption::empty());
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let blocks = Arc::new(RwLock::new(BlockLog::new()));
-    let block_source = IndexBlockSource::new(blocks);
+    let block_source = IndexBlockSource::default();
     let chain_events = Arc::new(TestChainCursor);
 
     WorkerInputs {
