@@ -258,7 +258,7 @@ fn indexed_selection_read_guard_counted() {
     let ctx = context();
     let payout = [0x51_u8];
     let guarded = pool.read();
-    let warmed = select_template_body(&guarded, &ctx, &payout, None)
+    let _warmed = select_template_body(&guarded, &ctx, &payout, None)
         .unwrap_or_else(|error| panic!("fixture selection failed: {error}"));
     drop(guarded);
     measured_samples::run(row, || counted_guard_unit(&pool, &ctx, &payout));
