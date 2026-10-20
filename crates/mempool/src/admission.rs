@@ -658,7 +658,7 @@ impl MempoolGateway {
             );
             match self.admit_transaction_claimed(&request, claim, fence) {
                 Ok(AdmitOutcome::Committed(result)) => {
-                    self.expire_after_admission(origin, fence, &[txid], request.time)?;
+                    self.check_admitted_residency(origin, fence, &[txid])?;
                     return Ok(SubmitOutcome::Committed(result));
                 }
                 Ok(AdmitOutcome::AlreadyKnown) => return Ok(SubmitOutcome::AlreadyKnown),
@@ -675,37 +675,20 @@ impl MempoolGateway {
         Err(SubmitError::RetryExhausted)
     }
 
-    /// Core's expiry after an accepted submission: removes every entry older
-    /// than the mempool expiry window, with its descendants, against the
-    /// wall clock rather than any timestamp the submission carried.
-    ///
-    /// Runs after the admission commit released the pool guard and queued its
-    /// observer batch, so the accepted change is always published before any
-    /// expiry removal. Re-admission after a disconnect (`Reorg` origin or the
-    /// chain-change fence) never expires. When an admitted transaction is no
-    /// longer resident after the expiry pass, the submission fails with the
-    /// pool's ordinary mempool-full refusal, as Core's post-accept check
-    /// does; the commit and its publication stand. Residency rather than the
-    /// expiry removal set is authoritative, so a concurrent non-expiry
-    /// removal racing the check is also reported. The `None` fast path keeps
-    /// no extra read: it means the pool held zero stale entries under the
-    /// expire read, so the pass removed nothing and could not have touched
-    /// the admitted set.
-    pub(crate) fn expire_after_admission(
+    /// Reports a post-admission full refusal if expiry removed an admitted
+    /// member. Admission plans publish acceptance before expiry in one atomic
+    /// commit, with capacity computed after expiry. Reorg bypass is unchanged.
+    pub(crate) fn check_admitted_residency(
         &self,
         origin: AdmissionOrigin,
         fence: AdmissionFence,
         admitted: &[Txid],
-        now: u64,
     ) -> Result<(), SubmitError> {
         let readmission = matches!(origin, AdmissionOrigin::Reorg)
             || matches!(fence, AdmissionFence::ChainChange(_));
         if readmission {
             return Ok(());
         }
-        let Some(_) = self.expire(origin, now) else {
-            return Ok(());
-        };
         let pool = self.pool.read();
         if admitted.iter().any(|txid| !pool.contains_txid(txid)) {
             return Err(SubmitError::Policy(crate::MempoolError::Full.into()));
@@ -3671,8 +3654,12 @@ mod tests {
                     let observer: Arc<dyn crate::MempoolObserver> = log.clone();
                     let gateway = MempoolGateway::new(
                         Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits {
-                            max_total_bytes: 100, ..crate::MempoolLimits::default()
-                        }))), Some(observer), ValidationEngine::Native, None,
+                            max_total_bytes: 100,
+                            ..crate::MempoolLimits::default()
+                        }))),
+                        Some(observer),
+                        ValidationEngine::Native,
+                        None,
                     );
                     let (stale, _) = independent_spend(70);
                     let stale_id = stale.txid();
@@ -3681,16 +3668,47 @@ mod tests {
                     let chain = funded_chain(fresh.inputs[0].previous_output, 9_000 + fee);
                     let fresh_id = fresh.txid();
                     let now = unix_time_secs();
-                    if expire_first { gateway.expire(AdmissionOrigin::Rpc, now); }
+                    if expire_first {
+                        gateway.expire(AdmissionOrigin::Rpc, now);
+                    }
                     let result = if package {
-                        gateway.submit_local_package(vec![(*fresh).clone()], LocalOrigin::Rpc, None, now, &chain).map(|_| ())
+                        gateway
+                            .submit_local_package(
+                                vec![(*fresh).clone()],
+                                LocalOrigin::Rpc,
+                                None,
+                                now,
+                                &chain,
+                            )
+                            .map(|_| ())
                     } else {
-                        gateway.submit_transaction(fresh, AdmissionOrigin::Rpc, None, now, &chain).map(|_| ())
+                        gateway
+                            .submit_transaction(fresh, AdmissionOrigin::Rpc, None, now, &chain)
+                            .map(|_| ())
                     };
                     let pool = gateway.read();
-                    let events = log.0.lock().iter().map(|(_, changes)| changes.iter().map(|(_, outcome)| *outcome).collect::<Vec<_>>()).collect::<Vec<_>>();
-                    println!("B package={package} fee={fee} expire_first={expire_first} now={now} stale_time=0 limit=100 result={result:?} stale={} fresh={} count={} vbytes={} floor={} events={events:?}", pool.contains_txid(&stale_id), pool.contains_txid(&fresh_id), pool.len(), pool.total_vsize(), pool.min_fee_sat_per_kvb(now));
-                    if expire_first { assert!(result.is_ok()); }
+                    let events = log
+                        .0
+                        .lock()
+                        .iter()
+                        .map(|(_, changes)| {
+                            changes
+                                .iter()
+                                .map(|(_, outcome)| *outcome)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "B package={package} fee={fee} expire_first={expire_first} now={now} stale_time=0 limit=100 result={result:?} stale={} fresh={} count={} vbytes={} floor={} events={events:?}",
+                        pool.contains_txid(&stale_id),
+                        pool.contains_txid(&fresh_id),
+                        pool.len(),
+                        pool.total_vsize(),
+                        pool.min_fee_sat_per_kvb(now)
+                    );
+                    assert!(result.is_ok());
+                    assert_eq!(pool.total_vsize(), 85);
+                    assert_eq!(pool.min_fee_sat_per_kvb(now), 1_000);
                 }
             }
         }
@@ -3716,7 +3734,7 @@ mod tests {
     // Core `LimitMempoolSize` expiry: an accepted admission removes entries
     // older than the mempool lifetime, and only after its own batch published.
     #[test]
-    fn committed_admission_expires_an_unrelated_stale_entry_after_its_own_batch() {
+    fn committed_admission_publishes_acceptance_before_expiry_atomically() {
         let (log, gateway) = batch_logged_gateway();
         let (stale, _) = independent_spend(70);
         let stale_txid = stale.txid();
@@ -3740,11 +3758,13 @@ mod tests {
                 ),
                 (
                     AdmissionOrigin::Rpc,
-                    vec![(fresh_txid, crate::MutationOutcome::Accepted)]
+                    vec![
+                        (fresh_txid, crate::MutationOutcome::Accepted),
+                        expired(stale_txid)
+                    ]
                 ),
-                (AdmissionOrigin::Rpc, vec![expired(stale_txid)]),
             ],
-            "the accepted batch publishes before the expiry batch"
+            "acceptance precedes expiry in the same atomic publication"
         );
     }
 
@@ -3774,13 +3794,18 @@ mod tests {
         assert_eq!(gateway.orphan_count(), 0);
         assert!(!gateway.is_rejected(Hash256::from(child_txid)));
         let batches = log.0.lock();
-        assert_eq!(batches.len(), 3, "stale insert, child commit, expiry");
         assert_eq!(
-            batches[1],
-            (peer, vec![(child_txid, crate::MutationOutcome::Accepted)]),
+            batches.len(),
+            2,
+            "stale insert, atomic child and expiry commit"
+        );
+        assert_eq!(
+            batches[1].1.first(),
+            Some(&(child_txid, crate::MutationOutcome::Accepted)),
             "the refused child's commit stays published"
         );
-        let (origin, removed) = &batches[2];
+        let (origin, changes) = &batches[1];
+        let removed = &changes[1..];
         assert_eq!(*origin, peer);
         assert_eq!(removed.len(), 2);
         assert!(removed.contains(&expired(parent_txid)));

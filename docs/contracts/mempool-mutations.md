@@ -86,8 +86,11 @@ state (`crates/mempool/src/orphan.rs`).
   `Descendant`, `PolicyEviction`, `Expiry`, `Clear`, `Reorg`.
 - `RemovalReason::Expiry` records transactions whose insertion timestamp is
   strictly older than 336 hours (`now.saturating_sub(MEMPOOL_EXPIRY_SECS)`),
-  removed along with their descendants. Expiry runs after each committed
-  transaction or package admission and during reorg trim; preview operations
+  removed along with their descendants. Normal submission plans capacity
+  against the post-expiry pool, then commits acceptance before expiry and
+  remaining capacity removals in the same writer interval and ordered batch.
+  Package insertion remains all-or-nothing and never capacity-evicts residents.
+  Expiry also runs during reorg trim; preview operations
   never expire entries. If expiry removes an admitted member, admission
   returns a mempool-full error.
 - `Mempool::sequence_number` advances exactly once per emitted change while

@@ -15,22 +15,44 @@ fn coinbase_input_sigop_growth_agrees_with_core() -> Result<(), Box<dyn std::err
     let address = bitcoin_rs_e2e::helpers::funding_address()?;
     let hashes = core.rpc("generatetoaddress", &json!([1, address.to_string()]))?;
     let raw = core.rpc("getblock", &json!([hashes[0], 0]))?;
-    let original: bitcoin::Block = bitcoin::consensus::encode::deserialize_hex(raw.as_str().ok_or("block hex")?)?;
+    let original: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize_hex(raw.as_str().ok_or("block hex")?)?;
     for opcode in [0xac, 0xae] {
         let mut block = original.clone();
         block.header.prev_blockhash = original.block_hash();
         block.header.time += 1;
-        block.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0xac; 19_999]);
-        let mut script = bitcoin::script::Builder::new().push_int(2).push_int(0).into_bytes();
+        block.txdata[0].output[0].script_pubkey =
+            bitcoin::ScriptBuf::from_bytes(vec![0xac; 19_999]);
+        let mut script = bitcoin::script::Builder::new()
+            .push_int(2)
+            .push_int(0)
+            .into_bytes();
         script.push(opcode);
         block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(script);
         block.header.merkle_root = block.compute_merkle_root().ok_or("merkle")?;
-        while block.header.validate_pow(block.header.target()).is_err() { block.header.nonce += 1; }
+        while block.header.validate_pow(block.header.target()).is_err() {
+            block.header.nonce += 1;
+        }
         let bytes = bitcoin::consensus::serialize(&block);
         let native = bitcoin_rs_primitives::deserialize(&bytes)?;
-        let result = core.rpc("submitblock", &json!([bitcoin::consensus::encode::serialize_hex(&block)]))?;
-        println!("A Core31.1 opcode={opcode:x} script_len={} weight={} native={:?} core={result}", block.txdata[0].input[0].script_sig.len(), block.weight().to_wu(), verify_block_non_contextual(&native));
-        assert_eq!(result, if opcode == 0xac { json!(null) } else { json!("bad-blk-sigops") });
+        let result = core.rpc(
+            "submitblock",
+            &json!([bitcoin::consensus::encode::serialize_hex(&block)]),
+        )?;
+        println!(
+            "A Core31.1 opcode={opcode:x} script_len={} weight={} native={:?} core={result}",
+            block.txdata[0].input[0].script_sig.len(),
+            block.weight().to_wu(),
+            verify_block_non_contextual(&native)
+        );
+        assert_eq!(
+            result,
+            if opcode == 0xac {
+                json!(null)
+            } else {
+                json!("bad-blk-sigops")
+            }
+        );
     }
     core.stop()?;
     Ok(())

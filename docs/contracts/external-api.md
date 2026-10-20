@@ -222,7 +222,10 @@ scanning and wallet interoperability remain unverified.
   compares level-one witness-nonce mutation outcomes through both live daemons.
 
 - Level 2 additionally reads each undo record and decodes it against its
-  block; levels 3 and 4 run the level-2 checks and do not replay disconnect
+  block. The copy bound comes from that block's input/output counts, the
+  interpreter's spendable-script limit, and the persisted codec's overhead;
+  the separate 64 MiB consumer-query budget does not limit startup or
+  verification of valid undo. Levels 3 and 4 run the level-2 checks and do not replay disconnect
   or reconnect. A history lease pins the window for the whole walk so a
   concurrent prune pass cannot delete rows about to be read; the lease is
   released when the walk ends. Data this node never kept or intentionally no

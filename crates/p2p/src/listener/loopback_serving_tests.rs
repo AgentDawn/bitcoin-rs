@@ -464,9 +464,12 @@ fn getblocktxn_survives_shared_saturation_without_resending() -> TestResult {
     let hog_block = child_block(genesis.block_hash(), 1, vec![coinbase(1, HOG_OUTPUTS)])?;
     let victim_block = child_block(hog_block.block_hash(), 2, vec![coinbase(2, 1), payment(2)])?;
     let frame_len = wire_len_of(&Message::BlockPayload(consensus_bytes(&hog_block).into()))?;
-    let request = Message::GetBlockTxn(GetBlockTxn { txs_request: BlockTransactionsRequest {
-        block_hash: wire_block_hash(victim_block.block_hash()), indexes: vec![1],
-    }});
+    let request = Message::GetBlockTxn(GetBlockTxn {
+        txs_request: BlockTransactionsRequest {
+            block_hash: wire_block_hash(victim_block.block_hash()),
+            indexes: vec![1],
+        },
+    });
     let hog_item = Inventory::WitnessBlock(wire_block_hash(hog_block.block_hash()));
     let blocks = [genesis, hog_block, victim_block];
     let node = Node::start(chain_over(&blocks, RecentBlockSlot::default())?)?;
@@ -478,21 +481,45 @@ fn getblocktxn_survives_shared_saturation_without_resending() -> TestResult {
     assert!(matches!(baseline.as_slice(), [(Message::BlockTxn(_), _)]));
     let mut hog = Client::connect(&node)?;
     let hog_session = session_of(&node, &hog)?;
-    wait_until("handshake credits returned", || node.aggregate.pending() == 0)?;
-    let queued = saturate(&node, &mut hog, &hog_session, &victim_session, frame_len, hog_item)?;
+    wait_until("handshake credits returned", || {
+        node.aggregate.pending() == 0
+    })?;
+    let queued = saturate(
+        &node,
+        &mut hog,
+        &hog_session,
+        &victim_session,
+        frame_len,
+        hog_item,
+    )?;
     let counters = counters_of(&victim_session)?;
     let before = counters.bytes_recv();
     let started = Instant::now();
     victim.send(&request)?;
     wait_until("getblocktxn read", || counters.bytes_recv() > before)?;
     std::thread::sleep(Duration::from_millis(300));
-    println!("C saturated queued={queued:?} shared={} victim_pending={:?} elapsed_ms={}", node.aggregate.pending(), victim_session.lease.budget_handle().pending(), started.elapsed().as_millis());
+    println!(
+        "C saturated queued={queued:?} shared={} victim_pending={:?} elapsed_ms={}",
+        node.aggregate.pending(),
+        victim_session.lease.budget_handle().pending(),
+        started.elapsed().as_millis()
+    );
     drop(hog);
-    wait_until("hog credit returned", || hog_session.lease.budget_handle().pending() == (0, 0))?;
+    wait_until("hog credit returned", || {
+        hog_session.lease.budget_handle().pending() == (0, 0)
+    })?;
     let nonce = victim.ping()?;
     let received = victim.read_through_pong(nonce)?;
-    println!("C recovered replies={} elapsed_ms={} messages={:?}", received.len(), started.elapsed().as_millis(), messages_of(received.clone()));
-    assert!(matches!(received.as_slice(), [(Message::BlockTxn(_), _)]), "the original request must be answered once after recovery");
+    println!(
+        "C recovered replies={} elapsed_ms={} messages={:?}",
+        received.len(),
+        started.elapsed().as_millis(),
+        messages_of(received.clone())
+    );
+    assert!(
+        matches!(received.as_slice(), [(Message::BlockTxn(_), _)]),
+        "the original request must be answered once after recovery"
+    );
     drop(victim);
     node.finish()
 }

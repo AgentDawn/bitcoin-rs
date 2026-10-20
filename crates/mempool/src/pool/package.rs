@@ -9,6 +9,7 @@ use hashbrown::HashSet;
 pub(crate) struct PreparedPackage {
     stamp: fee_policy::PolicyStamp,
     inserts: Vec<PreparedInsert>,
+    expiry_time: u64,
 }
 
 impl Mempool {
@@ -19,10 +20,20 @@ impl Mempool {
         entries: Vec<MempoolEntry>,
         now: u64,
     ) -> Result<PreparedPackage, AcceptanceRejectReason> {
+        let expiry_time = entries.iter().map(|entry| entry.time).max().unwrap_or(0);
         let size = entries.iter().try_fold(self.total_vsize(), |sum, entry| {
             sum.checked_add(u64::from(entry.vsize))
                 .ok_or(PolicyError::FeeArithmetic)
         })?;
+        let expired_vsize = self
+            .expired_entry_ids(expiry_time)
+            .iter()
+            .filter_map(|id| self.entry(*id))
+            .map(|entry| u64::from(entry.vsize))
+            .sum::<u64>();
+        let size = size
+            .checked_sub(expired_vsize)
+            .ok_or(PolicyError::FeeArithmetic)?;
         if self.limits.max_total_bytes != 0 && size > self.limits.max_total_bytes {
             return Err(MempoolError::Full.into());
         }
@@ -64,6 +75,7 @@ impl Mempool {
         Ok(PreparedPackage {
             stamp: self.policy_stamp(),
             inserts,
+            expiry_time,
         })
     }
 
@@ -81,6 +93,7 @@ impl Mempool {
         for entry in prepared.inserts {
             changes.extend(self.commit_insert(entry).changes);
         }
+        changes.extend(self.expire(prepared.expiry_time).changes);
         Ok(self.finish_mutation(changes))
     }
 }
