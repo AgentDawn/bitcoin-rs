@@ -40,6 +40,7 @@ fn timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot() -> anyhow
         ))),
         None,
         ValidationEngine::Native,
+        None,
     ));
     let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);

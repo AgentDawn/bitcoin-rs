@@ -5,9 +5,9 @@
 //! commit or a peer orphan/reject transition.
 
 use alloc::{sync::Arc, vec::Vec};
-use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxOut, Txid, Wtxid};
 #[cfg(test)]
 use bitcoin_rs_primitives::unix_time_secs;
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxOut, Txid, Wtxid};
 use hashbrown::{HashMap, HashSet};
 
 use crate::standardness::{AcceptanceRejectReason, StandardnessPolicy, is_standard_tx};
