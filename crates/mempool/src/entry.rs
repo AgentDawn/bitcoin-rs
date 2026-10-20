@@ -43,8 +43,10 @@ pub struct MempoolEntry {
     pub descendant_fee: u64,
     /// Total signed fee adjustment of this entry and all unconfirmed descendants.
     pub descendant_fee_delta: i128,
-    /// Mempool acceptance time in monotonically increasing seconds.
+    /// Mempool acceptance time in wall-clock seconds since the Unix epoch.
     pub time: u64,
+    /// Locally submitted body still awaiting a successful peer getdata response.
+    pub unbroadcast: bool,
     /// Chain height at acceptance.
     pub height: u32,
     /// BIP141 sigop cost, counted against the resolved prevouts.
@@ -101,6 +103,7 @@ impl MempoolEntry {
             descendant_fee: fee,
             descendant_fee_delta: 0,
             time,
+            unbroadcast: false,
             height,
         }
     }

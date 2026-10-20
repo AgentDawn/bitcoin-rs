@@ -41,7 +41,14 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         mempool_min_fee: sat_to_btc(mempool_min_fee_sat_per_kvb),
         min_relay_tx_fee: sat_to_btc(live_min_relay_sat_per_kvb),
         incremental_relay_fee: sat_to_btc(policy.incremental_relay_fee_sat_per_kvb),
-        unbroadcast_count: 0,
+        unbroadcast_count: i64_saturated(
+            u64::try_from(
+                pool.iter_entries()
+                    .filter(|entry| entry.unbroadcast)
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+        ),
         full_rbf: policy.full_rbf,
         permit_bare_multisig: policy.permit_bare_multisig,
         max_data_carrier_size: policy.max_data_carrier_size(),
@@ -387,7 +394,7 @@ fn mempool_entry_typed(
         depends,
         spent_by: spentby,
         bip125_replaceable: entry.is_replaceable(),
-        unbroadcast: false,
+        unbroadcast: entry.unbroadcast,
     }
 }
 

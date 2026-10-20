@@ -37,6 +37,8 @@ mod rbf;
 mod reader;
 /// Core rolling minimum fee state machine.
 mod rolling_min_fee;
+/// Optional, bounded transaction snapshots; membership is always revalidated.
+pub mod snapshot;
 /// Transaction relay standardness policy.
 pub mod standardness;
 mod submit_package;

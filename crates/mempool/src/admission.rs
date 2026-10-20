@@ -5,7 +5,9 @@
 //! commit or a peer orphan/reject transition.
 
 use alloc::{sync::Arc, vec::Vec};
-use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxOut, Txid, Wtxid, unix_time_secs};
+#[cfg(test)]
+use bitcoin_rs_primitives::unix_time_secs;
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxOut, Txid, Wtxid};
 use hashbrown::{HashMap, HashSet};
 
 use crate::standardness::{AcceptanceRejectReason, StandardnessPolicy, is_standard_tx};
@@ -656,7 +658,7 @@ impl MempoolGateway {
             );
             match self.admit_transaction_claimed(&request, claim, fence) {
                 Ok(AdmitOutcome::Committed(result)) => {
-                    self.expire_after_admission(origin, fence, &[txid])?;
+                    self.expire_after_admission(origin, fence, &[txid], request.time)?;
                     return Ok(SubmitOutcome::Committed(result));
                 }
                 Ok(AdmitOutcome::AlreadyKnown) => return Ok(SubmitOutcome::AlreadyKnown),
@@ -694,13 +696,14 @@ impl MempoolGateway {
         origin: AdmissionOrigin,
         fence: AdmissionFence,
         admitted: &[Txid],
+        now: u64,
     ) -> Result<(), SubmitError> {
         let readmission = matches!(origin, AdmissionOrigin::Reorg)
             || matches!(fence, AdmissionFence::ChainChange(_));
         if readmission {
             return Ok(());
         }
-        let Some(_) = self.expire(origin, unix_time_secs()) else {
+        let Some(_) = self.expire(origin, now) else {
             return Ok(());
         };
         let pool = self.pool.read();

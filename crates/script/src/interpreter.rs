@@ -432,22 +432,20 @@ impl<'tx> PreparedTransaction<'tx> {
         })
     }
 
-    /// Validates and consumes resolved prevouts the caller already owns.
-    ///
-    /// The borrowed transaction and owned outputs cannot change after
-    /// validation; outputs move into the retained vector without cloning
-    /// their script buffers.
+    /// Validates and takes ownership of resolved prevouts for parallel checks.
+    /// Script buffers move into the retained outputs without being cloned.
     ///
     /// # Errors
     /// Returns [`PrevoutError`] if the count or ordered outpoint identities differ.
-    pub fn from_spent_outputs(
-        tx: &'tx Tx,
-        prevouts: Vec<(OutPoint, TxOut)>,
-    ) -> Result<Self, PrevoutError> {
+    pub fn from_owned(tx: &'tx Tx, prevouts: Vec<(OutPoint, TxOut)>) -> Result<Self, PrevoutError> {
         validate_prevouts(tx, &prevouts)?;
+        let mut prevouts: Vec<TxOut> = prevouts.into_iter().map(|(_, output)| output).collect();
+        // In-place collection may reuse the larger tuple allocation. Do not
+        // retain that spare outpoint capacity for the parallel-check lifetime.
+        prevouts.shrink_to_fit();
         Ok(Self {
             tx,
-            prevouts: prevouts.into_iter().map(|(_, output)| output).collect(),
+            prevouts,
             cache: SighashCache::new(tx),
         })
     }
