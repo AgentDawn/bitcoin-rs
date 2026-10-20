@@ -27,9 +27,9 @@ pub(crate) const MAX_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 /// brute-force deterrent (`httprpc.cpp:215-225`).
 const WRONG_CREDENTIALS_DELAY: Duration = Duration::from_millis(250);
 
-/// How many bytes of an abandoned request body the unauthorized path still
-/// reads after its answer, so the peer sees a clean close instead of a reset
-/// for bytes it already sent.
+/// Most declared body bytes the unauthorized path reads after its answer.
+/// Bytes past this bound stay unread, so a peer that sends more may see a
+/// reset instead of a clean close.
 const MAX_DRAIN_BYTES: usize = 64 * 1_024;
 
 /// How long the drain may keep reading before the connection is closed
@@ -466,11 +466,12 @@ fn write_unauthorized(stream: &mut TcpStream) -> io::Result<()> {
     stream.shutdown(std::net::Shutdown::Write)
 }
 
-/// Reads and discards the `declared` body bytes the peer announced, up to
+/// Reads and discards the declared body bytes the peer announced, up to
 /// [`MAX_DRAIN_BYTES`] and for at most [`DRAIN_BUDGET`], then returns at EOF
-/// or on the first read failure. The peer then sees a clean close rather
-/// than a reset for bytes it already put on the wire. Reads go through the
-/// buffered reader, which may already hold body bytes past the head.
+/// or on the first read failure. Reads go through the buffered reader, so
+/// body bytes already buffered past the head count toward the declared
+/// length and a fully buffered body costs no wait. The peer then sees a
+/// clean close rather than a reset for the bytes it already put on the wire.
 fn drain_request(reader: &mut BufReader<RequestDeadlineStream>, declared: usize) {
     reader.get_mut().reset_deadline(DRAIN_BUDGET);
     let mut remaining = declared.min(MAX_DRAIN_BYTES);
@@ -1386,6 +1387,73 @@ mod tests {
         let mut response = String::new();
         client.read_to_string(&mut response)?;
         assert_eq!(response, CORE_UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// Runs the unauthorized path on the server side of one loopback pair and
+    /// returns the client's view of the response plus the next `take` bytes
+    /// the server reads once the handler returns. The server thread starts
+    /// first and reads while the client writes, so neither side waits on a
+    /// buffer the other has not drained.
+    fn serve_unauthorized(request: &[u8], take: usize) -> io::Result<(String, Vec<u8>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let server = thread::spawn(move || -> io::Result<Vec<u8>> {
+            let (stream, _) = listener.accept()?;
+            let mut reader =
+                BufReader::new(RequestDeadlineStream::new(stream, Duration::from_secs(30)));
+            let head = match read_request_head(&mut reader, REQUEST_HEAD_TIMEOUT) {
+                Ok(Some(head)) => head,
+                Ok(None) => {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing head"));
+                }
+                Err(RequestReadError::Io(error)) => return Err(error),
+                Err(RequestReadError::RestBodyTooLarge) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "body too large"));
+                }
+            };
+            let handled =
+                authenticate_json_rpc_head(&Auth::basic("alice", "secret"), &mut reader, &head)?;
+            assert!(handled, "unauthorized head must be handled");
+            let mut next = vec![0_u8; take];
+            reader.read_exact(&mut next)?;
+            Ok(next)
+        });
+        let mut client = TcpStream::connect(addr)?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        client.write_all(request)?;
+        client.shutdown(Shutdown::Write)?;
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        let next = server.join().expect("server thread")?;
+        Ok((response, next))
+    }
+
+    /// The drain consumes exactly the declared body, even at the cap, so the
+    /// bytes pipelined behind it are still on the stream for the next read.
+    #[test]
+    fn unauthorized_drain_consumes_exactly_the_declared_body() -> io::Result<()> {
+        let mut request = json_rpc_head(None, MAX_DRAIN_BYTES);
+        request.extend_from_slice(&vec![b'X'; MAX_DRAIN_BYTES]);
+        request.extend_from_slice(b"NEXT");
+        let (response, next) = serve_unauthorized(&request, 4)?;
+        assert_eq!(response, CORE_UNAUTHORIZED);
+        assert_eq!(next, b"NEXT");
+        Ok(())
+    }
+
+    /// A declared body above the cap is drained only up to the cap: the peer
+    /// still gets the 401 and a clean close, and the bytes past the cap stay
+    /// unread on the stream.
+    #[test]
+    fn unauthorized_drain_stops_at_the_cap_for_an_oversized_body() -> io::Result<()> {
+        const TAIL: usize = 4 * 1_024;
+        let mut request = json_rpc_head(None, MAX_DRAIN_BYTES + TAIL);
+        request.extend_from_slice(&vec![b'X'; MAX_DRAIN_BYTES]);
+        request.extend_from_slice(&vec![b'Y'; TAIL]);
+        let (response, rest) = serve_unauthorized(&request, TAIL)?;
+        assert_eq!(response, CORE_UNAUTHORIZED);
+        assert_eq!(rest, vec![b'Y'; TAIL]);
         Ok(())
     }
 

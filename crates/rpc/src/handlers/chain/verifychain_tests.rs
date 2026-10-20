@@ -4,16 +4,23 @@
 //! and answers a tip without a verifier as unverified. The node-owned
 //! verifier's answers, including the applied-genesis window, are proven
 //! against the real verifier in `node` (`lifecycle` tests) and in
-//! `chainstate::verify`; no stand-in verifier lives here.
+//! `chainstate::verify`; the stub control below proves delegation to the
+//! attached control, not its answers.
 #![expect(clippy::unwrap_used)]
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use super::*;
+use crate::context::{ChainControl, ChainControlError};
 use crate::handlers::Handler;
 
 /// A context whose applied tip is genesis, with no chain control attached.
 fn tipped() -> Arc<Context> {
+    Arc::new(tipped_context())
+}
+
+fn tipped_context() -> Context {
     let ctx = Context::new();
     let genesis = Network::Regtest.genesis_block();
     ctx.chain
@@ -28,7 +35,7 @@ fn tipped() -> Arc<Context> {
         ctx.chain.applied_tip.load_full().is_some(),
         "the fixture must apply its tip"
     );
-    Arc::new(ctx)
+    ctx
 }
 
 #[test]
@@ -110,4 +117,53 @@ fn tip_without_control_is_not_verified() {
             "level {level} without a verifier"
         );
     }
+}
+
+struct StubControl {
+    calls: AtomicBool,
+    level: AtomicU8,
+    nblocks: AtomicU32,
+}
+
+impl ChainControl for StubControl {
+    fn invalidate_block(
+        &self,
+        _hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), ChainControlError> {
+        Err(ChainControlError::UnknownBlock)
+    }
+
+    fn verify_chain(
+        &self,
+        check_level: u8,
+        nblocks: u32,
+        _cancellation: &bitcoin_rs_chain::LatchReader,
+    ) -> Result<bool, ChainControlError> {
+        self.calls.store(true, Ordering::SeqCst);
+        self.level.store(check_level, Ordering::SeqCst);
+        self.nblocks.store(nblocks, Ordering::SeqCst);
+        Ok(true)
+    }
+}
+
+#[test]
+fn empty_window_through_attached_control_is_verified() {
+    let control = Arc::new(StubControl {
+        calls: AtomicBool::new(false),
+        level: AtomicU8::new(u8::MAX),
+        nblocks: AtomicU32::new(u32::MAX),
+    });
+    let handler = Handler::new(Arc::new(
+        tipped_context().with_chain_control(control.clone()),
+    ));
+    assert_eq!(
+        handler.dispatch("verifychain", &json!([0, 0])).unwrap(),
+        json!(true)
+    );
+    assert!(
+        control.calls.load(Ordering::SeqCst),
+        "the applied tip must consult the attached control, not the no-tip shortcut"
+    );
+    assert_eq!(control.level.load(Ordering::SeqCst), 0);
+    assert_eq!(control.nblocks.load(Ordering::SeqCst), 0);
 }

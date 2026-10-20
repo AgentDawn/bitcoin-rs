@@ -82,8 +82,10 @@ the first embedder — there is one lifecycle implementation, not two.
   stores is dropped, not until `shutdown` returns: every store carries the
   `.lock` guard and drops it after its own handle closes, so a detached
   consumer (an idle keep-alive RPC connection until it closes or the RPC idle
-  timeout) keeps the directory locked, and a start meanwhile fails with
-  `DataDirLockError::InUse`, never with a backend store-lock error.
+  timeout) keeps the directory locked. The internal open reports that lock
+  as the typed `DataDirLockError::InUse`, never as a backend store-lock
+  error. `Node::start` maps every startup failure, including that one, to
+  `NodeError::Startup` for the embedder.
 - **EMB-08 — Mutations wake the template coordinator.** The
   `bitcoin_rs_mining::MiningGenerationSignal` (crates/mining/src/generation_signal.rs),
   constructed and wired by node, fans every

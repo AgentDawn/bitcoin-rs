@@ -436,3 +436,41 @@ fn barrier_bodies_verification_read_uses_the_inner_verification_path() -> Result
     );
     Ok(())
 }
+
+/// The barrier forwards verification reads through the inner store's
+/// verification path, so framed corruption surfaces instead of degrading
+/// to an ordinary miss.
+#[test]
+fn barrier_preserves_inner_verification_corruption() {
+    struct CorruptInner;
+    impl BlockBodyStore for CorruptInner {
+        fn persist_block_body(&self, _: u32, _: Hash256, _: &[u8]) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn load_block_body(&self, _: u32, _: Hash256) -> Result<Option<Vec<u8>>, StorageError> {
+            Ok(None)
+        }
+        fn sync(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn load_block_body_for_verification(
+            &self,
+            _: u32,
+            _: Hash256,
+        ) -> Result<Option<Vec<u8>>, StorageError> {
+            Err(StorageError::CorruptBlockFrame("frame"))
+        }
+    }
+    let wrapped = BarrierBodies {
+        inner: Arc::new(CorruptInner),
+        gate: SyncGate::new(),
+    };
+    let hash = Hash256::from_le_bytes(&[0xB4; 32]);
+    assert!(
+        matches!(
+            wrapped.load_block_body_for_verification(1, hash),
+            Err(StorageError::CorruptBlockFrame(_))
+        ),
+        "the barrier must preserve verification corruption like the inner store"
+    );
+}

@@ -22,12 +22,13 @@
 //! valid under `STANDARD` is valid under `MANDATORY`, matching the admission fill-then-
 //! consult direction whose cost Step 4 exposed.
 //!
-//! Frozen config: `SAMPLE_SIZE` samples per arm, one second of warm-up (well above three
-//! warm-up iterations at millisecond-scale iteration times), three seconds of measurement
-//! per arm, `INNER_REPS` verifications per iteration so each arm is millisecond-scale.
-//! Setup (key generation, sighash digests, signing, transaction assembly, positive and
-//! negative assertions) runs once before timing; the timer covers only `verify_input`
-//! calls plus the per-iteration flag alternation. No signing runs under the timer.
+//! MRP config: `SAMPLE_SIZE` measured samples per arm with `SamplingMode::Flat`, one
+//! second of warm-up, twenty seconds of measurement per arm, `INNER_REPS`
+//! verifications per iteration. Setup (key generation, sighash digests, signing,
+//! transaction assembly, positive and negative assertions) runs once before timing;
+//! the timer covers only `verify_input` calls plus the per-iteration flag alternation.
+//! No signing runs under the timer. Miss-arm fresh caches are built in the untimed
+//! `iter_batched` setup, never under the timer; no fixed batch counts are guessed.
 //!
 //! Construction reuses established in-repo patterns only: the ECDSA arm mirrors
 //! `tests/segwit_v0_sighash_edges.rs` (native `SighashCache` BIP143 digest, secp256k1
@@ -42,8 +43,12 @@
 //! policy); a Schnorr witness with one flipped signature byte fails with `SchnorrSig`
 //! under both flag sets.
 //!
-//! Command (identical for baseline and candidate; parent owns every execution):
-//! `cargo bench --locked -p bitcoin-rs-script --bench signature_verification`
+//! Commands (parent owns every execution):
+//! - benchmarks (identical for baseline and candidate):
+//!   `cargo bench --locked -p bitcoin-rs-script --bench signature_verification`
+//! - untimed verification (no Criterion, no timing output; prints `mrp-verify`
+//!   assertion lines and exits nonzero on any mismatch):
+//!   `cargo bench --locked -p bitcoin-rs-script --bench signature_verification -- --mrp-verify`
 //!
 //! Limitations: single-input spends only; P2WPKH `SIGHASH_ALL` and P2TR key-path
 //! `Default` only (no P2WSH, multisig, tapscript, or other sighash types); serial
@@ -72,18 +77,24 @@ use bitcoin_rs_script::{
     PreparedTransaction, ScriptErrCode, ScriptError, SignatureCache, VerifyFlags,
 };
 use criterion::measurement::WallTime;
-use criterion::{BatchSize, BenchmarkGroup, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkGroup, Criterion, SamplingMode, criterion_group};
 use secp256k1::{Message, PublicKey, SECP256K1, SecretKey};
 
 /// Verifications per timed iteration; identical for hit and miss arms.
 const INNER_REPS: usize = 64;
-/// Frozen Criterion sample count per arm (matches the `insert_fill` bench convention).
+/// MRP Criterion sample count per arm (matches the `insert_fill` bench convention).
 const SAMPLE_SIZE: usize = 10;
-/// Frozen warm-up budget per arm (millisecond-scale iterations: far above three passes).
+/// MRP warm-up budget per arm.
 const WARM_UP_SECS: u64 = 1;
-/// Frozen measurement budget per arm.
-const MEASURE_SECS: u64 = 3;
-/// First ECDSA seed byte; hit uses it, miss spans the next `INNER_REPS` bytes.
+/// MRP measurement budget per arm (twenty seconds; see module docs).
+const MEASURE_SECS: u64 = 20;
+/// Extra ECDSA seed beyond the miss range (`ECDSA_FIRST_SEED..=74`): a distinct key,
+/// outpoint, and digest exercising the over-capacity path in `--mrp-verify`.
+const ECDSA_EXTRA_SEED: u8 = 75;
+/// Extra Schnorr seed beyond the miss range (`SCHNORR_FIRST_SEED..=164`).
+const SCHNORR_EXTRA_SEED: u8 = 165;
+/// First ECDSA seed byte; the miss arm consumes the `INNER_REPS` seed bytes
+/// starting there, so the miss range includes the hit seed.
 const ECDSA_FIRST_SEED: u8 = 11;
 /// First Schnorr seed byte; disjoint from the ECDSA range by construction.
 const SCHNORR_FIRST_SEED: u8 = 101;
@@ -330,12 +341,7 @@ fn schnorr_fixtures() -> SchnorrFixtures {
         assert_valid(prepared, &format!("schnorr miss {i}"));
     }
 
-    let mut bad_tx = hit.tx.clone();
-    bad_tx.inputs[0].witness[0][0] ^= 0x01;
-    let bad = Case {
-        tx: bad_tx,
-        rows: hit.rows.clone(),
-    };
+    let bad = schnorr_negative_case(&hit);
     let bad_prepared = PreparedTransaction::new(&bad.tx, &bad.rows).expect("schnorr bad prevouts");
     for flags in [VerifyFlags::MANDATORY, VerifyFlags::STANDARD] {
         assert_eq!(
@@ -478,6 +484,7 @@ fn signature_verification(c: &mut Criterion) {
     let schnorr = schnorr_fixtures();
     let mut group = c.benchmark_group("signature_verification");
     group.sample_size(SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
     group.warm_up_time(Duration::from_secs(WARM_UP_SECS));
     group.measurement_time(Duration::from_secs(MEASURE_SECS));
 
@@ -486,5 +493,214 @@ fn signature_verification(c: &mut Criterion) {
     group.finish();
 }
 
+/// Flipped-byte Schnorr negative rebuilt from the hit spend.
+fn schnorr_negative_case(hit: &Case) -> Case {
+    let mut bad_tx = hit.tx.clone();
+    bad_tx.inputs[0].witness[0][0] ^= 0x01;
+    Case {
+        tx: bad_tx,
+        rows: hit.rows.clone(),
+    }
+}
+
+/// Checks one valid spend returns `Ok(true)` uncached and identical cached.
+fn assert_valid_equivalence(
+    prepared: &PreparedTransaction<'_>,
+    label: &str,
+    cache: &SignatureCache,
+) {
+    for flags in [VerifyFlags::STANDARD, VerifyFlags::MANDATORY] {
+        let uncached = prepared.verify_input(0, flags, None);
+        assert_eq!(uncached, Ok(true), "{label} uncached under {flags:?}");
+        let cached = prepared.verify_input(0, flags, Some(cache));
+        assert_eq!(
+            cached, uncached,
+            "{label} cached/no-cache equivalence under {flags:?}"
+        );
+    }
+}
+
+/// Checks one negative returns the expected `Err` uncached and identical cached.
+fn assert_invalid_equivalence(
+    prepared: &PreparedTransaction<'_>,
+    flags: VerifyFlags,
+    expected_code: ScriptErrCode,
+    label: &str,
+    cache: &SignatureCache,
+) {
+    let expected: Result<bool, ScriptError> = Err(ScriptError::Invalid {
+        code: expected_code,
+    });
+    assert_eq!(
+        prepared.verify_input(0, flags, None),
+        expected,
+        "{label} uncached under {flags:?}"
+    );
+    assert_eq!(
+        prepared.verify_input(0, flags, Some(cache)),
+        expected,
+        "{label} cached under {flags:?}"
+    );
+}
+
+/// Untimed `--mrp-verify` entrypoint (its `println!` lines are this binary's
+/// CLI output). Runs the real fixtures and checks cached/no-cache verdict
+/// agreement plus verdict equivalence under capacity pressure through one
+/// shared cache. Actual bound/refusal behavior is proven by the crate-private
+/// `at_capacity_existing_hits_work_and_new_entries_refused` test, not here.
+/// No Criterion, no timing output. Panics (nonzero exit) on any mismatch.
+fn mrp_verify() {
+    let ecdsa = ecdsa_fixtures();
+    let schnorr = schnorr_fixtures();
+    assert_eq!(ecdsa.miss.len(), INNER_REPS, "ecdsa miss count");
+    assert_eq!(schnorr.miss.len(), INNER_REPS, "schnorr miss count");
+    println!("mrp-verify: fixtures ok ({INNER_REPS} ecdsa miss, {INNER_REPS} schnorr miss)");
+
+    // One shared cache for the whole path.
+    let cache = SignatureCache::new();
+
+    let bad_ecdsa = ecdsa_case(ECDSA_FIRST_SEED, 0xFE);
+    let bad_ecdsa_prepared =
+        PreparedTransaction::new(&bad_ecdsa.tx, &bad_ecdsa.rows).expect("ecdsa bad prevouts");
+    assert_invalid_equivalence(
+        &bad_ecdsa_prepared,
+        VerifyFlags::MANDATORY,
+        ScriptErrCode::EvalFalse,
+        "wrong-key ecdsa",
+        &cache,
+    );
+    assert_invalid_equivalence(
+        &bad_ecdsa_prepared,
+        VerifyFlags::STANDARD,
+        ScriptErrCode::SigNullFail,
+        "wrong-key ecdsa",
+        &cache,
+    );
+    let bad_schnorr = schnorr_negative_case(&schnorr.hit);
+    let bad_schnorr_prepared =
+        PreparedTransaction::new(&bad_schnorr.tx, &bad_schnorr.rows).expect("schnorr bad prevouts");
+    assert_invalid_equivalence(
+        &bad_schnorr_prepared,
+        VerifyFlags::MANDATORY,
+        ScriptErrCode::SchnorrSig,
+        "flipped schnorr byte",
+        &cache,
+    );
+    assert_invalid_equivalence(
+        &bad_schnorr_prepared,
+        VerifyFlags::STANDARD,
+        ScriptErrCode::SchnorrSig,
+        "flipped schnorr byte",
+        &cache,
+    );
+    println!("mrp-verify: negative verdict agreement ok (4 flag-cases, cached == uncached)");
+
+    let ecdsa_hit_prepared =
+        PreparedTransaction::new(&ecdsa.hit.tx, &ecdsa.hit.rows).expect("ecdsa hit prevouts");
+    let schnorr_hit_prepared =
+        PreparedTransaction::new(&schnorr.hit.tx, &schnorr.hit.rows).expect("schnorr hit prevouts");
+    let mut valid_cases = 0u32;
+    assert_valid_equivalence(&ecdsa_hit_prepared, "ecdsa hit", &cache);
+    valid_cases += 1;
+    for (i, case) in ecdsa.miss.iter().enumerate() {
+        let prepared = PreparedTransaction::new(&case.tx, &case.rows).expect("ecdsa miss prevouts");
+        assert_valid_equivalence(&prepared, &format!("ecdsa miss {i}"), &cache);
+        valid_cases += 1;
+    }
+    assert_valid_equivalence(&schnorr_hit_prepared, "schnorr hit", &cache);
+    valid_cases += 1;
+    for (i, case) in schnorr.miss.iter().enumerate() {
+        let prepared =
+            PreparedTransaction::new(&case.tx, &case.rows).expect("schnorr miss prevouts");
+        assert_valid_equivalence(&prepared, &format!("schnorr miss {i}"), &cache);
+        valid_cases += 1;
+    }
+    println!(
+        "mrp-verify: cached/no-cache equivalence ok ({valid_cases} spends x 2 flag passes, strict Ok(true))"
+    );
+
+    verify_capacity_pressure_and_refutation(
+        &ecdsa_hit_prepared,
+        &schnorr_hit_prepared,
+        &bad_ecdsa_prepared,
+        &bad_schnorr_prepared,
+        &cache,
+    );
+    println!("mrp-verify: PASS");
+}
+
+/// Runs the `--mrp-verify` capacity-pressure and refutation phases through the
+/// shared `cache`: over-capacity extras re-verified alongside the earlier
+/// verified fixtures, then every negative repeated against the same cache to
+/// catch a cached false success. Its `println!` lines are this binary's CLI
+/// output.
+fn verify_capacity_pressure_and_refutation(
+    ecdsa_hit: &PreparedTransaction<'_>,
+    schnorr_hit: &PreparedTransaction<'_>,
+    bad_ecdsa: &PreparedTransaction<'_>,
+    bad_schnorr: &PreparedTransaction<'_>,
+    cache: &SignatureCache,
+) {
+    let extra_ecdsa = ecdsa_case(ECDSA_EXTRA_SEED, ECDSA_EXTRA_SEED);
+    let extra_ecdsa_prepared =
+        PreparedTransaction::new(&extra_ecdsa.tx, &extra_ecdsa.rows).expect("ecdsa extra prevouts");
+    assert_valid_equivalence(&extra_ecdsa_prepared, "ecdsa over-capacity extra", cache);
+    let extra_schnorr = schnorr_case(SCHNORR_EXTRA_SEED);
+    let extra_schnorr_prepared = PreparedTransaction::new(&extra_schnorr.tx, &extra_schnorr.rows)
+        .expect("schnorr extra prevouts");
+    assert_valid_equivalence(
+        &extra_schnorr_prepared,
+        "schnorr over-capacity extra",
+        cache,
+    );
+    assert_valid_equivalence(ecdsa_hit, "ecdsa hit after capacity", cache);
+    assert_valid_equivalence(schnorr_hit, "schnorr hit after capacity", cache);
+    println!(
+        "mrp-verify: verdict equivalence under capacity pressure ok (132 spends through one shared cache, early hits re-verified)"
+    );
+    // Repeat the negatives through the same cache: catches a cached false success.
+    assert_invalid_equivalence(
+        bad_ecdsa,
+        VerifyFlags::MANDATORY,
+        ScriptErrCode::EvalFalse,
+        "wrong-key ecdsa repeat",
+        cache,
+    );
+    assert_invalid_equivalence(
+        bad_ecdsa,
+        VerifyFlags::STANDARD,
+        ScriptErrCode::SigNullFail,
+        "wrong-key ecdsa repeat",
+        cache,
+    );
+    assert_invalid_equivalence(
+        bad_schnorr,
+        VerifyFlags::MANDATORY,
+        ScriptErrCode::SchnorrSig,
+        "flipped schnorr byte repeat",
+        cache,
+    );
+    assert_invalid_equivalence(
+        bad_schnorr,
+        VerifyFlags::STANDARD,
+        ScriptErrCode::SchnorrSig,
+        "flipped schnorr byte repeat",
+        cache,
+    );
+    println!(
+        "mrp-verify: negative verdict agreement repeats ok (4 flag-cases after capacity pressure)"
+    );
+}
+
 criterion_group!(benches, signature_verification);
-criterion_main!(benches);
+
+/// Binary entrypoint: `--mrp-verify` runs untimed verification (no Criterion,
+/// no timing output); anything else runs the Criterion benchmarks.
+fn main() {
+    if std::env::args().any(|arg| arg == "--mrp-verify") {
+        mrp_verify();
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

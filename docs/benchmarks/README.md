@@ -36,6 +36,7 @@ its end-state tables is a required contract value, not a measurement, and its
 | --- | --- |
 | [end-to-end-sync.md](end-to-end-sync.md) | End-to-end sync performance cells |
 | [muhash-rpc.md](muhash-rpc.md) | MuHash/gettxoutsetinfo RPC cells |
+| [measured-campaign.md](measured-campaign.md) | Registered per-lever campaign runner, analyzer, counted sampling, and control trees |
 | [native-validation-default.md](native-validation-default.md) | Native-validation promotion record (verdict historical since #1117) |
 | [offline-full-validation.md](offline-full-validation.md) | Offline full-validation campaign |
 | [p2p-loopback.md](p2p-loopback.md) | P2P loopback measurement |

@@ -234,6 +234,35 @@ impl ActiveChainQuery {
         (BlockHash::from(slot_hash) == hash).then_some(body)
     }
 
+    fn held_inventory_eligible(&self, hash: BlockHash) -> bool {
+        let tree = self.block_tree.read();
+        let Some(tip) = self.applied_tip.load_full() else {
+            return false;
+        };
+        let Ok(applied) = tree.node(tip.tip_id) else {
+            return false;
+        };
+        if applied.hash != tip.hash || applied.height != tip.height {
+            return false;
+        }
+        let Some(node_id) = tree.lookup(hash.into()) else {
+            return true;
+        };
+        let Ok(node) = tree.node(node_id) else {
+            return false;
+        };
+        if node.status == NodeStatus::Invalid {
+            return false;
+        }
+        if node.parent == Some(tip.tip_id)
+            && applied.height.checked_add(1) == Some(node.height)
+            && stale_block_is_recent(&tree, node, self.network)
+        {
+            return true;
+        }
+        false
+    }
+
     /// One `blocktxn` reply from consensus-encoded body bytes under the
     /// peer's servable BIP152 profile. Shared by the stored path and the
     /// held early-announced body.
@@ -527,6 +556,7 @@ impl ChainQuery for ActiveChainQuery {
                 if let BlockRequest::Compact(hash) = request
                     && let Some(version) = compact_version
                     && let Some(body) = self.recent_body(hash)
+                    && self.held_inventory_eligible(hash)
                 {
                     if !headroom() {
                         outcome.halted = true;
@@ -3214,6 +3244,158 @@ mod tests {
             full_served,
             Vec::<Message>::new(),
             "full requests cannot use the held body"
+        );
+        Ok(())
+    }
+
+    /// A held body the tree marked invalid stays `not_found` on the
+    /// inventory path: the slot never resurrects an invalid block.
+    #[test]
+    fn held_invalid_body_is_not_served_from_inventory() -> Result<(), Box<dyn std::error::Error>> {
+        let headers = seed_headers(2);
+        let block = block_at(&headers, 1)?;
+        let slot = RecentBlockSlot::default();
+        slot.store(Hash256::from(block.block_hash()), Arc::new(block.clone()));
+        let query = query_with(headers)?.with_recent_block(slot);
+        {
+            let mut tree = query.block_tree.write();
+            let id = tree.lookup(block.block_hash().into()).ok_or("held")?;
+            tree.invalidate_subtree(id)?;
+        }
+        let item = Inventory::CompactBlock(wire_block_hash(block.block_hash()));
+        let mut served = Vec::new();
+        let outcome = query.serve_inventory_blocks(&[item], Some(2), &|| true, &mut |message| {
+            served.push(message);
+            Ok(())
+        })?;
+        assert_eq!(outcome.not_found, vec![item]);
+        assert!(
+            served.is_empty(),
+            "an invalid held body must not serve, got {served:?}"
+        );
+        Ok(())
+    }
+
+    /// A held body for a block the inventory policy already rejected as
+    /// stale stays `not_found`: the slot follows the same age gate.
+    #[test]
+    fn held_stale_body_past_policy_is_not_served_from_inventory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let StaleFixture {
+            mut query, stale, ..
+        } = stale_query(1)?;
+        {
+            let mut tree = query.block_tree.write();
+            let tip = tree.tip_id().ok_or("tip")?;
+            tree.node_mut(tip)?.header.time = stale.header.time + 2_592_000;
+        }
+        let slot = RecentBlockSlot::default();
+        slot.store(Hash256::from(stale.block_hash()), Arc::new(stale.clone()));
+        query.recent = slot;
+        let item = Inventory::CompactBlock(wire_block_hash(stale.block_hash()));
+        let mut served = Vec::new();
+        let outcome = query.serve_inventory_blocks(&[item], Some(2), &|| true, &mut |message| {
+            served.push(message);
+            Ok(())
+        })?;
+        assert_eq!(outcome.not_found, vec![item]);
+        assert!(
+            served.is_empty(),
+            "a stale held body past policy must not serve, got {served:?}"
+        );
+        Ok(())
+    }
+
+    /// A held body whose header the tree already holds as the applied
+    /// tip's direct child answers compact `getdata` from the slot: the
+    /// early-announce race fires before commit, so no chain count exists
+    /// yet and no serving position is reachable.
+    #[test]
+    fn held_tip_child_body_is_served_from_inventory() -> Result<(), Box<dyn std::error::Error>> {
+        let headers = seed_headers(3);
+        let block = block_at(&headers, 2)?;
+        let slot = RecentBlockSlot::default();
+        slot.store(Hash256::from(block.block_hash()), Arc::new(block.clone()));
+        let query = query_with(headers[..2].to_vec())?.with_recent_block(slot);
+        {
+            let mut tree = query.block_tree.write();
+            let parent = tree
+                .lookup(headers[1].compute_hash().into())
+                .ok_or("parent")?;
+            tree.insert_node(Some(parent), headers[2], NodeStatus::HeaderValid)?;
+        }
+        let item = Inventory::CompactBlock(wire_block_hash(block.block_hash()));
+        let mut served = Vec::new();
+        let outcome = query.serve_inventory_blocks(&[item], Some(2), &|| true, &mut |message| {
+            served.push(message);
+            Ok(())
+        })?;
+        assert!(outcome.not_found.is_empty(), "{outcome:?}");
+        assert!(
+            matches!(served.as_slice(), [Message::CmpctBlock(_)]),
+            "a held tip child must answer from the slot, got {served:?}"
+        );
+        Ok(())
+    }
+
+    /// A held tip child older than the stale relay bound stays `not_found`:
+    /// the slot follows the same age gate as every other stale serve.
+    #[test]
+    fn held_stale_tip_child_is_not_served_from_inventory() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let headers = seed_headers(2);
+        let mut child = test_header(headers[1].compute_hash(), 3);
+        child.time = 0;
+        let block = Block {
+            header: child,
+            txs: vec![test_tx(1), test_tx(2)],
+        };
+        let parent_hash = headers[1].compute_hash();
+        let slot = RecentBlockSlot::default();
+        slot.store(Hash256::from(block.block_hash()), Arc::new(block.clone()));
+        let query = query_with(headers)?.with_recent_block(slot);
+        {
+            let mut tree = query.block_tree.write();
+            let parent = tree.lookup(parent_hash.into()).ok_or("parent")?;
+            let child_id = tree.insert_node(Some(parent), child, NodeStatus::HeaderValid)?;
+            let mut grandchild = test_header(block.block_hash(), 4);
+            grandchild.time = 2_592_000;
+            tree.insert_node(Some(child_id), grandchild, NodeStatus::HeaderValid)?;
+        }
+        let item = Inventory::CompactBlock(wire_block_hash(block.block_hash()));
+        let mut served = Vec::new();
+        let outcome = query.serve_inventory_blocks(&[item], Some(2), &|| true, &mut |message| {
+            served.push(message);
+            Ok(())
+        })?;
+        assert_eq!(outcome.not_found, vec![item]);
+        assert!(
+            served.is_empty(),
+            "a stale tip child must not serve, got {served:?}"
+        );
+        Ok(())
+    }
+
+    /// A held body for a deep applied block answers the full block, not
+    /// a `cmpctblock`: depth routing runs before the compact path even
+    /// with the slot occupied.
+    #[test]
+    fn held_deep_body_uses_full_block_inventory_policy() -> Result<(), Box<dyn std::error::Error>> {
+        let headers = seed_headers(8);
+        let block = block_at(&headers, 1)?;
+        let slot = RecentBlockSlot::default();
+        slot.store(Hash256::from(block.block_hash()), Arc::new(block.clone()));
+        let query = chain_at(&headers, 1, &block)?.with_recent_block(slot);
+        let item = Inventory::CompactBlock(wire_block_hash(block.block_hash()));
+        let mut served = Vec::new();
+        let outcome = query.serve_inventory_blocks(&[item], Some(2), &|| true, &mut |message| {
+            served.push(message);
+            Ok(())
+        })?;
+        assert!(outcome.not_found.is_empty(), "{outcome:?}");
+        assert!(
+            matches!(served.as_slice(), [Message::BlockPayload(_)]),
+            "a deep held body must fall back to the full block, got {served:?}"
         );
         Ok(())
     }

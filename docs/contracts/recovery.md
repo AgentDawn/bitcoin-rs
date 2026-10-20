@@ -217,12 +217,49 @@ coin view publication (step 5), and follower dispatch (step 8). Speculative
 projections never advance `tip` or `DurableHead`. They publish no applied tip,
 advance no durable serials, and expose no candidate before durable commit.
 
+Proof: `crates/node/tests/mining/coordination.rs` test
+`staged_preparation_does_not_publish_before_commit` pins the `PublishMode::Now`
+positive case (the worker finishes the direct tip child while the body sync is
+held) and the no-publish side (the applied tip and ordinary templates still
+reference the old parent); no dedicated test pins the reorg-connect-never-fires
+case;
+`crates/chainstate/tests/unit/apply/window_tx_count_tests.rs` test
+`a_grouped_window_stages_only_its_newest_block_before_the_sync` and
+`crates/chainstate/tests/unit/apply/window_invalidation_tests.rs` test
+`a_failing_window_stages_only_its_last_successful_block` pin the grouped
+newest-block handoff before the sync;
+`crates/chainstate/tests/unit/durable_replay_tests.rs` test
+`replay_of_a_committed_gap_never_fires_the_staged_tip_hook` pins the Replay
+arm. The IBD enqueue gate lives in `crates/node/src/state/open.rs` (the
+`set_tip_staged` closure over the chainstate IBD latch); no dedicated test
+pins that gate.
+
 Cache installation requires an authoritative committed receipt for the exact
 tip, matching txids and removal reasons, and the live full generation key. Any
 mismatch, prioritisation, or failure discards the preparation and falls back to
 lazy assembly. In follower dispatch (step 8), a gatewayless connect publishes a
 truthful empty receipt at the same point. Receipt publication notifies
 foreground waiters, including when the connect has no mempool gateway.
+
+Proof: `crates/mining/src/coordinator/tests.rs` tests
+`empty_preparation_installs_against_matching_receipt`,
+`nonempty_preparation_installs_against_matching_receipt`, and
+`empty_preparation_cannot_install_against_nonempty_receipt` pin exact-receipt
+installation and mismatch fallback;
+`stale_ready_without_a_receipt_serves_lazily_instead_of_parking` pins the
+prioritisation-moved fallback; `crates/node/tests/mining/coordination.rs`
+tests `prepared_candidate_installs_on_commit_with_arc_reuse` and
+`fee_priority_race_discards_stale_preparation` pin commit-time install and
+stale-race discard.
+
+Proof: `crates/node/src/chain_effects.rs` test
+`gatewayless_connect_publishes_an_empty_receipt_for_the_tip` pins the truthful
+empty receipt at the follower-dispatch point;
+`crates/mining/src/coordinator/tests.rs` test
+`ready_preparation_parks_until_the_receipt_and_serves_the_prepared_arc` pins
+receipt publication releasing the parked foreground waiter with the prepared
+candidate; `publish_block_generation_retains_receipt_and_publishes` pins the
+retained receipt carrying stable identities with exact removal reasons.
 
 A failure before stable publication leaves the fence closed until explicit
 recovery. A guard destructor must never quietly reopen the fence after an
@@ -616,9 +653,10 @@ durable.
   - `restart_adopts_persisted_estimator_history`,
     `corrupt_history_file_degrades_to_insufficient_data` (`RCV-11`);
 - `crates/node/tests/mining/coordination.rs`:
-  - `staged_preparation_does_not_publish_before_commit` proves that while the
-    body sync is held, applied tip and templates reference the old parent, and
-    pool spends remain uncommitted (`RCV-02`);
+  - `staged_preparation_does_not_publish_before_commit` proves that the worker
+    finishes the direct tip child while the body sync is held and that, while
+    held, applied tip and templates reference the old parent, and pool spends
+    remain uncommitted (`RCV-02`);
   - `prepared_candidate_installs_on_commit_with_arc_reuse` proves that after
     the durable commit lands, the first template on the new tip installs the
     prepared candidate `Arc` with exact removal survivors (`RCV-02`);

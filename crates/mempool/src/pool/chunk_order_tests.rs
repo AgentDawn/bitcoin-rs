@@ -311,14 +311,16 @@ fn equal_rate_parent_sorts_before_its_child() -> Result<(), MempoolError> {
     Ok(())
 }
 
-/// Children may spend any output index: links key on the full outpoint.
+/// Children may spend any output index: links key on the full outpoint,
+/// including one past the parent's real outputs.
 #[test]
 fn distinct_output_indices_link_by_vout() {
     let mut pool = order_pool();
     let parent_txid = insert_ordered(&mut pool, 1, &[], 3, order_fee(1));
     insert_ordered(&mut pool, 2, &[(parent_txid, 1)], 1, order_fee(2));
     insert_ordered(&mut pool, 3, &[(parent_txid, 2)], 1, order_fee(3));
-    assert_eq!(pool.len(), 3);
+    insert_ordered(&mut pool, 4, &[(parent_txid, 9)], 1, order_fee(4));
+    assert_eq!(pool.len(), 4);
     pool.assert_index_matches_oracle("distinct vout links");
 }
 
