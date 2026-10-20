@@ -3662,6 +3662,40 @@ mod tests {
         (Arc::new(tx), funded_chain(outpoint, 20_000))
     }
 
+    #[test]
+    fn expiry_capacity_ordering_under_pressure() {
+        for package in [false, true] {
+            for fee in [100, 11_000] {
+                for expire_first in [false, true] {
+                    let log = Arc::new(ReorgBatchLog::default());
+                    let observer: Arc<dyn crate::MempoolObserver> = log.clone();
+                    let gateway = MempoolGateway::new(
+                        Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits {
+                            max_total_bytes: 100, ..crate::MempoolLimits::default()
+                        }))), Some(observer), ValidationEngine::Native, None,
+                    );
+                    let (stale, _) = independent_spend(70);
+                    let stale_id = stale.txid();
+                    insert_stale(&gateway, stale);
+                    let (fresh, _) = independent_spend(71);
+                    let chain = funded_chain(fresh.inputs[0].previous_output, 9_000 + fee);
+                    let fresh_id = fresh.txid();
+                    let now = unix_time_secs();
+                    if expire_first { gateway.expire(AdmissionOrigin::Rpc, now); }
+                    let result = if package {
+                        gateway.submit_local_package(vec![(*fresh).clone()], LocalOrigin::Rpc, None, now, &chain).map(|_| ())
+                    } else {
+                        gateway.submit_transaction(fresh, AdmissionOrigin::Rpc, None, now, &chain).map(|_| ())
+                    };
+                    let pool = gateway.read();
+                    let events = log.0.lock().iter().map(|(_, changes)| changes.iter().map(|(_, outcome)| *outcome).collect::<Vec<_>>()).collect::<Vec<_>>();
+                    println!("B package={package} fee={fee} expire_first={expire_first} now={now} stale_time=0 limit=100 result={result:?} stale={} fresh={} count={} vbytes={} floor={} events={events:?}", pool.contains_txid(&stale_id), pool.contains_txid(&fresh_id), pool.len(), pool.total_vsize(), pool.min_fee_sat_per_kvb(now));
+                    if expire_first { assert!(result.is_ok()); }
+                }
+            }
+        }
+    }
+
     /// Residents stamped with time zero are older than the mempool lifetime
     /// against any wall clock, without sleeping.
     fn insert_stale(gateway: &MempoolGateway, tx: Arc<Tx>) {
