@@ -1,7 +1,7 @@
 //! Exact-identity block reads and transaction position verification.
 
 use super::{
-    Block, BlockHash, BlockTree, DerivedIndexQueryEngine, Hash256, MAX_SERIALIZED_BLOCK_BYTES,
+    Arc, Block, BlockHash, BlockTree, DerivedIndexQueryEngine, Hash256, MAX_SERIALIZED_BLOCK_BYTES,
     OutPoint, QueryBudget, TipSnapshot, Tx, TxIndexSnapshot, TxPosition, TxPositionValue,
     TxQueryError, Txid, deserialize,
 };
@@ -25,16 +25,26 @@ impl DerivedIndexQueryEngine {
         tree.node(node_id).ok().map(|n| n.hash)
     }
 
+    /// Returns the verified block at `(height, hash)`, decoded once per
+    /// query: the first fetch verifies and pins the block on the query
+    /// budget, while later reads at the same identity return the shared
+    /// handle with no further body read, byte charge, or deserialization.
+    /// Only successfully verified blocks are pinned, so a miss after an
+    /// error re-attempts the body fetch.
     pub(super) fn resolve_block(
         &self,
         budget: &mut QueryBudget,
         height: u32,
         hash: Hash256,
-    ) -> Result<Block, TxQueryError> {
+    ) -> Result<Arc<Block>, TxQueryError> {
+        if let Some(hit) = budget.memoized_block(height, hash) {
+            return Ok(hit);
+        }
         budget.reserve_body_read(MAX_SERIALIZED_BLOCK_BYTES)?;
         let bytes = self.resolve_block_body_bytes(height, BlockHash::from(hash))?;
         budget.charge_body_bytes(bytes.len())?;
-        Self::verify_block(&bytes, height, hash)
+        let block = Arc::new(Self::verify_block(&bytes, height, hash)?);
+        Ok(budget.memoize_block(height, hash, block))
     }
 
     fn resolve_block_body_bytes(
@@ -126,8 +136,9 @@ impl DerivedIndexQueryEngine {
         let block = self.resolve_block(budget, height, hash)?;
         Ok(block
             .txs
-            .into_iter()
-            .find(|transaction| transaction.txid() == *txid))
+            .iter()
+            .find(|transaction| transaction.txid() == *txid)
+            .cloned())
     }
 
     pub(super) fn transaction_for(

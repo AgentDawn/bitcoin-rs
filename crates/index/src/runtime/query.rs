@@ -12,6 +12,8 @@ use super::{
     TxPositionValue, TxQueryError, Txid, deserialize,
 };
 
+use hashbrown::HashMap;
+
 mod filters;
 mod scripts;
 mod transactions;
@@ -49,20 +51,30 @@ impl core::fmt::Debug for IndexBlockSource {
 }
 
 /// Aggregate work budget shared by every operation in one public query.
+///
+/// Also pins the query-scoped decoded-block memo: one entry per
+/// `(height, hash)` so repeated full-block reads at the same identity decode
+/// the body once. Positioned range reads do not use the memo. The memo lives
+/// and dies with the budget, so separate public queries never share entries.
+/// Every pinned body was first charged to `remaining_bytes`, so the pinned
+/// blocks' serialized body bytes never exceed `QUERY_SCAN_BYTE_LIMIT`; their
+/// decoded heap size is larger.
 pub(super) struct QueryBudget {
     remaining_rows: usize,
     remaining_bytes: usize,
     remaining_scans: usize,
     remaining_body_reads: usize,
+    block_memo: HashMap<(u32, Hash256), Arc<Block>>,
 }
 
 impl QueryBudget {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             remaining_rows: QUERY_SCAN_ROW_LIMIT,
             remaining_bytes: QUERY_SCAN_BYTE_LIMIT,
             remaining_scans: QUERY_SCAN_COUNT_LIMIT,
             remaining_body_reads: QUERY_BODY_READ_LIMIT,
+            block_memo: HashMap::new(),
         }
     }
 
@@ -134,6 +146,25 @@ impl QueryBudget {
         }
         self.remaining_bytes -= bytes;
         Ok(())
+    }
+
+    /// Returns the decoded block this query already fetched and verified for
+    /// `(height, hash)`. A hit costs no body budget: the reserve and the byte
+    /// charge happened once on the miss.
+    pub(super) fn memoized_block(&self, height: u32, hash: Hash256) -> Option<Arc<Block>> {
+        self.block_memo.get(&(height, hash)).cloned()
+    }
+
+    /// Pins a successfully verified block for the rest of this query and
+    /// returns the shared handle.
+    pub(super) fn memoize_block(
+        &mut self,
+        height: u32,
+        hash: Hash256,
+        block: Arc<Block>,
+    ) -> Arc<Block> {
+        self.block_memo.insert((height, hash), Arc::clone(&block));
+        block
     }
 }
 
@@ -574,6 +605,7 @@ mod tests {
                 remaining_bytes: bytes,
                 remaining_scans: scans,
                 remaining_body_reads: 1,
+                block_memo: HashMap::new(),
             };
             assert!(matches!(
                 budget.next_scan_limit(),

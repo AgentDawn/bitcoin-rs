@@ -527,3 +527,64 @@ fn spending_position_mismatch_falls_back_to_full_block() -> Result<(), Box<dyn s
     assert_eq!(fixture.full_reads()?, 1);
     Ok(())
 }
+
+#[test]
+fn confirmed_history_fetches_shared_block_once_per_query_and_refetches_next_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    // One funding row and one spending row at the same height force two
+    // `resolve_block` calls for one `(height, hash)` inside a single public
+    // query: `funding_outputs_for` resolves the block for the funding row,
+    // then `spender_for` resolves the same block for the spending row. Both
+    // rows carry an empty value so each falls back to the full-block path.
+    let (block, outpoint, scripthash, spend_txid) = block_with_spending_transaction()?;
+    let funding_txid = block.txs[0].txid();
+    let fixture = QueryFixture::new(FixtureConfig {
+        block,
+        retain_body: true,
+        scans: vec![
+            scan_response(
+                ColumnFamily::Funding,
+                ScriptHashRow::scan_prefix(scripthash),
+                vec![(
+                    ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
+                    Vec::new(),
+                )],
+                true,
+            ),
+            scan_response(
+                ColumnFamily::Spending,
+                SpendingPrefixRow::scan_prefix(&outpoint),
+                vec![(
+                    SpendingPrefixRow::row(&outpoint, 0).to_db_row().to_vec(),
+                    Vec::new(),
+                )],
+                true,
+            ),
+        ],
+        watermark: None,
+    })?;
+
+    // The counting body source (`SingleBlockBody::full_reads`) delegates to
+    // the real block bytes and counts `block_body` calls for this height and
+    // hash. A query-scoped memo hit skips the second fetch.
+    let history = fixture.engine.confirmed_history(scripthash)?;
+    assert_eq!(history.len(), 2);
+    assert!(
+        history
+            .iter()
+            .any(|record| record.txid == funding_txid && record.height == 0)
+    );
+    assert!(
+        history
+            .iter()
+            .any(|record| record.txid == spend_txid && record.height == 0)
+    );
+    assert_eq!(fixture.full_reads()?, 1);
+
+    // The memo lives and dies with its query budget, so a second public
+    // query for the same script must fetch the block body again.
+    let second = fixture.engine.confirmed_history(scripthash)?;
+    assert_eq!(second.len(), 2);
+    assert_eq!(fixture.full_reads()?, 2);
+    Ok(())
+}
