@@ -11,11 +11,17 @@ use regtest_blocks::{block, coinbase, submit};
 #[test]
 #[ignore = "manual pinned-Core capacity/expiry comparison"]
 fn core_expires_stale_members_before_capacity_trim() -> Result<(), Box<dyn Error>> {
-    for package in [false, true] {
+    for (package, native_fee) in [(false, 100), (true, 100), (false, 11_000), (true, 11_000)] {
         let mut core = ProcessNode::spawn_with(
             Kind::Core,
             &SpawnOptions {
-                extra_args: &["-maxmempool=5", "-mempoolexpiry=1", "-acceptnonstdtxn=1"],
+                extra_args: &[
+                    "-maxmempool=5",
+                    "-mempoolexpiry=336",
+                    "-acceptnonstdtxn=1",
+                    "-minrelaytxfee=0.00001000",
+                    "-incrementalrelayfee=0.00001000",
+                ],
                 ..SpawnOptions::default()
             },
         )?;
@@ -27,7 +33,7 @@ fn core_expires_stale_members_before_capacity_trim() -> Result<(), Box<dyn Error
             let outputs = if height == 1 {
                 vec![
                     TxOut {
-                        value: Amount::from_sat(1_000_000),
+                        value: Amount::from_sat(10_000_000),
                         script_pubkey: ScriptBuf::from_bytes(vec![0x51])
                     };
                     120
@@ -47,7 +53,7 @@ fn core_expires_stale_members_before_capacity_trim() -> Result<(), Box<dyn Error
             previous = next.block_hash();
         }
         let funding = funding.ok_or("funding")?;
-        let transaction = |index| Transaction {
+        let transaction = |index, fee| Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![TxIn {
@@ -57,14 +63,15 @@ fn core_expires_stale_members_before_capacity_trim() -> Result<(), Box<dyn Error
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(900_000),
+                value: Amount::from_sat(10_000_000 - fee),
                 script_pubkey: ScriptBuf::from_bytes(vec![0; 50_000]),
             }],
         };
+        let vsize = u64::try_from(transaction(0, 0).vsize())?;
         let mut count = 0;
         let mut last_usage = 0;
         let before = loop {
-            let tx = transaction(count);
+            let tx = transaction(count, 10 * vsize);
             core.rpc(
                 "sendrawtransaction",
                 &json!([bitcoin::consensus::encode::serialize_hex(&tx), 0, 1]),
@@ -82,8 +89,9 @@ fn core_expires_stale_members_before_capacity_trim() -> Result<(), Box<dyn Error
                 return Err("fixture did not approach capacity".into());
             }
         };
-        core.rpc("setmocktime", &json!([time + 3601]))?;
-        let fresh = transaction(count);
+        core.rpc("setmocktime", &json!([time + 336 * 3600 + 1]))?;
+        let fee = vsize * native_fee / 85;
+        let fresh = transaction(count, fee);
         let raw = bitcoin::consensus::encode::serialize_hex(&fresh);
         let result = if package {
             core.rpc("submitpackage", &json!([[raw], 0, 1]))?
@@ -92,7 +100,7 @@ fn core_expires_stale_members_before_capacity_trim() -> Result<(), Box<dyn Error
         };
         let after = core.rpc("getmempoolinfo", &json!([]))?;
         println!(
-            "B Core31.1 package={package} old_count={count} candidate_vbytes={} fee=100000 age_secs=3601 before={before} result={result} after={after}",
+            "B Core31.1 package={package} native_fee={native_fee} old_count={count} candidate_vbytes={} fee={fee} age_secs=1209601 before={before} result={result} after={after}",
             fresh.vsize()
         );
         assert_eq!(after["size"], json!(1));
