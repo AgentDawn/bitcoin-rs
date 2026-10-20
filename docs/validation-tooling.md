@@ -50,7 +50,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 - **Owner scripts & suites**:
   - Pinned installer: `scripts/install-bitcoind.sh` (POSIX) / `scripts/install-bitcoind.ps1` (Windows).
   - Test runner: `scripts/run-p2p-core-interop.sh`.
-  - Evidence validator: `crates/p2p/tests/core_interop_live.rs`.
+  - Evidence validator: `crates/p2p/tests/core_interop_live.rs` (BIP324 vector provenance in [`crates/p2p/tests/data/bip324/README.md`](../crates/p2p/tests/data/bip324/README.md); AddrMan/ASMap reference fixtures in [`crates/p2p/tests/support/README.md`](../crates/p2p/tests/support/README.md), [`crates/p2p/tests/data/asmap-core-v31.1.README.md`](../crates/p2p/tests/data/asmap-core-v31.1.README.md), [`crates/p2p/tests/data/asmap-linked-ipv4-core-v31.1.README.md`](../crates/p2p/tests/data/asmap-linked-ipv4-core-v31.1.README.md), and [`crates/p2p/tests/data/addrman-historical.README.md`](../crates/p2p/tests/data/addrman-historical.README.md)).
 - **What is verified**:
   - Pinned Bitcoin Core 31.1 binary downloaded from bitcoincore.org and checked
     against the SHA-256 archive digest pinned in `crates/rpc/core-compat.toml`.
@@ -150,7 +150,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   - `crates/script/tests/proptest.rs`: Property-based fuzzing using `rust-bitcoin`
     sighash and Schnorr signing as the oracle.
   - `crates/primitives/tests/differential.rs`: Core `sighash.json` legacy vectors.
-  - `crates/primitives/tests/bip_vectors.rs`: Authoritative BIP143 SegWit vectors.
+  - `crates/primitives/tests/bip_vectors.rs`: Authoritative BIP143 and BIP341 vectors (provenance in [`crates/primitives/tests/vectors/PROVENANCE.md`](../crates/primitives/tests/vectors/PROVENANCE.md)).
 - **What is verified**:
   - Exact digest equality across all sighash flags (`SIGHASH_ALL`, `NONE`, `SINGLE`,
     `ANYONECANPAY`, `DEFAULT`) for legacy, BIP143 (SegWit v0), and BIP341 (Taproot).
@@ -174,10 +174,12 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     script verdicts. `BADTX` rows are excluded because this entry point does not
     perform non-script transaction checks. This is a kernel-versus-vector oracle,
     not a native-versus-kernel differential over the full corpus.
-  - `crates/consensus/tests/kernel_block_parity.rs`: Kernel acceptance/rejection
-    checks on pristine and mutated mainnet transaction fixtures. Direct native
-    interpreter parity is limited to fixtures opting into `interpreter_parity`
-    (currently Taproot key-path), plus a Taproot script-path non-vacuity check.
+  - `crates/consensus/tests/kernel_block_parity.rs`: Kernel and native interpreter
+    acceptance/rejection checks across all six committed mainnet spend-class
+    fixtures (`legacy_p2pk`, `legacy_p2pkh`, `p2sh_spend`, `segwit_v0_spend`,
+    `taproot_keypath_spend`, `taproot_scriptpath_spend`), all carrying
+    `interpreter_parity: true`, plus a Taproot script-path non-vacuity check
+    (fixture provenance in [`crates/consensus/tests/vectors/scripts/README.md`](../crates/consensus/tests/vectors/scripts/README.md)).
 - **Prerequisites**: `libboost-dev`, `cmake`, and C++ compiler toolchain.
 - **Reproduce**:
   ```sh
@@ -255,11 +257,11 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   - `crates/chainstate/tests/unit/durable_replay_tests.rs`: Replay from durable commit points.
   - `crates/chainstate/tests/unit/assumeutxo_recovery_tests.rs`: Simulates process
     termination (SIGKILL) mid-import, mid-activation, and mid-validation; verifies
-    lost failure receipt retention, durable head checkpoint recovery, and below-base reorgs.
+    lost failure receipt retention, durable head checkpoint recovery, and below-base reorgs (Core v2 snapshot fixture provenance in [`crates/utxo/tests/fixtures/core-v2/README.md`](../crates/utxo/tests/fixtures/core-v2/README.md); offline snapshot inspection CLI in [`tools/snapshot/README.md`](../tools/snapshot/README.md)).
   - `crates/storage/tests/durable_head_store.rs`: Atomic head row commits and corruption refusal.
   - `crates/storage/src/checkpoint/tests.rs`: Checkpoint generation publication failpoints and retention.
   - `e2e/tests/reorg.rs`, `e2e/tests/reorg_state.rs`: Reorg tip rewinds, invalid higher-work branches,
-    and mempool restoration.
+    and mempool restoration (process-test mapping in [`e2e/REORG-COVERAGE.md`](../e2e/REORG-COVERAGE.md)).
 - **Feature requirement**: The AssumeUTXO recovery unit module is gated by
   `fjall`; without it, that filter selects no tests.
 - **Reproduce**:
@@ -304,11 +306,15 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 - **Contract & matrix**: [`docs/contracts/ecosystem-compatibility.md`](contracts/ecosystem-compatibility.md) (`ECO-08`),
   [`docs/api/ecosystem-compat.toml`](api/ecosystem-compat.toml).
 - **Status overview**:
-  - **Externally verified**: P2P v1 wire protocol, Compact block relay (BIP152), BIP324 v2 transport.
+  - **Externally verified**: P2P v1 wire protocol, Compact block relay (BIP152),
+    Compact block filters (BIP157/BIP158; runner in [`tools/compact-filter-interop/README.md`](../tools/compact-filter-interop/README.md)), BIP324 v2 transport.
   - **Partially compatible**: Peer lifecycle and address management (recorded deviations in P2P policy).
-  - **Implemented**: JSON-RPC, REST, ZMQ notifications, Esplora-compatible API, GetBlockTemplate,
+  - **Implemented**: JSON-RPC, REST, ZMQ notifications, Esplora-compatible API (Compose example in [`tools/btc-mempool-explorer/README.md`](../tools/btc-mempool-explorer/README.md)), GetBlockTemplate,
     block submission, USDT tracepoints.
-  - **Intentionally unsupported**: BIP157/BIP158 (block filters), Stratum V2 / Core IPC adapters.
+  - **Experimental**: BIP352 Silent Payments (`getblocktweaks`, [`docs/silent-payments.md`](silent-payments.md)); the Stratum V2 Template Distribution adapter, a regtest-only example
+    outside the workspace (not a compatibility commitment, no production pool
+    qualification; see [`tools/stratum-sv2/README.md`](../tools/stratum-sv2/README.md)); and the standalone in-process LDK L1 adapter ([`tools/ldk/README.md`](../tools/ldk/README.md)).
+  - **Intentionally unsupported**: Core IPC adapters.
 - **Reproduction & audit**:
   - Audit status strings against the canonical matrix:
     ```sh
@@ -332,7 +338,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   - Live external tracing via `bpftrace`/BCC remains planned as an ecosystem consumer.
 - **Reproduce**:
   ```sh
-  # Verify enabled probe SDT notes in the compiled binary (Linux ELF64):
+  # Verify enabled probe SDT notes in the test binary (or set SDT_ELF=$PWD/target/release/bitcoin-rs):
   cargo test --locked -p bitcoin-rs-consensus \
     --features usdt --test sdt_notes
 

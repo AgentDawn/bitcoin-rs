@@ -436,6 +436,7 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
             capabilities: Vec::new(),
             rules: Vec::new(),
             long_poll_id: None,
+            coinbase_budget: None,
         });
     }
     let array = params_array(params)?;
@@ -445,6 +446,7 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
             capabilities: Vec::new(),
             rules: Vec::new(),
             long_poll_id: None,
+            coinbase_budget: None,
         });
     };
     if request.is_null() {
@@ -453,6 +455,7 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
             capabilities: Vec::new(),
             rules: Vec::new(),
             long_poll_id: None,
+            coinbase_budget: None,
         });
     }
     if !request.is_object() {
@@ -483,6 +486,7 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
             capabilities: Vec::new(),
             rules: Vec::new(),
             long_poll_id: None,
+            coinbase_budget: None,
         });
     }
     if mode_text != "template" {
@@ -512,6 +516,8 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
             .collect(),
         rules: rules.into_iter().map(MiningRule::new).collect(),
         long_poll_id,
+        // The BIP22/BIP23 surface never carries a coinbase budget.
+        coinbase_budget: None,
     })
 }
 

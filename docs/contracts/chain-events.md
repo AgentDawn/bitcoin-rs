@@ -130,8 +130,9 @@ Owners:
   Unknown headers, unavailable ancestry and missing/pruned bodies are explicit
   errors. Fetch bodies separately with `block_by_hash`; never mark a failed
   body applied. Replay reconstructs a path, not a historical event log.
-- Proof: `chain_feed::tests` covers bounded batches, missed commits, stale
-  targets, disconnect-before-connect, restart, refusal and unsettled fences.
+- Proof: `chain_feed::tests` (`crates/node/tests/unit/chain_feed.rs`) covers
+  bounded batches, missed commits, stale targets, disconnect-before-connect,
+  restart, refusal and unsettled fences.
 
 ## Startup crash recovery
 
@@ -168,4 +169,4 @@ checkpoint or replay a journal as an authority.
 ## Vocabulary
 
 Terms used above are defined in [`../../CONCEPTS.md`](../../CONCEPTS.md):
-ordered commit protocol, coherent view, `ChainSnapshot`, chain generation.
+chain snapshot, chain-event hint, reconciliation consumer, consumer cursor, chain generation.

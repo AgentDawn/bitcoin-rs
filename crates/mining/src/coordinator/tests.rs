@@ -29,6 +29,7 @@ use std::time::Instant;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+mod coinbase_budget;
 mod fee_revision;
 
 fn sample_candidate(
@@ -75,22 +76,26 @@ fn rule_names(template: &BlockTemplate) -> Vec<&str> {
 #[test]
 fn candidate_cache_evicts_the_oldest_entry_at_the_bound() {
     let mut state = CoordinatorState::default();
-    let mut first_id = None;
+    let mut first_key = None;
     for seq in 0..=CANDIDATE_CACHE_LIMIT {
         let seq = u64::try_from(seq).unwrap_or(u64::MAX);
         let hash = Hash256::from_le_bytes(&[u8::try_from(seq).unwrap_or(0xff); 32]);
         let candidate = sample_candidate(hash, seq, seq, false, false);
-        let id = candidate.template_id.clone();
+        let key = CandidateKey::ordinary(GenerationKey {
+            tip_hash: hash,
+            mempool_sequence: seq,
+            fee_delta_sequence: seq,
+        });
         if seq == 0 {
-            first_id = Some(id.clone());
+            first_key = Some(key);
         }
-        state.cache_insert(id, Arc::new(candidate));
+        state.cache_insert(key, Arc::new(candidate));
     }
     assert_eq!(state.cache.len(), CANDIDATE_CACHE_LIMIT);
     assert!(
         !state
             .cache
-            .contains_key(first_id.as_ref().unwrap_or_else(|| panic!("first id"))),
+            .contains_key(first_key.as_ref().unwrap_or_else(|| panic!("first key"))),
         "oldest cached candidate must be evicted at the bound"
     );
 }
@@ -250,12 +255,16 @@ fn long_poll_rejects_malformed_components_without_panicking() {
 #[test]
 fn template_generation_race_classification_excludes_other_failures() {
     assert!(generation_race().is_template_generation_race());
+    assert!(assembly_busy().is_template_generation_race());
     for error in [
         MiningControlError::Unavailable("node is shutting down".into()),
         MiningControlError::Unavailable("applied tip is not available".into()),
         MiningControlError::InvalidRequest(GENERATION_RACE.into()),
         MiningControlError::Failed(GENERATION_RACE.into()),
         MiningControlError::Rejected(GENERATION_RACE.into()),
+        MiningControlError::InvalidRequest(ASSEMBLY_BUSY.into()),
+        MiningControlError::Failed(ASSEMBLY_BUSY.into()),
+        MiningControlError::Rejected(ASSEMBLY_BUSY.into()),
     ] {
         assert!(!error.is_template_generation_race(), "{error:?}");
     }
@@ -308,6 +317,7 @@ impl MempoolSnapshotSource for StaticPool {
         expected_sequences: Option<(u64, u64)>,
         context: &CandidateContext,
         payout: &[u8],
+        budget: Option<CoinbaseBudget>,
     ) -> Result<Option<SelectedBody>, MiningControlError> {
         self.pool_reads.fetch_add(1, Ordering::Relaxed);
         let (sequence, fee_delta_sequence) = *self.counters.lock();
@@ -322,7 +332,7 @@ impl MempoolSnapshotSource for StaticPool {
         // fixture counters read under the same check, mirroring the
         // production adapter stamping the pool state it selected under.
         let fixture = Mempool::new(MempoolLimits::default());
-        let mut body = select_template_body(&fixture, context, payout)
+        let mut body = select_template_body(&fixture, context, payout, budget)
             .map_err(|error| MiningControlError::Failed(CompactString::from(error.to_string())))?;
         body.sequence = sequence;
         body.fee_delta_sequence = fee_delta_sequence;
@@ -554,12 +564,10 @@ fn publish_fee_delta_generation_drops_a_stale_fee_revision() {
     };
     service.publish_fee_delta_generation(9);
     assert_eq!(service.state.lock().published, Some(newer));
-    let candidate = sample_candidate(tip, 5, 9, false, false);
-    let newer_id = candidate.template_id.clone();
-    service
-        .state
-        .lock()
-        .cache_insert(newer_id.clone(), Arc::new(candidate));
+    service.state.lock().cache_insert(
+        CandidateKey::ordinary(newer),
+        Arc::new(sample_candidate(tip, 5, 9, false, false)),
+    );
     // A delayed callback carrying the older revision must neither regress
     // the published key nor invalidate the newer candidate.
     service.publish_fee_delta_generation(4);
@@ -569,7 +577,11 @@ fn publish_fee_delta_generation_drops_a_stale_fee_revision() {
         "a stale fee revision must not regress the published key"
     );
     assert!(
-        service.state.lock().cache_get(&newer_id).is_some(),
+        service
+            .state
+            .lock()
+            .cache_get(&CandidateKey::ordinary(newer))
+            .is_some(),
         "a stale fee revision must not invalidate the newer candidate"
     );
 }
@@ -678,8 +690,9 @@ fn assemble_refuses_when_either_pool_counter_moves() {
     };
     // Matching counters pass the selection gate and assemble a real candidate
     // whose identity carries both sequences.
+    let ordinary = CandidateKey::ordinary(key);
     let assembled = service
-        .assemble_for_key(key)
+        .assemble_for_key(ordinary)
         .unwrap_or_else(|error| panic!("matching counters must assemble: {error}"));
     assert_eq!(assembled.template_id, key.template_id());
     assert_eq!(assembled.previous_block_hash, tip);
@@ -687,7 +700,7 @@ fn assemble_refuses_when_either_pool_counter_moves() {
     pool.set(5, 3);
     assert!(
         matches!(
-            service.assemble_for_key(key),
+            service.assemble_for_key(ordinary),
             Err(MiningControlError::Unavailable(message))
                 if message.as_str() == GENERATION_RACE
         ),
@@ -696,7 +709,7 @@ fn assemble_refuses_when_either_pool_counter_moves() {
     pool.set(6, 2);
     assert!(
         matches!(
-            service.assemble_for_key(key),
+            service.assemble_for_key(ordinary),
             Err(MiningControlError::Unavailable(message))
                 if message.as_str() == GENERATION_RACE
         ),
@@ -755,6 +768,7 @@ impl MempoolSnapshotSource for GatedPool {
         expected_sequences: Option<(u64, u64)>,
         context: &CandidateContext,
         payout: &[u8],
+        budget: Option<CoinbaseBudget>,
     ) -> Result<Option<SelectedBody>, MiningControlError> {
         self.live_calls.fetch_add(1, Ordering::Relaxed);
         let (sequence, fee_delta_sequence) = *self.counters.lock();
@@ -764,7 +778,7 @@ impl MempoolSnapshotSource for GatedPool {
             return Ok(None);
         }
         let fixture = Mempool::new(MempoolLimits::default());
-        let mut body = select_template_body(&fixture, context, payout)
+        let mut body = select_template_body(&fixture, context, payout, budget)
             .map_err(|error| MiningControlError::Failed(CompactString::from(error.to_string())))?;
         body.sequence = sequence;
         body.fee_delta_sequence = fee_delta_sequence;
@@ -1026,7 +1040,7 @@ fn empty_preparation_installs_against_matching_receipt() {
     let cached = service
         .state
         .lock()
-        .cache_get(&key.template_id())
+        .cache_get(&CandidateKey::ordinary(key))
         .unwrap_or_else(|| panic!("the install must fill the template cache"));
     assert!(
         Arc::ptr_eq(&installed, &cached),
@@ -1094,7 +1108,11 @@ fn empty_preparation_cannot_install_against_nonempty_receipt() {
         "a definitive receipt mismatch discards the preparation"
     );
     assert!(
-        service.state.lock().cache_get(&key.template_id()).is_some(),
+        service
+            .state
+            .lock()
+            .cache_get(&CandidateKey::ordinary(key))
+            .is_some(),
         "lazy assembly still serves the live generation"
     );
 }
@@ -1533,20 +1551,20 @@ fn signalling_rules_resolve_once_per_tip_and_height() -> TestResult {
         Vec::new(),
         Arc::new(AtomicBool::new(false)),
     );
-    service.get_block_template(None)?;
+    service.get_block_template(None, None)?;
     assert_eq!(
         chain.rules_calls.load(Ordering::Relaxed),
         1,
         "the first template resolves its signalling rules"
     );
-    service.get_block_template(None)?;
+    service.get_block_template(None, None)?;
     assert_eq!(
         chain.rules_calls.load(Ordering::Relaxed),
         1,
         "the same tip and height must reuse the cached rules"
     );
     tip_source.set(Some(tip_snapshot(Hash256::from_le_bytes(&[0x6b; 32]))));
-    service.get_block_template(None)?;
+    service.get_block_template(None, None)?;
     assert_eq!(
         chain.rules_calls.load(Ordering::Relaxed),
         2,

@@ -2,6 +2,7 @@
 
 use super::CursorCommit;
 use super::DerivedIndexWorkerError;
+use super::ForwardLeg;
 use super::PendingForward;
 use super::ReconcileAction;
 use super::Worker;
@@ -19,6 +20,12 @@ use bitcoin_rs_primitives::Hash256;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+
+/// First height a capability whose durable watermark is `watermark` still
+/// needs.
+fn forward_start(watermark: Option<IndexWatermark>) -> u32 {
+    watermark.map_or(0, |watermark| watermark.height.saturating_add(1))
+}
 
 impl Worker {
     pub(super) fn run(self) -> Result<(), DerivedIndexWorkerError> {
@@ -131,7 +138,7 @@ impl Worker {
             .is_some()
             || target
                 .as_deref()
-                .is_some_and(|target| self.forward_selection(watermarks, target).is_some())
+                .is_some_and(|target| self.forward_selection(watermarks, target, None).is_some())
         {
             return Ok(ReconcileAction::Progressed);
         }
@@ -279,6 +286,16 @@ impl Worker {
     /// Publishes the rollbacks-finished phase and runs the forward catch-up:
     /// a rewind ends with the rollback loop, a rebuild ends only when the
     /// reset capabilities reach the tip again.
+    ///
+    /// Capability groups run in ascending start height. A group whose next
+    /// body is absent and which retains no rows yields to the next higher
+    /// start within this pass, at most once per distinct start. No cursor or
+    /// queue outlives the pass: the lowest group is tried first again next
+    /// time. Every other outcome, including retained rows behind an absent
+    /// body, ends the pass, so no group runs on a fence or watermark capture
+    /// that a stop, reset, stale commit, deferred grant, or pending batch has
+    /// outdated. When every group that still needs rows waits on an absent
+    /// body the pass is `Stalled`: it is neither `CaughtUp` nor progress.
     fn finish_reconcile_pass(
         &self,
         target: Option<Arc<TipSnapshot>>,
@@ -298,10 +315,22 @@ impl Worker {
             self.seed_live_from_utxo()?;
             return Ok(ReconcileAction::Progressed);
         }
-        let Some((capabilities, watermark)) = self.forward_selection(watermarks, &target) else {
-            return Ok(ReconcileAction::CaughtUp);
-        };
-        self.catch_up_to(&target, fence, watermarks, watermark, capabilities, pending)
+        let mut after_start = None;
+        loop {
+            let Some((capabilities, watermark)) =
+                self.forward_selection(watermarks, &target, after_start)
+            else {
+                return Ok(if after_start.is_some() {
+                    ReconcileAction::Stalled
+                } else {
+                    ReconcileAction::CaughtUp
+                });
+            };
+            match self.catch_up_to(&target, fence, watermarks, watermark, capabilities, pending)? {
+                ForwardLeg::Settled(action) => return Ok(action),
+                ForwardLeg::BodyAbsent => after_start = Some(forward_start(watermark)),
+            }
+        }
     }
 
     pub(super) fn reconcile_pending(
@@ -352,14 +381,20 @@ impl Worker {
                     Ok(ReconcileAction::Stalled)
                 };
             }
-            return self.catch_up_to(
+            let leg = self.catch_up_to(
                 target,
                 state.fence,
                 state.watermarks,
                 state.durable,
                 state.capabilities,
                 pending,
-            );
+            )?;
+            return Ok(match leg {
+                ForwardLeg::Settled(action) => action,
+                // Retained rows answer `Buffered`, so an empty leg cannot
+                // occur here; waiting like any other stall is the safe reading.
+                ForwardLeg::BodyAbsent => ReconcileAction::Stalled,
+            });
         }
 
         if self.commit_pending(pending)? {
@@ -416,10 +451,15 @@ impl Worker {
         Some((selection, selected))
     }
 
+    /// Selects the lowest group of enabled capabilities that still needs rows:
+    /// those sharing one next height. A group never mixes capabilities with
+    /// different next heights. `after_start` excludes groups starting at or
+    /// below it, which lets a pass step past a group that must wait.
     pub(super) fn forward_selection(
         &self,
         watermarks: IndexWatermarks,
         target: &TipSnapshot,
+        after_start: Option<u32>,
     ) -> Option<(IndexCapabilities, Option<IndexWatermark>)> {
         let enabled = self.effective_enabled();
         let enabled_watermark = |capability: IndexCapability| {
@@ -430,14 +470,12 @@ impl Worker {
         let needs_forward = |watermark: Option<IndexWatermark>| {
             watermark.is_none_or(|watermark| watermark.height < target.height)
         };
-        let start_height = |watermark: Option<IndexWatermark>| {
-            watermark.map_or(0, |watermark| watermark.height.saturating_add(1))
-        };
         let selected_start = IndexCapability::ALL
             .into_iter()
             .filter_map(&enabled_watermark)
             .filter(|watermark| needs_forward(*watermark))
-            .map(start_height)
+            .map(forward_start)
+            .filter(|start| after_start.is_none_or(|after| *start > after))
             .min()?;
         let selected_watermark = if selected_start == 0 {
             None
@@ -453,7 +491,7 @@ impl Worker {
             .into_iter()
             .filter(|&capability| {
                 enabled_watermark(capability).is_some_and(|watermark| {
-                    needs_forward(watermark) && start_height(watermark) == selected_start
+                    needs_forward(watermark) && forward_start(watermark) == selected_start
                 })
             })
             .collect();

@@ -238,7 +238,7 @@ fn counted_guard_unit(
 ) -> Duration {
     let guard = pool.read();
     let start = Instant::now();
-    let body = select_template_body(&guard, ctx, payout)
+    let body = select_template_body(&guard, ctx, payout, None)
         .unwrap_or_else(|error| panic!("selection failed: {error}"));
     drop(guard);
     let elapsed = start.elapsed();
@@ -258,10 +258,9 @@ fn indexed_selection_read_guard_counted() {
     let ctx = context();
     let payout = [0x51_u8];
     let guarded = pool.read();
-    let warmed = select_template_body(&guarded, &ctx, &payout)
+    let warmed = select_template_body(&guarded, &ctx, &payout, None)
         .unwrap_or_else(|error| panic!("fixture selection failed: {error}"));
     drop(guarded);
-    drop(warmed);
     measured_samples::run(row, || counted_guard_unit(&pool, &ctx, &payout));
 }
 
@@ -453,7 +452,7 @@ fn verify_snapshot_unit(count: usize) {
 fn verify_guard_unit(ctx: &CandidateContext, payout: &[u8]) {
     let pool = parking_lot::RwLock::new(snapshot_with(100_000));
     let guarded = pool.read();
-    let warmed = select_template_body(&guarded, ctx, payout)
+    let warmed = select_template_body(&guarded, ctx, payout, None)
         .unwrap_or_else(|error| panic!("fixture selection failed: {error}"));
     drop(guarded);
     drop(warmed);
@@ -543,7 +542,7 @@ fn mrp_verify_end_to_end(ctx: &CandidateContext, payout: &[u8]) {
         );
         let candidate = assemble_candidate(ctx, &pool, payout)
             .unwrap_or_else(|error| panic!("fixture assemble {count} failed: {error}"));
-        let selected = select_template_body(&pool, ctx, payout)
+        let selected = select_template_body(&pool, ctx, payout, None)
             .unwrap_or_else(|error| panic!("fixture selection {count} failed: {error}"));
         assert!(
             !selected.transactions.is_empty(),
@@ -576,7 +575,7 @@ fn mrp_verify_end_to_end(ctx: &CandidateContext, payout: &[u8]) {
         CHAIN_POOL_CHAINS * CHAIN_DEPTH,
         "chained fixture pool must retain every inserted transaction"
     );
-    let chained = select_template_body(&chains, ctx, payout)
+    let chained = select_template_body(&chains, ctx, payout, None)
         .unwrap_or_else(|error| panic!("chained selection failed: {error}"));
     assert!(
         !chained.transactions.is_empty(),
@@ -622,7 +621,7 @@ fn mrp_verify_removal_plan(ctx: &CandidateContext, payout: &[u8]) {
         511,
         "removing a childless entry must confirm exactly one entry"
     );
-    let actual = select_template_body(&twin, ctx, payout)
+    let actual = select_template_body(&twin, ctx, payout, None)
         .unwrap_or_else(|error| panic!("post-removal selection failed: {error}"));
     assert_eq!(
         projected

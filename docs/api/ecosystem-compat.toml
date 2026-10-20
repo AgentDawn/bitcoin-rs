@@ -127,11 +127,11 @@ representative_consumer = "planned: an existing mining consumer (issue #1122 fol
 evidence = "in-tree only: crates/mining/src/control.rs proposal/solved-block vocabulary and mining suites; external-miner harness as above (implemented evidence only)."
 
 [[row]]
-surface = "Mining IPC / Stratum V2 adapters"
-core_reference = "selected Core IPC / mining protocol interfaces"
-status = "intentionally unsupported"
-representative_consumer = "none"
-evidence = "no adapter is shipped; this is future work (issue #1122 compatibility surfaces), not a compatibility commitment. When built, IPC stays an adapter, not an internal architecture template (ECO-01)."
+surface = "Stratum V2 Template Distribution adapter (regtest example)"
+core_reference = "Stratum V2 Template Distribution Protocol as implemented by SRI; not a Bitcoin Core interface"
+status = "experimental"
+representative_consumer = "SRI pool and CPU mining devices pinned in tools/stratum-sv2/compose.yaml"
+evidence = "an experimental regtest adapter, not a compatibility commitment and no production pool qualification. It is a standalone crate outside the workspace (tools/stratum-sv2/template-provider) that embeds the production Node; Noise/TDP sessions get owner-budgeted jobs and retain them per session (tools/stratum-sv2/README.md). In-tree evidence is its localhost Noise and embedded-Node tests. One retained functional compose run exercised the pinned SRI pool and two devices (tools/stratum-sv2/evidence/interop.md); it predates budgeted jobs and pinned-job retention, has not been repeated for them, and did not exercise the translator. No throughput claim. IPC is tracked separately by the Core IPC row and stays unsupported (ECO-01)."
 
 [[row]]
 surface = "USDT tracepoints (validation/mempool/net providers)"

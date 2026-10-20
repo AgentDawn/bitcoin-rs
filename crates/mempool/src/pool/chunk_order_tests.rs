@@ -27,46 +27,12 @@ use crate::{
     EntryId, FeeDiagramError, MempoolEntry, MempoolError, MempoolLimits, ReplacementCandidate,
 };
 
-/// Parent spends from actually inserted bodies: every edge names a tracked
-/// parent txid with a vout inside its real output count. Recomputing either
-/// the txid or the output count rebuilds a different transaction, so the
-/// edge silently skips; validity of out-of-range vouts themselves is pinned
-/// by `distinct_output_indices_link_by_vout`.
-fn linked_spends(
-    parents: [Option<u64>; 2],
-    vout: u32,
-    inserted: &HashMap<u64, (Txid, u32)>,
-) -> Vec<(Txid, u32)> {
-    let mut spends = Vec::new();
-    for parent_label in parents.into_iter().flatten() {
-        let Some(&(parent_txid, slots)) = inserted.get(&parent_label) else {
-            continue;
-        };
-        if spends.iter().all(|&(txid, _)| txid != parent_txid) {
-            spends.push((parent_txid, vout % slots));
-        }
-    }
-    spends
-}
-
-#[test]
-fn spends_name_real_parent_outputs_not_label_guesses() {
-    let parent = order_tx(5, &[], 1, Sequence::ENABLE_RBF_NO_LOCKTIME);
-    let parent_txid = parent.txid();
-    let one_output: HashMap<u64, (Txid, u32)> = HashMap::from_iter([(5, (parent_txid, 1))]);
-    assert_eq!(
-        linked_spends([Some(5), Some(5)], 2, &one_output),
-        alloc::vec![(parent_txid, 0)]
-    );
-    let three_outputs: HashMap<u64, (Txid, u32)> = HashMap::from_iter([(4, (parent_txid, 3))]);
-    assert_eq!(
-        linked_spends([Some(4), None], 2, &three_outputs),
-        alloc::vec![(parent_txid, 2)]
-    );
-    assert_eq!(
-        linked_spends([Some(9), None], 2, &three_outputs),
-        Vec::new()
-    );
+/// Nominal output count for `label`: deterministic, so the proptest can name
+/// a plausible vout of a tracked parent insert. The guess may overshoot the
+/// parent's real outputs, which exercises the spend index's beyond-count
+/// path; validity itself is pinned by `distinct_output_indices_link_by_vout`.
+fn label_outputs(label: u64) -> u32 {
+    u32::try_from(label % 3).map_or(1, |residue| residue + 1)
 }
 
 /// Test-only Mempool helpers: the maintained order and its from-scratch
@@ -592,12 +558,11 @@ proptest! {
         ),
     ) {
         let mut pool = order_pool();
-        // Actually inserted txids and output counts by label: recomputing a
-        // parent rebuilds a different transaction (the insert's spends,
-        // sequence, and output count vary per action), so the rebuilt txid
-        // misses and the edge silently skips. Only tracked inserts can link
-        // chained, shared-parent, and bridge-merge components.
-        let mut inserted: HashMap<u64, (Txid, u32)> = HashMap::new();
+        // Actually inserted txids by label: recomputing a parent's txid is
+        // unsound because the txid covers the sequence, and inserts signal
+        // RBF while a recompute would use final. Only tracked inserts can
+        // link chained, shared-parent, and bridge-merge components.
+        let mut inserted: HashMap<u64, Txid> = HashMap::new();
         // A deterministic chained edge up front: label 1 must spend tracked
         // label 0. Restoring txid recomputation misses this edge and fails
         // the intended-edge pin below instead of silently losing coverage.
@@ -609,14 +574,23 @@ proptest! {
             let fee = fees[fee_class];
             // Two optional parents: distinct pooled labels join components
             // through the bridge, exercising the merge path.
-            let spends = linked_spends([parent_a, parent_b], vout, &inserted);
+            let mut spends = Vec::new();
+            for parent_label in [parent_a, parent_b].into_iter().flatten() {
+                let Some(parent_txid) = inserted.get(&parent_label) else {
+                    continue;
+                };
+                if spends.iter().all(|&(txid, _)| txid != *parent_txid) {
+                    let slots = label_outputs(parent_label);
+                    spends.push((*parent_txid, vout % slots));
+                }
+            }
             // Every intended resident parent must appear in the spends: a
             // harness that recomputes parent txids instead of tracking them
             // silently builds parentless transactions here.
             for parent_label in [parent_a, parent_b].into_iter().flatten() {
-                if let Some(&(parent_txid, _)) = inserted.get(&parent_label) {
+                if let Some(parent_txid) = inserted.get(&parent_label) {
                     assert!(
-                        spends.iter().any(|&(txid, _)| txid == parent_txid),
+                        spends.iter().any(|&(txid, _)| txid == *parent_txid),
                         "tracked resident parent {parent_label} must link into label {label}"
                     );
                 }
@@ -626,7 +600,7 @@ proptest! {
             // resident has nothing to act on. A freshly reconstructed
             // transaction (this action's spends and outputs) is never the
             // resident's identity.
-            let resident = inserted.get(&label).copied().map(|(txid, _)| txid);
+            let resident = inserted.get(&label).copied();
             match op {
                 0..=4 => {
                     let tx = order_tx(label, &spends, outputs, Sequence::ENABLE_RBF_NO_LOCKTIME);
@@ -636,7 +610,7 @@ proptest! {
                         .is_ok();
                     if admitted {
                         assert!(pool.contains_txid(&txid));
-                        inserted.insert(label, (txid, outputs));
+                        inserted.insert(label, txid);
                         // The pool must hold the intended edges in one
                         // component, not just the transactions side by side.
                         if !spends.is_empty() {
@@ -719,7 +693,7 @@ proptest! {
                     }
                 }
             }
-            inserted.retain(|_, resident| pool.contains_txid(&resident.0));
+            inserted.retain(|_, txid| pool.contains_txid(txid));
             pool.assert_index_matches_oracle("one random mutation");
         }
         pool.clear();

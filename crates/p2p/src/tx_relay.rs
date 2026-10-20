@@ -546,31 +546,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_live_announcement_excludes_its_source() {
-        let gateway = relay_identity_gateway();
-        let (peers, ids) = fake_peers(3);
-        let (queue, rx) = TxRelayQueue::new(8);
-        let sink = FakeSink::new(peers);
-        let (tx, sequence) = admit_live_tx(31, &gateway);
-        queue.announce(
-            tx.txid(),
-            live_wtxid(&tx.txid(), &gateway),
-            Some(ids[1]),
-            sequence,
-        );
-
-        let processed = drain_relay_queue(&rx, &sink, &gateway);
-
-        assert_eq!(processed, 1);
-        let log = sink.log();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].1, Some(ids[1]));
-        assert_eq!(log[0].2.attempted, 3);
-        assert_eq!(log[0].2.excluded, 1);
-        assert_eq!(log[0].2.saturated, 0);
-    }
-
-    #[test]
     fn pending_local_broadcast_survives_absent_peers_and_saturation() {
         let gateway = relay_identity_gateway();
         let (local, _) = admit_live_tx(21, &gateway);
@@ -670,32 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_announcement_with_stale_source_excludes_nothing() {
-        let gateway = relay_identity_gateway();
-        let stale_source = fresh_node_id();
-        let (peers, _ids) = fake_peers(2);
-        let (queue, rx) = TxRelayQueue::new(8);
-        let sink = FakeSink::new(peers);
-        let (tx, sequence) = admit_live_tx(32, &gateway);
-        queue.announce(
-            tx.txid(),
-            live_wtxid(&tx.txid(), &gateway),
-            Some(stale_source),
-            sequence,
-        );
-
-        let processed = drain_relay_queue(&rx, &sink, &gateway);
-
-        assert_eq!(processed, 1);
-        let log = sink.log();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].1, Some(stale_source));
-        assert_eq!(log[0].2.attempted, 2);
-        assert_eq!(log[0].2.excluded, 0, "stale source id no longer connected");
-        assert_eq!(log[0].2.saturated, 0);
-    }
-
-    #[test]
     fn relay_queue_saturation_drops_overflow() {
         let gateway = relay_identity_gateway();
         let (queue, rx) = TxRelayQueue::new(2);
@@ -757,6 +706,65 @@ mod tests {
         assert_eq!(log[1].2.excluded, 1);
         assert_eq!(log[2].1, None);
         assert_eq!(log[2].2.excluded, 0);
+    }
+
+    #[test]
+    fn drain_live_announcement_excludes_its_source() {
+        let gateway = relay_identity_gateway();
+        let (peers, ids) = fake_peers(3);
+        let (queue, rx) = TxRelayQueue::new(8);
+        let sink = FakeSink::new(peers);
+        let (tx, sequence) = admit_live_tx(0xA1, &gateway);
+
+        assert!(queue.announce(
+            tx.txid(),
+            live_wtxid(&tx.txid(), &gateway),
+            Some(ids[1]),
+            sequence
+        ));
+
+        let processed = drain_relay_queue(&rx, &sink, &gateway);
+        assert_eq!(processed, 1);
+
+        let log = sink.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].1, Some(ids[1]));
+        assert_eq!(log[0].2.attempted, 3);
+        assert_eq!(log[0].2.excluded, 1);
+        assert_eq!(log[0].2.saturated, 0);
+        let locked = sink.peers.lock();
+        assert_eq!(locked[0].capacity, 63);
+        assert_eq!(locked[1].capacity, 64);
+        assert_eq!(locked[2].capacity, 63);
+    }
+
+    #[test]
+    fn drain_announcement_with_stale_source_excludes_nothing() {
+        let gateway = relay_identity_gateway();
+        let stale_source = fresh_node_id();
+        let (peers, _ids) = fake_peers(2);
+        let (queue, rx) = TxRelayQueue::new(8);
+        let sink = FakeSink::new(peers);
+        let (tx, sequence) = admit_live_tx(0xC3, &gateway);
+
+        assert!(queue.announce(
+            tx.txid(),
+            live_wtxid(&tx.txid(), &gateway),
+            Some(stale_source),
+            sequence
+        ));
+
+        let processed = drain_relay_queue(&rx, &sink, &gateway);
+        assert_eq!(processed, 1);
+
+        let log = sink.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].1, Some(stale_source));
+        assert_eq!(log[0].2.attempted, 2);
+        assert_eq!(log[0].2.excluded, 0);
+        assert_eq!(log[0].2.saturated, 0);
+        let locked = sink.peers.lock();
+        assert!(locked.iter().all(|peer| peer.capacity == 63));
     }
 
     #[test]

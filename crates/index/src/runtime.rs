@@ -662,8 +662,23 @@ struct BlockIdentity {
 /// Outcome of one sub-chunk prepare-and-admit step.
 enum ChunkAction {
     Continue,
+    /// Shutdown, a revoked history pin, a rejected or stale commit, or an
+    /// anchor-class reset: the pass must end, never move to another group.
     Stalled,
     Progressed,
+    /// A body in the next window is absent. Only this outcome lets the
+    /// forward pass look at another capability group.
+    MissingBody,
+}
+
+/// How one forward catch-up leg ended.
+enum ForwardLeg {
+    /// The leg ended with a scheduler answer.
+    Settled(ReconcileAction),
+    /// The leg's next body is absent and the leg retained no rows, so the
+    /// pass may try the next capability group with the same fence and
+    /// watermarks: nothing was written.
+    BodyAbsent,
 }
 
 enum CursorCommit {

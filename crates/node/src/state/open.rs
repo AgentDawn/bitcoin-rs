@@ -604,7 +604,7 @@ impl NodeState {
             bitcoin_rs_chainstate::AssumeUtxoManager::open(
                 config.network,
                 Arc::clone(&chainstate),
-                Some(config.data_dir.clone()),
+                config.data_dir.clone(),
             )
             .map_err(|err| anyhow::anyhow!("assumeutxo open failed: {err}"))?,
         );

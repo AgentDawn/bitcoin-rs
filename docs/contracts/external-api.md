@@ -571,6 +571,15 @@ scanning and wallet interoperability remain unverified.
   the fee component, and pending long-poll waiters return with that id.
   Admissions invalidate older membership generations and wake long-polls.
   The next template read captures membership and fee revisions together.
+- `getblocktemplate` never carries a coinbase budget. The typed
+  `BlockTemplateRequest.coinbase_budget` is `None` for every RPC request, so
+  the template body, limits, `longpollid` and JSON are as above. Only an
+  embedder of the typed `MiningControl` (the experimental SV2 regtest adapter
+  in `tools/stratum-sv2`) sets it. A budgeted candidate is selected to leave
+  that room in the coinbase and has an id qualified by the budget, or is the
+  generation's ordinary candidate when that already admits the budget. The
+  qualifier is not part of the RPC contract: an RPC caller never receives it,
+  and a long-poll wait compares generations only.
 
 ### `API-12`: Mainnet template operational gates
 
@@ -1218,6 +1227,14 @@ evidence does not establish mainnet memory or throughput qualifications.
     `long_poll_rejects_non_ascii_split_boundary_without_panicking`
   - `crates/node/tests/mining.rs` tests `template_does_not_echo_client_capabilities`,
     `signet_template_includes_challenge_and_signet_rule`
+  - The budget selection rule and `Candidate::admits` belong to `crates/mining`;
+    its suites and `crates/node/tests/mining` are their evidence, not the
+    adapter tests. The adapter's tests cover the typed consumer's protocol path
+    only
+    (`cargo test --manifest-path tools/stratum-sv2/template-provider/Cargo.toml`):
+    `tight_budget_gets_a_fitting_job_and_budgets_stay_independent`,
+    `pinned_job_outlives_peer_churn_and_evicted_ids_never_substitute` and
+    `infeasible_budget_closes_only_its_session` in `src/server/tests.rs`
 
 - `API-12`:
   - `crates/rpc/src/handlers/mining.rs` tests `getblocktemplate_rejects_mainnet_without_peers`,

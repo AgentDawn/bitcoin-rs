@@ -1345,6 +1345,98 @@ mod tests {
         }
     }
 
+    // BIP152 extras: the gate counts reserved script capacity, not just wire
+    // bytes. Bodies with one consensus serialization (one wtxid) fall on
+    // opposite sides of the gate when only spare script capacity differs;
+    // charging length here would retain the roomy bodies.
+    #[test]
+    fn peer_policy_refusal_gate_counts_script_spare_capacity() {
+        let (coin, chain) = funded_coin();
+        let limit = u64::try_from(crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES).unwrap_or(u64::MAX);
+        let packed =
+            nonstandard_with_heap_usage(coin, 3, crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES - 1);
+        let mut roomy_pubkey = packed.clone();
+        let mut bytes = roomy_pubkey.outputs[0].script_pubkey.as_bytes().to_vec();
+        bytes.reserve(64);
+        roomy_pubkey.outputs[0].script_pubkey = Script::from_bytes(bytes);
+        let mut roomy_sig = packed.clone();
+        roomy_sig.inputs[0].script_sig = Script::from_bytes(Vec::with_capacity(64));
+        for roomy in [&roomy_pubkey, &roomy_sig] {
+            assert_eq!(packed.total_size(), roomy.total_size(), "one wire size");
+            assert_eq!(packed.wtxid(), roomy.wtxid(), "one witness identity");
+            assert!(crate::pool::transaction_heap_usage(&packed) < limit);
+            assert!(
+                crate::pool::transaction_heap_usage(roomy) >= limit,
+                "spare script capacity must count"
+            );
+        }
+
+        for (tx, retained) in [
+            (Arc::new(packed), true),
+            (Arc::new(roomy_pubkey), false),
+            (Arc::new(roomy_sig), false),
+        ] {
+            let gateway = gateway();
+            let result = gateway.submit_transaction(
+                Arc::clone(&tx),
+                AdmissionOrigin::Peer(source()),
+                None,
+                1,
+                &chain,
+            );
+            assert!(matches!(result, Err(SubmitError::Policy(_))), "{result:?}");
+            assert_eq!(
+                gateway.reconstruction_tx_by_wtxid(tx.wtxid()).is_some(),
+                retained,
+                "retained {retained}"
+            );
+        }
+    }
+
+    // BIP152 extras: the gate counts reserved witness capacity, outer stack
+    // and items alike. The witness variants carry different bytes than the
+    // control, so only the heap accounting and the retention verdicts are
+    // compared; charging length here would retain both roomy bodies.
+    #[test]
+    fn peer_policy_refusal_gate_counts_witness_spare_capacity() {
+        let (coin, chain) = funded_coin();
+        let limit = u64::try_from(crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES).unwrap_or(u64::MAX);
+        let packed =
+            nonstandard_with_heap_usage(coin, 3, crate::gateway::EXTRA_TXN_MAX_MEMORY_BYTES - 100);
+        let mut roomy_outer = packed.clone();
+        roomy_outer.inputs[0].witness = Witness::from_stack(Vec::with_capacity(8));
+        let mut roomy_item = packed.clone();
+        roomy_item.inputs[0].witness = Witness::from_stack(vec![Vec::with_capacity(128)]);
+        for roomy in [&roomy_outer, &roomy_item] {
+            assert!(crate::pool::transaction_heap_usage(&packed) < limit);
+            assert!(
+                crate::pool::transaction_heap_usage(roomy) >= limit,
+                "spare witness capacity must count"
+            );
+        }
+
+        for (tx, retained) in [
+            (Arc::new(packed), true),
+            (Arc::new(roomy_outer), false),
+            (Arc::new(roomy_item), false),
+        ] {
+            let gateway = gateway();
+            let result = gateway.submit_transaction(
+                Arc::clone(&tx),
+                AdmissionOrigin::Peer(source()),
+                None,
+                1,
+                &chain,
+            );
+            assert!(matches!(result, Err(SubmitError::Policy(_))), "{result:?}");
+            assert_eq!(
+                gateway.reconstruction_tx_by_wtxid(tx.wtxid()).is_some(),
+                retained,
+                "retained {retained}"
+            );
+        }
+    }
+
     // BIP152 extras: refusals made for local callers are never retained.
     #[test]
     fn local_origin_policy_refusal_is_not_retained() {

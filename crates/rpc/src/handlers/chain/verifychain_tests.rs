@@ -5,7 +5,7 @@
 //! verifier's answers, including the applied-genesis window, are proven
 //! against the real verifier in `node` (`lifecycle` tests) and in
 //! `chainstate::verify`; the stub control below proves delegation to the
-//! attached verifier, not its answers.
+//! attached control, not its answers.
 #![expect(clippy::unwrap_used)]
 
 use alloc::sync::Arc;

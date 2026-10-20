@@ -1,15 +1,16 @@
 //! Candidate lifecycle state and pure mining-domain projections.
 //!
 //! Generation is keyed by `(applied_tip_hash, mempool_sequence,
-//! fee_delta_sequence)`. Template
-//! assembly is single-flight per key, cached by [`TemplateId`], and woken by
-//! explicit generation publication. [`MiningService`] drives this state
-//! through capability sources implemented by the node; proposal validation
-//! and solved-block submission stay on `node`'s authoritative apply path.
+//! fee_delta_sequence)`. Ordinary template assembly is single-flight per
+//! generation. A candidate is cached by that generation plus the
+//! [`CoinbaseBudget`] it was selected under (`None` for the ordinary
+//! template), and waiters are woken by explicit generation publication.
+//! [`MiningService`] drives this state through capability sources implemented
+//! by the node; proposal validation and solved-block submission stay on
+//! `node`'s authoritative apply path.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-#[cfg(any(test, feature = "test-seam"))]
 use std::time::Instant;
 
 use bitcoin_rs_chain::ChainError;
@@ -50,6 +51,7 @@ use crate::control::TemplateMutation;
 use crate::control::difficulty_for_bits;
 use crate::template::Candidate;
 use crate::template::CandidateContext;
+use crate::template::CoinbaseBudget;
 use crate::template::SelectedBody;
 use crate::template::TemplateId;
 use crate::template::assemble_ordered_candidate;
@@ -61,12 +63,15 @@ const CANDIDATE_CACHE_LIMIT: usize = 8;
 const CANDIDATE_GENERATION_RETRIES: usize = 8;
 /// Error message identifying a generation-key race during candidate assembly.
 const GENERATION_RACE: &str = "generation key changed during candidate assembly";
+/// Error message identifying a budgeted assembly that stayed behind another
+/// one for a full [`LONG_POLL_SLICE`].
+const ASSEMBLY_BUSY: &str = "budgeted candidate assembly is busy";
 /// Upper bound for a single long-poll wait slice while rechecking predicates.
 const LONG_POLL_SLICE: Duration = Duration::from_secs(1);
 
 /// Applied-tip hash plus the mempool membership and fee-delta sequences that
 /// identify one candidate generation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct GenerationKey {
     /// Applied tip hash in consensus little-endian storage order.
     tip_hash: Hash256,
@@ -85,6 +90,33 @@ impl GenerationKey {
             self.mempool_sequence,
             self.fee_delta_sequence,
         )
+    }
+}
+
+/// One cached candidate's identity: its generation and the budget its body was
+/// selected under. `budget: None` is the ordinary template, whose
+/// [`TemplateId`] is the generation's alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct CandidateKey {
+    generation: GenerationKey,
+    budget: Option<CoinbaseBudget>,
+}
+
+impl CandidateKey {
+    /// The ordinary template of `generation`.
+    #[must_use]
+    fn ordinary(generation: GenerationKey) -> Self {
+        Self {
+            generation,
+            budget: None,
+        }
+    }
+
+    /// Identity of the candidate this key selects: the generation's id,
+    /// qualified by the budget.
+    #[must_use]
+    fn template_id(self) -> TemplateId {
+        self.generation.template_id().qualified(self.budget)
     }
 }
 
@@ -108,14 +140,23 @@ struct CoordinatorState {
     /// Test-seam probe: long-poll waiters parked on the wake condvar.
     #[cfg(any(test, feature = "test-seam"))]
     parked_long_poll_waiters: usize,
-    cache: HashMap<TemplateId, Arc<Candidate>>,
+    /// Candidates by generation and budget. The entry count is bounded; the
+    /// memory is not: callers keep the `Arc`s they were served after eviction.
+    cache: HashMap<CandidateKey, Arc<Candidate>>,
     /// Insertion order for deterministic eviction of the oldest entry.
-    cache_order: VecDeque<TemplateId>,
+    cache_order: VecDeque<CandidateKey>,
     /// Last resolved signalling-rule snapshot. The template path serves only
     /// the current candidate tip and height, so one entry is enough and a tip
     /// move naturally invalidates it; no history is retained.
     signalling_rules: Option<(Hash256, u32, Vec<AvailableMiningRule>)>,
     in_flight: Option<InFlight>,
+    /// Flight id of the one budgeted assembly walking the pool, if any.
+    ///
+    /// Unlike `in_flight`, publication never clears it: the slot stays
+    /// occupied for exactly as long as the walk runs, and only the assembler's
+    /// own `BudgetedSlot` guard releases it. That keeps budgeted pool walks at
+    /// one regardless of generation churn.
+    budgeted: Option<u64>,
     next_flight_id: u64,
     last_candidate: Option<LastCandidateInfo>,
 }
@@ -128,14 +169,14 @@ impl CoordinatorState {
         self.published.map_or(self.seed, |key| key.mempool_sequence)
     }
 
-    fn cache_get(&self, id: &TemplateId) -> Option<Arc<Candidate>> {
-        self.cache.get(id).cloned()
+    fn cache_get(&self, key: &CandidateKey) -> Option<Arc<Candidate>> {
+        self.cache.get(key).cloned()
     }
 
-    /// Inserts or refreshes `id`, evicting the oldest entry at the bound.
-    fn cache_insert(&mut self, id: TemplateId, candidate: Arc<Candidate>) {
-        if self.cache.contains_key(&id) {
-            self.cache.insert(id, candidate);
+    /// Inserts or refreshes `key`, evicting the oldest entry at the bound.
+    fn cache_insert(&mut self, key: CandidateKey, candidate: Arc<Candidate>) {
+        if self.cache.contains_key(&key) {
+            self.cache.insert(key, candidate);
             return;
         }
         while self.cache.len() >= CANDIDATE_CACHE_LIMIT {
@@ -144,8 +185,8 @@ impl CoordinatorState {
             };
             self.cache.remove(&oldest);
         }
-        self.cache_order.push_back(id.clone());
-        self.cache.insert(id, candidate);
+        self.cache_order.push_back(key);
+        self.cache.insert(key, candidate);
     }
 
     fn signalling_cache_get(&self, tip: &Hash256, height: u32) -> Option<Vec<AvailableMiningRule>> {
@@ -167,16 +208,19 @@ impl CoordinatorState {
         self.signalling_rules = Some((tip, height, rules));
     }
 
-    /// Drops the cached candidate and any matching in-flight assembly for `key`.
-    fn invalidate_key(&mut self, key: GenerationKey) {
-        let id = key.template_id();
-        if self.cache.remove(&id).is_some() {
-            self.cache_order.retain(|cached| cached != &id);
-        }
+    /// Drops every cached candidate of `generation`, whatever budget it was
+    /// selected under, and any matching ordinary in-flight assembly.
+    ///
+    /// The budgeted slot is deliberately left alone: its assembler may still be
+    /// walking the pool, and it releases the slot itself. Its install is
+    /// refused because the generation is no longer live.
+    fn invalidate_key(&mut self, generation: GenerationKey) {
+        self.cache.retain(|key, _| key.generation != generation);
+        self.cache_order.retain(|key| key.generation != generation);
         if self
             .in_flight
             .as_ref()
-            .is_some_and(|flight| flight.key == key)
+            .is_some_and(|flight| flight.key == generation)
         {
             self.in_flight = None;
         }
@@ -243,11 +287,21 @@ pub trait MempoolSnapshotSource: Send + Sync {
     /// is released before the candidate finishes: only the selected
     /// transactions leave the pool. Returns `None` when the pool moved past
     /// `expected_sequences`, which the caller retries as a generation race.
+    ///
+    /// `budget` is the coinbase growth the body must leave room for; the
+    /// implementation passes it to the one selector unchanged. A budget the
+    /// empty block cannot hold fails before any chunk is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MiningControlError::Failed`] when selection refuses the
+    /// context's limits, including an unsatisfiable `budget`.
     fn select_template(
         &self,
         expected_sequences: Option<(u64, u64)>,
         context: &CandidateContext,
         payout: &[u8],
+        budget: Option<CoinbaseBudget>,
     ) -> Result<Option<SelectedBody>, MiningControlError>;
     /// Selects the template body as if `block` had applied, without mutating
     /// the pool.
@@ -328,6 +382,23 @@ pub trait ChainContextSource: Send + Sync {
 /// isolation); accepted-generation and cache publication are linearizable
 /// under the coordinator mutex. Repeated identical stage and publication
 /// notifications are idempotent.
+///
+/// Budgeted templates ([`CoinbaseBudget`]) follow the same rules with one
+/// addition, finite owner admission: at most one budgeted selection walks the
+/// pool at a time, beside the ordinary single-flight assembly, which neither
+/// waits for it nor displaces it. Publication drops cached budgeted candidates
+/// of the old generation but never frees the slot while its assembler runs;
+/// the assembler's guard releases it, and an install for a generation that is
+/// no longer live is refused under the coordinator mutex. A caller behind
+/// the slot waits at most one `LONG_POLL_SLICE` (one second) per attempt and
+/// at most `CANDIDATE_GENERATION_RETRIES` attempts, then fails with a
+/// retryable error.
+/// Nothing promises liveness under endless churn or contention: a caller can
+/// exhaust its attempts and the next one starts afresh.
+///
+/// The cache bounds entries, not memory: the `Arc`s handed to callers (and
+/// the ordinary candidate a budgeted request may reuse) stay alive after
+/// eviction for as long as their holders keep them.
 pub struct MiningService {
     /// Network whose genesis anchors an empty applied chain.
     network: Network,
@@ -631,15 +702,29 @@ impl MiningService {
     ///
     /// Long-poll callers pass the `longpollid` they are still working; the call
     /// blocks until the published generation changes or the node shuts down.
+    /// The wait compares generations only: a budget qualifier on the id is
+    /// validated and otherwise ignored, and the budget of the returned template
+    /// is `coinbase_budget`, never the id's.
+    ///
+    /// With a `coinbase_budget` the template's body leaves room for the
+    /// consumer's coinbase growth (see [`CoinbaseBudget`]). The candidate is
+    /// either selected under that budget, with a qualified id, or the
+    /// generation's ordinary candidate when it already admits the budget. Read
+    /// `candidate.template_id` for which. `None` is the ordinary template.
     ///
     /// # Errors
     ///
     /// [`MiningControlError::InvalidRequest`] for a malformed long-poll id;
     /// [`MiningControlError::Unavailable`] while no tip is applied, on
-    /// shutdown, or when the generation raced during assembly.
+    /// shutdown, when the generation raced during assembly, or when a
+    /// budgeted assembly stayed behind another one for every attempt (both
+    /// retryable: see [`MiningControlError::is_template_generation_race`]);
+    /// [`MiningControlError::Failed`] when the budget cannot fit even an empty
+    /// block.
     pub fn get_block_template(
         &self,
         long_poll_id: Option<&str>,
+        coinbase_budget: Option<CoinbaseBudget>,
     ) -> Result<BlockTemplate, MiningControlError> {
         let waited = if let Some(long_poll_id) = long_poll_id {
             let waited = parse_long_poll_id(long_poll_id).ok_or_else(|| {
@@ -660,7 +745,7 @@ impl MiningService {
         // snapshot with the candidate it describes, rather than with a stale
         // snapshot captured before assembly.
         for _ in 0..CANDIDATE_GENERATION_RETRIES {
-            let candidate = self.live_candidate()?;
+            let candidate = self.live_candidate(coinbase_budget)?;
             let Some(tip) = self.applied_tip.applied_tip() else {
                 return Err(MiningControlError::Unavailable(CompactString::from(
                     "applied tip is not available",
@@ -743,8 +828,14 @@ impl MiningService {
         })
     }
 
-    /// Returns the live candidate, retrying bounded generation-key races.
-    fn live_candidate(&self) -> Result<Arc<Candidate>, MiningControlError> {
+    /// Returns the live candidate for `budget` (`None` is the ordinary
+    /// template), retrying bounded generation-key races and busy budgeted
+    /// assemblies. Each attempt re-reads the live generation, so a retry never
+    /// chases a key that already went stale.
+    fn live_candidate(
+        &self,
+        budget: Option<CoinbaseBudget>,
+    ) -> Result<Arc<Candidate>, MiningControlError> {
         let mut last_race = None;
         for _attempt in 0..CANDIDATE_GENERATION_RETRIES {
             if self.shutdown.is_triggered() {
@@ -752,13 +843,17 @@ impl MiningService {
                     "node is shutting down",
                 )));
             }
-            let key = {
+            let generation = {
                 let mut state = self.state.lock();
                 self.ensure_published(&mut state)
             };
-            match self.candidate_for_key(key) {
+            let served = match budget {
+                None => self.candidate_for_key(generation),
+                Some(budget) => self.budgeted_candidate(generation, budget),
+            };
+            match served {
                 Ok(candidate) => {
-                    if self.live_generation_key() == key {
+                    if self.live_generation_key() == generation {
                         return Ok(candidate);
                     }
                     last_race = Some(generation_race());
@@ -948,9 +1043,10 @@ impl MiningService {
             self.discard_preparation(key.tip_hash);
             return Ok(None);
         }
-        let template_id = key.template_id();
+        // A preparation is always the ordinary template of its generation.
+        let cache_key = CandidateKey::ordinary(key);
         let mut state = self.state.lock();
-        if let Some(cached) = state.cache_get(&template_id) {
+        if let Some(cached) = state.cache_get(&cache_key) {
             return Ok(Some(cached));
         }
         // Recheck under the state lock: the tip may have moved while the pool
@@ -958,7 +1054,7 @@ impl MiningService {
         if self.live_generation_key() != key {
             return Ok(None);
         }
-        state.cache_insert(template_id, Arc::clone(&ready.candidate));
+        state.cache_insert(cache_key, Arc::clone(&ready.candidate));
         state.last_candidate = Some(last_candidate_info(&ready.candidate));
         state.published = Some(key);
         drop(state);
@@ -970,12 +1066,13 @@ impl MiningService {
         Ok(Some(ready.candidate))
     }
 
-    /// Cache lookup or single-flight assembly for one generation key.
+    /// Cache lookup or single-flight assembly of one generation's ordinary
+    /// template.
     fn candidate_for_key(&self, key: GenerationKey) -> Result<Arc<Candidate>, MiningControlError> {
-        let template_id = key.template_id();
+        let cache_key = CandidateKey::ordinary(key);
         {
             let state = self.state.lock();
-            if let Some(cached) = state.cache_get(&template_id) {
+            if let Some(cached) = state.cache_get(&cache_key) {
                 return Ok(cached);
             }
         }
@@ -1003,7 +1100,7 @@ impl MiningService {
             }
             let _ = self.wake.wait_for(&mut state, LONG_POLL_SLICE);
         }
-        if let Some(cached) = state.cache_get(&template_id) {
+        if let Some(cached) = state.cache_get(&cache_key) {
             return Ok(cached);
         }
 
@@ -1022,7 +1119,7 @@ impl MiningService {
             armed: true,
         };
 
-        let assembled = self.assemble_for_key(key);
+        let assembled = self.assemble_for_key(cache_key);
         let mut state = self.state.lock();
         // Recheck after acquiring the lifecycle mutex: a publication may
         // have won while assembly was completing.
@@ -1030,7 +1127,7 @@ impl MiningService {
         let returned = match &assembled {
             Ok(candidate) => {
                 if live == key {
-                    state.cache_insert(template_id, Arc::clone(candidate));
+                    state.cache_insert(cache_key, Arc::clone(candidate));
                     state.last_candidate = Some(last_candidate_info(candidate));
                     state.published = Some(key);
                     Ok(Arc::clone(candidate))
@@ -1058,19 +1155,22 @@ impl MiningService {
         returned
     }
 
-    /// Assembles the candidate for `key`, refusing a raced tip or mempool.
-    fn assemble_for_key(&self, key: GenerationKey) -> Result<Arc<Candidate>, MiningControlError> {
+    /// Assembles the candidate for `key`, selected under `key.budget`,
+    /// refusing a raced tip or mempool.
+    fn assemble_for_key(&self, key: CandidateKey) -> Result<Arc<Candidate>, MiningControlError> {
+        let generation = key.generation;
         let tip = self.applied_tip.applied_tip().ok_or_else(|| {
             MiningControlError::Unavailable(CompactString::from("applied tip is not available"))
         })?;
-        if tip.hash != key.tip_hash {
+        if tip.hash != generation.tip_hash {
             return Err(generation_race());
         }
         let context = self.candidate_context(&tip)?;
         let Some(body) = self.mempool.select_template(
-            Some((key.mempool_sequence, key.fee_delta_sequence)),
+            Some((generation.mempool_sequence, generation.fee_delta_sequence)),
             &context,
             &self.coinbase_script,
+            key.budget,
         )?
         else {
             return Err(generation_race());
@@ -1079,10 +1179,130 @@ impl MiningService {
             .map_err(|error| MiningControlError::Failed(CompactString::from(error.to_string())))?;
         if candidate.template_id != key.template_id() {
             return Err(MiningControlError::Failed(CompactString::from(
-                "assembled candidate template id does not match generation key",
+                "assembled candidate template id does not match candidate key",
             )));
         }
         Ok(Arc::new(candidate))
+    }
+
+    /// Serves a budgeted request: the exact cached candidate, the
+    /// generation's ordinary candidate when it already admits `budget`, or one
+    /// candidate selected under `budget`.
+    ///
+    /// Reuse is a cost optimisation, never a claim about what a budgeted walk
+    /// would have chosen: a reused body is the one selector's own output for
+    /// this generation that fits the budget, and which of several fitting
+    /// bodies is served is unspecified. Reuse installs the ordinary candidate
+    /// it serves (cache, published key, `last_candidate`, slot release),
+    /// exactly like the prepared install; only a fresh budgeted assembly
+    /// installs a budgeted key. A budgeted request never compares a budgeted
+    /// id against a preparation, so it cannot discard one.
+    ///
+    /// Selection is finite owner admission: one budgeted walk at a time
+    /// (`CoordinatorState::budgeted`). A caller behind the slot waits at most
+    /// one [`LONG_POLL_SLICE`] in total, re-running the cache and reuse
+    /// lookups on every wake, then fails with a retryable busy error; the
+    /// caller's retry loop re-reads the live generation. Shutdown ends the
+    /// wait at the next wake.
+    fn budgeted_candidate(
+        &self,
+        generation: GenerationKey,
+        budget: CoinbaseBudget,
+    ) -> Result<Arc<Candidate>, MiningControlError> {
+        let key = CandidateKey {
+            generation,
+            budget: Some(budget),
+        };
+        let mut deadline = None;
+        let flight_id = loop {
+            if self.shutdown.is_triggered() {
+                return Err(MiningControlError::Unavailable(CompactString::from(
+                    "node is shutting down",
+                )));
+            }
+            if let Some(candidate) = self.reusable_candidate(key, budget)? {
+                return Ok(candidate);
+            }
+            let mut state = self.state.lock();
+            // An assembler may have installed `key` between the lookup above
+            // and this lock.
+            if let Some(cached) = state.cache_get(&key) {
+                return Ok(cached);
+            }
+            if state.budgeted.is_none() {
+                state.next_flight_id = state.next_flight_id.wrapping_add(1);
+                let flight_id = state.next_flight_id;
+                state.budgeted = Some(flight_id);
+                break flight_id;
+            }
+            // One slice in total, however many wakes arrive meanwhile.
+            let until = *deadline.get_or_insert_with(|| Instant::now() + LONG_POLL_SLICE);
+            let now = Instant::now();
+            if now >= until {
+                return Err(assembly_busy());
+            }
+            let _ = self.wake.wait_for(&mut state, until - now);
+        };
+        // Declared before `state` below, so it drops after the lock guard.
+        let _slot = BudgetedSlot {
+            service: self,
+            id: flight_id,
+        };
+
+        let assembled = self.assemble_for_key(key)?;
+        let mut state = self.state.lock();
+        // Refuse the install when the generation is no longer live. Read
+        // under the coordinator mutex, like the ordinary install, so a
+        // publication that won while the walk ran can never be overwritten.
+        if self.live_generation_key() != generation {
+            return Err(generation_race());
+        }
+        state.cache_insert(key, Arc::clone(&assembled));
+        state.last_candidate = Some(last_candidate_info(&assembled));
+        Ok(assembled)
+    }
+
+    /// The cached candidate for `key`, else the generation's ordinary
+    /// candidate if it admits `budget`, else `None`.
+    ///
+    /// The ordinary candidate is the cached one or, without waiting, an
+    /// installable preparation: one that is finished and already holds its
+    /// committed receipt. `admits` runs outside the coordinator mutex.
+    fn reusable_candidate(
+        &self,
+        key: CandidateKey,
+        budget: CoinbaseBudget,
+    ) -> Result<Option<Arc<Candidate>>, MiningControlError> {
+        let ordinary_key = CandidateKey::ordinary(key.generation);
+        let (exact, ordinary) = {
+            let state = self.state.lock();
+            (state.cache_get(&key), state.cache_get(&ordinary_key))
+        };
+        if exact.is_some() {
+            return Ok(exact);
+        }
+        let ordinary = match ordinary {
+            Some(ordinary) => Some(ordinary),
+            None if self.preparation_installable(key.generation.tip_hash) => {
+                self.prepared_candidate_for_key(key.generation)?
+            }
+            None => None,
+        };
+        Ok(ordinary.filter(|candidate| candidate.admits(budget).is_ok()))
+    }
+
+    /// Whether the preparation for `tip` is finished and already holds its
+    /// committed receipt, so installing it cannot park the caller.
+    fn preparation_installable(&self, tip: Hash256) -> bool {
+        let mailbox = self.prep.mailbox();
+        let finished = mailbox.active.as_ref().is_some_and(|active| {
+            active.target_tip == tip && matches!(active.progress, PrepProgress::Ready { .. })
+        });
+        finished
+            && mailbox
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.tip_hash == tip)
     }
 
     /// Resolves the candidate context for a block extending `tip`.
@@ -1129,7 +1349,7 @@ impl MiningService {
             GenerateSelection::Mempool => {
                 let body = self
                     .mempool
-                    .select_template(None, &context, payout)?
+                    .select_template(None, &context, payout, None)?
                     .ok_or_else(generation_race)?;
                 finish_candidate(&context, &body, payout)
             }
@@ -1173,6 +1393,29 @@ impl Drop for InFlightAssemblyGuard<'_> {
         }
     }
 }
+
+/// Holds the one budgeted-assembly slot for as long as its assembler runs.
+///
+/// Dropped on every exit, including an unwinding panic, so a dead assembler
+/// cannot leave later budgeted callers waiting. Publication never releases the
+/// slot: occupancy equals the running pool walk. Releasing wakes the waiters
+/// parked behind it.
+struct BudgetedSlot<'a> {
+    service: &'a MiningService,
+    id: u64,
+}
+
+impl Drop for BudgetedSlot<'_> {
+    fn drop(&mut self) {
+        let mut state = self.service.state.lock();
+        if state.budgeted == Some(self.id) {
+            state.budgeted = None;
+        }
+        drop(state);
+        self.service.wake.notify_all();
+    }
+}
+
 /// Staged tip and block handed to the preparation worker.
 struct StagedPrep {
     tip: TipSnapshot,
@@ -1738,14 +1981,26 @@ fn generation_race() -> MiningControlError {
     MiningControlError::Unavailable(CompactString::from(GENERATION_RACE))
 }
 
+/// Constructs the error for a budgeted assembly that waited a full slice
+/// behind another one. Retryable like a generation race.
+fn assembly_busy() -> MiningControlError {
+    MiningControlError::Unavailable(CompactString::from(ASSEMBLY_BUSY))
+}
+
 impl MiningControlError {
-    /// Whether candidate acquisition failed because its tip or mempool generation changed.
+    /// Whether candidate acquisition failed transiently and may be retried
+    /// after a delay: its tip or mempool generation changed, or a budgeted
+    /// assembly stayed behind another one for the whole bounded wait.
     ///
-    /// Callers may retry this race after a delay. Other unavailable states,
-    /// including shutdown, are not classified as generation races.
+    /// Neither says anything about the pool or the budget. Other unavailable
+    /// states, including shutdown, are not classified as races, and neither is
+    /// [`Self::Failed`] for a budget that cannot fit an empty block.
     #[must_use]
     pub fn is_template_generation_race(&self) -> bool {
-        matches!(self, Self::Unavailable(message) if message == GENERATION_RACE)
+        matches!(
+            self,
+            Self::Unavailable(message) if message == GENERATION_RACE || message == ASSEMBLY_BUSY
+        )
     }
 }
 
@@ -1753,9 +2008,13 @@ impl MiningControlError {
 ///
 /// At fee revision zero the id retains Core's hash plus decimal membership
 /// sequence; later fee revisions append `:<revision>`. Both forms parse;
-/// legacy ids imply fee revision zero.
+/// legacy ids imply fee revision zero. A candidate selected under a coinbase
+/// budget carries an `@cb<size>.<sigops>` qualifier: it parses strictly and is
+/// then dropped, because waiting compares generations and the budget of the
+/// template served next comes from the request.
 #[must_use]
 fn parse_long_poll_id(id: &str) -> Option<GenerationKey> {
+    let (id, _budget) = CoinbaseBudget::split_qualifier(id)?;
     let hash_hex = id.get(..64)?;
     let sequence = id.get(64..)?;
     if sequence.is_empty() {

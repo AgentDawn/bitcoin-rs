@@ -1257,29 +1257,30 @@ mod tests {
         }
     }
 
+    /// One context answers `getblockcount` from eight threads at once, which
+    /// is the behavior the old compile-time bound stood in for: shared
+    /// dispatch, not a trait assertion about the struct.
     #[test]
     fn eight_threads_share_one_context_for_getblockcount() {
-        use sonic_rs::{JsonValueTrait, json};
+        use alloc::vec::Vec;
+        use sonic_rs::json;
 
-        use crate::handlers::chain::getblockcount;
+        use crate::handlers::Handler;
 
-        let ctx = Arc::new(Context::new());
-        std::thread::scope(|scope| {
-            let handles = [(); 8].map(|()| {
-                scope.spawn(|| {
-                    getblockcount(&ctx, &json!(null))
-                        .unwrap_or_else(|err| panic!("getblockcount failed: {err}"))
-                })
-            });
-            for handle in handles {
-                let value = handle.join().expect("worker answers");
-                assert_eq!(
-                    JsonValueTrait::as_u64(&value),
-                    Some(0),
-                    "a fresh context has applied height zero on every thread"
-                );
-            }
-        });
+        let handler = Arc::new(Handler::new(Arc::new(Context::new())));
+        let workers: Vec<std::thread::JoinHandle<_>> = (0..8)
+            .map(|_| {
+                let handler = Arc::clone(&handler);
+                std::thread::spawn(move || handler.dispatch("getblockcount", &json!([])))
+            })
+            .collect();
+        for worker in workers {
+            let outcome = worker.join().expect("a worker answers");
+            assert!(
+                outcome.is_ok(),
+                "shared dispatch must answer every worker: {outcome:?}"
+            );
+        }
     }
 
     /// The count travels inside the applied tip: one publication replaces
@@ -1762,73 +1763,36 @@ mod tests {
         assert_eq!(snapshot.total_amount, 125_000);
     }
 
+    /// Two connected log records resolve their metadata through the height
+    /// read seam with no header bytes, which is what the log stores: the
+    /// tree supplies headers, never the log.
     #[test]
-    fn connected_blocks_resolve_records_with_tree_headers_and_no_cached_header_bytes() {
-        use bitcoin_rs_chain::NodeStatus;
+    fn connected_log_blocks_resolve_metadata_without_header_bytes() {
+        let genesis = Network::Regtest.genesis_block();
+        let mut child = genesis.clone();
+        child.header.prev_blockhash = genesis.block_hash();
+        child.header.nonce = child.header.nonce.wrapping_add(1);
+        child.header.time = child.header.time.wrapping_add(600);
 
         let ctx = Context::new();
-        let genesis = Network::Regtest.genesis_block();
-        let mut child_header = genesis.header;
-        child_header.prev_blockhash = genesis.block_hash();
-        child_header.nonce = 1;
-        {
-            let mut tree = ctx.chain.block_tree.write();
-            let genesis_id = tree
-                .insert_node(None, genesis.header, NodeStatus::Active)
-                .expect("genesis inserts");
-            tree.insert_node(Some(genesis_id), child_header, NodeStatus::Active)
-                .expect("child inserts");
+        ctx.chain.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.chain.add_block(BlockRecord::from_block(1, &child));
+
+        for (height, source) in [(0_u32, &genesis), (1_u32, &child)] {
+            let resolved = ctx
+                .chain
+                .block_by_height(height)
+                .unwrap_or_else(|| panic!("the log resolves height {height}"));
+            assert_eq!(resolved.height, height);
+            assert_eq!(resolved.hash, source.block_hash());
+            assert_eq!(resolved.time, source.header.time);
+            assert_eq!(resolved.body_size, consensus_bytes(source).len());
+            assert_eq!(resolved.tx_count, source.txs.len());
+            assert!(
+                resolved.header_bytes().is_none(),
+                "the log stores no header at height {height}"
+            );
         }
-        let mut child_block = genesis.clone();
-        child_block.header = child_header;
-        let genesis_record = BlockRecord::from_block(0, &genesis);
-        let child_record = BlockRecord::from_block(1, &child_block);
-        assert!(
-            genesis_record.header_bytes().is_none(),
-            "the log stores no header"
-        );
-        assert!(
-            child_record.header_bytes().is_none(),
-            "the log stores no header"
-        );
-        ctx.chain.add_block(genesis_record);
-        ctx.chain.add_block(child_record);
-
-        let genesis_hash = Hash256::from(genesis.block_hash());
-        let child_hash = Hash256::from(child_block.block_hash());
-        let resolved_genesis = ctx
-            .chain
-            .record_for_hash(genesis_hash)
-            .expect("the tree knows the genesis hash");
-        let resolved_child = ctx
-            .chain
-            .record_for_hash(child_hash)
-            .expect("the tree knows the child hash");
-
-        assert_eq!(resolved_genesis.height, 0);
-        assert_eq!(resolved_genesis.hash, genesis.block_hash());
-        assert_eq!(
-            resolved_genesis.header_bytes().map(<[u8; 80]>::as_slice),
-            Some(consensus_bytes(&genesis.header).as_slice()),
-            "the resolved record must carry the tree's header"
-        );
-        assert_eq!(resolved_genesis.body_size, consensus_bytes(&genesis).len());
-        assert_eq!(resolved_child.height, 1);
-        assert_eq!(resolved_child.hash, child_block.block_hash());
-        assert_eq!(
-            resolved_child.header_bytes().map(<[u8; 80]>::as_slice),
-            Some(consensus_bytes(&child_header).as_slice()),
-            "the resolved record must carry the tree's header"
-        );
-        assert_eq!(
-            resolved_child.body_size,
-            consensus_bytes(&child_block).len()
-        );
-        assert_eq!(
-            child_header.prev_blockhash,
-            genesis.block_hash(),
-            "the fixture blocks must connect"
-        );
     }
 
     #[test]

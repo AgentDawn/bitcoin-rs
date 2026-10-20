@@ -12,7 +12,8 @@ use bitcoin_rs_chain::regtest_fixture::{self, REGTEST_BITS};
 use bitcoin_rs_mempool::{AdmissionOrigin, MempoolEntry, SubmitOutcome};
 use bitcoin_rs_mining::{
     BlockTemplate, BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult,
-    BlockValidationResult, MempoolSequenceWake, MiningControl, MiningGenerationSignal, solve_block,
+    BlockValidationResult, CoinbaseBudget, MempoolSequenceWake, MiningControl,
+    MiningGenerationSignal, solve_block,
 };
 use bitcoin_rs_node::{MiningCoordinator, Network, NodeConfig, state::NodeState};
 use bitcoin_rs_primitives::{
@@ -109,6 +110,16 @@ pub(crate) fn template_request(long_poll_id: Option<CompactString>) -> BlockTemp
         capabilities: Vec::new(),
         rules: Vec::new(),
         long_poll_id,
+        coinbase_budget: None,
+    }
+}
+
+/// An ordinary template request that also asks the owner to leave `budget`
+/// of coinbase growth.
+pub(crate) fn budgeted_template_request(budget: CoinbaseBudget) -> BlockTemplateRequest {
+    BlockTemplateRequest {
+        coinbase_budget: Some(budget),
+        ..template_request(None)
     }
 }
 
@@ -232,6 +243,7 @@ pub(crate) fn propose_block(
         capabilities: Vec::new(),
         rules: Vec::new(),
         long_poll_id: None,
+        coinbase_budget: None,
     })? {
         BlockTemplateResult::Proposal(result) => Ok(result),
         other @ BlockTemplateResult::Template(_) => {

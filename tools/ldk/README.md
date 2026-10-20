@@ -5,7 +5,8 @@ pinning `lightning = 0.2.7` and `lightning-block-sync = 0.2.0` with its own
 `Cargo.lock` and independent Cargo workspace. LDK stays out of the authoritative
 workspace dependency graph and default CI.
 
-The adapter borrows the production public `Node`. It uses neither `NodeState`
+The adapter borrows the production public `Node`
+([embedding contract](../../docs/contracts/embedding.md)). It uses neither `NodeState`
 nor `test-seam`, and makes no RPC/REST/ZMQ requests. It owns no chain/mempool
 store, worker, event journal or channel persistence.
 

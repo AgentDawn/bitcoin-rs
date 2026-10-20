@@ -64,7 +64,6 @@ fn gateway(limits: MempoolLimits, seen: Option<Arc<Seen>>) -> MempoolGateway {
         None,
     )
 }
-
 fn output(value: u64) -> TxOut {
     TxOut {
         value: Amount::from_sat(value),

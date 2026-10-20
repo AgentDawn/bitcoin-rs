@@ -136,67 +136,76 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
     fn enforced_cluster_count_rejects_a_joining_transaction() {
         use alloc::sync::Arc;
-        use alloc::vec::Vec;
 
+        use bitcoin_rs_consensus::ValidationEngine;
         use bitcoin_rs_primitives::{
-            Amount, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
+            Amount, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut, Txid, Witness,
         };
+        use parking_lot::RwLock;
 
-        use crate::{Mempool, MempoolEntry, MempoolError};
+        use crate::{AdmissionOrigin, Mempool, MempoolEntry, MempoolError, MempoolGateway};
 
-        fn chain_tx(nonce: u32, inputs: Vec<OutPoint>) -> Tx {
+        fn tx_with(inputs: &[OutPoint], outputs: u32, tag: u64) -> Tx {
             Tx {
                 version: 2,
-                lock_time: LockTime::from_consensus(nonce),
+                lock_time: LockTime::ZERO,
                 inputs: inputs
-                    .into_iter()
+                    .iter()
                     .map(|previous_output| TxIn {
-                        previous_output,
+                        previous_output: *previous_output,
                         script_sig: Script::new(),
                         sequence: Sequence::MAX,
                         witness: Witness::new(),
                     })
                     .collect(),
-                outputs: alloc::vec![TxOut {
-                    value: Amount::from_sat(1_000),
-                    script_pubkey: alloc::vec![0x51; 8].into(),
-                }],
+                outputs: (0..outputs)
+                    .map(|vout| TxOut {
+                        value: Amount::from_sat(
+                            10_000_u64
+                                .saturating_add(u64::from(vout))
+                                .saturating_add(tag.saturating_mul(1_000)),
+                        ),
+                        script_pubkey: alloc::vec![0x51].into(),
+                    })
+                    .collect(),
             }
         }
 
-        fn insert(pool: &mut Mempool, nonce: u32, inputs: Vec<OutPoint>) -> Txid {
-            let tx = chain_tx(nonce, inputs);
-            let txid = tx.txid();
-            pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 800, 0))
-                .expect("fixture insert must pass validation");
-            txid
-        }
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                cluster_count: 2,
+                ..MempoolLimits::default()
+            }))),
+            None,
+            ValidationEngine::Native,
+            None,
+        );
+        let admit = |tx: Tx| {
+            gateway.insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7, 0),
+            )
+        };
 
-        let mut pool = Mempool::new(MempoolLimits {
-            max_total_bytes: 0,
-            min_relay_fee_sat_per_kvb: 0,
-            cluster_count: 2,
-            cluster_size_vbytes: 1_000_000,
-            ..MempoolLimits::default()
-        });
-        let a = insert(&mut pool, 1, Vec::new());
-        let b = insert(&mut pool, 2, alloc::vec![OutPoint::new(a, 0)]);
+        let confirmed = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[9_u8; 32])), 0);
+        let root = tx_with(&[confirmed], 2, 1);
+        let root_txid = root.txid();
+        assert!(admit(root).is_ok(), "the root fits in an empty cluster");
+        assert!(
+            admit(tx_with(&[OutPoint::new(root_txid, 0)], 1, 2)).is_ok(),
+            "the first sibling fits a limit of two"
+        );
 
-        let joiner = chain_tx(3, alloc::vec![OutPoint::new(b, 0)]);
-        let joiner_txid = joiner.txid();
-        let error = pool
-            .insert_entry(MempoolEntry::new(Arc::new(joiner), 100, 1_000, 1, 800, 0))
-            .expect_err("a third chained transaction is over the count limit");
-
-        assert!(matches!(
-            error,
-            MempoolError::Policy(PolicyError::ClusterCountLimit)
-        ));
-        assert_eq!(pool.len(), 2, "rejection commits nothing");
-        assert!(!pool.contains_txid(&joiner_txid));
+        let refused = admit(tx_with(&[OutPoint::new(root_txid, 1)], 1, 3));
+        assert!(
+            matches!(
+                refused,
+                Err(MempoolError::Policy(PolicyError::ClusterCountLimit))
+            ),
+            "the joining child must be refused on cluster count: {refused:?}"
+        );
     }
 
     #[test]

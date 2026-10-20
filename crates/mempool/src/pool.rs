@@ -2716,6 +2716,10 @@ const fn cluster_within_limits(
 }
 
 /// Heap a single transaction owns, beyond the `Tx` struct itself.
+///
+/// Every byte buffer is charged at capacity, like Core's
+/// `RecursiveDynamicUsage`, so reserved-but-unfilled allocation still counts
+/// against the retained-memory gate.
 pub(crate) fn transaction_heap_usage(tx: &Tx) -> u64 {
     use core::mem::size_of;
 
@@ -2727,14 +2731,28 @@ pub(crate) fn transaction_heap_usage(tx: &Tx) -> u64 {
         u64::try_from(tx.outputs.capacity().saturating_mul(size_of::<TxOut>())).unwrap_or(u64::MAX),
     );
     for input in &tx.inputs {
-        total = total.saturating_add(u64::try_from(input.script_sig.len()).unwrap_or(u64::MAX));
+        total =
+            total.saturating_add(u64::try_from(input.script_sig.capacity()).unwrap_or(u64::MAX));
         total = total.saturating_add(
-            u64::try_from(input.witness.iter().map(std::vec::Vec::len).sum::<usize>())
-                .unwrap_or(u64::MAX),
+            u64::try_from(
+                input
+                    .witness
+                    .capacity()
+                    .saturating_mul(size_of::<Vec<u8>>())
+                    .saturating_add(
+                        input
+                            .witness
+                            .iter()
+                            .map(std::vec::Vec::capacity)
+                            .sum::<usize>(),
+                    ),
+            )
+            .unwrap_or(u64::MAX),
         );
     }
     for output in &tx.outputs {
-        total = total.saturating_add(u64::try_from(output.script_pubkey.len()).unwrap_or(u64::MAX));
+        total = total
+            .saturating_add(u64::try_from(output.script_pubkey.capacity()).unwrap_or(u64::MAX));
     }
     total
 }

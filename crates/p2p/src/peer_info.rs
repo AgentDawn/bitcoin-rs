@@ -246,27 +246,53 @@ mod tests {
 
     #[test]
     fn peer_table_projection_keeps_remote_and_bind_apart() {
-        use crate::{PeerLease, PeerTable};
+        use crate::peer_table::PeerTable;
 
-        let table = PeerTable::new();
-        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 51_234);
-        let (tx, _rx) = crossbeam_channel::bounded::<crate::QueuedFrame>(8);
-        let lease = PeerLease::new(tx);
-        table.register(remote, lease.clone());
-        let info =
-            PeerInfo::inbound_from_version(remote, bind, &fake_version(), 100, 50, counters());
-        assert!(table.publish_info(remote, &lease, info));
+        let table = PeerTable::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        assert!(!table.register(peer, lease.clone()));
+        assert!(
+            table.publish_info(
+                peer,
+                &lease,
+                PeerInfo::inbound_from_version(peer, bind, &fake_version(), 0, 0, counters())
+            ),
+            "the live connection publishes"
+        );
 
         let infos = table.infos();
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].addr, remote);
+        assert_eq!(infos[0].addr, peer);
         assert_eq!(infos[0].addr_bind, bind);
-        assert_ne!(
-            infos[0].addr, infos[0].addr_bind,
-            "the projection must not collapse the two ends of the connection"
+        assert_ne!(infos[0].addr, infos[0].addr_bind);
+    }
+
+    #[test]
+    fn constructors_preserve_direction_and_handshake_metadata() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let version = fake_version();
+        let counters = counters();
+        let inbound =
+            PeerInfo::inbound_from_version(addr, addr, &version, 100, 50, Arc::clone(&counters));
+        let outbound = PeerInfo::outbound_from_version(addr, addr, &version, 100, 50, counters);
+        assert!(inbound.inbound);
+        assert!(!outbound.inbound);
+        assert_eq!(outbound.start_height, 7);
+        assert_eq!(outbound.best_known_height, 7);
+        assert_eq!(outbound.conn_time, 100);
+        assert_eq!(outbound.time_offset, -50);
+        assert!(!outbound.wtxid_relay);
+        assert!(!outbound.compact_block_relay);
+        assert_eq!(
+            PeerInfo {
+                inbound: false,
+                ..inbound
+            },
+            outbound
         );
-        assert!(infos[0].inbound);
     }
 
     #[test]

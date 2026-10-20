@@ -676,32 +676,24 @@ mod tests {
     fn a_zero_byte_read_stamps_nothing_while_a_single_byte_write_counts() {
         let counters = Arc::new(PeerCounters::default());
         let mut stream =
-            CountingStream::new(std::io::Cursor::new(Vec::new()), Arc::clone(&counters));
+            CountingStream::new(std::io::Cursor::new(vec![7_u8; 8]), Arc::clone(&counters));
 
-        let mut byte = [0_u8; 1];
+        let mut empty: [u8; 0] = [];
         let read = stream
-            .read(&mut byte)
-            .unwrap_or_else(|error| panic!("read failed: {error}"));
+            .read(&mut empty)
+            .unwrap_or_else(|error| panic!("zero-length read failed: {error}"));
         assert_eq!(read, 0);
+        assert_eq!(counters.bytes_sent(), 0);
         assert_eq!(counters.bytes_recv(), 0);
-        assert_eq!(
-            counters.last_recv(),
-            0,
-            "a zero-byte read must not stamp a receive time"
-        );
+        assert_eq!(counters.last_send(), 0);
+        assert_eq!(counters.last_recv(), 0);
 
         let written = stream
-            .write(&[0xA5])
-            .unwrap_or_else(|error| panic!("write failed: {error}"));
+            .write_vectored(&[IoSlice::new(&[9_u8; 1])])
+            .unwrap_or_else(|error| panic!("single-byte write failed: {error}"));
         assert_eq!(written, 1);
         assert_eq!(counters.bytes_sent(), 1);
-        assert_ne!(
-            counters.last_send(),
-            0,
-            "a counted byte must stamp a send time"
-        );
-        assert_eq!(counters.bytes_recv(), 0);
-        assert_eq!(counters.last_recv(), 0);
+        assert_ne!(counters.last_send(), 0);
     }
 
     #[test]

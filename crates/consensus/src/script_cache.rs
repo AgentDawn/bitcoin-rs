@@ -146,7 +146,21 @@ impl<'a> WindowCacheTakes<'a> {
 
     /// Restores every entry this window took, in take order.
     pub fn rollback(self) {
-        for (wtxid, flags) in self.taken {
+        self.rollback_to(0);
+    }
+
+    /// Marks the current end of the take log; a later
+    /// [`Self::rollback_to`] with this mark restores only later takes.
+    pub fn checkpoint(&self) -> usize {
+        self.taken.len()
+    }
+
+    /// Restores every entry taken at or after `pos`, in take order. A past
+    /// mark restores the takes of blocks that never committed while the
+    /// committed prefix stays consumed; a mark past the end restores
+    /// nothing.
+    pub fn rollback_to(self, pos: usize) {
+        for (wtxid, flags) in self.taken.into_iter().skip(pos) {
             self.cache.insert(wtxid, flags);
         }
     }

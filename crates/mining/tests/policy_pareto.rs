@@ -868,7 +868,7 @@ fn projected_selection_treats_staged_parent_as_confirmed_for_bip68() -> Result<(
     insert_forged(&mut pool, child_tx, Forged::new(10_000, 400, 100))?;
 
     let ctx = context();
-    let live = select_template_body(&pool, &ctx, PAYOUT)?;
+    let live = select_template_body(&pool, &ctx, PAYOUT, None)?;
     assert!(
         live.transactions.is_empty(),
         "unconfirmed relative lock must skip the whole chunk live"
@@ -883,7 +883,7 @@ fn projected_selection_treats_staged_parent_as_confirmed_for_bip68() -> Result<(
     let projected = select_template_body_after(&pool, &plan, &ctx, PAYOUT)?;
 
     pool.remove_for_block(&[&block.txs[0]], &[parent_txid], ctx.height, 0);
-    let actual = select_template_body(&pool, &ctx, PAYOUT)?;
+    let actual = select_template_body(&pool, &ctx, PAYOUT, None)?;
 
     let projected_txids: Vec<Txid> = projected
         .transactions
