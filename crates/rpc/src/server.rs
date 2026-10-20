@@ -103,24 +103,48 @@ impl RpcServer {
         self,
         shutdown: impl Into<bitcoin_rs_chain::LatchReader>,
     ) -> io::Result<()> {
-        let shutdown = shutdown.into();
+        self.serve_accept_loop(&shutdown.into(), TcpListener::accept)
+    }
+
+    fn serve_accept_loop(
+        self,
+        shutdown: &bitcoin_rs_chain::LatchReader,
+        mut accept: impl FnMut(&TcpListener) -> io::Result<(TcpStream, SocketAddr)>,
+    ) -> io::Result<()> {
         let _stop = RpcStop(Arc::clone(&self.handler));
         self.handler
             .configure_blocking_admission(per_source_limit(self.max_connections));
         self.listener.set_nonblocking(true)?;
         let active = Arc::new(Mutex::new(ActiveConnections::default()));
         while !shutdown.is_triggered() {
-            match self.listener.accept() {
+            match accept(&self.listener) {
                 Ok((stream, addr)) => {
-                    stream.set_nonblocking(false)?;
-                    if let Err(error) = self.handle_accept(&active, stream, addr.ip()) {
+                    if let Err(error) = stream
+                        .set_nonblocking(false)
+                        .and_then(|()| self.handle_accept(&active, stream, addr.ip()))
+                    {
                         debug!(%error, "rpc connection setup failed");
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(POLL_INTERVAL);
                 }
-                Err(error) => return Err(error),
+                Err(error) => match error.kind() {
+                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {
+                        debug!(%error, "rpc accept interrupted or connection aborted");
+                    }
+                    io::ErrorKind::InvalidInput | io::ErrorKind::NotConnected => return Err(error),
+                    _ => {
+                        // Resource exhaustion (including EMFILE/ENFILE) and
+                        // pending network errors need not invalidate the listener.
+                        // Linux may report EOPNOTSUPP (Unsupported) for a new
+                        // connection, so that kind must also remain retryable.
+                        // Back off unknown OS errors too, avoiding a busy loop,
+                        // and recheck shutdown before the next accept attempt.
+                        warn!(%error, "rpc accept failed; retrying after backoff");
+                        thread::sleep(POLL_INTERVAL);
+                    }
+                },
             }
         }
         // Drop cancels the new blocking RPC capabilities even when only this
@@ -1654,6 +1678,109 @@ mod tests {
         std::thread::sleep(core::time::Duration::from_millis(150));
         shutdown.store(true, Ordering::Release);
         handle.join().expect("join serve thread")
+    }
+
+    fn accept_test_server() -> io::Result<RpcServer> {
+        RpcServer::bind(
+            "127.0.0.1:0",
+            Arc::new(Auth::basic("alice", "secret")),
+            Arc::new(Handler::new(Arc::new(Context::new()))),
+            4,
+            Duration::from_secs(1),
+            false,
+        )
+    }
+
+    // Inject at the syscall boundary, without exhausting the test process's
+    // descriptors. The listener and subsequent HTTP worker remain real.
+    #[test]
+    fn accept_recovers_from_resource_and_connection_errors() -> io::Result<()> {
+        let server = accept_test_server()?;
+        let addr = server.local_addr()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            let mut errors = vec![
+                io::Error::from(io::ErrorKind::Interrupted),
+                io::Error::from(io::ErrorKind::ConnectionAborted),
+                io::Error::from(io::ErrorKind::ConnectionReset),
+                io::Error::from(io::ErrorKind::PermissionDenied),
+                io::Error::from(io::ErrorKind::Unsupported),
+                io::Error::other("pending protocol error"),
+            ];
+            #[cfg(unix)]
+            errors.extend([
+                io::Error::from_raw_os_error(rustix::io::Errno::MFILE.raw_os_error()),
+                io::Error::from_raw_os_error(rustix::io::Errno::NFILE.raw_os_error()),
+            ]);
+            #[cfg(target_os = "linux")]
+            {
+                let error =
+                    io::Error::from_raw_os_error(rustix::io::Errno::OPNOTSUPP.raw_os_error());
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                errors.push(error);
+            }
+            #[cfg(windows)]
+            errors.push(io::Error::from_raw_os_error(10024)); // WSAEMFILE
+            let mut errors = errors.into_iter();
+            let start = Instant::now();
+            server.serve_accept_loop(&stop.into(), |listener| {
+                if let Some(error) = errors.next() {
+                    return Err(error);
+                }
+                assert!(start.elapsed() >= POLL_INTERVAL * 3);
+                listener.accept()
+            })
+        });
+        let response = (|| -> io::Result<String> {
+            let mut client = TcpStream::connect(addr)?;
+            client.set_read_timeout(Some(Duration::from_secs(5)))?;
+            client.write_all(
+                b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )?;
+            let mut response = String::new();
+            client.read_to_string(&mut response)?;
+            Ok(response)
+        })();
+        shutdown.store(true, Ordering::Release);
+        handle.join().expect("accept thread")?;
+        assert!(response?.starts_with("HTTP/1.1 401"));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_accept_errors_back_off_and_observe_shutdown() -> io::Result<()> {
+        let server = accept_test_server()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+        let start = Instant::now();
+        let mut attempts = 0;
+        server.serve_accept_loop(&shutdown.into(), |_| {
+            attempts += 1;
+            if attempts == 3 {
+                stop.store(true, Ordering::Release);
+            }
+            Err(io::Error::other("resource temporarily exhausted"))
+        })?;
+        assert_eq!(attempts, 3);
+        assert!(start.elapsed() >= POLL_INTERVAL * 3);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_listener_errors_are_returned() -> io::Result<()> {
+        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::NotConnected] {
+            let server = accept_test_server()?;
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut attempts = 0;
+            let result = server.serve_accept_loop(&shutdown.into(), |_| {
+                attempts += 1;
+                Err(kind.into())
+            });
+            assert_eq!(result.expect_err("fatal listener error").kind(), kind);
+            assert_eq!(attempts, 1);
+        }
+        Ok(())
     }
 
     #[test]

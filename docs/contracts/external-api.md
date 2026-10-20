@@ -1038,6 +1038,17 @@ evidence does not establish mainnet memory or throughput qualifications.
   `busy`. A source is an address, so clients behind loopback, a Docker gateway
   or a reverse proxy share one. Pools below four workers keep no per-source
   share.
+  - Interrupted and aborted accepts retry immediately. Other accept errors,
+    including descriptor exhaustion and Linux's pending-connection `EOPNOTSUPP`
+    (`Unsupported`), warn and retry after 100 ms; shutdown is checked before
+    each attempt. Invalid-input and not-connected
+    listener errors remain fatal. Accepted-socket setup failures drop only that
+    connection. The node logs a listener exit before shutdown immediately,
+    while retaining the I/O result for its normal shutdown join.
+    Proof: `rpc::server::tests::accept_recovers_from_resource_and_connection_errors`,
+    `repeated_accept_errors_back_off_and_observe_shutdown`, and
+    `invalid_listener_errors_are_returned`. These inject accept errors and use a
+    real listener/HTTP worker; they do not exhaust process or system descriptors.
   - Once the server starts reading a request, its head must complete within
     10 s and its body within 60 s, however slowly the bytes arrive.
   - Waiting for the next keep-alive request keeps the listener's idle timeout

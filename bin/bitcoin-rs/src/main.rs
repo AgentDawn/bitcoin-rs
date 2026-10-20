@@ -128,6 +128,81 @@ mod tests {
     }
 
     #[test]
+    fn mempool_persistence_resolves_toml_environment_and_cli() -> anyhow::Result<()> {
+        let config = load_file(
+            "--config",
+            "persist_mempool = false\n",
+            &[],
+            std::iter::empty(),
+        )?;
+        assert!(!config.persist_mempool);
+        let config = load_file(
+            "--config",
+            "persist_mempool = true\n",
+            &[],
+            [(
+                OsString::from("BITCOIN_RS_PERSIST_MEMPOOL"),
+                OsString::from("false"),
+            )]
+            .into_iter(),
+        )?;
+        assert!(!config.persist_mempool);
+        let config = resolved(
+            &["bitcoin-rs", "--persist-mempool=true"],
+            &[("BITCOIN_RS_PERSIST_MEMPOOL", "false")],
+        );
+        assert!(config.persist_mempool);
+        assert!(!resolved(&["bitcoin-rs", "--persist-mempool=false"], &[]).persist_mempool);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_max_mb = 128\n",
+            &[],
+            std::iter::empty(),
+        )?;
+        assert_eq!(config.mempool_snapshot_max_bytes, 128 * 1024 * 1024);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_max_mb = 128\n",
+            &[],
+            [(
+                OsString::from("BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB"),
+                OsString::from("256"),
+            )]
+            .into_iter(),
+        )?;
+        assert_eq!(config.mempool_snapshot_max_bytes, 256 * 1024 * 1024);
+        let config = resolved(
+            &["bitcoin-rs", "--mempool-snapshot-max-mb=512"],
+            &[("BITCOIN_RS_MEMPOOL_SNAPSHOT_MAX_MB", "256")],
+        );
+        assert_eq!(config.mempool_snapshot_max_bytes, 512 * 1024 * 1024);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_restore_timeout_secs = 120\n",
+            &[],
+            std::iter::empty(),
+        )?;
+        assert_eq!(config.mempool_snapshot_restore_timeout_secs, 120);
+        let config = load_file(
+            "--config",
+            "mempool_snapshot_restore_timeout_secs = 120\n",
+            &[],
+            [(
+                OsString::from("BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS"),
+                OsString::from("180"),
+            )]
+            .into_iter(),
+        )?;
+        assert_eq!(config.mempool_snapshot_restore_timeout_secs, 180);
+        let config = resolved(
+            &["bitcoin-rs", "--mempool-snapshot-restore-timeout-secs=240"],
+            &[("BITCOIN_RS_MEMPOOL_SNAPSHOT_RESTORE_TIMEOUT_SECS", "180")],
+        );
+        assert_eq!(config.mempool_snapshot_restore_timeout_secs, 240);
+        Ok(())
+    }
+
+    #[test]
     fn bitcoin_conf_is_overridden_by_cli() {
         let config = load_file(
             "--bitcoin-conf",

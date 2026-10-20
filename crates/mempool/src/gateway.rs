@@ -1407,6 +1407,16 @@ impl MempoolGateway {
         self.apply_prioritise(&mut pool, txid, fee_delta)
     }
 
+    /// A successful P2P getdata response completes initial broadcast of this
+    /// exact witness body. Membership and its public sequence do not change.
+    pub fn mark_broadcast(&self, wtxid: bitcoin_rs_primitives::Wtxid) {
+        self.pool.write().set_unbroadcast(wtxid, false);
+    }
+
+    pub(crate) fn restore_unbroadcast(&self, wtxid: bitcoin_rs_primitives::Wtxid) {
+        self.pool.write().set_unbroadcast(wtxid, true);
+    }
+
     /// Atomically rejects pooled dust before applying a fee overlay.
     pub fn prioritise_if_not_dust(
         &self,
@@ -1462,6 +1472,17 @@ impl MempoolGateway {
             let mut pool = self.pool.write();
             let outcome = mutate(&mut pool)?;
             if let Some(result) = mutation(&outcome) {
+                if matches!(origin, AdmissionOrigin::Rpc | AdmissionOrigin::Esplora) {
+                    for change in &result.changes {
+                        if matches!(change.outcome, crate::MutationOutcome::Accepted)
+                            && let Some(wtxid) = pool
+                                .entry_by_txid(&Txid(change.txid))
+                                .map(|entry| entry.wtxid)
+                        {
+                            pool.set_unbroadcast(wtxid, true);
+                        }
+                    }
+                }
                 self.update_admission_lifecycle(&pool, result);
                 if !result.changes.is_empty() && self.observer.is_some() {
                     let mut publish = self.publish.lock();

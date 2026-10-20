@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn chain_frontier_uses_captured_applied_tip_during_advance() -> TestResult {
+    let (tree, blocks) = mined_chain(2, 1)?;
+    let mut harness = SyncHarness::new(tree);
+    harness.sync.chain.bootstrap_genesis();
+    let header_tip = harness.block_tree.write().tip_handle();
+    let old_header = header_tip.load_full().ok_or("missing header tip")?;
+    let old_applied = harness.applied_tip.load_full().ok_or("missing genesis")?;
+    let advanced = {
+        let tree = harness.block_tree.read();
+        let id = tree
+            .lookup(Hash256::from(blocks[0].block_hash()))
+            .ok_or("missing child")?;
+        let node = tree.node(id)?;
+        Arc::new(TipSnapshot {
+            tip_id: id,
+            chain_tx_count: node.chain_tx_count,
+            height: node.height,
+            chainwork: node.chainwork,
+            hash: node.hash,
+        })
+    };
+    let chain = TestChain::new(
+        header_tip,
+        Arc::clone(&harness.applied_tip),
+        Arc::clone(&harness.block_tree),
+    );
+    *chain.scripted_tip_update.lock() = Some((old_header, Arc::clone(&advanced)));
+    harness.sync.chain = Arc::new(chain);
+
+    let frontier = harness.sync.observe_chain_frontier();
+
+    assert_eq!(
+        frontier.applied_tip.as_ref().map(|tip| tip.hash),
+        Some(old_applied.hash)
+    );
+    assert_eq!(
+        harness.applied_tip.load_full().as_ref().map(|tip| tip.hash),
+        Some(advanced.hash)
+    );
+    assert_eq!(
+        frontier.next_required.map(|body| (body.height, body.hash)),
+        Some((1, Hash256::from(blocks[0].block_hash()))),
+        "the required body must follow the captured applied tip, not the later publication"
+    );
+    Ok(())
+}
+
+#[test]
 fn request_frontier_retains_parent_plan_on_height_gaps() -> TestResult {
     let mut tree = BlockTree::new();
     let root = tree.insert_node(None, genesis_header(), NodeStatus::HeaderValid)?;
@@ -139,6 +187,40 @@ fn pending_reorg_frontier_is_first_connect_node() -> TestResult {
         harness.sync.next_expected_block(),
         Some((1, first_connect)),
         "the connect frontier must name the winner's first block, not the winner at applied+1"
+    );
+    Ok(())
+}
+
+#[test]
+fn chain_frontier_uses_captured_header_tip_during_branch_change() -> TestResult {
+    let (mut harness, applied, winning) = pending_reorg_fixture()?;
+    let header_tip = harness.block_tree.write().tip_handle();
+    let captured = header_tip.load_full().ok_or("missing winning header tip")?;
+    let replacement = Arc::new(applied);
+    let chain = TestChain::new(
+        header_tip,
+        Arc::clone(&harness.applied_tip),
+        Arc::clone(&harness.block_tree),
+    );
+    // Model publication falling back to the applied branch after the winning
+    // branch is abandoned, immediately after capturing the old header tip.
+    *chain.scripted_tip_update.lock() = Some((Arc::clone(&replacement), Arc::clone(&replacement)));
+    harness.sync.chain = Arc::new(chain);
+
+    let frontier = harness.sync.observe_chain_frontier();
+
+    assert_eq!(
+        frontier.chain_tip.as_ref().map(|tip| tip.hash),
+        Some(captured.hash)
+    );
+    assert_eq!(
+        harness.sync.chain.chain_tip().as_ref().map(|tip| tip.hash),
+        Some(replacement.hash)
+    );
+    assert_eq!(
+        frontier.next_required.map(|body| (body.height, body.hash)),
+        Some((1, Hash256::from(winning[0].block_hash()))),
+        "the captured winning branch must retain its first connect body"
     );
     Ok(())
 }

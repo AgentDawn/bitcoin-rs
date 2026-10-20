@@ -155,6 +155,8 @@ pub enum AdmissionOrigin {
     Rpc,
     /// Submitted through an Esplora raw-transaction broadcast route.
     Esplora,
+    /// Revalidated from the optional restart snapshot before services start.
+    Snapshot,
     /// Relayed in from a network peer.
     Peer(PeerToken),
     /// Re-admitted by a reorg's disconnect walk.
@@ -174,6 +176,8 @@ pub enum LocalOrigin {
     Rpc,
     /// Recorded as [`AdmissionOrigin::Esplora`].
     Esplora,
+    /// Recorded as [`AdmissionOrigin::Snapshot`].
+    Snapshot,
 }
 
 impl From<LocalOrigin> for AdmissionOrigin {
@@ -181,6 +185,7 @@ impl From<LocalOrigin> for AdmissionOrigin {
         match origin {
             LocalOrigin::Rpc => Self::Rpc,
             LocalOrigin::Esplora => Self::Esplora,
+            LocalOrigin::Snapshot => Self::Snapshot,
         }
     }
 }

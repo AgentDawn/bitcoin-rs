@@ -525,11 +525,10 @@ fn prove_window<'a, 'h>(
     );
     let mut prepared = Vec::with_capacity(blocks.len());
     for ((block, parsed), context) in blocks.iter().zip(parsed).zip(&contexts) {
-        let Ok((parsed, txids)) = parsed else {
+        let Ok((script_source, facts)) = parsed else {
             return ProvenWindow::default();
         };
-        let tx_plan = plan_block_transactions(block, &txids);
-        let facts = parsed.derive_facts(&block.txs, &txids);
+        let tx_plan = plan_block_transactions(block, facts.txids());
         let view = bitcoin_rs_consensus::BlockView::from_facts(&block.txs, facts);
         let resolved = Arc::new(ResolvedUtxoView::resolve(&overlay, block, &tx_plan));
         if overlay
@@ -544,7 +543,7 @@ fn prove_window<'a, 'h>(
             return ProvenWindow::default();
         }
         prepared.push(PreparedApply {
-            parsed,
+            script_source,
             view,
             tx_plan,
             resolved,
@@ -653,7 +652,7 @@ fn prove_window<'a, 'h>(
                 context.height,
                 context.locktime_cutoff,
                 context.flags,
-                &unit.parsed,
+                &unit.script_source,
                 takes.as_mut(),
             ) {
                 units.push(checks);
