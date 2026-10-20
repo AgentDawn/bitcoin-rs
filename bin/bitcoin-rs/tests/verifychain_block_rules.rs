@@ -18,6 +18,8 @@ fn coinbase_input_sigop_growth_agrees_with_core() -> Result<(), Box<dyn std::err
     let original: bitcoin::Block = bitcoin::consensus::encode::deserialize_hex(raw.as_str().ok_or("block hex")?)?;
     for opcode in [0xac, 0xae] {
         let mut block = original.clone();
+        block.header.prev_blockhash = original.block_hash();
+        block.header.time += 1;
         block.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0xac; 19_999]);
         let mut script = block.txdata[0].input[0].script_sig.as_bytes().to_vec();
         script.push(opcode);
