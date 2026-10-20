@@ -136,6 +136,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used)]
     fn enforced_cluster_count_rejects_a_joining_transaction() {
         use alloc::sync::Arc;
         use alloc::vec::Vec;
