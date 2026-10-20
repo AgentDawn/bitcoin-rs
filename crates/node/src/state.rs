@@ -575,7 +575,6 @@ impl crate::storage_backend::StoreConsumer for DerivedIndexComposer {
 struct TxIndexSpawn {
     spec: bitcoin_rs_index::runtime::DerivedIndexOpenSpec,
     generation: bitcoin_rs_index::runtime::Generation,
-    block_source: bitcoin_rs_index::runtime::IndexBlockSource,
     body_source: Arc<dyn BlockBodySource>,
     wake_rx: Receiver<()>,
     recovery_reporter: Arc<storage::RecoveryReporter>,

@@ -16,9 +16,9 @@ Owners:
 - `DerivedIndexQueryEngine` in `crates/index/src/runtime/query.rs` owns the shared
   snapshot gate and public query entrypoints. Its `query/transactions.rs` and
   `query/scripts.rs` modules own exact transaction resolution and script
-  traversal; `query.rs` itself owns block body access (`IndexBlockSource`) and
-  aggregate work accounting (`QueryBudget`). Active-chain block identity comes
-  from the engine's block tree.
+  traversal; the engine's body source owns block body access and `query.rs`
+  owns aggregate work accounting (`QueryBudget`). Active-chain block identity
+  comes from the engine's block tree.
 - Worker supervision and backend opening in `runtime/lifecycle.rs` and
   `runtime/startup.rs`; startup owns generation-checked publication.
 - Durable mutation: `IndexWriter` in `crates/index/src/index/write.rs`;
@@ -133,7 +133,8 @@ unneeded funding record lists when callers only require history records.
   across a reorg, or experiences a concurrent tip advance during read assembly,
   the query engine refuses the request with `TxQueryError::Retry` or
   `TxQueryError::Unavailable`. Stale, unconfirmed, or torn rows are never
-  returned to callers.
+  returned to callers. A body-store read failure is `TxQueryError::Storage`,
+  not a missing body.
 - `unspent_outputs` consumes the `ScriptLive` watermark only. The query holds
   chain-transition authority across watermark validation, live locator scan,
   and authoritative UTXO resolution. Apply mutates the UTXO set before

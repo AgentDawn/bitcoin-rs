@@ -280,11 +280,9 @@ impl QueryFixture {
                     source
                 })
             });
-        let block_source = IndexBlockSource::default();
         let engine = DerivedIndexQueryEngine::new(
             Arc::clone(&runtime),
             reader,
-            block_source,
             bitcoin_rs_chain::BlockTreeReader::new(tree),
             bitcoin_rs_chain::TipReader::new(applied_tip),
             body_source,
@@ -563,6 +561,164 @@ fn transaction_reports_unavailable_when_indexed_body_is_missing()
     assert!(matches!(
         fixture.engine.transaction(&txid),
         Err(TxQueryError::Unavailable(_))
+    ));
+    Ok(())
+}
+
+/// Body source that fails every read with a cloned error, proving read
+/// failures surface as `Storage` rather than missing-body `Unavailable`.
+struct FailingBody {
+    error: bitcoin_rs_chain::BlockBodyReadError,
+}
+
+impl BlockBodySource for FailingBody {
+    fn block_body(
+        &self,
+        _height: u32,
+        _hash: BlockHash,
+    ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+        Err(self.error.clone())
+    }
+}
+
+/// Body source that reports every body as absent, proving `Ok(None)` stays
+/// missing-body `Unavailable` rather than becoming `Storage`.
+struct MissingBody;
+
+impl BlockBodySource for MissingBody {
+    fn block_body(
+        &self,
+        _height: u32,
+        _hash: BlockHash,
+    ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+        Ok(None)
+    }
+}
+
+fn engine_with_body_source(
+    block: &Block,
+    scans: Vec<ScanResponse>,
+    body_source: Option<Arc<dyn BlockBodySource>>,
+) -> Result<DerivedIndexQueryEngine, Box<dyn std::error::Error>> {
+    let mut tree = BlockTree::new();
+    let tip_id = tree.insert_header(block.header, NodeStatus::HeaderValid)?;
+    let node = tree.node(tip_id)?;
+    let tip = TipSnapshot {
+        tip_id,
+        height: node.height,
+        chainwork: node.chainwork,
+        hash: node.hash,
+        chain_tx_count: node.chain_tx_count,
+    };
+    let tree = Arc::new(RwLock::new(tree));
+    let applied_tip = Arc::new(ArcSwapOption::empty());
+    applied_tip.store(Some(Arc::new(tip.clone())));
+    let chain_transition = bitcoin_rs_chain::TransitionDomain::new().stable_read();
+    let (wake_tx, _wake_rx) = crossbeam_channel::bounded(4);
+    let runtime = Arc::new(DerivedIndexRuntime::new(wake_tx));
+    let reader = Arc::new(QueryReader {
+        snapshot: QuerySnapshot {
+            watermark: IndexWatermark {
+                height: tip.height,
+                hash: *tip.hash.as_byte_array(),
+            },
+            scans,
+            chain_transition: chain_transition.clone(),
+        },
+    });
+    Ok(DerivedIndexQueryEngine::new(
+        runtime,
+        reader,
+        bitcoin_rs_chain::BlockTreeReader::new(tree),
+        bitcoin_rs_chain::TipReader::new(applied_tip),
+        body_source,
+        QueryEngineLive {
+            utxo: None,
+            chain_transition: Some(chain_transition),
+            enabled: IndexCapabilities::ALL,
+        },
+    ))
+}
+
+fn engine_with_body_error(
+    block: &Block,
+    scans: Vec<ScanResponse>,
+    error: bitcoin_rs_chain::BlockBodyReadError,
+) -> Result<DerivedIndexQueryEngine, Box<dyn std::error::Error>> {
+    engine_with_body_source(block, scans, Some(Arc::new(FailingBody { error })))
+}
+
+#[test]
+fn transaction_reports_unavailable_when_body_source_returns_none()
+-> Result<(), Box<dyn std::error::Error>> {
+    let block = Network::Regtest.genesis_block();
+    let txid = block.txs[0].txid();
+    let prefix = TxidRow::scan_prefix(&txid);
+    let indexed_row = TxidRow::row(&txid, 0).to_db_row().to_vec();
+    let engine = engine_with_body_source(
+        &block,
+        vec![scan_response(
+            ColumnFamily::TxConfirmed,
+            prefix,
+            vec![(indexed_row, Vec::new())],
+            true,
+        )],
+        Some(Arc::new(MissingBody)),
+    )?;
+
+    assert!(matches!(
+        engine.transaction(&txid),
+        Err(TxQueryError::Unavailable(
+            TxUnavailableCause::BlockBodyMissing { height: 0 }
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
+fn transaction_reports_storage_when_body_read_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let block = Network::Regtest.genesis_block();
+    let txid = block.txs[0].txid();
+    let prefix = TxidRow::scan_prefix(&txid);
+    let indexed_row = TxidRow::row(&txid, 0).to_db_row().to_vec();
+    let engine = engine_with_body_error(
+        &block,
+        vec![scan_response(
+            ColumnFamily::TxConfirmed,
+            prefix,
+            vec![(indexed_row, Vec::new())],
+            true,
+        )],
+        bitcoin_rs_chain::BlockBodyReadError::Read("injected read failure".into()),
+    )?;
+
+    assert!(matches!(
+        engine.transaction(&txid),
+        Err(TxQueryError::Storage(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn transaction_reports_storage_when_body_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
+    let block = Network::Regtest.genesis_block();
+    let txid = block.txs[0].txid();
+    let prefix = TxidRow::scan_prefix(&txid);
+    let indexed_row = TxidRow::row(&txid, 0).to_db_row().to_vec();
+    let engine = engine_with_body_error(
+        &block,
+        vec![scan_response(
+            ColumnFamily::TxConfirmed,
+            prefix,
+            vec![(indexed_row, Vec::new())],
+            true,
+        )],
+        bitcoin_rs_chain::BlockBodyReadError::Corrupt("injected corruption".into()),
+    )?;
+
+    assert!(matches!(
+        engine.transaction(&txid),
+        Err(TxQueryError::Storage(_))
     ));
     Ok(())
 }

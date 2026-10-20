@@ -528,6 +528,9 @@ scanning and wallet interoperability remain unverified.
 - Sentinel `last == Some("")` (`/txs/mempool`) queries resolve mempool activity
   directly from mempool locators without scanning confirmed history or taking
   block metadata snapshot locks.
+- Index query refusals map to HTTP status by cause: `Retry` and `Unavailable`
+  (lag, reorg, disabled capability, missing or pruned block body) are 503;
+  `Storage` (a failed or corrupt body read, a corrupt index row) is 500.
 
 ### `API-10`: Broadcast and preview through the admission gateway
 
@@ -1178,7 +1181,12 @@ evidence does not establish mainnet memory or throughput qualifications.
   `crates/rpc/src/esplora.rs` tests
   `esplora_lives_only_under_the_api_prefix`,
   `api_is_the_public_electrs_directory`,
-  `esplora_is_the_mempool_backend_superset`.
+  `esplora_is_the_mempool_backend_superset`,
+  `parent_query_errors_and_republication_never_yield_a_cached_success`
+  (index refusal status by cause); `crates/index/src/runtime/query_tests.rs`
+  tests `transaction_reports_storage_when_body_read_fails`,
+  `transaction_reports_storage_when_body_is_corrupt`, and
+  `transaction_reports_unavailable_when_body_source_returns_none`.
 - `API-05` and `API-06`, existing:
   `crates/rpc/src/handlers/mining.rs` tests
   `generatetoaddress_projects_solved_hashes`,

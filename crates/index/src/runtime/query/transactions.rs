@@ -1,10 +1,11 @@
 //! Exact-identity block reads and transaction position verification.
 
 use super::{
-    Arc, Block, BlockHash, BlockTree, DerivedIndexQueryEngine, Hash256, MAX_SERIALIZED_BLOCK_BYTES,
-    OutPoint, QueryBudget, TipSnapshot, Tx, TxIndexSnapshot, TxPosition, TxPositionValue,
-    TxQueryError, TxUnavailableCause, Txid, deserialize,
+    Arc, Block, BlockTree, DerivedIndexQueryEngine, Hash256, MAX_SERIALIZED_BLOCK_BYTES, OutPoint,
+    QueryBudget, TipSnapshot, Tx, TxIndexSnapshot, TxPosition, TxPositionValue, TxQueryError,
+    TxUnavailableCause, Txid, deserialize,
 };
+use bitcoin_rs_primitives::BlockHash;
 
 impl DerivedIndexQueryEngine {
     pub(super) fn resolve_hash_at_height(
@@ -52,16 +53,20 @@ impl DerivedIndexQueryEngine {
         height: u32,
         hash: BlockHash,
     ) -> Result<Vec<u8>, TxQueryError> {
-        if let Some(body_source) = self.body_source.as_ref() {
-            if let Ok(Some(bytes)) = body_source.block_body(height, hash) {
-                return Ok(bytes);
-            }
+        let Some(body_source) = self.body_source.as_ref() else {
+            return Err(TxQueryError::Unavailable(
+                TxUnavailableCause::BlockBodyMissing { height },
+            ));
+        };
+        match body_source.block_body(height, hash) {
+            Ok(Some(bytes)) => Ok(bytes),
+            Ok(None) => Err(TxQueryError::Unavailable(
+                TxUnavailableCause::BlockBodyMissing { height },
+            )),
+            Err(error) => Err(TxQueryError::Storage(
+                format!("block body read failed at height {height}: {error}").into(),
+            )),
         }
-        self.block_source
-            .block_body_bytes_for(height, hash)
-            .ok_or_else(|| {
-                TxQueryError::Unavailable(TxUnavailableCause::BlockBodyMissing { height })
-            })
     }
 
     fn verify_block(bytes: &[u8], height: u32, hash: Hash256) -> Result<Block, TxQueryError> {

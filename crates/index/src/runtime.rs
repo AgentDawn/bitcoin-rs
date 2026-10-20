@@ -30,7 +30,7 @@ use crate::{
     writer::TxIndexWriter,
 };
 
-use bitcoin_rs_primitives::{Block, BlockHash, Hash256, OutPoint, Tx, Txid, deserialize};
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, Txid, deserialize};
 
 use crate::capabilities::{
     CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
@@ -81,9 +81,9 @@ mod startup;
 pub use startup::open_derived_index_store_on_worker;
 
 pub use capability::DerivedIndexCapability;
+pub use query::DerivedIndexQueryEngine;
 use query::IndexProgress;
 pub(crate) use query::QueryEngineLive;
-pub use query::{DerivedIndexQueryEngine, IndexBlockSource};
 
 /// Shared wake/revision/health state owned by `NodeState` and referenced by
 /// `Chainstate`, the worker thread, and the query engine.
