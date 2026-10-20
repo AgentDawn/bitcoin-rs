@@ -9,7 +9,7 @@ use super::{
     QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT, QUERY_SCAN_ROW_LIMIT, ScriptHash,
     ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, ScriptLiveScan,
     SpendingRecord, TipSnapshot, Tx, TxIndexScan, TxIndexScanRow, TxIndexSnapshot, TxPosition,
-    TxPositionValue, TxQueryError, Txid, deserialize,
+    TxPositionValue, TxQueryError, TxUnavailableCause, Txid, deserialize,
 };
 
 use hashbrown::HashMap;
@@ -81,7 +81,7 @@ impl QueryBudget {
     pub(super) fn next_scan_limit(&mut self) -> Result<PrefixScanLimit, TxQueryError> {
         if self.remaining_scans == 0 || self.remaining_rows == 0 || self.remaining_bytes == 0 {
             return Err(TxQueryError::Unavailable(
-                "txindex query work budget exhausted".into(),
+                TxUnavailableCause::RowBudgetExhausted,
             ));
         }
         self.remaining_scans -= 1;
@@ -97,7 +97,7 @@ impl QueryBudget {
     ) -> Result<Vec<TxIndexScanRow>, TxQueryError> {
         if !scan.complete {
             return Err(TxQueryError::Unavailable(
-                "txindex prefix scan truncated".into(),
+                TxUnavailableCause::PrefixScanTruncated,
             ));
         }
         self.charge_scan(scan.rows.len(), scan.encoded_bytes)?;
@@ -110,7 +110,7 @@ impl QueryBudget {
     ) -> Result<Vec<crate::ScriptLiveRow>, TxQueryError> {
         if !scan.complete {
             return Err(TxQueryError::Unavailable(
-                "txindex live prefix scan truncated".into(),
+                TxUnavailableCause::LivePrefixScanTruncated,
             ));
         }
         self.charge_scan(scan.rows.len(), scan.encoded_bytes)?;
@@ -120,7 +120,7 @@ impl QueryBudget {
     fn charge_scan(&mut self, rows: usize, encoded_bytes: usize) -> Result<(), TxQueryError> {
         if rows > self.remaining_rows || encoded_bytes > self.remaining_bytes {
             return Err(TxQueryError::Unavailable(
-                "txindex query work budget exceeded".into(),
+                TxUnavailableCause::RowBudgetExceeded,
             ));
         }
         self.remaining_rows -= rows;
@@ -131,7 +131,7 @@ impl QueryBudget {
     pub(super) fn reserve_body_read(&mut self, max_bytes: usize) -> Result<(), TxQueryError> {
         if self.remaining_body_reads == 0 || max_bytes > self.remaining_bytes {
             return Err(TxQueryError::Unavailable(
-                "txindex query body budget exhausted".into(),
+                TxUnavailableCause::BodyReadBudgetExhausted,
             ));
         }
         self.remaining_body_reads -= 1;
@@ -141,7 +141,7 @@ impl QueryBudget {
     pub(super) fn charge_body_bytes(&mut self, bytes: usize) -> Result<(), TxQueryError> {
         if bytes > self.remaining_bytes {
             return Err(TxQueryError::Unavailable(
-                "txindex query body budget exceeded".into(),
+                TxUnavailableCause::BodyBudgetExceeded,
             ));
         }
         self.remaining_bytes -= bytes;
@@ -257,14 +257,14 @@ impl DerivedIndexQueryEngine {
 
     fn query_health(&self) -> Result<(), TxQueryError> {
         if self.runtime.failed.load(Ordering::Acquire) {
-            return Err(TxQueryError::Unavailable(
+            return Err(TxQueryError::Unavailable(TxUnavailableCause::WorkerFailed(
                 self.runtime
                     .failure_message()
                     .unwrap_or_else(|| "txindex worker failed".into()),
-            ));
+            )));
         }
         if self.runtime.shutdown.load(Ordering::Acquire) {
-            return Err(TxQueryError::Unavailable("txindex worker stopped".into()));
+            return Err(TxQueryError::Unavailable(TxUnavailableCause::WorkerStopped));
         }
         Ok(())
     }
@@ -275,7 +275,7 @@ impl DerivedIndexQueryEngine {
         for capability in required.iter() {
             if !self.enabled.contains(capability) {
                 return Err(TxQueryError::Unavailable(
-                    capability.disabled_message().into(),
+                    TxUnavailableCause::CapabilityDisabled(capability),
                 ));
             }
         }
@@ -296,7 +296,9 @@ impl DerivedIndexQueryEngine {
         if required.contains(IndexCapability::CompactFilters)
             && let Some(reason) = self.runtime.compact_filter_failure.read().clone()
         {
-            return Err(TxQueryError::Unavailable(reason));
+            return Err(TxQueryError::Unavailable(
+                TxUnavailableCause::CompactFilterFailed(reason),
+            ));
         }
 
         // Live answers compose the index snapshot, the authoritative UTXO set,
@@ -309,9 +311,9 @@ impl DerivedIndexQueryEngine {
                 self.chain_transition
                     .as_ref()
                     .ok_or_else(|| {
-                        TxQueryError::Unavailable(
-                            "chain transition authority missing for ScriptLive".into(),
-                        )
+                        TxQueryError::Unavailable(TxUnavailableCause::MissingAuthority(
+                            "chain transition authority missing for ScriptLive",
+                        ))
                     })?
                     .lock(),
             )
@@ -362,7 +364,9 @@ impl DerivedIndexQueryEngine {
         if required.contains(IndexCapability::CompactFilters)
             && let Some(reason) = self.runtime.compact_filter_failure.read().clone()
         {
-            return Err(TxQueryError::Unavailable(reason));
+            return Err(TxQueryError::Unavailable(
+                TxUnavailableCause::CompactFilterFailed(reason),
+            ));
         }
         let tip_after = self.applied_tip.load_full();
         let revision_after = self.runtime.revision();
@@ -566,17 +570,23 @@ mod tests {
             encoded_bytes: 2,
             complete: false,
         });
-        assert!(
-            matches!(historical, Err(TxQueryError::Unavailable(reason)) if reason == "txindex prefix scan truncated")
-        );
+        assert!(matches!(
+            historical,
+            Err(TxQueryError::Unavailable(
+                TxUnavailableCause::PrefixScanTruncated
+            ))
+        ));
         let live = budget.accept_live_scan(ScriptLiveScan {
             rows: Vec::new(),
             encoded_bytes: 3,
             complete: false,
         });
-        assert!(
-            matches!(live, Err(TxQueryError::Unavailable(reason)) if reason == "txindex live prefix scan truncated")
-        );
+        assert!(matches!(
+            live,
+            Err(TxQueryError::Unavailable(
+                TxUnavailableCause::LivePrefixScanTruncated
+            ))
+        ));
         assert_eq!((budget.remaining_rows, budget.remaining_bytes), before);
     }
 

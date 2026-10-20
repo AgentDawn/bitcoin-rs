@@ -17,7 +17,7 @@ use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait, 
 use super::util::{ScanScript, parse_derivation_range, scan_descriptor};
 use bitcoin::hex::DisplayHex as _;
 
-use crate::context::{AppliedView, ChainControlError, Context, TxQueryError};
+use crate::context::{AppliedView, ChainControlError, Context, TxQueryError, TxUnavailableCause};
 use crate::convert::{
     self, compact_target_hex, i32_saturated, i64_saturated, i64_saturated_len, sat_to_btc,
     typed_to_sonic, typed_to_sonic_omitting_nulls,
@@ -764,9 +764,9 @@ struct FeeFields {
 
 fn resolve_per_tx_fees(ctx: &Context, block: &Block) -> Result<Vec<(u64, u64)>, TxQueryError> {
     let Some(derived_index) = ctx.indexes.derived_index.as_ref() else {
-        return Err(TxQueryError::Unavailable(
+        return Err(TxQueryError::Unavailable(TxUnavailableCause::Other(
             "transaction index disabled".into(),
-        ));
+        )));
     };
     let tx_count = block.txs.len().saturating_sub(1);
     let mut fees = Vec::with_capacity(tx_count);
@@ -776,9 +776,9 @@ fn resolve_per_tx_fees(ctx: &Context, block: &Block) -> Result<Vec<(u64, u64)>, 
             match derived_index.outpoint_value(&input.previous_output) {
                 Ok(Some(value)) => total_in = total_in.saturating_add(value),
                 Ok(None) => {
-                    return Err(TxQueryError::Unavailable(
+                    return Err(TxQueryError::Unavailable(TxUnavailableCause::Other(
                         "input value missing from complete index".into(),
-                    ));
+                    )));
                 }
                 Err(error) => return Err(error),
             }
@@ -787,7 +787,9 @@ fn resolve_per_tx_fees(ctx: &Context, block: &Block) -> Result<Vec<(u64, u64)>, 
             sum.saturating_add(output.value.to_sat())
         });
         let Some(fee) = total_in.checked_sub(total_out) else {
-            return Err(TxQueryError::Unavailable("negative fee".into()));
+            return Err(TxQueryError::Unavailable(TxUnavailableCause::Other(
+                "negative fee".into(),
+            )));
         };
         fees.push((fee, tx.weight()));
     }
@@ -920,24 +922,24 @@ fn utxo_size_inc_for_block(ctx: &Context, block: &Block) -> Result<i64, TxQueryE
         return Ok(size_inc);
     }
     let Some(derived_index) = ctx.indexes.derived_index.as_ref() else {
-        return Err(TxQueryError::Unavailable(
+        return Err(TxQueryError::Unavailable(TxUnavailableCause::Other(
             "transaction index disabled".into(),
-        ));
+        )));
     };
     for tx in block.txs.iter().skip(1) {
         for input in &tx.inputs {
             let Some(prev) = derived_index.transaction(&input.previous_output.txid)? else {
-                return Err(TxQueryError::Unavailable(
+                return Err(TxQueryError::Unavailable(TxUnavailableCause::Other(
                     "input transaction missing from complete index".into(),
-                ));
+                )));
             };
             let Some(output) = prev
                 .outputs
                 .get(usize::try_from(input.previous_output.vout).unwrap_or(usize::MAX))
             else {
-                return Err(TxQueryError::Unavailable(
+                return Err(TxQueryError::Unavailable(TxUnavailableCause::Other(
                     "input vout missing from complete index".into(),
-                ));
+                )));
             };
             let removed = i64::try_from(output_utxo_size(output)).unwrap_or(i64::MAX);
             size_inc = size_inc.saturating_sub(removed);
@@ -1212,7 +1214,9 @@ pub(crate) fn getblockfilter(ctx: &Arc<Context>, params: &Value) -> Result<Value
         use bitcoin_rs_index::TxQueryError;
         match error {
             TxQueryError::Retry => RpcError::Misc("Block filter index is still catching up; retry later".into()),
-            TxQueryError::Unavailable(reason) | TxQueryError::Storage(reason) =>
+            TxQueryError::Unavailable(cause) =>
+                RpcError::Misc(format!("Block filter index unavailable: {cause}")),
+            TxQueryError::Storage(reason) =>
                 RpcError::Misc(format!("Block filter index unavailable: {reason}")),
         }
     })?.ok_or_else(|| RpcError::Misc("Filter not found. This could be because the block was not connected to the active chain.".into()))?;

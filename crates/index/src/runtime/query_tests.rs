@@ -274,10 +274,7 @@ impl QueryFixture {
 
 #[test]
 fn unusable_worker_makes_queries_unavailable() -> Result<(), Box<dyn std::error::Error>> {
-    for (publish, expected) in [
-        (true, "injected worker failure"),
-        (false, "txindex worker stopped"),
-    ] {
+    for publish in [true, false] {
         let block = Network::Regtest.genesis_block();
         let txid = block.txs[0].txid();
         let fixture = QueryFixture::new(FixtureConfig {
@@ -292,10 +289,26 @@ fn unusable_worker_makes_queries_unavailable() -> Result<(), Box<dyn std::error:
             fixture.runtime.request_shutdown();
         }
 
-        assert!(matches!(
-            fixture.engine.transaction(&txid),
-            Err(TxQueryError::Unavailable(reason)) if reason == expected
-        ));
+        let result = fixture.engine.transaction(&txid);
+        if publish {
+            assert!(
+                matches!(
+                    &result,
+                    Err(TxQueryError::Unavailable(
+                        TxUnavailableCause::WorkerFailed(reason)
+                    )) if reason.as_str() == "injected worker failure"
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    &result,
+                    Err(TxQueryError::Unavailable(TxUnavailableCause::WorkerStopped))
+                ),
+                "{result:?}"
+            );
+        }
     }
     Ok(())
 }

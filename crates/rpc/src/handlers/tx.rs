@@ -895,7 +895,7 @@ mod tests {
 
     use super::{getrawtransaction, gettxout};
     use crate::Handler;
-    use crate::context::{Context, DerivedIndexQuery, TxQueryError};
+    use crate::context::{Context, DerivedIndexQuery, TxQueryError, TxUnavailableCause};
     use crate::error::RpcError;
     use bitcoin::hex::DisplayHex as _;
     use bitcoin_rs_index::block_log::BlockRecord;
@@ -1784,7 +1784,7 @@ mod tests {
         // refuse a call the scan can answer today.
         for error in [
             TxQueryError::Retry,
-            TxQueryError::Unavailable("worker stopped".into()),
+            TxQueryError::Unavailable(TxUnavailableCause::Other("worker stopped".into())),
             TxQueryError::Storage("disk full".into()),
         ] {
             let blocks = [distinct_block(1), distinct_block(2)];

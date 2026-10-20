@@ -662,7 +662,7 @@ fn getindexinfo_named_request_returns_only_that_index() -> Result<(), Box<dyn st
             &self,
         ) -> Result<bitcoin_rs_index::DerivedIndexInfo, bitcoin_rs_index::TxQueryError> {
             Err(bitcoin_rs_index::TxQueryError::Unavailable(
-                "history unavailable".into(),
+                bitcoin_rs_index::TxUnavailableCause::Other("history unavailable".into()),
             ))
         }
     }

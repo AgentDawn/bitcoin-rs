@@ -37,7 +37,7 @@ use crate::capabilities::{
 };
 use crate::query_api::{
     DerivedIndexInfo, DerivedIndexQuery, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
-    ScriptIndexSnapshot, SpendingRecord, TxQueryError,
+    ScriptIndexSnapshot, SpendingRecord, TxQueryError, TxUnavailableCause,
 };
 
 use bitcoin_rs_storage::{
@@ -403,14 +403,14 @@ impl DerivedIndexQueryAdapter {
         let snapshot = self.lifecycle.load_full();
         match &*snapshot {
             DerivedIndexLifecycle::Serving(engine) => Ok(Arc::clone(engine)),
-            DerivedIndexLifecycle::Opening => {
-                Err(TxQueryError::Unavailable("txindex is opening".into()))
-            }
-            DerivedIndexLifecycle::Failed(_) => {
-                Err(TxQueryError::Unavailable("txindex is unavailable".into()))
-            }
+            DerivedIndexLifecycle::Opening => Err(TxQueryError::Unavailable(
+                TxUnavailableCause::Other("txindex is opening".into()),
+            )),
+            DerivedIndexLifecycle::Failed(_) => Err(TxQueryError::Unavailable(
+                TxUnavailableCause::WorkerFailed("txindex is unavailable".into()),
+            )),
             DerivedIndexLifecycle::ShutdownAbandoned => Err(TxQueryError::Unavailable(
-                "txindex was abandoned at shutdown".into(),
+                TxUnavailableCause::Other("txindex was abandoned at shutdown".into()),
             )),
         }
     }

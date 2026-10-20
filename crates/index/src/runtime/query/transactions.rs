@@ -3,7 +3,7 @@
 use super::{
     Arc, Block, BlockHash, BlockTree, DerivedIndexQueryEngine, Hash256, MAX_SERIALIZED_BLOCK_BYTES,
     OutPoint, QueryBudget, TipSnapshot, Tx, TxIndexSnapshot, TxPosition, TxPositionValue,
-    TxQueryError, Txid, deserialize,
+    TxQueryError, TxUnavailableCause, Txid, deserialize,
 };
 
 impl DerivedIndexQueryEngine {
@@ -60,9 +60,7 @@ impl DerivedIndexQueryEngine {
         self.block_source
             .block_body_bytes_for(height, hash)
             .ok_or_else(|| {
-                TxQueryError::Unavailable(
-                    format!("block body missing for txindex query at height {height}").into(),
-                )
+                TxQueryError::Unavailable(TxUnavailableCause::BlockBodyMissing { height })
             })
     }
 
@@ -210,13 +208,13 @@ impl DerivedIndexQueryEngine {
 
     /// A row's absence is only proven when the index covers the chain from
     /// genesis; below a pruned prefix, answer `Unavailable` instead.
-    pub(super) fn none_below_floor<T>(floor: u32, family: &str) -> Result<Option<T>, TxQueryError> {
+    pub(super) fn none_below_floor<T>(
+        floor: u32,
+        family: &'static str,
+    ) -> Result<Option<T>, TxQueryError> {
         if floor > 0 {
             Err(TxQueryError::Unavailable(
-                format!(
-                    "{family} coverage starts at height {floor}; the pruned prefix is unproven"
-                )
-                .into(),
+                TxUnavailableCause::PrunedPrefixUnproven { family, floor },
             ))
         } else {
             Ok(None)

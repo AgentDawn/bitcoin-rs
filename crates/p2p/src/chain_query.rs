@@ -1414,7 +1414,9 @@ mod tests {
     fn a_resumed_filter_range_that_stops_before_its_first_filter_is_interrupted()
     -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::p2p::message_filter::GetCFilters;
-        use bitcoin_rs_index::{BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError};
+        use bitcoin_rs_index::{
+            BasicFilter, CompactFilterQuery, DerivedIndexInfo, TxQueryError, TxUnavailableCause,
+        };
 
         /// Reports `outcome` without ever delivering a filter.
         struct StopsAtOnce(Result<Option<[u8; 32]>, TxQueryError>);
@@ -1470,7 +1472,9 @@ mod tests {
         // Not published, unreadable, or a tip that moved under the snapshot.
         for outcome in [
             Ok(None),
-            Err(TxQueryError::Unavailable("index failed".into())),
+            Err(TxQueryError::Unavailable(TxUnavailableCause::Other(
+                "index failed".into(),
+            ))),
             Err(TxQueryError::Storage("read failed".into())),
         ] {
             assert!(
