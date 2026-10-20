@@ -39,11 +39,12 @@ fn coinbase_input_sigop_growth_agrees_with_core() -> Result<(), Box<dyn std::err
             "submitblock",
             &json!([bitcoin::consensus::encode::serialize_hex(&block)]),
         )?;
+        let native_verdict = verify_block_non_contextual(&native);
         println!(
             "A Core31.1 opcode={opcode:x} script_len={} weight={} native={:?} core={result}",
             block.txdata[0].input[0].script_sig.len(),
             block.weight().to_wu(),
-            verify_block_non_contextual(&native)
+            native_verdict
         );
         assert_eq!(
             result,
@@ -53,6 +54,20 @@ fn coinbase_input_sigop_growth_agrees_with_core() -> Result<(), Box<dyn std::err
                 json!("bad-blk-sigops")
             }
         );
+        if opcode == 0xac {
+            assert!(
+                native_verdict.is_ok(),
+                "native validation should accept 0xac: {native_verdict:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    native_verdict,
+                    Err(bitcoin_rs_consensus::ConsensusError::SigopsLimit { .. })
+                ),
+                "native validation should reject 0xae with sigops limit: {native_verdict:?}"
+            );
+        }
     }
     core.stop()?;
     Ok(())

@@ -89,8 +89,9 @@ state (`crates/mempool/src/orphan.rs`).
   removed along with their descendants. Normal submission plans capacity
   against the post-expiry pool, then commits acceptance before expiry and
   remaining capacity removals in the same writer interval and ordered batch.
-  Package insertion remains all-or-nothing and never capacity-evicts residents.
-  Expiry also runs during reorg trim; preview operations
+  Package insertion remains all-or-nothing, runs expiry after member inserts
+  using the max member entry time cutoff rather than wall-clock `now`, and
+  never capacity-evicts residents. Expiry also runs during reorg trim; preview operations
   never expire entries. If expiry removes an admitted member, admission
   returns a mempool-full error.
 - `Mempool::sequence_number` advances exactly once per emitted change while

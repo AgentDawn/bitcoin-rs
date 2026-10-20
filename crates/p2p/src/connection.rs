@@ -405,6 +405,7 @@ pub(crate) struct OutboundBudget {
     block_reserve: usize,
     pending_messages: AtomicUsize,
     pending_bytes: AtomicUsize,
+    refusals: AtomicUsize,
     /// Signalled when a credit releases or the writer exits.
     drained: Condvar,
     /// Serializes this connection's admissions and releases against each
@@ -434,6 +435,7 @@ impl OutboundBudget {
             block_reserve,
             pending_messages: AtomicUsize::new(0),
             pending_bytes: AtomicUsize::new(0),
+            refusals: AtomicUsize::new(0),
             drained: Condvar::new(),
             drained_lock: Mutex::new(()),
             writer_dead: AtomicBool::new(false),
@@ -461,16 +463,19 @@ impl OutboundBudget {
     pub(crate) fn try_charge(self: &Arc<Self>, wire_len: usize) -> Result<OutboundCredit, Refusal> {
         let _guard = self.drained_lock.lock();
         if self.writer_dead.load(Ordering::Acquire) {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::Local);
         }
         let messages = self.pending_messages.load(Ordering::Acquire);
         let bytes = self.pending_bytes.load(Ordering::Acquire);
         if messages >= self.max_messages || bytes >= self.max_bytes {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::Local);
         }
         if let Some(shared) = &self.shared
             && !shared.try_charge(wire_len, shared.max_bytes)
         {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::Shared);
         }
         Ok(self.commit_locked(wire_len))
@@ -487,11 +492,13 @@ impl OutboundBudget {
     pub(crate) fn try_reserve_production(self: &Arc<Self>) -> Result<OutboundCredit, Refusal> {
         let _guard = self.drained_lock.lock();
         if self.writer_dead.load(Ordering::Acquire) || !self.local_production_headroom() {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::Local);
         }
         if let Some(shared) = &self.shared
             && !shared.try_charge(self.block_reserve, shared.bulk_limit)
         {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::Shared);
         }
         Ok(self.commit_locked(self.block_reserve))
@@ -652,6 +659,13 @@ impl OutboundBudget {
             self.pending_messages.load(Ordering::Acquire),
             self.pending_bytes.load(Ordering::Acquire),
         )
+    }
+
+    /// Returns the count of charges and reservations refused on this budget.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn refusals(&self) -> usize {
+        self.refusals.load(Ordering::Acquire)
     }
 
     /// Snapshot: whether one more worst-case frame could be reserved right

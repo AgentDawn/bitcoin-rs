@@ -675,9 +675,10 @@ impl MempoolGateway {
         Err(SubmitError::RetryExhausted)
     }
 
-    /// Reports a post-admission full refusal if expiry removed an admitted
-    /// member. Admission plans publish acceptance before expiry in one atomic
-    /// commit, with capacity computed after expiry. Reorg bypass is unchanged.
+    /// Reports a post-admission full refusal if an admitted member is no longer
+    /// resident (e.g. removed by expiry or concurrent capacity trim). Admission plans
+    /// publish acceptance before expiry in one atomic commit, with capacity
+    /// computed after expiry. Reorg bypass is unchanged.
     pub(crate) fn check_admitted_residency(
         &self,
         origin: AdmissionOrigin,
@@ -3717,9 +3718,10 @@ mod tests {
     /// Residents stamped with time zero are older than the mempool lifetime
     /// against any wall clock, without sleeping.
     fn insert_stale(gateway: &MempoolGateway, tx: Arc<Tx>) {
+        let vsize = u32::try_from(tx.vsize()).unwrap_or(80);
         let inserted = gateway.insert_entry(
             AdmissionOrigin::Rpc,
-            MempoolEntry::new(tx, 100, 1_000, 0, 1, 0),
+            MempoolEntry::new(tx, vsize, 1_000, 0, 1, 0),
         );
         assert!(inserted.is_ok());
     }
@@ -3773,43 +3775,77 @@ mod tests {
     // submission is refused as full while its commit stays published.
     #[test]
     fn child_of_a_stale_parent_expires_with_it_and_is_refused_as_full() {
-        let (log, gateway) = batch_logged_gateway();
-        let (parent, child) = parent_and_child();
-        let (parent_txid, child_txid) = (parent.txid(), child.txid());
-        insert_stale(&gateway, Arc::new(parent));
-        let peer = AdmissionOrigin::Peer(source());
+        for package in [false, true] {
+            let log = Arc::new(ReorgBatchLog::default());
+            let observer: Arc<dyn crate::MempoolObserver> = log.clone();
+            let gateway = Arc::new(MempoolGateway::new(
+                Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits {
+                    max_total_bytes: 100,
+                    ..crate::MempoolLimits::default()
+                }))),
+                Some(observer),
+                ValidationEngine::Native,
+                None,
+            ));
+            let (parent, child) = {
+                let (parent, child) = parent_and_child();
+                let mut child_tx = (*child).clone();
+                child_tx.outputs[0].value = Amount::from_sat(4_000);
+                child_tx.outputs.push(child_tx.outputs[0].clone());
+                (parent, Arc::new(child_tx))
+            };
+            let (parent_txid, child_txid) = (parent.txid(), child.txid());
+            insert_stale(&gateway, Arc::new(parent));
+            let peer = AdmissionOrigin::Peer(source());
 
-        let now = unix_time_secs();
+            let now = unix_time_secs();
 
-        let outcome = gateway.submit_transaction(child, peer, None, now, &Coins(vec![]));
+            let err = if package {
+                gateway
+                    .submit_local_package(
+                        vec![(*child).clone()],
+                        LocalOrigin::Rpc,
+                        None,
+                        now,
+                        &Coins(vec![]),
+                    )
+                    .err()
+            } else {
+                gateway
+                    .submit_transaction(child, peer, None, now, &Coins(vec![]))
+                    .err()
+            };
 
-        assert_eq!(
-            outcome,
-            Err(SubmitError::Policy(AcceptanceRejectReason::Mempool(
-                crate::MempoolError::Full
-            )))
-        );
-        assert!(gateway.read().is_empty());
-        assert_eq!(gateway.recent_rejects_count(), 0);
-        assert_eq!(gateway.orphan_count(), 0);
-        assert!(!gateway.is_rejected(Hash256::from(child_txid)));
-        let batches = log.0.lock();
-        assert_eq!(
-            batches.len(),
-            2,
-            "stale insert, atomic child and expiry commit"
-        );
-        assert_eq!(
-            batches[1].1.first(),
-            Some(&(child_txid, crate::MutationOutcome::Accepted)),
-            "the refused child's commit stays published"
-        );
-        let (origin, changes) = &batches[1];
-        let removed = &changes[1..];
-        assert_eq!(*origin, peer);
-        assert_eq!(removed.len(), 2);
-        assert!(removed.contains(&expired(parent_txid)));
-        assert!(removed.contains(&expired(child_txid)));
+            assert_eq!(
+                err,
+                Some(SubmitError::Policy(AcceptanceRejectReason::Mempool(
+                    crate::MempoolError::Full
+                )))
+            );
+            assert!(
+                gateway.read().is_empty(),
+                "pool must be empty for package={package}"
+            );
+            assert_eq!(gateway.recent_rejects_count(), 0);
+            assert_eq!(gateway.orphan_count(), 0);
+            assert!(!gateway.is_rejected(Hash256::from(child_txid)));
+            let batches = log.0.lock();
+            assert_eq!(
+                batches.len(),
+                2,
+                "stale insert, atomic child and expiry commit"
+            );
+            assert_eq!(
+                batches[1].1.first(),
+                Some(&(child_txid, crate::MutationOutcome::Accepted)),
+                "the refused child's commit stays published"
+            );
+            let (_origin, changes) = &batches[1];
+            let removed = &changes[1..];
+            assert_eq!(removed.len(), 2);
+            assert!(removed.contains(&expired(parent_txid)));
+            assert!(removed.contains(&expired(child_txid)));
+        }
     }
 
     // Re-admission after a disconnect never expires: neither the reorg origin

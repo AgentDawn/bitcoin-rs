@@ -4,6 +4,7 @@ use crate::rbf::LimitEnforcement;
 use crate::standardness::AcceptanceRejectReason;
 use crate::{MempoolEntry, MempoolError, MutationResult, PolicyError};
 use alloc::vec::Vec;
+use bitcoin_rs_primitives::Txid;
 use hashbrown::HashSet;
 
 pub(crate) struct PreparedPackage {
@@ -25,12 +26,43 @@ impl Mempool {
             sum.checked_add(u64::from(entry.vsize))
                 .ok_or(PolicyError::FeeArithmetic)
         })?;
-        let expired_vsize = self
-            .expired_entry_ids(expiry_time)
+        let cutoff = expiry_time.saturating_sub(crate::policy::MEMPOOL_EXPIRY_SECS);
+        let expired_ids = self.expired_entry_ids(expiry_time);
+        let mut expired_txids: HashSet<Txid> = expired_ids
+            .iter()
+            .filter_map(|id| self.entry(*id).map(|e| e.txid))
+            .collect();
+        let mut expired_vsize = expired_ids
             .iter()
             .filter_map(|id| self.entry(*id))
             .map(|entry| u64::from(entry.vsize))
             .sum::<u64>();
+
+        let mut expired_pending_indices = HashSet::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (idx, entry) in entries.iter().enumerate() {
+                if expired_pending_indices.contains(&idx) {
+                    continue;
+                }
+                let is_expired_root = entry.time < cutoff;
+                let spends_expired = entry
+                    .tx
+                    .inputs
+                    .iter()
+                    .any(|input| expired_txids.contains(&input.previous_output.txid));
+                if is_expired_root || spends_expired {
+                    expired_pending_indices.insert(idx);
+                    expired_txids.insert(entry.txid);
+                    expired_vsize = expired_vsize
+                        .checked_add(u64::from(entry.vsize))
+                        .ok_or(PolicyError::FeeArithmetic)?;
+                    changed = true;
+                }
+            }
+        }
+
         let size = size
             .checked_sub(expired_vsize)
             .ok_or(PolicyError::FeeArithmetic)?;

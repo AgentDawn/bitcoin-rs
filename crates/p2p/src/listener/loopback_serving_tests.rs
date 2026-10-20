@@ -492,16 +492,18 @@ fn getblocktxn_survives_shared_saturation_without_resending() -> TestResult {
         frame_len,
         hog_item,
     )?;
-    let counters = counters_of(&victim_session)?;
-    let before = counters.bytes_recv();
+    let budget = victim_session.lease.budget_handle();
+    let before_refusals = budget.refusals();
     let started = Instant::now();
     victim.send(&request)?;
-    wait_until("getblocktxn read", || counters.bytes_recv() > before)?;
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("getblocktxn deferred on reservation refusal", || {
+        budget.refusals() > before_refusals
+    })?;
     println!(
-        "C saturated queued={queued:?} shared={} victim_pending={:?} elapsed_ms={}",
+        "C saturated queued={queued:?} shared={} victim_pending={:?} refusals={} elapsed_ms={}",
         node.aggregate.pending(),
-        victim_session.lease.budget_handle().pending(),
+        budget.pending(),
+        budget.refusals(),
         started.elapsed().as_millis()
     );
     drop(hog);

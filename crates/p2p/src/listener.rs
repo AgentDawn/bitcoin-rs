@@ -1848,6 +1848,8 @@ fn reply_bound(message: &crate::Message, getaddr_answerable: bool) -> Option<usi
     Some(crate::wire::HEADER_LEN + payload.min(crate::wire::MAX_MESSAGE_PAYLOAD))
 }
 
+/// Compact-block reconstruction messages (`CmpctBlock`, `BlockTxn`, `GetBlockTxn`)
+/// defer on local queue saturation rather than disconnecting.
 fn defers_on_local(message: &crate::Message) -> bool {
     matches!(
         message,
