@@ -111,7 +111,8 @@ The audit exercises the read-path operations that ScriptIndex callers use:
 
 The query mix is read-only. No write-path measurement is in scope.
 
-The derived index query engine is the read path.
+The derived index query engine is the only read path that proves a complete
+answer. The `Indexer` row scans above stay as low-level reads.
 
 ### Materiality rule
 
