@@ -90,12 +90,11 @@ impl DerivedIndexQueryEngine {
 
     pub(super) fn resolve_positioned_transaction(
         &self,
-        tip: &TipSnapshot,
         budget: &mut QueryBudget,
         height: u32,
+        hash: Hash256,
         position: TxPosition,
     ) -> Result<Option<Tx>, TxQueryError> {
-        let hash = self.resolve_hash_at_height(height, tip)?;
         let Some(body_source) = self.body_source.as_ref() else {
             return Ok(None);
         };
@@ -119,12 +118,11 @@ impl DerivedIndexQueryEngine {
 
     fn transaction_from_full_block(
         &self,
-        tip: &TipSnapshot,
         budget: &mut QueryBudget,
         height: u32,
+        hash: Hash256,
         txid: &Txid,
     ) -> Result<Option<Tx>, TxQueryError> {
-        let hash = self.resolve_hash_at_height(height, tip)?;
         let block = self.resolve_block(budget, height, hash)?;
         Ok(block
             .txs
@@ -173,21 +171,23 @@ impl DerivedIndexQueryEngine {
         for row in rows {
             let height = row.row.height();
             let Some(positions) = Self::validated_positions(&row.value) else {
+                let hash = self.resolve_hash_at_height(height, tip)?;
                 if let Some(transaction) =
-                    self.transaction_from_full_block(tip, budget, height, txid)?
+                    self.transaction_from_full_block(budget, height, hash, txid)?
                 {
                     return Ok(Some((height, transaction)));
                 }
                 continue;
             };
             let position = positions[0];
-            match self.resolve_positioned_transaction(tip, budget, height, position)? {
+            let hash = self.resolve_hash_at_height(height, tip)?;
+            match self.resolve_positioned_transaction(budget, height, hash, position)? {
                 Some(transaction) if transaction.txid() == *txid => {
                     return Ok(Some((height, transaction)));
                 }
                 _ => {
                     if let Some(transaction) =
-                        self.transaction_from_full_block(tip, budget, height, txid)?
+                        self.transaction_from_full_block(budget, height, hash, txid)?
                     {
                         return Ok(Some((height, transaction)));
                     }

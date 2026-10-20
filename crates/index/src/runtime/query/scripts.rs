@@ -73,8 +73,8 @@ impl DerivedIndexQueryEngine {
         let mut outputs = Vec::new();
         for row in rows {
             let height = row.row.height();
+            let hash = self.resolve_hash_at_height(height, tip)?;
             let Some(positions) = Self::validated_positions(&row.value) else {
-                let hash = self.resolve_hash_at_height(height, tip)?;
                 let block = self.resolve_block(budget, height, hash)?;
                 for transaction in &block.txs {
                     Self::collect_funding_outputs(transaction, height, scripthash, &mut outputs)?;
@@ -86,7 +86,7 @@ impl DerivedIndexQueryEngine {
             let mut complete = true;
             for &position in positions {
                 let Some(transaction) =
-                    self.resolve_positioned_transaction(tip, budget, height, position)?
+                    self.resolve_positioned_transaction(budget, height, hash, position)?
                 else {
                     complete = false;
                     break;
@@ -101,7 +101,6 @@ impl DerivedIndexQueryEngine {
             }
 
             outputs.truncate(row_start);
-            let hash = self.resolve_hash_at_height(height, tip)?;
             let block = self.resolve_block(budget, height, hash)?;
             for transaction in &block.txs {
                 Self::collect_funding_outputs(transaction, height, scripthash, &mut outputs)?;
@@ -126,10 +125,11 @@ impl DerivedIndexQueryEngine {
                 continue;
             }
             last_height = Some(height);
+            let hash = self.resolve_hash_at_height(height, tip)?;
             if let Some(positions) = Self::validated_positions(&row.value) {
                 for &position in positions {
                     let Some(transaction) =
-                        self.resolve_positioned_transaction(tip, budget, height, position)?
+                        self.resolve_positioned_transaction(budget, height, hash, position)?
                     else {
                         break;
                     };
@@ -138,7 +138,6 @@ impl DerivedIndexQueryEngine {
                     }
                 }
             }
-            let hash = self.resolve_hash_at_height(height, tip)?;
             let block = self.resolve_block(budget, height, hash)?;
             for transaction in &block.txs {
                 if let Some(record) = Self::spending_input(transaction, height, outpoint)? {
