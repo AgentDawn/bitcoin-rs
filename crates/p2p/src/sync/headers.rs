@@ -1258,7 +1258,7 @@ impl BlockSync {
         batch_len: usize,
     ) -> PresyncOutcome {
         let (failure, request_more, ready_headers, finished) =
-            match state.process(headers, batch_len >= crate::dispatch::MAX_HEADERS_RESPONSE) {
+            match state.process(headers, batch_len >= crate::wire::MAX_HEADERS_MESSAGE_COUNT) {
                 Ok(result) => (
                     None,
                     result.request_more,

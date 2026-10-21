@@ -1831,7 +1831,7 @@ const fn closed_queue() -> crate::wire::PeerError {
 fn reply_bound(message: &crate::Message, getaddr_answerable: bool) -> Option<usize> {
     let payload = match message {
         crate::Message::Ping(_) => 8,
-        crate::Message::GetHeaders(_) => 3 + crate::dispatch::MAX_HEADERS_RESPONSE * 81,
+        crate::Message::GetHeaders(_) => 3 + crate::wire::MAX_HEADERS_MESSAGE_COUNT * 81,
         crate::Message::GetAddr if getaddr_answerable => {
             3 + crate::wire::MAX_ADDR_MESSAGE_COUNT * 33
         }

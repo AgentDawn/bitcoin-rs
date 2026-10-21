@@ -14,11 +14,11 @@ use super::super::default_sync_budget;
 use super::super::headers_presync::HeadersSyncPhase;
 use super::super::headers_presync::HeadersSyncState;
 use super::*;
-use crate::dispatch::MAX_HEADERS_RESPONSE;
+use crate::wire::MAX_HEADERS_MESSAGE_COUNT;
 
 /// The wire page size a full `headers` message must fill to keep a
 /// download-twice sync in its collection phase.
-const PAGE: usize = MAX_HEADERS_RESPONSE;
+const PAGE: usize = MAX_HEADERS_MESSAGE_COUNT;
 
 /// Work units one regtest-easy header mints (measured, not assumed: see
 /// the assertion in the first test).

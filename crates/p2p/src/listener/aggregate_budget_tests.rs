@@ -155,7 +155,7 @@ fn reply_bound_covers_actual_replies() -> TestResult {
     ));
     let full_headers = Message::Headers(vec![
         Header::default();
-        crate::dispatch::MAX_HEADERS_RESPONSE
+        crate::wire::MAX_HEADERS_MESSAGE_COUNT
     ]);
     assert_eq!(
         reply_bound(&get_headers, false),
