@@ -819,6 +819,7 @@ mod tests {
         assert!(!state.is_rejected(Hash256::from(first.txid())));
         state.clear_rejects();
         assert_eq!(state.rejects_len(), 0);
+        assert!(state.reject_order.is_empty());
         assert!(!state.is_rejected(Hash256::from(second.txid())));
     }
 
