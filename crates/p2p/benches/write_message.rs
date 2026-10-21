@@ -33,8 +33,8 @@ use bitcoin_rs_primitives::{
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use bitcoin_rs_p2p::compact_blocks::Outcome;
 use bitcoin_rs_p2p::COMPACT_BLOCK_VERSION;
+use bitcoin_rs_p2p::compact_blocks::Outcome;
 use bitcoin_rs_p2p::wire::{Message, write_message};
 use bitcoin_rs_p2p::{CompactBlockHints, Reconstruction};
 
