@@ -2679,7 +2679,7 @@ fn process_compact_wire_message(
     }
 
     let identity_version =
-        local_compact_version.unwrap_or(crate::compact_blocks::COMPACT_BLOCK_VERSION);
+        local_compact_version.unwrap_or(crate::peer::COMPACT_BLOCK_VERSION);
     let outcome = process_compact_message(
         compact_reconstruction,
         message,

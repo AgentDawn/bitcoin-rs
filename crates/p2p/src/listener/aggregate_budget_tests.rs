@@ -708,7 +708,7 @@ fn conditional_local_retry_defers_then_readies_with_no_reply() -> TestResult {
     let outcome = super::process_compact_message(
         &mut recon,
         &message,
-        crate::compact_blocks::COMPACT_BLOCK_VERSION,
+        crate::peer::COMPACT_BLOCK_VERSION,
         None,
         Instant::now(),
     );
