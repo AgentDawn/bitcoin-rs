@@ -118,7 +118,6 @@ impl DerivedIndexHost {
             chainstate.block_tree_reader(),
             chainstate.block_body_store_handle(),
             history,
-            spawn.block_source,
             Some(spawn.body_source),
             Arc::new(super::IndexChainCursorSource(
                 chainstate.chain_events_handle(),

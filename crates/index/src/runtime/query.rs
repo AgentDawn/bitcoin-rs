@@ -3,7 +3,7 @@
 //! entrypoints retain health, revision, watermark, and chain-transition checks.
 
 use super::{
-    Arc, Block, BlockBodySource, BlockHash, BlockTree, DerivedIndexInfo, DerivedIndexQuery,
+    Arc, Block, BlockBodySource, BlockTree, DerivedIndexInfo, DerivedIndexQuery,
     DerivedIndexRuntime, Hash256, IndexCapabilities, IndexCapability, IndexReader, IndexWatermark,
     MAX_SERIALIZED_BLOCK_BYTES, Ordering, OutPoint, PrefixScanLimit, QUERY_BODY_READ_LIMIT,
     QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT, QUERY_SCAN_ROW_LIMIT, ScriptHash,
@@ -17,38 +17,6 @@ use hashbrown::HashMap;
 mod filters;
 mod scripts;
 mod transactions;
-
-/// Index-side access to raw block bodies in the chain body store. Not a
-/// node-owned concept.
-#[derive(Clone, Default)]
-pub struct IndexBlockSource {
-    block_body_source: Option<Arc<dyn BlockBodySource>>,
-}
-
-impl IndexBlockSource {
-    /// Adds the chain body store used to fetch raw block bodies.
-    #[must_use]
-    pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
-        self.block_body_source = Some(source);
-        self
-    }
-
-    /// Returns the stored body bytes for the block identified by height and
-    /// hash, or `None` when no body store is attached or the body is absent.
-    pub fn block_body_bytes_for(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
-        self.block_body_source
-            .as_ref()?
-            .block_body(height, hash)
-            .ok()
-            .flatten()
-    }
-}
-
-impl core::fmt::Debug for IndexBlockSource {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("IndexBlockSource").finish_non_exhaustive()
-    }
-}
 
 /// Aggregate work budget shared by every operation in one public query.
 ///
@@ -214,7 +182,6 @@ impl CapabilityFloors {
 pub struct DerivedIndexQueryEngine {
     runtime: Arc<DerivedIndexRuntime>,
     reader: Arc<dyn IndexReader>,
-    block_source: IndexBlockSource,
     block_tree: bitcoin_rs_chain::BlockTreeReader,
     applied_tip: bitcoin_rs_chain::TipReader,
     body_source: Option<Arc<dyn BlockBodySource>>,
@@ -236,7 +203,6 @@ impl DerivedIndexQueryEngine {
     pub(crate) fn new(
         runtime: Arc<DerivedIndexRuntime>,
         reader: Arc<dyn IndexReader>,
-        block_source: IndexBlockSource,
         block_tree: bitcoin_rs_chain::BlockTreeReader,
         applied_tip: bitcoin_rs_chain::TipReader,
         body_source: Option<Arc<dyn BlockBodySource>>,
@@ -245,7 +211,6 @@ impl DerivedIndexQueryEngine {
         Self {
             runtime,
             reader,
-            block_source,
             block_tree,
             applied_tip,
             body_source,

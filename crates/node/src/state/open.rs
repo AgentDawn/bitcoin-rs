@@ -328,8 +328,6 @@ impl NodeState {
                     Arc::new(bitcoin_rs_index::runtime::DerivedIndexRuntime::new(wake_tx));
                 let body_source: Arc<dyn BlockBodySource> =
                     Arc::new(StoredBlockBodySource::new(Arc::clone(&block_body_store)));
-                let block_source = bitcoin_rs_index::runtime::IndexBlockSource::default()
-                    .with_block_body_source(Arc::clone(&body_source));
                 let lifecycle: Arc<
                     arc_swap::ArcSwap<bitcoin_rs_index::runtime::DerivedIndexLifecycle>,
                 > = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -344,7 +342,6 @@ impl NodeState {
                     TxIndexSpawn {
                         spec,
                         generation,
-                        block_source,
                         body_source,
                         wake_rx,
                         recovery_reporter: Arc::clone(&recovery_reporter),
