@@ -81,8 +81,7 @@ pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use inv::request_missing_parents;
 pub use listener::ListenerExtras;
 pub use peer::{
-    COMPACT_BLOCK_VERSION, CompactBlockNegotiation, NetworkActivity, Peer, PeerCapabilities,
-    PeerState, WtxidRelayState,
+    CompactBlockNegotiation, NetworkActivity, Peer, PeerCapabilities, PeerState, WtxidRelayState,
 };
 pub use peer_info::{PeerInfo, PeerRole, service_flag_names};
 pub use peer_table::{PeerSession, PeerTable};

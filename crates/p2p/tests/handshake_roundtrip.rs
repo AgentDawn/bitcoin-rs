@@ -7,10 +7,11 @@ use std::io::{Cursor, Read, Write};
 
 use bitcoin::p2p::message_compact_blocks::SendCmpct;
 use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin_rs_p2p::CompactBlockNegotiation;
+use bitcoin_rs_p2p::compact_blocks::COMPACT_BLOCK_VERSION;
 use bitcoin_rs_p2p::dispatch::dispatch_inbound;
 use bitcoin_rs_p2p::handshake::start;
 use bitcoin_rs_p2p::wire::PROTOCOL_VERSION;
-use bitcoin_rs_p2p::{COMPACT_BLOCK_VERSION, CompactBlockNegotiation};
 use bitcoin_rs_p2p::{Message, Peer, PeerError, PeerRole, PeerState};
 
 /// Drive a complete version/verack handshake between two cursor-backed
