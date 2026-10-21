@@ -145,6 +145,21 @@ unneeded funding record lists when callers only require history records.
 - A required capability that is not in the configured selection is
   `Unavailable` with a distinct disabled reason. A configured capability
   whose watermark lags is `Retry` (backfilling), never "disabled".
+- A query MUST retain at most one decoded block in its memo. Consecutive
+  full-block reads at the same `(height, hash)` reuse it. An identity miss
+  MUST evict the retained block before fetching another one. Evicted
+  identities are read and charged again.
+
+Proof: these tests establish the memo-retention rule:
+- `crates/index/src/runtime/query.rs`:
+  `block_memo_retains_only_the_latest_identity` proves release on a miss
+  before replacement and release when the query budget is dropped.
+- `crates/index/src/runtime/query_tests.rs`:
+  `confirmed_history_fetches_shared_block_once_per_query_and_refetches_next_query`
+  proves same-identity reuse and isolation between queries.
+- `crates/index/src/runtime/query_tests.rs`:
+  `confirmed_history_with_nonmatching_script_falls_back_per_height_and_stays_empty`
+  proves distinct-height reads for repeated nonmatching-script fallbacks.
 
 ### `IDX-04`: Selective reset preserves sibling readiness
 
@@ -446,10 +461,8 @@ Core/Kyoto runner are described in
 `crates/index/src/runtime/query.rs` tests exercise the shared
 historical/live byte budget, independent row/scan/body-read admission limits,
 rejection of truncated scans, and non-consuming rejection of over-budget work
-(`IDX-03` and the project bounded-resources invariant). The query memo retains
-at most one decoded block per query: consecutive full-block reads at the same
-`(height, hash)` reuse it, and a miss evicts before fetching, so
-distinct-height fallbacks re-read and re-charge. No query limit or persisted representation changes.
+(`IDX-03` and the project bounded-resources invariant). No query limit or
+persisted representation changes.
 
 ### Store-open cancellation evidence
 
