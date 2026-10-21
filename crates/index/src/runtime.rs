@@ -22,23 +22,22 @@ use arc_swap::ArcSwap;
 use bitcoin_rs_chain::{BlockBodySource, BlockTree, BlockTreeReader, TipReader, TipSnapshot};
 
 use crate::{
-    BlockSource, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
-    IndexWatermarks, IndexWriteFence, PreparedBatch, PreparedBatchLimits, ScriptHash,
-    ScriptLiveScan, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark, IndexWatermarks,
+    IndexWriteFence, PreparedBatch, PreparedBatchLimits, ScriptHash, ScriptLiveScan, TxIndexScan,
+    TxIndexScanRow, TxIndexSnapshot,
     reconcile::{ReconcileLeg, ReconcilePhase},
     types::{TxPosition, TxPositionValue},
     writer::TxIndexWriter,
 };
 
-use bitcoin_rs_primitives::{Block, BlockHash, Hash256, OutPoint, Tx, Txid, deserialize};
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, Txid, deserialize};
 
-use crate::block_log::{BlockLogReader, record_at_height};
 use crate::capabilities::{
     CapabilityState, CapabilityStatus, DerivedIndexCapabilitySource, derived_index_status,
 };
 use crate::query_api::{
     DerivedIndexInfo, DerivedIndexQuery, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
-    ScriptIndexSnapshot, SpendingRecord, TxQueryError,
+    ScriptIndexSnapshot, SpendingRecord, TxQueryError, TxUnavailableCause,
 };
 
 use bitcoin_rs_storage::{
@@ -82,9 +81,9 @@ mod startup;
 pub use startup::open_derived_index_store_on_worker;
 
 pub use capability::DerivedIndexCapability;
+pub use query::DerivedIndexQueryEngine;
 use query::IndexProgress;
 pub(crate) use query::QueryEngineLive;
-pub use query::{DerivedIndexQueryEngine, IndexBlockSource};
 
 /// Shared wake/revision/health state owned by `NodeState` and referenced by
 /// `Chainstate`, the worker thread, and the query engine.
@@ -404,14 +403,14 @@ impl DerivedIndexQueryAdapter {
         let snapshot = self.lifecycle.load_full();
         match &*snapshot {
             DerivedIndexLifecycle::Serving(engine) => Ok(Arc::clone(engine)),
-            DerivedIndexLifecycle::Opening => {
-                Err(TxQueryError::Unavailable("txindex is opening".into()))
-            }
-            DerivedIndexLifecycle::Failed(_) => {
-                Err(TxQueryError::Unavailable("txindex is unavailable".into()))
-            }
+            DerivedIndexLifecycle::Opening => Err(TxQueryError::Unavailable(
+                TxUnavailableCause::Other("txindex is opening".into()),
+            )),
+            DerivedIndexLifecycle::Failed(_) => Err(TxQueryError::Unavailable(
+                TxUnavailableCause::WorkerFailed("txindex is unavailable".into()),
+            )),
             DerivedIndexLifecycle::ShutdownAbandoned => Err(TxQueryError::Unavailable(
-                "txindex was abandoned at shutdown".into(),
+                TxUnavailableCause::Other("txindex was abandoned at shutdown".into()),
             )),
         }
     }

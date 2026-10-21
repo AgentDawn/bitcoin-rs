@@ -282,7 +282,7 @@ pub enum ChainControlError {
 
 pub use bitcoin_rs_index::{
     DerivedIndexInfo, DerivedIndexQuery, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
-    ScriptIndexSnapshot, SpendingRecord, TxQueryError,
+    ScriptIndexSnapshot, SpendingRecord, TxQueryError, TxUnavailableCause,
 };
 
 /// The complete description of one RPC context, grouped by node capability:

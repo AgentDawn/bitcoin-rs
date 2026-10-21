@@ -3,122 +3,53 @@
 //! entrypoints retain health, revision, watermark, and chain-transition checks.
 
 use super::{
-    Arc, Block, BlockBodySource, BlockHash, BlockLogReader, BlockSource, BlockTree,
-    DerivedIndexInfo, DerivedIndexQuery, DerivedIndexRuntime, Hash256, IndexCapabilities,
-    IndexCapability, IndexReader, IndexWatermark, MAX_SERIALIZED_BLOCK_BYTES, Ordering, OutPoint,
-    PrefixScanLimit, QUERY_BODY_READ_LIMIT, QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT,
-    QUERY_SCAN_ROW_LIMIT, ScriptHash, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
-    ScriptIndexSnapshot, ScriptLiveScan, SpendingRecord, TipSnapshot, Tx, TxIndexScan,
-    TxIndexScanRow, TxIndexSnapshot, TxPosition, TxPositionValue, TxQueryError, Txid, deserialize,
-    record_at_height,
+    Arc, Block, BlockBodySource, BlockTree, DerivedIndexInfo, DerivedIndexQuery,
+    DerivedIndexRuntime, Hash256, IndexCapabilities, IndexCapability, IndexReader, IndexWatermark,
+    MAX_SERIALIZED_BLOCK_BYTES, Ordering, OutPoint, PrefixScanLimit, QUERY_BODY_READ_LIMIT,
+    QUERY_SCAN_BYTE_LIMIT, QUERY_SCAN_COUNT_LIMIT, QUERY_SCAN_ROW_LIMIT, ScriptHash,
+    ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, ScriptLiveScan,
+    SpendingRecord, TipSnapshot, Tx, TxIndexScan, TxIndexScanRow, TxIndexSnapshot, TxPosition,
+    TxPositionValue, TxQueryError, TxUnavailableCause, Txid, deserialize,
 };
 
 mod filters;
 mod scripts;
 mod transactions;
 
-/// Private index-side `BlockSource`: active-chain identity from the tree,
-/// bodies from the chain body store. Not a node-owned concept.
-#[derive(Clone)]
-pub struct IndexBlockSource {
-    blocks: BlockLogReader,
-    block_body_source: Option<Arc<dyn BlockBodySource>>,
-    block_tree: Option<bitcoin_rs_chain::BlockTreeReader>,
-}
-
-impl IndexBlockSource {
-    /// A source backed only by the log of connected block records.
-    #[must_use]
-    pub fn new(blocks: impl Into<BlockLogReader>) -> Self {
-        Self {
-            blocks: blocks.into(),
-            block_body_source: None,
-            block_tree: None,
-        }
-    }
-
-    /// Adds the chain body store used to fetch raw block bodies.
-    #[must_use]
-    pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
-        self.block_body_source = Some(source);
-        self
-    }
-
-    /// Adds the authoritative block tree used for active-chain identity.
-    #[must_use]
-    pub fn with_block_tree(mut self, tree: bitcoin_rs_chain::BlockTreeReader) -> Self {
-        self.block_tree = Some(tree);
-        self
-    }
-
-    /// Returns the stored body bytes for the block identified by height and
-    /// hash, or `None` when no body store is attached or the body is absent.
-    pub fn block_body_bytes_for(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
-        self.block_body_source
-            .as_ref()?
-            .block_body(height, hash)
-            .ok()
-            .flatten()
-    }
-
-    pub(super) fn resolve_block_by_hash(&self, height: u32, active_hash: Hash256) -> Option<Block> {
-        let bytes = self.block_body_bytes_for(height, BlockHash::from(active_hash))?;
-        let block = deserialize::<Block>(&bytes).ok()?;
-        (block.block_hash() == BlockHash::from(active_hash)).then_some(block)
-    }
-}
-
-impl core::fmt::Debug for IndexBlockSource {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("IndexBlockSource").finish_non_exhaustive()
-    }
-}
-
-impl BlockSource for IndexBlockSource {
-    fn block_at_height(&self, height: u32) -> Option<Block> {
-        let active_hash = if let Some(tree) = &self.block_tree {
-            tree.read().active_node_at_height(height)?.hash
-        } else {
-            let guard = self.blocks.read();
-            Hash256::from(record_at_height(&guard, height)?.hash)
-        };
-        self.resolve_block_by_hash(height, active_hash)
-    }
-
-    fn block_bytes_at_height(&self, height: u32, offset: u32, len: u32) -> Option<Vec<u8>> {
-        let source = self.block_body_source.as_ref()?;
-        let hash = if let Some(tree) = &self.block_tree {
-            BlockHash::from(tree.read().active_node_at_height(height)?.hash)
-        } else {
-            let guard = self.blocks.read();
-            record_at_height(&guard, height)?.hash
-        };
-        source.block_body_range(height, hash, offset, len)
-    }
-}
-
 /// Aggregate work budget shared by every operation in one public query.
+///
+/// Also pins at most one query-scoped decoded block: consecutive full-block
+/// reads at the same `(height, hash)` identity reuse the retained block, while
+/// a read at any other identity evicts it before fetching and decoding the new
+/// block, so an evicted identity is re-read and re-charged on its next use.
+/// Positioned range reads do not use the memo. The memo lives and dies
+/// with the budget, so separate public queries never share entries. Every
+/// pinned body was first charged to `remaining_bytes`, so the pinned block's
+/// serialized body bytes never exceed `QUERY_SCAN_BYTE_LIMIT`; its decoded
+/// heap size is larger.
 pub(super) struct QueryBudget {
     remaining_rows: usize,
     remaining_bytes: usize,
     remaining_scans: usize,
     remaining_body_reads: usize,
+    block_memo: Option<(u32, Hash256, Arc<Block>)>,
 }
 
 impl QueryBudget {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             remaining_rows: QUERY_SCAN_ROW_LIMIT,
             remaining_bytes: QUERY_SCAN_BYTE_LIMIT,
             remaining_scans: QUERY_SCAN_COUNT_LIMIT,
             remaining_body_reads: QUERY_BODY_READ_LIMIT,
+            block_memo: None,
         }
     }
 
     pub(super) fn next_scan_limit(&mut self) -> Result<PrefixScanLimit, TxQueryError> {
         if self.remaining_scans == 0 || self.remaining_rows == 0 || self.remaining_bytes == 0 {
             return Err(TxQueryError::Unavailable(
-                "txindex query work budget exhausted".into(),
+                TxUnavailableCause::RowBudgetExhausted,
             ));
         }
         self.remaining_scans -= 1;
@@ -134,7 +65,7 @@ impl QueryBudget {
     ) -> Result<Vec<TxIndexScanRow>, TxQueryError> {
         if !scan.complete {
             return Err(TxQueryError::Unavailable(
-                "txindex prefix scan truncated".into(),
+                TxUnavailableCause::PrefixScanTruncated,
             ));
         }
         self.charge_scan(scan.rows.len(), scan.encoded_bytes)?;
@@ -147,7 +78,7 @@ impl QueryBudget {
     ) -> Result<Vec<crate::ScriptLiveRow>, TxQueryError> {
         if !scan.complete {
             return Err(TxQueryError::Unavailable(
-                "txindex live prefix scan truncated".into(),
+                TxUnavailableCause::LivePrefixScanTruncated,
             ));
         }
         self.charge_scan(scan.rows.len(), scan.encoded_bytes)?;
@@ -157,7 +88,7 @@ impl QueryBudget {
     fn charge_scan(&mut self, rows: usize, encoded_bytes: usize) -> Result<(), TxQueryError> {
         if rows > self.remaining_rows || encoded_bytes > self.remaining_bytes {
             return Err(TxQueryError::Unavailable(
-                "txindex query work budget exceeded".into(),
+                TxUnavailableCause::RowBudgetExceeded,
             ));
         }
         self.remaining_rows -= rows;
@@ -168,7 +99,7 @@ impl QueryBudget {
     pub(super) fn reserve_body_read(&mut self, max_bytes: usize) -> Result<(), TxQueryError> {
         if self.remaining_body_reads == 0 || max_bytes > self.remaining_bytes {
             return Err(TxQueryError::Unavailable(
-                "txindex query body budget exhausted".into(),
+                TxUnavailableCause::BodyReadBudgetExhausted,
             ));
         }
         self.remaining_body_reads -= 1;
@@ -178,11 +109,40 @@ impl QueryBudget {
     pub(super) fn charge_body_bytes(&mut self, bytes: usize) -> Result<(), TxQueryError> {
         if bytes > self.remaining_bytes {
             return Err(TxQueryError::Unavailable(
-                "txindex query body budget exceeded".into(),
+                TxUnavailableCause::BodyBudgetExceeded,
             ));
         }
         self.remaining_bytes -= bytes;
         Ok(())
+    }
+
+    /// Returns the decoded block retained for `(height, hash)`. A hit costs no
+    /// body budget: the reserve and the byte charge happened on the miss that
+    /// cached it. A miss evicts the previously retained block, if any, before
+    /// the caller fetches and decodes a new one, so a failed fetch or decode
+    /// leaves the memo empty instead of pinning a stale identity.
+    pub(super) fn memoized_block(&mut self, height: u32, hash: Hash256) -> Option<Arc<Block>> {
+        if let Some((memo_height, memo_hash, block)) = &self.block_memo {
+            if *memo_height == height && *memo_hash == hash {
+                return Some(Arc::clone(block));
+            }
+        }
+        self.block_memo = None;
+        None
+    }
+
+    /// Pins a successfully verified block as the single retained entry,
+    /// replacing whatever the memo held, and returns the shared handle. Only
+    /// call this after verification: failures must leave the memo as the miss
+    /// left it (empty).
+    pub(super) fn memoize_block(
+        &mut self,
+        height: u32,
+        hash: Hash256,
+        block: Arc<Block>,
+    ) -> Arc<Block> {
+        self.block_memo = Some((height, hash, Arc::clone(&block)));
+        block
     }
 }
 
@@ -232,7 +192,6 @@ impl CapabilityFloors {
 pub struct DerivedIndexQueryEngine {
     runtime: Arc<DerivedIndexRuntime>,
     reader: Arc<dyn IndexReader>,
-    block_source: IndexBlockSource,
     block_tree: bitcoin_rs_chain::BlockTreeReader,
     applied_tip: bitcoin_rs_chain::TipReader,
     body_source: Option<Arc<dyn BlockBodySource>>,
@@ -254,7 +213,6 @@ impl DerivedIndexQueryEngine {
     pub(crate) fn new(
         runtime: Arc<DerivedIndexRuntime>,
         reader: Arc<dyn IndexReader>,
-        block_source: IndexBlockSource,
         block_tree: bitcoin_rs_chain::BlockTreeReader,
         applied_tip: bitcoin_rs_chain::TipReader,
         body_source: Option<Arc<dyn BlockBodySource>>,
@@ -263,7 +221,6 @@ impl DerivedIndexQueryEngine {
         Self {
             runtime,
             reader,
-            block_source,
             block_tree,
             applied_tip,
             body_source,
@@ -275,14 +232,14 @@ impl DerivedIndexQueryEngine {
 
     fn query_health(&self) -> Result<(), TxQueryError> {
         if self.runtime.failed.load(Ordering::Acquire) {
-            return Err(TxQueryError::Unavailable(
+            return Err(TxQueryError::Unavailable(TxUnavailableCause::WorkerFailed(
                 self.runtime
                     .failure_message()
                     .unwrap_or_else(|| "txindex worker failed".into()),
-            ));
+            )));
         }
         if self.runtime.shutdown.load(Ordering::Acquire) {
-            return Err(TxQueryError::Unavailable("txindex worker stopped".into()));
+            return Err(TxQueryError::Unavailable(TxUnavailableCause::WorkerStopped));
         }
         Ok(())
     }
@@ -293,7 +250,7 @@ impl DerivedIndexQueryEngine {
         for capability in required.iter() {
             if !self.enabled.contains(capability) {
                 return Err(TxQueryError::Unavailable(
-                    capability.disabled_message().into(),
+                    TxUnavailableCause::CapabilityDisabled(capability),
                 ));
             }
         }
@@ -314,7 +271,9 @@ impl DerivedIndexQueryEngine {
         if required.contains(IndexCapability::CompactFilters)
             && let Some(reason) = self.runtime.compact_filter_failure.read().clone()
         {
-            return Err(TxQueryError::Unavailable(reason));
+            return Err(TxQueryError::Unavailable(
+                TxUnavailableCause::CompactFilterFailed(reason),
+            ));
         }
 
         // Live answers compose the index snapshot, the authoritative UTXO set,
@@ -327,9 +286,9 @@ impl DerivedIndexQueryEngine {
                 self.chain_transition
                     .as_ref()
                     .ok_or_else(|| {
-                        TxQueryError::Unavailable(
-                            "chain transition authority missing for ScriptLive".into(),
-                        )
+                        TxQueryError::Unavailable(TxUnavailableCause::MissingAuthority(
+                            "chain transition authority missing for ScriptLive",
+                        ))
                     })?
                     .lock(),
             )
@@ -380,7 +339,9 @@ impl DerivedIndexQueryEngine {
         if required.contains(IndexCapability::CompactFilters)
             && let Some(reason) = self.runtime.compact_filter_failure.read().clone()
         {
-            return Err(TxQueryError::Unavailable(reason));
+            return Err(TxQueryError::Unavailable(
+                TxUnavailableCause::CompactFilterFailed(reason),
+            ));
         }
         let tip_after = self.applied_tip.load_full();
         let revision_after = self.runtime.revision();
@@ -584,17 +545,23 @@ mod tests {
             encoded_bytes: 2,
             complete: false,
         });
-        assert!(
-            matches!(historical, Err(TxQueryError::Unavailable(reason)) if reason == "txindex prefix scan truncated")
-        );
+        assert!(matches!(
+            historical,
+            Err(TxQueryError::Unavailable(
+                TxUnavailableCause::PrefixScanTruncated
+            ))
+        ));
         let live = budget.accept_live_scan(ScriptLiveScan {
             rows: Vec::new(),
             encoded_bytes: 3,
             complete: false,
         });
-        assert!(
-            matches!(live, Err(TxQueryError::Unavailable(reason)) if reason == "txindex live prefix scan truncated")
-        );
+        assert!(matches!(
+            live,
+            Err(TxQueryError::Unavailable(
+                TxUnavailableCause::LivePrefixScanTruncated
+            ))
+        ));
         assert_eq!((budget.remaining_rows, budget.remaining_bytes), before);
     }
 
@@ -623,6 +590,7 @@ mod tests {
                 remaining_bytes: bytes,
                 remaining_scans: scans,
                 remaining_body_reads: 1,
+                block_memo: None,
             };
             assert!(matches!(
                 budget.next_scan_limit(),
@@ -677,5 +645,35 @@ mod tests {
         })?;
         assert_eq!(budget.remaining_bytes, 0);
         Ok(())
+    }
+
+    #[test]
+    fn block_memo_retains_only_the_latest_identity() {
+        use std::sync::Weak;
+
+        let mut budget = QueryBudget::new();
+        let hash_a = Hash256::from_le_bytes(&[0x11; 32]);
+        let hash_b = Hash256::from_le_bytes(&[0x22; 32]);
+
+        let block_a = Arc::new(Block::default());
+        let weak_a: Weak<Block> = Arc::downgrade(&block_a);
+        let pinned_a = budget.memoize_block(1, hash_a, block_a);
+        assert!(weak_a.upgrade().is_some());
+        drop(pinned_a);
+
+        assert!(budget.memoized_block(2, hash_b).is_none());
+        assert!(
+            weak_a.upgrade().is_none(),
+            "a miss must release the previously retained block before fetching its replacement"
+        );
+
+        let block_b = Arc::new(Block::default());
+        let weak_b: Weak<Block> = Arc::downgrade(&block_b);
+        let pinned_b = budget.memoize_block(2, hash_b, block_b);
+        drop(pinned_b);
+        assert!(budget.memoized_block(2, hash_b).is_some());
+        assert!(weak_b.upgrade().is_some());
+        drop(budget);
+        assert!(weak_b.upgrade().is_none());
     }
 }

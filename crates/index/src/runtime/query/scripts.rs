@@ -3,7 +3,7 @@
 use super::{
     DerivedIndexQueryEngine, OutPoint, QueryBudget, ScriptHash, ScriptHistoryRecord,
     ScriptIndexRecord, ScriptIndexSnapshot, ScriptLiveScan, SpendingRecord, TipSnapshot, Tx,
-    TxIndexScanRow, TxIndexSnapshot, TxQueryError, Txid,
+    TxIndexScanRow, TxIndexSnapshot, TxQueryError, TxUnavailableCause, Txid,
 };
 
 impl DerivedIndexQueryEngine {
@@ -177,7 +177,7 @@ impl DerivedIndexQueryEngine {
     ) -> Result<ScriptIndexSnapshot, TxQueryError> {
         if floor > 0 {
             return Err(TxQueryError::Unavailable(
-                format!("script history coverage starts at height {floor}; history cannot be proven complete").into(),
+                TxUnavailableCause::HistoryUnproven { floor },
             ));
         }
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
@@ -224,7 +224,7 @@ impl DerivedIndexQueryEngine {
     ) -> Result<Vec<ScriptHistoryRecord>, TxQueryError> {
         if floor > 0 {
             return Err(TxQueryError::Unavailable(
-                format!("script history coverage starts at height {floor}; history cannot be proven complete").into(),
+                TxUnavailableCause::HistoryUnproven { floor },
             ));
         }
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
@@ -255,7 +255,9 @@ impl DerivedIndexQueryEngine {
     ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
         let Some(utxo) = self.utxo.as_ref() else {
             return Err(TxQueryError::Unavailable(
-                "authoritative UTXO view is unavailable for ScriptLive".into(),
+                TxUnavailableCause::MissingAuthority(
+                    "authoritative UTXO view is unavailable for ScriptLive",
+                ),
             ));
         };
         let rows = Self::scan_live_rows(snapshot, budget, scripthash)?;
@@ -268,7 +270,9 @@ impl DerivedIndexQueryEngine {
                     // corruption or a failed transition. Returning an empty
                     // result would turn that into a false negative.
                     return Err(TxQueryError::Unavailable(
-                        "ScriptLive locator is absent from authoritative UTXO".into(),
+                        TxUnavailableCause::MissingAuthority(
+                            "ScriptLive locator is absent from authoritative UTXO",
+                        ),
                     ));
                 };
                 if ScriptHash::new(&entry.txout.script_pubkey) != scripthash {

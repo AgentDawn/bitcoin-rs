@@ -130,7 +130,9 @@ mod tests {
         CHAIN_PAGE, address_transaction_summary, block_txs, fee_rate_sat_per_vbyte, history,
         outspend, summary,
     };
-    use crate::context::{Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError};
+    use crate::context::{
+        Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError, TxUnavailableCause,
+    };
     use crate::handlers::Handler;
     use crate::rest::Response;
 
@@ -2945,7 +2947,12 @@ mod tests {
         ctx.chain.applied_tip.store(Some(tip));
         for (error, status) in [
             (Some(TxQueryError::Retry), 503),
-            (Some(TxQueryError::Unavailable("pruned".into())), 503),
+            (
+                Some(TxQueryError::Unavailable(TxUnavailableCause::Other(
+                    "pruned".into(),
+                ))),
+                503,
+            ),
             (Some(TxQueryError::Storage("corrupt".into())), 500),
         ] {
             ctx.indexes.esplora_tx_index = Some(Arc::new(FailingParentIndex {

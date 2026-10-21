@@ -10,7 +10,6 @@
 
 use super::namespace::NAMESPACE_REGISTRY;
 use super::*;
-use crate::block_log::BlockLog;
 use arc_swap::ArcSwap;
 use bitcoin_rs_chain::BlockTree;
 use std::sync::Arc;
@@ -46,7 +45,6 @@ struct WorkerInputs {
     block_tree: Arc<RwLock<BlockTree>>,
     shutdown: Arc<AtomicBool>,
     wake_rx: Receiver<()>,
-    block_source: IndexBlockSource,
     chain_events: Arc<dyn crate::reconcile::ChainCursorSource>,
 }
 
@@ -59,8 +57,6 @@ fn build_worker_inputs(dir: &std::path::Path, epoch: u64) -> WorkerInputs {
     let applied_tip = Arc::new(arc_swap::ArcSwapOption::empty());
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let blocks = Arc::new(RwLock::new(BlockLog::new()));
-    let block_source = IndexBlockSource::new(blocks);
     let chain_events = Arc::new(TestChainCursor);
 
     WorkerInputs {
@@ -72,7 +68,6 @@ fn build_worker_inputs(dir: &std::path::Path, epoch: u64) -> WorkerInputs {
         block_tree,
         shutdown,
         wake_rx,
-        block_source,
         chain_events,
     }
 }
@@ -101,7 +96,6 @@ fn blocked_open_abandonment_detaches_and_poisons() {
             Arc::new(bitcoin_rs_storage::pruning::RetentionRegistry::new()),
             bitcoin_rs_storage::pruning::RetentionBudget::Unlimited,
         ),
-        inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
         RecordedIndexAhead::new(),
@@ -185,7 +179,6 @@ fn shutdown_during_open_reports_abandonment_after_supervisor_exit() {
             Arc::new(bitcoin_rs_storage::pruning::RetentionRegistry::new()),
             bitcoin_rs_storage::pruning::RetentionBudget::Unlimited,
         ),
-        inputs.block_source,
         None,
         Arc::clone(&inputs.chain_events),
         RecordedIndexAhead::new(),

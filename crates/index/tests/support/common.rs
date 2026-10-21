@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bitcoin_rs_index::types::{TxPosition, TxPositionValue};
 use bitcoin_rs_index::{
     PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHash, ScriptHashRow, SpendingPrefixRow,
 };
@@ -170,31 +169,6 @@ pub(crate) fn put_funding_row(
         ColumnFamily::Funding,
         &ScriptHashRow::row(scripthash, height).to_db_row(),
         &[],
-    )
-}
-
-/// Writes one funding-row key at `height` carrying `positions`.
-///
-/// Real positions take the resolver's positioned-read path; tests that pin
-/// `TxPosition`-backed resolution use this instead of the empty-value
-/// [`put_funding_row`].
-pub(crate) fn put_funding_row_positions(
-    store: &MemoryStore,
-    scripthash: ScriptHash,
-    height: u32,
-    positions: &[TxPosition],
-) -> Result<(), StorageError> {
-    // An empty slice encodes an empty value — indistinguishable from
-    // `put_funding_row`'s scan-path marker, so the positioned read would
-    // silently not be exercised.
-    assert!(
-        !positions.is_empty(),
-        "a funding row exists only because at least one transaction produced it"
-    );
-    store.put(
-        ColumnFamily::Funding,
-        &ScriptHashRow::row(scripthash, height).to_db_row(),
-        &TxPositionValue::encode(positions),
     )
 }
 
