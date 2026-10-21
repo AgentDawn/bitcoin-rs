@@ -797,21 +797,97 @@ fn a_rejected_envelope_never_dispatches_the_method() {
 }
 
 #[test]
-fn an_empty_batch_is_rejected_as_an_invalid_request() {
-    // Local behavior, not a Core rule: the pinned Core source does not
-    // specify an empty batch, so this server answers the legacy -32600
-    // envelope. API-02 records the case as local for the same reason.
+fn an_empty_batch_answers_an_empty_ok_batch() {
+    // Core's batch reply path produces an empty array for an empty
+    // batch (`httprpc.cpp`): HTTP 200 with `[]`.
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(&handler, b"[]");
     let body = response.body.expect("empty batch replies");
 
-    assert_eq!(response.status, 400);
-    assert_eq!(
-        body.get("error")
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_i64),
-        Some(-32600)
-    );
+    assert_eq!(response.status, 200);
+    assert_eq!(body, json!([]), "an empty batch answers []: {body:?}");
+}
+
+#[test]
+fn a_top_level_scalar_is_a_parse_error() {
+    // Core's final `else` in `HTTPReq_JSONRPC` answers `RPC_PARSE_ERROR`
+    // (-32700) "Top-level object parse error" at HTTP 500 with a null id.
+    let handler = Handler::new(Arc::new(Context::new()));
+    for request in [br"5".as_slice(), br#""x""#.as_slice()] {
+        let response = handle_json(&handler, request);
+        let body = response.body.expect("top-level scalar replies");
+
+        assert_eq!(response.status, 500, "-32700 keeps the legacy 500");
+        assert_eq!(
+            body.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64),
+            Some(-32700),
+            "top-level scalar is a parse error: {body:?}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str),
+            Some("Top-level object parse error"),
+            "Core's exact message: {body:?}"
+        );
+        assert!(
+            body.get("id").is_none_or(Value::is_null),
+            "a parse error carries a null id: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn json_rpc_2_method_and_params_envelope_errors_answer_400() {
+    // parse() has already accepted `"2.0"` when method/params validation
+    // throws, so the body keeps the v2 envelope while the status is the
+    // 400 every envelope refusal takes (`httprpc.cpp`). `"method":null`
+    // is "Missing method": Core checks `isNull()` before `isStr()`.
+    let handler = Handler::new(Arc::new(Context::new()));
+    for (request, message) in [
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":7}"#,
+            "Params must be an array or object",
+        ),
+        (r#"{"jsonrpc":"2.0","id":1,"params":[]}"#, "Missing method"),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":null}"#,
+            "Missing method",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":5}"#,
+            "Method must be a string",
+        ),
+    ] {
+        let response = handle_json(&handler, request.as_bytes());
+        let body = response.body.expect("JSON-RPC response body");
+
+        assert_eq!(
+            response.status, 400,
+            "v2 envelope refusal maps to HTTP 400: {request}"
+        );
+        assert_eq!(
+            body.get("jsonrpc").and_then(Value::as_str),
+            Some("2.0"),
+            "the body keeps the v2 envelope: {body:?}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64),
+            Some(-32600),
+            "envelope refusal is -32600: {body:?}"
+        );
+        assert_eq!(
+            body.get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str),
+            Some(message),
+            "Core's exact message for {request}: {body:?}"
+        );
+    }
 }
 
 #[test]
