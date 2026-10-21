@@ -5,10 +5,11 @@
 //! `start` on real streams.
 use std::io::{Cursor, Read, Write};
 
+use bitcoin::p2p::message_compact_blocks::SendCmpct;
 use bitcoin::p2p::{Magic, ServiceFlags};
-use bitcoin_rs_p2p::handshake::{post_verack_messages, start};
-use bitcoin_rs_p2p::{COMPACT_BLOCK_VERSION, CompactBlockNegotiation};
+use bitcoin_rs_p2p::handshake::start;
 use bitcoin_rs_p2p::wire::PROTOCOL_VERSION;
+use bitcoin_rs_p2p::{COMPACT_BLOCK_VERSION, CompactBlockNegotiation};
 use bitcoin_rs_p2p::{Message, Peer, PeerError, PeerRole, PeerState};
 
 /// Drive a complete version/verack handshake between two cursor-backed
@@ -16,7 +17,7 @@ use bitcoin_rs_p2p::{Message, Peer, PeerError, PeerRole, PeerState};
 ///
 /// PRE: both peers wrap independent buffers.
 /// POST: both peers are ready, advertising the explicit unpruned service
-///   set (full history plus witness), and both recorded the local
+///   set (full history plus witness), and each recorded the other's
 ///   compact-block advertisement.
 /// INVARIANT: this helper never varies the advertisement by role.
 fn handshake_cursors(
@@ -30,13 +31,12 @@ fn handshake_cursors(
     exchange(right, left, right_messages)?;
     exchange(left, right, vec![Message::Verack])?;
     exchange(right, left, vec![Message::Verack])?;
-    exchange(left, right, post_verack_messages().to_vec())?;
-    exchange(right, left, post_verack_messages().to_vec())?;
-    left.compact_blocks
-        .record_local_advertised(COMPACT_BLOCK_VERSION);
-    right
-        .compact_blocks
-        .record_local_advertised(COMPACT_BLOCK_VERSION);
+    let send_cmpct = Message::SendCmpct(SendCmpct {
+        send_compact: false,
+        version: COMPACT_BLOCK_VERSION,
+    });
+    exchange(left, right, vec![send_cmpct.clone()])?;
+    exchange(right, left, vec![send_cmpct])?;
     Ok(())
 }
 
@@ -127,7 +127,7 @@ fn cursor_handshake_advertises_the_pinned_wire_protocol_version() {
 }
 
 #[test]
-fn cursor_handshake_records_the_local_compact_block_advertisement()
+fn cursor_handshake_records_the_remote_compact_block_advertisement()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut left = Peer::new(Cursor::new(Vec::new()), Magic::BITCOIN);
     let mut right = Peer::new(Cursor::new(Vec::new()), Magic::BITCOIN);
@@ -135,12 +135,14 @@ fn cursor_handshake_records_the_local_compact_block_advertisement()
     handshake_cursors(&mut left, &mut right)?;
 
     assert_eq!(
-        left.compact_blocks.local_version,
+        left.compact_blocks.remote_version,
         Some(COMPACT_BLOCK_VERSION)
     );
     assert_eq!(
-        right.compact_blocks.local_version,
+        right.compact_blocks.remote_version,
         Some(COMPACT_BLOCK_VERSION)
     );
+    assert_eq!(left.compact_blocks.remote_send_compact, Some(false));
+    assert_eq!(right.compact_blocks.remote_send_compact, Some(false));
     Ok(())
 }

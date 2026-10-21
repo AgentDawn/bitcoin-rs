@@ -84,7 +84,7 @@ impl CompactBlockNegotiation {
     }
 
     /// Record the version this node sent in its handshake `sendcmpct`.
-    pub const fn record_local_advertised(&mut self, version: u64) {
+    pub(crate) const fn record_local_advertised(&mut self, version: u64) {
         self.local_version = Some(version);
     }
 
