@@ -32,20 +32,16 @@ use crate::state::NodeState;
 /// Teardown-entry observation seam local to the lifecycle owner.
 mod shutdown {
     #[cfg(test)]
-    pub(super) struct ShutdownStageGuard;
-
-    #[cfg(test)]
     thread_local! {
         static SHUTDOWN_STAGES_REACHED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
     }
 
     /// Records that the shared teardown ran. Test builds count the entry through
     /// the observation seam; other builds record nothing. Both builds share one
-    /// plain call shape; the guard carries no behavior, so callers drop it.
+    /// plain `()`-returning call shape.
     #[cfg(test)]
-    pub(super) fn mark_shutdown_stage() -> ShutdownStageGuard {
+    pub(super) fn mark_shutdown_stage() {
         SHUTDOWN_STAGES_REACHED.with(|slot| slot.set(slot.get().saturating_add(1)));
-        ShutdownStageGuard
     }
 
     #[cfg(test)]
