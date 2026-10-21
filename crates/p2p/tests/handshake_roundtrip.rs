@@ -46,7 +46,7 @@ fn handshake_cursors(
 ///
 /// PRE: both peers wrap writable buffers.
 /// POST: `to` applied every inbound message and answered onto its stream.
-/// INVARIANT: response order matches the collecting dispatch's order.
+/// INVARIANT: response order matches the dispatch order.
 fn exchange<A, B>(
     from: &mut Peer<A>,
     to: &mut Peer<B>,

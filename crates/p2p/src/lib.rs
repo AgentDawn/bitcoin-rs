@@ -76,9 +76,7 @@ pub use compact_blocks::{CompactBlockHints, Reconstruction};
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, PINNED_CORE_VERSION};
 pub use connection::{ConnectionId, OutboundRefusal, PeerLease, PeerSource, QueuedFrame};
 pub use counters::{CountingStream, PeerCounters};
-pub use dispatch::{
-    ChainQuery, FilterRequest, FilterServing, InventoryServing, TxInventory, dispatch_inbound_full,
-};
+pub use dispatch::{ChainQuery, FilterRequest, FilterServing, InventoryServing, TxInventory};
 pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use inv::request_missing_parents;
 pub use listener::ListenerExtras;
