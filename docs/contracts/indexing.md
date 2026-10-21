@@ -446,7 +446,10 @@ Core/Kyoto runner are described in
 `crates/index/src/runtime/query.rs` tests exercise the shared
 historical/live byte budget, independent row/scan/body-read admission limits,
 rejection of truncated scans, and non-consuming rejection of over-budget work
-(`IDX-03` and the project bounded-resources invariant). No query limit or persisted representation changes.
+(`IDX-03` and the project bounded-resources invariant). The query memo retains
+at most one decoded block per query: consecutive full-block reads at the same
+`(height, hash)` reuse it, and a miss evicts before fetching, so
+distinct-height fallbacks re-read and re-charge. No query limit or persisted representation changes.
 
 ### Store-open cancellation evidence
 

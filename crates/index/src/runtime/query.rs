@@ -12,27 +12,27 @@ use super::{
     TxPositionValue, TxQueryError, TxUnavailableCause, Txid, deserialize,
 };
 
-use hashbrown::HashMap;
-
 mod filters;
 mod scripts;
 mod transactions;
 
 /// Aggregate work budget shared by every operation in one public query.
 ///
-/// Also pins the query-scoped decoded-block memo: one entry per
-/// `(height, hash)` so repeated full-block reads at the same identity decode
-/// the body once. Positioned range reads do not use the memo. The memo lives
-/// and dies with the budget, so separate public queries never share entries.
-/// Every pinned body was first charged to `remaining_bytes`, so the pinned
-/// blocks' serialized body bytes never exceed `QUERY_SCAN_BYTE_LIMIT`; their
-/// decoded heap size is larger.
+/// Also pins at most one query-scoped decoded block: consecutive full-block
+/// reads at the same `(height, hash)` identity reuse the retained block, while
+/// a read at any other identity evicts it before fetching and decoding the new
+/// block, so an evicted identity is re-read and re-charged on its next use.
+/// Positioned range reads do not use the memo. The memo lives and dies
+/// with the budget, so separate public queries never share entries. Every
+/// pinned body was first charged to `remaining_bytes`, so the pinned block's
+/// serialized body bytes never exceed `QUERY_SCAN_BYTE_LIMIT`; its decoded
+/// heap size is larger.
 pub(super) struct QueryBudget {
     remaining_rows: usize,
     remaining_bytes: usize,
     remaining_scans: usize,
     remaining_body_reads: usize,
-    block_memo: HashMap<(u32, Hash256), Arc<Block>>,
+    block_memo: Option<(u32, Hash256, Arc<Block>)>,
 }
 
 impl QueryBudget {
@@ -42,7 +42,7 @@ impl QueryBudget {
             remaining_bytes: QUERY_SCAN_BYTE_LIMIT,
             remaining_scans: QUERY_SCAN_COUNT_LIMIT,
             remaining_body_reads: QUERY_BODY_READ_LIMIT,
-            block_memo: HashMap::new(),
+            block_memo: None,
         }
     }
 
@@ -116,22 +116,32 @@ impl QueryBudget {
         Ok(())
     }
 
-    /// Returns the decoded block this query already fetched and verified for
-    /// `(height, hash)`. A hit costs no body budget: the reserve and the byte
-    /// charge happened once on the miss.
-    pub(super) fn memoized_block(&self, height: u32, hash: Hash256) -> Option<Arc<Block>> {
-        self.block_memo.get(&(height, hash)).cloned()
+    /// Returns the decoded block retained for `(height, hash)`. A hit costs no
+    /// body budget: the reserve and the byte charge happened on the miss that
+    /// cached it. A miss evicts the previously retained block, if any, before
+    /// the caller fetches and decodes a new one, so a failed fetch or decode
+    /// leaves the memo empty instead of pinning a stale identity.
+    pub(super) fn memoized_block(&mut self, height: u32, hash: Hash256) -> Option<Arc<Block>> {
+        if let Some((memo_height, memo_hash, block)) = &self.block_memo {
+            if *memo_height == height && *memo_hash == hash {
+                return Some(Arc::clone(block));
+            }
+        }
+        self.block_memo = None;
+        None
     }
 
-    /// Pins a successfully verified block for the rest of this query and
-    /// returns the shared handle.
+    /// Pins a successfully verified block as the single retained entry,
+    /// replacing whatever the memo held, and returns the shared handle. Only
+    /// call this after verification: failures must leave the memo as the miss
+    /// left it (empty).
     pub(super) fn memoize_block(
         &mut self,
         height: u32,
         hash: Hash256,
         block: Arc<Block>,
     ) -> Arc<Block> {
-        self.block_memo.insert((height, hash), Arc::clone(&block));
+        self.block_memo = Some((height, hash, Arc::clone(&block)));
         block
     }
 }
@@ -580,7 +590,7 @@ mod tests {
                 remaining_bytes: bytes,
                 remaining_scans: scans,
                 remaining_body_reads: 1,
-                block_memo: HashMap::new(),
+                block_memo: None,
             };
             assert!(matches!(
                 budget.next_scan_limit(),
@@ -635,5 +645,35 @@ mod tests {
         })?;
         assert_eq!(budget.remaining_bytes, 0);
         Ok(())
+    }
+
+    #[test]
+    fn block_memo_retains_only_the_latest_identity() {
+        use std::sync::Weak;
+
+        let mut budget = QueryBudget::new();
+        let hash_a = Hash256::from_le_bytes(&[0x11; 32]);
+        let hash_b = Hash256::from_le_bytes(&[0x22; 32]);
+
+        let block_a = Arc::new(Block::default());
+        let weak_a: Weak<Block> = Arc::downgrade(&block_a);
+        let pinned_a = budget.memoize_block(1, hash_a, block_a);
+        assert!(weak_a.upgrade().is_some());
+        drop(pinned_a);
+
+        assert!(budget.memoized_block(2, hash_b).is_none());
+        assert!(
+            weak_a.upgrade().is_none(),
+            "a miss must release the previously retained block before fetching its replacement"
+        );
+
+        let block_b = Arc::new(Block::default());
+        let weak_b: Weak<Block> = Arc::downgrade(&block_b);
+        let pinned_b = budget.memoize_block(2, hash_b, block_b);
+        drop(pinned_b);
+        assert!(budget.memoized_block(2, hash_b).is_some());
+        assert!(weak_b.upgrade().is_some());
+        drop(budget);
+        assert!(weak_b.upgrade().is_none());
     }
 }

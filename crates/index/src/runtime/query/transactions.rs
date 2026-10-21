@@ -26,12 +26,15 @@ impl DerivedIndexQueryEngine {
         tree.node(node_id).ok().map(|n| n.hash)
     }
 
-    /// Returns the verified block at `(height, hash)`, decoded once per
-    /// query: the first fetch verifies and pins the block on the query
-    /// budget, while later reads at the same identity return the shared
-    /// handle with no further body read, byte charge, or deserialization.
-    /// Only successfully verified blocks are pinned, so a miss after an
-    /// error re-attempts the body fetch.
+    /// Returns the verified block at `(height, hash)`, reusing the query's one
+    /// retained block on consecutive reads at the same identity: the first
+    /// fetch verifies and pins the block on the query budget, while later
+    /// reads at the same identity return the shared handle with no further
+    /// body read, byte charge, or deserialization. A read at any other
+    /// identity evicts the retained block before fetching, so older identities
+    /// are re-read and re-charged. Only successfully verified blocks are
+    /// pinned, so a failure leaves the memo empty and the next read
+    /// re-attempts the body fetch.
     pub(super) fn resolve_block(
         &self,
         budget: &mut QueryBudget,

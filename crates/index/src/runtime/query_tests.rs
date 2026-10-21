@@ -1224,3 +1224,50 @@ fn unspent_outputs_orders_live_rows_by_height_then_txid() -> Result<(), Box<dyn 
     }
     Ok(())
 }
+
+#[test]
+fn confirmed_history_with_nonmatching_script_falls_back_per_height_and_stays_empty()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Hostile shape from the finding: one unauthenticated scripthash query
+    // fans out to full-block fallbacks at several candidate heights. The
+    // funding rows below are filed under the queried hash but carry empty
+    // values, so every height falls back to a full-block decode that matches
+    // nothing; the memo holds at most one decoded block at a time.
+    let (genesis, chain, _) = paying_chain()?;
+    let foreign = ScriptHash::new(&Script::from_bytes(vec![0x51, 0x41, 0x42]));
+    let fixture = QueryFixture::new(FixtureConfig {
+        block: genesis,
+        retain_body: true,
+        scans: vec![scan_response(
+            ColumnFamily::Funding,
+            ScriptHashRow::scan_prefix(foreign),
+            vec![
+                (
+                    ScriptHashRow::row(foreign, 2).to_db_row().to_vec(),
+                    Vec::new(),
+                ),
+                (
+                    ScriptHashRow::row(foreign, 0).to_db_row().to_vec(),
+                    Vec::new(),
+                ),
+                (
+                    ScriptHashRow::row(foreign, 1).to_db_row().to_vec(),
+                    Vec::new(),
+                ),
+            ],
+            true,
+        )],
+        watermark: None,
+        extra_blocks: chain,
+        utxo_adds: Vec::new(),
+    })?;
+
+    let history = fixture.engine.confirmed_history(foreign)?;
+    assert_eq!(history.len(), 0);
+    assert_eq!(fixture.full_reads()?, 3);
+
+    let second = fixture.engine.confirmed_history(foreign)?;
+    assert_eq!(second.len(), 0);
+    assert_eq!(fixture.full_reads()?, 6);
+    Ok(())
+}
