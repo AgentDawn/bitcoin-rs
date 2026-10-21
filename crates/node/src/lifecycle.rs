@@ -32,18 +32,16 @@ use crate::state::NodeState;
 /// Teardown-entry observation seam local to the lifecycle owner.
 mod shutdown {
     #[cfg(test)]
-    pub(super) struct ShutdownStageGuard;
-
-    #[cfg(test)]
     thread_local! {
         static SHUTDOWN_STAGES_REACHED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
     }
 
+    /// Records that the shared teardown ran. Test builds count the entry through
+    /// the observation seam; other builds record nothing. Both builds share one
+    /// plain `()`-returning call shape.
     #[cfg(test)]
-    #[must_use]
-    pub(super) fn mark_shutdown_stage() -> ShutdownStageGuard {
+    pub(super) fn mark_shutdown_stage() {
         SHUTDOWN_STAGES_REACHED.with(|slot| slot.set(slot.get().saturating_add(1)));
-        ShutdownStageGuard
     }
 
     #[cfg(test)]
@@ -51,14 +49,9 @@ mod shutdown {
         SHUTDOWN_STAGES_REACHED.with(core::cell::Cell::take)
     }
 
+    /// Non-test builds record nothing.
     #[cfg(not(test))]
-    pub(super) struct ShutdownStageMark;
-
-    #[cfg(not(test))]
-    #[must_use]
-    pub(super) fn mark_shutdown_stage() -> ShutdownStageMark {
-        ShutdownStageMark
-    }
+    pub(super) fn mark_shutdown_stage() {}
 }
 
 /// Bounded wait for the derived-index worker join on explicit shutdown and
@@ -329,7 +322,7 @@ impl NodeServices {
             }
             &*state
         });
-        let _stage = shutdown::mark_shutdown_stage();
+        shutdown::mark_shutdown_stage();
         if let Some(state) = state {
             state.request_shutdown();
             state.p2p().shutdown();
