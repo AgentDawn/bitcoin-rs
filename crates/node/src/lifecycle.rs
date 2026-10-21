@@ -39,8 +39,10 @@ mod shutdown {
         static SHUTDOWN_STAGES_REACHED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
     }
 
+    /// Records that the shared teardown ran. Test builds count the entry through
+    /// the observation seam; other builds record nothing. Both builds share one
+    /// plain call shape; the guard carries no behavior, so callers drop it.
     #[cfg(test)]
-    #[must_use]
     pub(super) fn mark_shutdown_stage() -> ShutdownStageGuard {
         SHUTDOWN_STAGES_REACHED.with(|slot| slot.set(slot.get().saturating_add(1)));
         ShutdownStageGuard
@@ -51,14 +53,9 @@ mod shutdown {
         SHUTDOWN_STAGES_REACHED.with(core::cell::Cell::take)
     }
 
+    /// Non-test builds record nothing.
     #[cfg(not(test))]
-    pub(super) struct ShutdownStageMark;
-
-    #[cfg(not(test))]
-    #[must_use]
-    pub(super) fn mark_shutdown_stage() -> ShutdownStageMark {
-        ShutdownStageMark
-    }
+    pub(super) fn mark_shutdown_stage() {}
 }
 
 /// Bounded wait for the derived-index worker join on explicit shutdown and
@@ -329,7 +326,7 @@ impl NodeServices {
             }
             &*state
         });
-        let _stage = shutdown::mark_shutdown_stage();
+        shutdown::mark_shutdown_stage();
         if let Some(state) = state {
             state.request_shutdown();
             state.p2p().shutdown();
