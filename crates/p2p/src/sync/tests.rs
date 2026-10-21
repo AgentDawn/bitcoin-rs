@@ -2789,6 +2789,17 @@ fn telemetry_ibd_bit_agrees_with_the_shared_latch() -> TestResult {
     let now = bitcoin_rs_primitives::unix_time_secs();
 
     let syncing = SyncHarness::new(BlockTree::new());
+    // Pin the fixture frontier the doc comment names: no header tip and no
+    // applied tip. If the harness starts seeding either, the disagreement
+    // this snapshot exercises quietly disappears while the test stays green.
+    assert!(
+        syncing.block_tree.read().tip().is_none(),
+        "the active snapshot must run over a frontier with no header tip"
+    );
+    assert!(
+        syncing.applied_tip.load_full().is_none(),
+        "the active snapshot must run over a frontier with no applied tip"
+    );
     assert!(
         syncing.sync.ibd.is_active(now, Network::Regtest),
         "the fixture latch must be active for this snapshot"
@@ -2800,6 +2811,18 @@ fn telemetry_ibd_bit_agrees_with_the_shared_latch() -> TestResult {
 
     let (tree, _blocks) = mined_chain(0, 3)?;
     let synced = SyncHarness::with_ibd(tree, synced_ibd_latch());
+    // Pin the second fixture frontier: header-tip height 3 with the applied
+    // tip still absent — the shape the old applied-behind-header rule read
+    // as still syncing while the latch had already left it.
+    assert!(
+        synced.applied_tip.load_full().is_none(),
+        "the latched-off snapshot must leave the applied tip absent"
+    );
+    assert_eq!(
+        synced.block_tree.read().tip().map(|tip| tip.height),
+        Some(3),
+        "the latched-off snapshot must carry a header tip at height 3"
+    );
     assert!(
         !synced.sync.ibd.is_active(now, Network::Regtest),
         "the fixture latch must have left initial block download"
