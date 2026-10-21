@@ -32,6 +32,11 @@ use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn};
 use bitcoin_rs_primitives::deserialize;
 use bitcoin_rs_primitives::{Block, BlockHash, Header, Tx, Txid, Wtxid};
 
+/// Compact-block protocol version this node advertises: the identity
+/// profile peers use for the compact blocks they send us. Re-exported from
+/// `peer` as the authority.
+pub use crate::peer::COMPACT_BLOCK_VERSION;
+
 /// Concurrent pending reconstructions per peer connection.
 const MAX_PENDING_RECONSTRUCTIONS: usize = 4;
 /// Approximate retained bytes across all pending entries before new

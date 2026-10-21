@@ -7,6 +7,7 @@ use std::io::{Cursor, Read, Write};
 
 use bitcoin::p2p::message_compact_blocks::SendCmpct;
 use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin_rs_p2p::dispatch::dispatch_inbound;
 use bitcoin_rs_p2p::handshake::start;
 use bitcoin_rs_p2p::wire::PROTOCOL_VERSION;
 use bitcoin_rs_p2p::{COMPACT_BLOCK_VERSION, CompactBlockNegotiation};
@@ -40,11 +41,11 @@ fn handshake_cursors(
     Ok(())
 }
 
-/// Deliver each message from `from` to `to` through the collecting
-/// dispatch, writing every response back onto `from`'s stream.
+/// Deliver each message from `from` to `to` through the chainless
+/// inbound dispatch, writing every response onto `to`'s stream.
 ///
 /// PRE: both peers wrap writable buffers.
-/// POST: `to` applied every inbound message and answered onto `from`.
+/// POST: `to` applied every inbound message and answered onto its stream.
 /// INVARIANT: response order matches the collecting dispatch's order.
 fn exchange<A, B>(
     from: &mut Peer<A>,
@@ -57,34 +58,11 @@ where
 {
     for message in messages {
         from.send(&message)?;
-        for response in collect_dispatch(to, &message)? {
+        for response in dispatch_inbound(to, &message)? {
             to.send(&response)?;
         }
     }
     Ok(())
-}
-
-/// Collecting form of the chainless inbound dispatch.
-fn collect_dispatch<S: Read + Write>(
-    peer: &mut Peer<S>,
-    message: &Message,
-) -> Result<Vec<Message>, PeerError> {
-    let responses = std::cell::RefCell::new(Vec::new());
-    bitcoin_rs_p2p::dispatch_inbound_full(
-        peer,
-        message,
-        None,
-        None,
-        &|| true,
-        &|| true,
-        &mut |response| {
-            responses.borrow_mut().push(response);
-            Ok(())
-        },
-        &mut |_| {},
-        &mut |_| {},
-    )?;
-    Ok(responses.into_inner())
 }
 
 #[test]
