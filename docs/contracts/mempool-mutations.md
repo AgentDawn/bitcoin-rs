@@ -108,6 +108,12 @@ state (`crates/mempool/src/orphan.rs`).
   per-change assignment;
   `gateway::tests::failed_insert_and_noop_remove_publish_nothing` checks a
   failed insert and a no-op removal assign nothing and publish nothing.
+  The expiry/capacity ordering is covered by
+  `admission::tests::committed_admission_publishes_acceptance_before_expiry_atomically`,
+  `admission::tests::child_of_a_stale_parent_expires_with_it_and_is_refused_as_full`
+  in `crates/mempool/src/admission.rs`, and
+  `package::tests::native_package_commit_expires_an_unrelated_stale_entry_in_its_own_envelope`
+  in `crates/mempool/src/package/tests.rs`.
 
 ### `MPL-03`: ZeroMQ sequence event payload mapping
 

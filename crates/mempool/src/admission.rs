@@ -3734,7 +3734,8 @@ mod tests {
     }
 
     // Core `LimitMempoolSize` expiry: an accepted admission removes entries
-    // older than the mempool lifetime, and only after its own batch published.
+    // older than the mempool lifetime, ordered inside the same atomic batch
+    // as its acceptance.
     #[test]
     fn committed_admission_publishes_acceptance_before_expiry_atomically() {
         let (log, gateway) = batch_logged_gateway();
@@ -3840,7 +3841,12 @@ mod tests {
                 Some(&(child_txid, crate::MutationOutcome::Accepted)),
                 "the refused child's commit stays published"
             );
-            let (_origin, changes) = &batches[1];
+            let (origin, changes) = &batches[1];
+            assert_eq!(
+                *origin,
+                if package { AdmissionOrigin::Rpc } else { peer },
+                "the atomic commit publishes the submission's own origin"
+            );
             let removed = &changes[1..];
             assert_eq!(removed.len(), 2);
             assert!(removed.contains(&expired(parent_txid)));

@@ -775,9 +775,9 @@ fn package_children_cannot_jointly_cross_a_cluster_or_truc_limit() -> TestResult
 }
 
 // Core expires stale entries after each accepted transaction: a committed
-// package does too, and only after its own envelope published.
+// package does too, inside the same atomic envelope as its acceptance.
 #[test]
-fn native_package_commit_expires_an_unrelated_stale_entry_after_its_own_envelope() -> TestResult {
+fn native_package_commit_expires_an_unrelated_stale_entry_in_its_own_envelope() -> TestResult {
     let seen = Arc::new(Seen::default());
     let gateway = gateway_observed(Some(seen.clone()));
     let stale = spend(&[coin(820)], &[100_000], false);
