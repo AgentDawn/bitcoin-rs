@@ -176,9 +176,12 @@ Distinguish, and never conflate:
 
 - **Invalid header** — rejected by header admission (`P2P-10`); the peer's
   ancestry is not admitted.
-- **Invalid body** — rejected by the chain transition. An otherwise valid
-  header branch is not invalidated because a peer delivered a bad body; the
-  body gate clears and another peer may serve it (`P2P-05`).
+- **Invalid body** — rejected by the chain transition with two outcomes:
+  a body/header **binding** failure (`BodyMutated`) preserves the header
+  branch, clears the body gate, and lets another peer serve the body
+  (`P2P-05`); a consensus-**invalid** body (`Permanent`) poisons the
+  failed block and every descendant, so the header branch does not
+  survive for retry.
 - **Transient delivery failure** — strike/retry/handover under the existing
   header-request and window rules; no chain-state change.
 - **Unavailable history** — missing or pruned bodies; reported as unavailable
@@ -271,8 +274,9 @@ verdict, or extra state machine is implied.
 - Cross-crate composition proof:
   `crates/node/tests/sync_smoke.rs::tick_recovers_rejected_frontier_without_publishing_unapplied_blocks`
   feeds admitted headers and a malformed frontier body through the real
-  delivery channels and asserts applied progress, the durable chain snapshot,
-  UTXO/CoinStats, the RPC block log and both tree nodes stay unchanged, then
+  delivery channels and asserts applied progress, the in-memory
+  `ChainEventPublisher::snapshot()`, UTXO/CoinStats, the RPC block log and
+  that both admitted tree nodes keep `NodeStatus != Invalid`, then
   that resending only the correct parent applies its already-staged
   successor. It proves the channel-fed, in-memory composition across
   `SYNC-01`/`SYNC-02`/`SYNC-05`; it does **not** prove live peer sockets,
@@ -341,7 +345,7 @@ per hypothetical feature.
 | Scheduling/execution | An eligible request is actually sent to a peer, or the tick records why not | Event-loop sync tick → `BlockSync::tick` | `tick_fetches_new_tip_headers_from_at_tip_peers` and the transitions suites | None recorded |
 | Recovery closure | A peer loss/timeout/failed delivery ends in retry, handover, or terminal outcome without restart | `P2P-05` strike/expiry and peer handover; startup dialing on persisted AddrMan recovery (not `RCV-08`, which covers chainstate reorg disconnect/reconnect) | `crates/p2p/src/sync/tests/` expiry strikes; `bin/bitcoin-rs/tests/addrman_restart_e2e.rs` restart reconnection | Live reorg + expiry combined lane is main-only |
 | Non-starvation | A foreground commit lands while optional work runs, on paths the fences bound | Apply fences (`EVT-02`) — bounded by construction | `EVT-02` fencing tests (fences held only around the mutation window) | **Not proven for seeding:** `EVT-02` fencing tests do not establish foreground isolation for ScriptLive seeding, which holds the stable UTXO view across its scan and batch writes (`crates/index/src/runtime/rollback.rs`), so commits needing that write lock contend. Recorded as an unresolved contention obligation above |
-| Index delay/failure | An index failure never blocks apply; queries refuse honestly | `IDX-07` supervision + `SYNC-01` authorities | `unusable_worker_makes_queries_unavailable` | None recorded |
+| Index delay/failure | An index failure never blocks apply; queries refuse honestly | `IDX-07` supervision + `SYNC-01` authorities | `unusable_worker_makes_queries_unavailable` proves only query refusal: the test marks the worker failed and asserts `TxQueryError::Unavailable` without applying a block; apply isolation rests on the `SYNC-03` fences and `EVT-02` evidence | None recorded |
 | Durable convergence | A successful apply survives restart at the published tip | Durable head + checkpoint (`RCV-01`–`RCV-04`) | `crates/node/tests/crash_recovery.rs` `RCV-04` matrix | Formal temporal runs are not completed proofs |
 
 ## Formal models
