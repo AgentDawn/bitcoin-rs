@@ -720,6 +720,12 @@ impl BlockAnnouncer {
     /// by the planner, and an `inv` fallback may repeat. Without a pending
     /// retry, nothing happens.
     pub fn process_tip_retry(&self) -> Vec<(SocketAddr, Message)> {
+        // IBD suppresses announcements entirely; consuming the intent here
+        // would drop a disconnect-armed retry before the first poll that can
+        // act on it. Keep it armed until `process_tip` can run.
+        if self.in_ibd() {
+            return Vec::new();
+        }
         {
             let mut state = self.state.lock();
             if !std::mem::take(&mut state.announcement_retry) {
@@ -2183,6 +2189,70 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "peer must receive nothing during IBD"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_during_ibd_keeps_the_retry_armed_until_delivery() {
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let block_tree = Arc::new(RwLock::new(BlockTree::new()));
+        let ibd = Arc::new(InitialBlockDownload::new(
+            TipReader::new(Arc::clone(&applied_tip)),
+            BlockTreeReader::new(Arc::clone(&block_tree)),
+        ));
+        let chain = Arc::new(MockAnnounceChain::new(2));
+        chain.set_committed_height(1);
+        let table = Arc::new(PeerTable::new());
+        let announcer = BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        )
+        .with_ibd(Arc::clone(&ibd), Network::Regtest);
+
+        let addr = test_addr(1044);
+        let (old_lease, _rx) = setup_peer(&table, &announcer, addr, true);
+        mark_known(&table, &announcer, addr, chain.hash_at(0));
+        let old_source = old_lease.source(addr);
+        table.remove_current(addr, &old_lease);
+        announcer.on_peer_disconnected(old_source);
+        let (_replacement, replacement_rx) = setup_peer(&table, &announcer, addr, true);
+        mark_known(&table, &announcer, addr, chain.hash_at(0));
+
+        assert!(announcer.in_ibd());
+        assert_eq!(
+            announcer.process_tip_retry(),
+            Vec::new(),
+            "IBD suppresses announcements"
+        );
+        assert!(
+            announcer.state.lock().announcement_retry,
+            "the IBD poll must not consume the armed retry"
+        );
+
+        // A fresh header younger than the IBD window ends initial download.
+        let genesis = Network::Regtest.genesis_block();
+        let recent = Header {
+            prev_blockhash: genesis.block_hash(),
+            time: u32::try_from(bitcoin_rs_primitives::unix_time_secs()).unwrap_or(u32::MAX),
+            ..genesis.header
+        };
+        {
+            let mut tree = block_tree.write();
+            let genesis_id = tree
+                .insert_node(None, genesis.header, NodeStatus::Active)
+                .expect("insert genesis");
+            tree.insert_node(Some(genesis_id), recent, NodeStatus::Active)
+                .expect("insert recent child");
+        }
+        applied_tip.store(block_tree.read().tip());
+        assert!(!announcer.in_ibd());
+
+        let sent = announcer.process_tip_retry();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            replacement_rx.try_recv().is_ok(),
+            "the replacement receives the committed tip after IBD exits"
         );
     }
 
