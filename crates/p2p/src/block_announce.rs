@@ -677,10 +677,11 @@ impl BlockAnnouncer {
         }
         // Keep one retry intent across a disconnected interval. Each poll
         // rereads chainstate, so reconnecting peers receive the current tip
-        // rather than a stored announcement from a superseded branch.
-        if refused_by_node_budget || (attempted && sent.is_empty()) || no_ready_peers {
-            self.state.lock().announcement_retry = true;
-        }
+        // rather than a stored announcement from a superseded branch. A
+        // poll that delivered clears a stale flag; only refusal, an
+        // all-failed send, or no ready peers keeps it armed.
+        self.state.lock().announcement_retry =
+            refused_by_node_budget || (attempted && sent.is_empty()) || no_ready_peers;
         sent
     }
 
@@ -1670,6 +1671,45 @@ mod tests {
             chain.block_hash_at(2)
         );
         assert_eq!(announcer.peer_known_block(addr), Some(chain.hash_at(2)));
+        assert_eq!(announcer.process_tip_retry(), Vec::new());
+    }
+
+    #[test]
+    fn a_delivered_tip_clears_the_stale_retry_intent() {
+        let chain = Arc::new(MockAnnounceChain::new(3));
+        chain.set_committed_height(1);
+        let table = Arc::new(PeerTable::new());
+        let announcer = BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        );
+        let addr = test_addr(1011);
+        let (_lease, rx) = setup_peer(&table, &announcer, addr, true);
+        mark_known(&table, &announcer, addr, chain.hash_at(0));
+        drop(rx);
+
+        assert_eq!(announcer.process_tip(), Vec::new());
+        assert!(
+            announcer.state.lock().announcement_retry,
+            "an all-failed send arms the retry"
+        );
+
+        let (_replacement, replacement_rx) = setup_peer(&table, &announcer, addr, true);
+        mark_known(&table, &announcer, addr, chain.hash_at(0));
+        chain.set_committed_height(2);
+        // A fresh committed tip arrives on a direct poll, not the retry path
+        // (which would consume the flag itself).
+        let sent = announcer.process_tip();
+        assert_eq!(sent.len(), 1);
+        assert!(replacement_rx.try_recv().is_ok());
+
+        // The successful delivery must not leave a stale flag that replays
+        // the tip to fallback peers on the next timeout.
+        assert!(
+            !announcer.state.lock().announcement_retry,
+            "a delivered tip discharges the retry intent"
+        );
         assert_eq!(announcer.process_tip_retry(), Vec::new());
     }
 
