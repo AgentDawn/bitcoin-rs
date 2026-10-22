@@ -1831,7 +1831,7 @@ const fn closed_queue() -> crate::wire::PeerError {
 fn reply_bound(message: &crate::Message, getaddr_answerable: bool) -> Option<usize> {
     let payload = match message {
         crate::Message::Ping(_) => 8,
-        crate::Message::GetHeaders(_) => 3 + crate::dispatch::MAX_HEADERS_RESPONSE * 81,
+        crate::Message::GetHeaders(_) => 3 + crate::wire::MAX_HEADERS_MESSAGE_COUNT * 81,
         crate::Message::GetAddr if getaddr_answerable => {
             3 + crate::wire::MAX_ADDR_MESSAGE_COUNT * 33
         }
@@ -2678,8 +2678,7 @@ fn process_compact_wire_message(
         return;
     }
 
-    let identity_version =
-        local_compact_version.unwrap_or(crate::compact_blocks::COMPACT_BLOCK_VERSION);
+    let identity_version = local_compact_version.unwrap_or(crate::peer::COMPACT_BLOCK_VERSION);
     let outcome = process_compact_message(
         compact_reconstruction,
         message,

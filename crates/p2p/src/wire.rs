@@ -29,7 +29,7 @@ pub const MAX_MESSAGE_PAYLOAD: usize = 4_000_000;
 pub(crate) const MAX_WRITE_BURST: usize = 8;
 
 /// Maximum number of headers accepted in one `headers` message.
-const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
+pub const MAX_HEADERS_MESSAGE_COUNT: usize = 2_000;
 
 /// Maximum block locator hashes accepted in one locator-based request.
 pub const MAX_LOCATOR_HASHES: usize = 101;

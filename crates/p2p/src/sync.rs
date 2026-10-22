@@ -81,9 +81,6 @@ pub(crate) use crate::download_window::MIN_PEERS_FOR_FANOUT;
 /// Maximum number of locator entries we ever send.
 const LOCATOR_MAX_ENTRIES: usize = 32;
 
-/// Wire protocol version we advertise on outbound `getheaders`.
-const PROTOCOL_VERSION: u32 = 70_016;
-
 /// Time after which an unanswered frontier `getheaders` request may be retried.
 const HEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 

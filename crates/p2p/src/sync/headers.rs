@@ -7,7 +7,6 @@ use super::HeaderRequest;
 use super::HeaderRequestKind;
 use super::HeaderRequestState;
 use super::LOCATOR_MAX_ENTRIES;
-use super::PROTOCOL_VERSION;
 use super::chain::HeaderAdmission;
 use super::chain::SyncChainError;
 use super::frontier::ChainFrontier;
@@ -28,6 +27,7 @@ use crate::Message;
 use crate::PeerSource;
 use crate::download_window::SyncPeer;
 use crate::peer_info::PeerInfo;
+use crate::wire::PROTOCOL_VERSION;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
 use bitcoin_rs_chain::{ChainError, NodeId, NodeStatus, validate_pow};
@@ -1258,7 +1258,7 @@ impl BlockSync {
         batch_len: usize,
     ) -> PresyncOutcome {
         let (failure, request_more, ready_headers, finished) =
-            match state.process(headers, batch_len >= crate::dispatch::MAX_HEADERS_RESPONSE) {
+            match state.process(headers, batch_len >= crate::wire::MAX_HEADERS_MESSAGE_COUNT) {
                 Ok(result) => (
                     None,
                     result.request_more,
