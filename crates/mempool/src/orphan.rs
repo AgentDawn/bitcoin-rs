@@ -679,6 +679,12 @@ mod tests {
         pool.mark_ready(child.wtxid(), source(1));
         pool.remove(child.wtxid());
         assert!(pool.get(child.wtxid()).is_none());
+        // `take_ready` drops claims for absent bodies and clears
+        // `ready_ids`, so the public surface cannot observe stale
+        // readiness. Assert both owner-local indexes the way
+        // `clear_rejects` is probed below.
+        assert!(pool.ready_ids.is_empty());
+        assert!(pool.ready.is_empty());
         assert!(pool.take_ready().is_empty());
     }
     // MPL-04: aggregate orphan weight is bounded independently of count.
