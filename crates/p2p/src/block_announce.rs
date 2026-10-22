@@ -120,9 +120,9 @@ struct AnnounceState {
     /// same height (reorg race, duplicate connect) or a stale side branch
     /// never re-announces.
     highest_fast_announce: u32,
-    /// Set when a post-commit announcement was refused by the node's
-    /// aggregate outbound budget while its peer was live. The worker replans
-    /// the committed tip on a later poll ([`BlockAnnouncer::process_tip_retry`]).
+    /// Set when no ready peer could receive a post-commit announcement, or
+    /// the node's aggregate outbound budget refused a live peer. The worker
+    /// replans the committed tip on a later poll ([`BlockAnnouncer::process_tip_retry`]).
     announcement_retry: bool,
 }
 
@@ -528,13 +528,16 @@ impl BlockAnnouncer {
         sent
     }
 
-    fn planned_announcements(&self, tip: CommittedTip) -> Vec<PlannedAnnouncement> {
+    fn planned_announcements(
+        &self,
+        tip: CommittedTip,
+        live_sessions: &[crate::PeerSession],
+    ) -> Vec<PlannedAnnouncement> {
         let tip_hash = Hash256::from(tip.hash);
-        let live_sessions = self.ready_sessions();
 
         let mut planned = Vec::new();
 
-        for session in &live_sessions {
+        for session in live_sessions {
             let addr = session.addr;
             let (source, peer_state, known_position) = self.peer_anchor(session);
 
@@ -646,7 +649,10 @@ impl BlockAnnouncer {
             }
             state.last_processed_tip = Some(tip_hash);
         }
-        let planned = self.planned_announcements(tip);
+        let live_sessions = self.ready_sessions();
+        let no_ready_peers = live_sessions.is_empty();
+        let planned = self.planned_announcements(tip, &live_sessions);
+        let attempted = !planned.is_empty();
         let mut sent = Vec::with_capacity(planned.len());
         let mut refused_by_node_budget = false;
         for announcement in planned {
@@ -669,20 +675,24 @@ impl BlockAnnouncer {
             }
             sent.push((announcement.source.addr, announcement.message));
         }
-        if refused_by_node_budget {
+        // Keep one retry intent across a disconnected interval. Each poll
+        // rereads chainstate, so reconnecting peers receive the current tip
+        // rather than a stored announcement from a superseded branch.
+        if refused_by_node_budget || (attempted && sent.is_empty()) || no_ready_peers {
             self.state.lock().announcement_retry = true;
         }
         sent
     }
 
-    /// Replans the committed tip once after an announcement was refused by the
-    /// node's aggregate outbound budget.
+    /// Replans the committed tip after aggregate-budget refusal, all sends
+    /// failing, or processing with no ready peers.
     ///
     /// PRE: none.
     /// POST: with a retry pending, the pending flag clears and the tip is
-    /// processed again as if it had not been seen: peers that already know it
-    /// are skipped by the planner, and an `inv` fallback may repeat. Without
-    /// one, nothing happens.
+    /// processed again as if it had not been seen. Continued refusal or no
+    /// ready peers rearms the retry. Peers that already know it are skipped
+    /// by the planner, and an `inv` fallback may repeat. Without a pending
+    /// retry, nothing happens.
     pub fn process_tip_retry(&self) -> Vec<(SocketAddr, Message)> {
         {
             let mut state = self.state.lock();
@@ -1544,8 +1554,9 @@ mod tests {
         mark_known(&table, &announcer, addr, chain.hash_at(0));
 
         let tip = chain.committed_tip().expect("committed tip");
-        assert_eq!(announcer.planned_announcements(tip).len(), 1);
-        assert_eq!(announcer.planned_announcements(tip).len(), 1);
+        let sessions = announcer.ready_sessions();
+        assert_eq!(announcer.planned_announcements(tip, &sessions).len(), 1);
+        assert_eq!(announcer.planned_announcements(tip, &sessions).len(), 1);
 
         let sent = announcer.process_tip();
         assert_eq!(sent.len(), 1);
@@ -1619,8 +1630,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_send_does_not_advance_peer_known_tip() {
-        let chain = Arc::new(MockAnnounceChain::new(2));
+    fn failed_sends_retry_latest_committed_tip_after_reconnect() {
+        let chain = Arc::new(MockAnnounceChain::new(3));
+        chain.set_committed_height(1);
         let table = Arc::new(PeerTable::new());
         let announcer = BlockAnnouncer::new(
             Arc::clone(&table),
@@ -1639,6 +1651,67 @@ mod tests {
                 .and_then(|state| state.last_announced_block),
             Some(chain.hash_at(0))
         );
+
+        // #1560: losing every send must retain the committed tip across a
+        // disconnected interval, without requiring another chain wake.
+        assert!(lease.is_cancelled());
+        assert_eq!(announcer.process_tip_retry(), Vec::new());
+        assert_eq!(announcer.process_tip_retry(), Vec::new());
+        chain.set_committed_height(2);
+        let (_replacement, replacement_rx) = setup_peer(&table, &announcer, addr, true);
+        mark_known(&table, &announcer, addr, chain.hash_at(0));
+        let sent = announcer.process_tip_retry();
+        assert_eq!(sent.len(), 1);
+        let Message::Headers(headers) = replacement_rx.try_recv().unwrap() else {
+            panic!("the replacement must receive the current committed headers");
+        };
+        assert_eq!(
+            headers.last().unwrap().compute_hash(),
+            chain.block_hash_at(2)
+        );
+        assert_eq!(announcer.peer_known_block(addr), Some(chain.hash_at(2)));
+        assert_eq!(announcer.process_tip_retry(), Vec::new());
+    }
+
+    #[test]
+    fn worker_retries_tip_with_no_ready_peers_until_connection_arrives() {
+        let chain = Arc::new(MockAnnounceChain::new(2));
+        let table = Arc::new(PeerTable::new());
+        let announcer = Arc::new(BlockAnnouncer::new(
+            Arc::clone(&table),
+            Arc::clone(&chain) as Arc<dyn ChainQuery>,
+            BlockAnnounceConfig::default(),
+        ));
+        assert_eq!(announcer.process_tip(), Vec::new());
+        assert_eq!(announcer.process_tip_retry(), Vec::new());
+        let (_lease, rx) = setup_peer(&table, &announcer, test_addr(1014), false);
+        let (queue, worker_rx) = BlockAnnounceQueue::new();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker =
+            spawn_block_announce_worker(Arc::clone(&announcer), worker_rx, Arc::clone(&shutdown))
+                .expect("the announce worker spawns");
+        let _stop = WorkerStop {
+            shutdown,
+            queue: Some(queue),
+            handle: Some(worker),
+        };
+        // No chain wake: the worker must discover the new connection on a poll.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let message = loop {
+            if let Ok(message) = rx.try_recv() {
+                break message;
+            }
+            assert!(std::time::Instant::now() < deadline, "tip was not retried");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            message,
+            Message::Inv(vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+                chain.hash_at(1).to_le_bytes()
+            ))])
+        );
+        assert_eq!(announcer.process_tip_retry(), Vec::new());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
