@@ -379,7 +379,7 @@ impl BlockSync {
                 if self.peer_table.disconnect_source(owner) {
                     metrics::counter!("node.sync.staller_disconnects").increment(1);
                     tracing::warn!(
-                        peer_addr = %owner.addr,
+                        peer_addr = ?owner.endpoint,
                         next_apply_height,
                         "block sync: peer is stalling the download window; disconnecting and re-queueing its blocks"
                     );
@@ -389,7 +389,7 @@ impl BlockSync {
                 if self.peer_table.disconnect_source(owner) {
                     metrics::counter!("node.sync.pending_timeout_disconnects").increment(1);
                     tracing::warn!(
-                        peer_addr = %owner.addr,
+                        peer_addr = ?owner.endpoint,
                         "block sync: peer missed the block request timeout; disconnecting and re-queueing its blocks"
                     );
                 }
@@ -602,7 +602,7 @@ impl BlockSync {
         let required_hash = frontier.chain.next_required.map(|body| body.hash);
         for candidate in &mut *candidates {
             candidate.soft_blocked = window.peer_has_expired_pending(candidate.peer.source, now)
-                || window.peer_in_staller_cooldown(candidate.peer.source.addr, now)
+                || window.peer_in_staller_cooldown(candidate.peer.source.endpoint, now)
                 || required_hash
                     .is_some_and(|hash| body_unavailable.refuses(candidate.peer.source, hash, now));
         }
@@ -677,7 +677,7 @@ impl BlockSync {
         if self.peer_table.disconnect_source(source) {
             metrics::counter!("node.sync.chain_sync_disconnects").increment(1);
             tracing::warn!(
-                peer_addr = %source.addr,
+                peer_addr = ?source.endpoint,
                 "block sync: peer brought no better chain within the sync timeout; disconnecting"
             );
         }
