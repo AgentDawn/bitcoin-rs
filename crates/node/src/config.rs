@@ -168,6 +168,8 @@ pub struct RpcConfig {
     pub rest: bool,
     /// Optional experimental keyless BIP352 read service, off by default.
     pub silent_payments: bool,
+    /// Optional BIP337 compressed-transaction RPCs, off by default.
+    pub compressed_transactions: bool,
     pub auth: Auth,
 }
 
@@ -299,6 +301,7 @@ impl NodeConfig {
                 public_max_connections: settings.rpc.public_max_connections.unwrap_or(128),
                 rest: settings.rpc.rest.unwrap_or(false),
                 silent_payments: settings.rpc.silent_payments.unwrap_or(false),
+                compressed_transactions: settings.rpc.compressed_transactions.unwrap_or(false),
                 auth: rpc_auth(settings),
             },
             indexes: IndexConfig {
