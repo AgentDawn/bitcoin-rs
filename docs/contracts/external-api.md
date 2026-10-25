@@ -1109,7 +1109,10 @@ evidence does not establish mainnet memory or throughput qualifications.
   Private keys, derivations requiring private keys, Taproot trees and other
   descriptors are refused; these remain explicit Core deviations. Repeated
   alternatives within one multipath specifier are rejected with -5, like Core,
-  with native parser diagnostics rather than identical error text.
+  with an implementation-specific diagnostic rather than identical error text.
+
+  Proof: RPC `scantxoutset_tests::scan_ranged_keys_preserve_refusals_and_release_reservation`
+  and `e2e/tests/scantxoutset.rs::ranged_and_multipath_scans_match_core_and_fixed_scripts`.
 - One transient reservation belongs to the authoritative `UtxoSet`. A second
   start returns -8. Status is null when idle, otherwise approximate progress;
   abort requests cancellation and returns whether a reservation exists.
@@ -1124,13 +1127,18 @@ evidence does not establish mainnet memory or throughput qualifications.
   omitted range exceeds this budget and requires a smaller explicit range;
   duplicate expansions also consume work budget. The reservation has a
   60-second deadline, checked during parsing and before each script expansion,
-  while waiting for exclusion and every 256 coins or shard boundary. Traversal permits at most
-  250 million coins, 10,000 matches and 8 MiB of matched script bytes; projection additionally caps
-  estimated JSON materialization at 16 MiB, including repeated descriptors.
+  while waiting for exclusion and every 256 coins or shard boundary. Traversal
+  permits at most 250 million coins, 10,000 matches and 8 MiB of matched script
+  bytes; projection additionally caps estimated JSON materialization at 16 MiB,
+  including repeated descriptors.
   Retained-branch ancestry resolves requested distinct heights in one walk
   capped at 2 million nodes, with timed lock acquisition and cancellation
   checks every 256 nodes; sorting and projection also recheck cancellation.
   Limit failures return errors, never a complete/truncated success.
+
+  Proof (expansion budget and cancellation): RPC
+  `scantxoutset_tests::scan_expansion_budget_counts_ranges_paths_and_duplicates`
+  and `scantxoutset_tests::scan_expansion_observes_abort_shutdown_and_deadline`.
 - Script lookup uses one bounded set; duplicate scripts preserve the first
   descriptor's inferred attribution. Unspents follow Core outpoint order.
   `raw` and `addr` use shared script descriptor inference; public key
