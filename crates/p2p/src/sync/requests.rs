@@ -536,7 +536,7 @@ impl BlockSync {
                 .into_iter()
                 .filter(|source| {
                     !window.peer_has_expired_pending(*source, now)
-                        && !window.peer_in_staller_cooldown(source.endpoint, now)
+                        && !window.peer_in_staller_cooldown(*source, now)
                         && !scheduler.body_unavailable.refuses(*source, front_hash, now)
                 })
                 .collect()

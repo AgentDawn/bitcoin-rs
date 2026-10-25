@@ -602,7 +602,7 @@ impl BlockSync {
         let required_hash = frontier.chain.next_required.map(|body| body.hash);
         for candidate in &mut *candidates {
             candidate.soft_blocked = window.peer_has_expired_pending(candidate.peer.source, now)
-                || window.peer_in_staller_cooldown(candidate.peer.source.endpoint, now)
+                || window.peer_in_staller_cooldown(candidate.peer.source, now)
                 || required_hash
                     .is_some_and(|hash| body_unavailable.refuses(candidate.peer.source, hash, now));
         }

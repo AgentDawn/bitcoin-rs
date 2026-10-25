@@ -291,6 +291,26 @@ impl CoreValue for Option<PathBuf> {
     }
 }
 
+impl CoreValue for Option<SocketAddr> {
+    fn apply(value: &str, slot: &mut Self) {
+        if let Ok(addr) = value.parse() {
+            *slot = Some(addr);
+        }
+    }
+}
+
+impl CoreValue for Option<Vec<bitcoin_rs_node::options::NetworkLabel>> {
+    fn apply(value: &str, slot: &mut Self) {
+        let entries = slot.get_or_insert_with(Vec::new);
+        for item in value.split(',') {
+            if let Ok(label) = bitcoin_rs_node::options::parse_network_label(item.trim()) {
+                if !entries.contains(&label) {
+                    entries.push(label);
+                }
+            }
+        }
+    }
+}
 /// Sets the one Core key that no table row can express: `listen` is a boolean
 /// switch over the bind list, not an address, and only its false value is an
 /// override. Returns whether it consumed `key`.
@@ -400,6 +420,7 @@ mod compat_tests {
     use anyhow::Result;
     use bitcoin_rs_node::{Auth, Network, NodeConfig, resolve};
     use std::fs;
+    use std::net::SocketAddr;
 
     fn load_conf(text: &str, network: Network) -> Result<NodeConfig> {
         let temp = tempfile::tempdir()?;
@@ -431,6 +452,49 @@ mod compat_tests {
         assert_eq!(config.p2p.listen, []);
         assert!(config.indexes.txindex);
         assert_eq!(config.storage.dbcache_mb, 768);
+
+        let conf_with_overlays = load_conf(
+            r"
+proxy=127.0.0.1:9050
+onion=127.0.0.1:9051
+proxyrandomize=1
+torcontrol=127.0.0.1:9052
+torpassword=secret
+i2psam=127.0.0.1:7656
+i2pacceptincoming=1
+onlynet=onion,i2p
+",
+            Network::Mainnet,
+        )?;
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.proxy,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9050)))
+        );
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.onion,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9051)))
+        );
+        assert!(conf_with_overlays.p2p.overlay.proxy_randomize_credentials);
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.tor_control.as_deref(),
+            Some("127.0.0.1:9052")
+        );
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.tor_password.as_deref(),
+            Some("secret")
+        );
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.i2p_sam,
+            Some(SocketAddr::from(([127, 0, 0, 1], 7656)))
+        );
+        assert!(conf_with_overlays.p2p.overlay.i2p_accept_incoming);
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.onlynet,
+            vec![
+                bitcoin_rs_node::options::NetworkLabel::Onion,
+                bitcoin_rs_node::options::NetworkLabel::I2p
+            ]
+        );
         Ok(())
     }
 
