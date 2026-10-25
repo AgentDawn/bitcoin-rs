@@ -144,7 +144,7 @@ impl BlockSync {
                             self.scheduler
                                 .lock()
                                 .window
-                                .mark_peer_unresponsive(source.endpoint, Instant::now());
+                                .mark_peer_unresponsive(source, Instant::now());
                             blamed_peer = Some(source.endpoint);
                         }
                     }
@@ -1384,7 +1384,7 @@ impl BlockSync {
             self.scheduler
                 .lock()
                 .window
-                .mark_peer_unresponsive(source.endpoint, Instant::now());
+                .mark_peer_unresponsive(source, Instant::now());
         }
         tracing::warn!(
             peer_addr = ?source.endpoint,

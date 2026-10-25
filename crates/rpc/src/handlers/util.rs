@@ -1411,6 +1411,7 @@ mod tests {
     }
 
     #[test]
+
     fn getmemoryinfo_reports_resident_bytes_as_the_whole_locked_pool() {
         use alloc::sync::Arc;
 

@@ -727,6 +727,7 @@ fn send_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, RpcErro
     } else {
         optional_max_feerate(params, index)
     }
+
 }
 
 fn optional_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, RpcError> {
@@ -2896,4 +2897,5 @@ mod finalizepsbt_tests {
         assert!(result.get("psbt").is_none_or(Value::is_null));
         assert!(result.get("hex").and_then(Value::as_str).is_some());
     }
+
 }

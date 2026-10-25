@@ -1134,7 +1134,7 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
         sync.scheduler
             .lock()
             .window
-            .peer_in_staller_cooldown(Some(crate::PeerEndpoint::Ip(staller)), Instant::now()),
+            .peer_in_staller_cooldown(crate::PeerSource::for_test(staller), Instant::now()),
         "disconnected staller must enter the cooldown"
     );
     assert_no_getdata(&rxs[0])?;
@@ -1872,7 +1872,7 @@ fn historical_delivery_retries_corruption_and_does_not_rewind_foreground() -> Te
             .historical
             .lock()
             .window
-            .peer_in_staller_cooldown(Some(crate::PeerEndpoint::Ip(addr)), Instant::now())
+            .peer_in_staller_cooldown(crate::PeerSource::for_test(addr), Instant::now())
     );
     let retry_addr = test_addr(28001, 0)?;
     let retry_rx = connect_peer(&harness.peers, synthetic_peer(retry_addr, 3));
@@ -2392,15 +2392,11 @@ fn test_frontier(sync: &BlockSync) -> super::ChainFrontier {
 fn register_info(peer_table: &Arc<PeerTable>, info: PeerInfo) {
     let (tx, _rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    peer_table.register(
-        info.endpoint.expect("identified peer endpoint"),
-        lease.clone(),
-    );
-    peer_table.publish_info(
-        info.endpoint.expect("identified peer endpoint"),
-        &lease,
-        info,
-    );
+    let Some(endpoint) = info.endpoint else {
+        panic!("identified peer endpoint");
+    };
+    peer_table.register(endpoint, lease.clone());
+    peer_table.publish_info(endpoint, &lease, info);
 }
 /// The canonical sync-test peer: outbound, and advertising `NODE_NETWORK` plus
 /// `NODE_WITNESS`, so it may serve block bodies at any height.
@@ -2453,15 +2449,11 @@ pub(crate) fn connect_peer(
 ) -> crate::test_support::MessageReceiver {
     let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    peer_table.register(
-        info.endpoint.expect("identified peer endpoint"),
-        lease.clone(),
-    );
-    peer_table.publish_info(
-        info.endpoint.expect("identified peer endpoint"),
-        &lease,
-        info,
-    );
+    let Some(endpoint) = info.endpoint else {
+        panic!("identified peer endpoint");
+    };
+    peer_table.register(endpoint, lease.clone());
+    peer_table.publish_info(endpoint, &lease, info);
     rx
 }
 
