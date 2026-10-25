@@ -516,8 +516,9 @@ impl BlockSync {
     ///   invalid, the header passes the contextual rules header admission
     ///   applies against that parent (required nBits, median time past,
     ///   timewarp, future time, version), and it either carries more work
-    ///   than the applied chain at most [`COMPACT_RECONSTRUCTION_MAX_AHEAD`]
-    ///   blocks above the applied tip or answers a body fetch `source` owns.
+    ///   than the applied chain and sits at most
+    ///   [`COMPACT_RECONSTRUCTION_MAX_AHEAD`] blocks above the applied tip,
+    ///   or answers a body fetch `source` owns.
     ///   This matches Core, which runs its contextual header checks before
     ///   reconstruction and scans only blocks that close to its active tip.
     ///   With the required nBits enforced, forging such a header costs a
