@@ -421,6 +421,20 @@ Proof: these tests establish the memo-retention rule:
     cumulative transaction count at the base. A bundle with a different index
     format version is refused; the bundle is not a migration path
     ([db-migration.md](../policies/db-migration.md)).
+  - The receiver's count at the base is its block tree's count when the tree
+    holds one. A restart restores the cumulative count on the applied tip
+    only, so a base below the tip is usually uncounted. The count is then the
+    nearest counted node's count at or above the base (the tree's, or the
+    published one for the applied tip) minus the transaction count of every
+    block above the base up to that node, each read through the block body
+    source (its metadata when it has any, else the whole body). Nothing comes
+    from the manifest, an underflow refuses (`Identity`), and the cost is one
+    body read per block from the base to that node, polled for cancellation
+    like the other bundle loops. A chain with no counted node from the base up
+    to the tip is refused (`Identity`): without a counted anchor the exact
+    cumulative count cannot be established, whatever bodies exist. Absent
+    bodies are the withhold case below. Export needs no such read: its base
+    is the applied tip.
   - Restore needs a fresh capability. It refuses (`NotFresh`) only when
     `TxLookup` already has a watermark, and it never resets a ready index.
     `TxConfirmed` rows without a `TxLookup` watermark are leftovers of an
@@ -436,9 +450,11 @@ Proof: these tests establish the memo-retention rule:
     locator outcome in record order decides: a mismatch found before any
     unavailable body is a refusal (`Locator`); an unavailable body found first
     withholds the bundle.
-  - If the receiver has no block body source, or a body a locator needs is
-    absent or pruned, the bundle is withheld, not refused: restore writes
-    nothing, logs a warning, and ordinary backfill proceeds.
+  - If the receiver has no block body source, or a body a locator needs, or a
+    body the count derivation above needs, is absent or pruned, the bundle is
+    withheld, not refused: restore writes nothing, logs a warning, and
+    ordinary backfill proceeds. Any identity refusal is reported before a
+    withhold.
 - **Restore apply**: The row stream writes the receiver's own 80-byte header for
   every height from 0 to the base (from its block tree, not from the bundle)
   and then the `TxConfirmed` rows. A batch commits after 65,536 rows (headers
@@ -473,11 +489,14 @@ Proof: these tests establish the memo-retention rule:
   - No test compares restored rows with rows an ordinary derivation writes.
   - The clause makes no performance, interoperability with other
     implementations, or cross-version claim.
-- Executable proof covers only the manifest and artifact codec and the
-  configuration surface. The export, restore, apply, cleanup, and
-  failure-handling rules above are stated from the code and have no executable
-  proof (see Live gaps).
-- Proof (codec and configuration only): the `crates/index/src/portable/manifest.rs`
+- Executable proof covers the manifest and artifact codec, the configuration
+  surface, the publication cleanup, and the Fjall lifecycle paths (export,
+  restore, withhold, cancellation, damage refusal, interrupted-import reset).
+  It does not cover a live mid-stream `Stale` export race or power loss. The scoped
+  cross-process cases (ahead-tip restore, divergent-base refusal, post-restore reorg,
+  same-prefix wrong-full-id refusal) are covered by the private scoped run cited
+  in Live gaps, not by a checked-in portable process suite.
+- Proof: the `crates/index/src/portable/manifest.rs`
   tests `manifest_round_trips_through_json_and_validates`,
   `unknown_fields_are_denied_at_every_level`,
   `script_live_is_never_a_capability_and_script_history_is_refused`, and
@@ -494,7 +513,135 @@ Proof: these tests establish the memo-retention rule:
   `bin/bitcoin-rs/src/config.rs` tests
   `index_bundle_directories_resolve_from_the_command_line_and_stay_exclusive`,
   `empty_index_bundle_directories_are_refused_by_clap_and_the_environment`, and
-  `bitcoin_conf_cannot_request_a_bundle_or_relay_feature`.
+  `bitcoin_conf_cannot_request_a_bundle_or_relay_feature`; and the
+  `crates/index/tests/portable_bundle.rs` lifecycle tests
+  `export_then_restore_serves_the_same_queries_as_backfill`,
+  `damaged_bundles_are_refused_before_any_write_or_reset`,
+  `export_preserves_a_preexisting_destination`,
+  `cancelled_export_removes_only_its_own_staging`,
+  `cancelled_restore_writes_nothing_and_restart_completes`,
+  `missing_bodies_withhold_readiness_until_ordinary_backfill`,
+  `restore_below_a_restarted_receivers_tip_then_reconciles_forward`, and
+  `interrupted_import_is_cleared_on_restart_and_restore_retries`.
+
+### `IDX-12`: Historical prefix queries (one-shot, server-selected)
+
+This clause owns historical-prefix consistency. The embedding surface that
+exposes it is linked from [embedding.md](embedding.md); that document gives
+consumer usage and defers to this clause for every consistency rule.
+
+- Additive surface: three synchronous `Node` operations read confirmed
+  history at a server-selected covered prefix. Each returns its answer
+  qualified by the prefix it was proven against:
+  ```rust
+  impl Node {
+      pub fn transaction_at_prefix(&self, txid: &Txid)
+          -> Result<AtPrefix<Option<(u32, Tx)>>, HistoricalQueryError>;
+      pub fn script_history_at_prefix(&self, script: ScriptHash)
+          -> Result<AtPrefix<ScriptIndexSnapshot>, HistoricalQueryError>;
+      pub fn spender_at_prefix(&self, outpoint: OutPoint)
+          -> Result<AtPrefix<Option<SpendingRecord>>, HistoricalQueryError>;
+  }
+  ```
+  The new public types live in `bitcoin_rs_index::query_api` (already public;
+  no re-export is added):
+  ```rust
+  pub struct CoveredPrefix { pub floor: u32, pub height: u32, pub hash: Hash256 }
+  pub struct AtPrefix<T> { pub prefix: CoveredPrefix, pub answer: T }
+  pub enum HistoricalQueryError {
+      Retry,
+      Unavailable(HistoricalUnavailableCause),
+      Storage(CompactString),
+  }
+  pub enum HistoricalUnavailableCause {
+      Shared(TxUnavailableCause),
+      NoCoveredPrefix { capability: IndexCapability },
+      AncestryBudgetExhausted { capability: IndexCapability, watermark_height: u32 },
+      PrefixBelowFloor { floor: u32 },
+  }
+  ```
+  `CoveredPrefix.hash` is the full chain hash at `height`; `floor` is the
+  lowest provable height (`0` means genesis, positive means a pruned prefix).
+  `Txid`, `Tx`, and `OutPoint` are `bitcoin_rs_primitives` types; `Hash256` is
+  `bitcoin_rs_primitives::Hash256`; `CompactString` is
+  `compact_str::CompactString`; `ScriptHash`, `IndexCapability`,
+  `ScriptIndexSnapshot`, and `SpendingRecord` keep their existing paths.
+  `TxQueryError` and `TxUnavailableCause` are byte-for-byte unchanged: no new
+  variant there, no text change, and strict exact-tip paths stay identical.
+  Matchers match the variant, never the rendered string.
+- Per-call capabilities: each call consumes only the capabilities its
+  answer depends on: `transaction_at_prefix` needs `TxLookup` only, and
+  tx-only nodes serve it without `ScriptHistory`; `script_history_at_prefix`
+  and `spender_at_prefix` need `ScriptHistory`. A disabled required capability
+  is `Shared(CapabilityDisabled)`, preserving typed visibility.
+- One snapshot, server-selected anchor: each call takes one immutable DB
+  snapshot holding rows, watermarks, and floors, checks worker health before
+  and after, and derives the common covered ancestor of its required
+  capability watermarks and the published tip under one shared bounded
+  ancestry budget. There is no client anchor parameter, no cursor, and no
+  paging. Independent calls never share an anchor automatically: each returns
+  its own prefix, and callers that compose answers compare the returned
+  `floor`/`height`/`hash` metadata themselves.
+- Floor and range: `floor` equals the maximum consumed floor for the call.
+  Only rows in `[floor, anchor]` on `chain(anchor)` are read; rows outside
+  the range are skipped. An anchor below the floor is
+  `Unavailable(PrefixBelowFloor { floor })`. Record identity and position
+  verification and the existing query budgets apply unchanged. Historical
+  queries take no live-UTXO or chain-transition lock; the tree guard is held
+  only for the bounded ancestry walk and released before body reads.
+- Post-read freshness: after the read the call checks health again and
+  requires the anchor to still be an ancestor of the newly published tip.
+  Ordinary extension, index forward progress mid-read, a reorganization above
+  the anchor, and a reset completing after the snapshot was taken keep a
+  coherent answer valid. A reorganization below the anchor, an absent tip, or
+  a watermark hash unknown to the tree is `Retry`. A reset claim visible in
+  the snapshot (required watermark absent) is
+  `Unavailable(NoCoveredPrefix)`, so rebuilds do not spin on `Retry`. A stale
+  branch deeper than the shared hop budget is
+  `Unavailable(AncestryBudgetExhausted)`, distinct from an absent watermark.
+- Scoped absence, no mempool: absence means "not present in
+  `[floor, anchor]` on `chain(anchor)`", never a global claim. Historical
+  calls read the confirmed index only; mempool contents are never merged in.
+- Duplicates keep existing order: prefix-bounded scans still return one
+  transaction id's rows in ascending height order, and each candidate is
+  verified against the chain hash at its height through the existing
+  positioned-then-full-block ladder. `transaction_at_prefix` reports the
+  earliest verified occurrence on `chain(anchor)`; unverified rows on other
+  branches, prefix collisions, and corrupt positions are skipped, never
+  reported.
+- Positive-floor split (shared context with `IDX-02`): spend discovery for
+  a script starts from funding outputs, so a funding discovery over
+  `[floor, anchor]` cannot see spends of funding below `floor` even when the
+  spend height itself is in range. The full `script_history_at_prefix` answer
+  therefore stays unproven on a positive floor and returns
+  `Shared(HistoryUnproven { floor })` rather than a silently partial history.
+  The standalone `spender_at_prefix` takes the exact `OutPoint`, whose
+  spending rows are keyed directly by outpoint prefix and height and verified
+  per candidate, so it needs no funding discovery and may return a scoped
+  `Ok(None)` above a positive floor after verifying every matching spending
+  row in range. That `None` means no verified spend in `[floor, anchor]`,
+  not that the coin is unspent and not that the outpoint exists.
+- Unchanged and not added: strict `ScriptLive` reads, current Core RPC
+  handlers, compact-filter serving, and the existing exact-tip methods keep
+  their behavior. Nothing here adds a runtime, a framework, persistent query
+  state, a durable format, a full-scan compatibility path, an arbitrary
+  historical anchor, or HTTP routes. The three operations are synchronous
+  bounded blocking reads; embedders choose the blocking context, as detailed
+  in [embedding.md](embedding.md).
+- Error shape:
+  | Case | Result |
+  |---|---|
+  | Reorg below anchor, absent tip, watermark hash unknown to tree | `Retry` |
+  | Required watermark absent in snapshot (reset claim, rebuild) | `Unavailable(NoCoveredPrefix { capability })` |
+  | Stale branch deeper than the shared hop budget | `Unavailable(AncestryBudgetExhausted { capability, watermark_height })` |
+  | Anchor below max floor | `Unavailable(PrefixBelowFloor { floor })` |
+  | Positive floor on full script history | `Unavailable(Shared(HistoryUnproven { floor }))` |
+  | Row, scan, body-read, and body-byte budgets, truncated scans, `BlockBodyMissing`, disabled capability, worker failure/stop, missing authority, lifecycle causes | `Unavailable(Shared(...))` with the identical wrapped variant |
+  | Snapshot-open and body-read storage failures | `Storage(...)` |
+- Provenance: the surface above is implemented in this change. Executable
+  proof references for its gate, floor, ancestry, reset, reorg, and error
+  behavior are recorded by the parent after runs; this clause makes no
+  pass/fail claim about them.
 
 ### `IDX-12`: Historical prefix queries (one-shot, server-selected)
 
@@ -690,19 +837,35 @@ Core/Kyoto runner are described in
   checkpoints, block bodies, and derived indexes is normative in
   [recovery.md](recovery.md) (`RCV-01`–`RCV-04`); a `kill -9` gate that
   re-applies real block bodies through it is not yet exercised.
-- **Portable bundle end to end**: No test runs an export, a restore, a
-  withheld restore, or an interrupted import against a store (`IDX-11`). The
-  export, restore, and cleanup rules in that clause rest on the code paths
-  `portable/export.rs`, `portable/restore.rs`, `index/write.rs`
-  `import_tx_lookup_stream`, and `runtime/startup.rs` `open_and_run`, plus the
-  codec and configuration tests it lists.
-- **Orphan manifest after a failed export**: `publish_manifest` ends with a
-  directory sync (`portable/export.rs`). If that sync fails after
-  `manifest.json` exists, the export returns an error, the artifact is removed,
-  and the manifest stays. Restore of that directory then fails reading the
-  artifact, and a new export into it is refused as `ExistingBundle` until the
-  operator clears the directory. The code does not remove the manifest on this
-  path.
+- **Portable bundle cross-process scope**: `crates/index/tests/portable_bundle.rs`
+  proves export/restore equality, damage refusal, existing-destination
+  preservation, export/restore cancellation, missing-body withhold with ordinary
+  backfill, restore-below-receiver-tip forward reconciliation, and interrupted-import reset
+  over real Fjall stores (`IDX-11`). The live Core200/C150/withheld receipts are
+  private external runs, not a repository portable process suite. Scoped live run
+  `.outline/evidence/snapshot-stage2-live/runs/20261026T200208Z-remaining-1850397/`
+  (binary SHA-256 `9406226483c7ac4c29f822e133a1f36bea82cc2c1078d9795f16388b8a4e5df2`,
+  PASS 64/0, error null, survivors []) covers four selected cases: base-200 bundle
+  into same-chain receiver at 202 restores and serves all 202 txid/blockhash/sample
+  queries; off-chain base refuses with `bundle identity refused: the bundle base is not
+  on the receiver's active chain` and zero `LOG_RESTORED` while the receiver stays honest
+  at 201 and the bundle
+  base coinbase stays unserved; genuine restore at 200 then a Core P2P fork unseats
+  the base to 202 with the old base coinbase gone and the new 202 queries reconciled;
+  valid outer digest with a wrong full txid sharing the 8-byte prefix refuses at the
+  `recorded locator at height 88` guard with zero `LOG_RESTORED`. Foreign-format
+  refusal reuses prior run
+  `.outline/evidence/snapshot-stage2-live/runs/20261026T190659Z-remaining-1337602/`
+  case-4 PASS (`bundle uses a different index format version`); it was NOT_REQUESTED
+  in the scoped run and counts are not combined. Cost is closed as characterization
+  only from `.outline/evidence/snapshot-stage2-live/runs/20261026T192106Z-c150-cost/`
+  (`measurements.json` plus separate post-validation-stopped `allocated-supplement.json`),
+  one historical height-150,000 pair, not a gain or modern-mainnet claim. Stage 2 closes
+  at the accepted scoped requirements; Stage 3 remains blocked only on qualified v6
+  occurrence-schema acceptance. Limits remain: live mid-stream `Stale` export race
+  unobserved, no power-loss campaign (SIGKILL bounds stop at process kill), no
+  full-TxLookup completeness proof (every present record resolves; no missing-record
+  check), and private receipts are not a checked-in portable process suite.
 
 ## Proven by
 
