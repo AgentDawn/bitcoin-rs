@@ -87,6 +87,23 @@ That pass runs after it has emptied the receiver, so
 `inbound_block_queue_depth` is a post-drain residual, normally near zero, not
 a peak, and it is not refreshed on passes that emit nothing.
 
+Staging policy decision (retained): production keeps the fixed 256-block /
+512 MiB wire budget. An isolated count-horizon experiment (candidate
+`f24b7ded0`, committed after the matrix so source bytes match the gated binary)
+ran 48 synthetic regtest trials (4 cells x 4 policies x 3 rounds, 320 blocks
+applied each; raw samples in
+`.outline/evidence/native-gate-20261026T183745Z-1096270/gate.log`) and was
+evaluated and rejected under the fixed Step 25 gate (>=10% peak-RSS reduction,
+throughput >=98%, strictly lower retained high-water, no
+retry/starvation/stall regression): no horizon met the RSS gate (binding
+medians ~1.00-1.01x fixed vs required <=0.90), and the modern-large 8-peer
+15 s and 30 s horizons each added a stall-episode start (median 1 vs fixed 0;
+disconnects stayed 0, which does not cancel the episode regression). Five
+early-multi rows were not valid binding comparisons (all 60 s first refusals
+arrived after the corpus was fully requested; 30 s rounds 1-2 had no refusal).
+Synthetic regtest only (early/small and modern/large-OP_RETURN corpora, 3 runs
+per arm); no mainnet, p99, or whole-node claim.
+
 ### `OBS-02`: `tracing::` is diagnostics, not an API
 
 Free-form development and debugging detail belongs in `tracing::` events and
