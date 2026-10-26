@@ -7,7 +7,7 @@ use core::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use bitcoin_rs_chain::{BlockBodySource, LatchReader};
 use bitcoin_rs_chainstate::verify::{
@@ -225,9 +225,13 @@ fn bind_rpc(
         config.rpc.max_connections,
         RPC_IDLE_TIMEOUT,
         state.config().rpc.rest,
-    )?;
+    )
+    .with_context(|| format!("failed to bind RPC listener at {}", config.rpc.bind))?;
     let mut servers = Vec::with_capacity(2);
     if let Some(address) = config.rpc.public_bind {
+        // RpcServer's existing binding API requires Auth. Public mode shares
+        // this object only for API compatibility: its closed route policy
+        // rejects JSON-RPC before consulting credentials, even valid ones.
         let public = RpcServer::bind(
             address,
             rpc_auth,
@@ -235,7 +239,8 @@ fn bind_rpc(
             config.rpc.public_max_connections,
             RPC_IDLE_TIMEOUT,
             config.rpc.rest,
-        )?;
+        )
+        .with_context(|| format!("failed to bind public HTTP listener at {address}"))?;
         servers.push((server, RpcSurface::Management));
         servers.push((public, RpcSurface::Public));
     } else {
@@ -805,7 +810,7 @@ pub(crate) fn start_node(
             .spawn(move || {
                 let result = rpc_server.serve_surface_with_shutdown(rpc_shutdown.clone(), surface);
                 if !rpc_shutdown.is_triggered() {
-                    tracing::error!(error = ?result.as_ref().err(), "rpc listener exited before shutdown");
+                    tracing::error!(?surface, error = ?result.as_ref().err(), "rpc listener exited before shutdown");
                 }
                 result
             })?;

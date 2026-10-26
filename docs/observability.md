@@ -44,8 +44,11 @@ complete request head through body read, authentication and response write,
 including subsequent failures; excludes idle/head acquisition). The closed `surface`
 label is `shared`, `management`, or `public`; the histogram's closed `route`
 label is `json_rpc`, `rest`, `esplora_public`, `esplora_backend`, or `not_found`.
+`route` records classification before the listener's route policy is checked;
+it includes refused routes. For example, `surface=management, route=rest`
+records a REST request rejected by the management listener with 404.
 Values aggregate bindings of the same surface. Operators can distinguish
-public saturation from management pressure and compare routed request
+public saturation from management pressure and compare classified request
 latency. Occupancy updates follow the existing connection permit lifetime,
 including spawn failure and shutdown; no second admission counter is added.
 No paths, method names, credentials, addresses, hashes or txids are labels.

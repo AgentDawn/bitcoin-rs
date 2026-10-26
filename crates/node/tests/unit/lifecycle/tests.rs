@@ -82,7 +82,22 @@ fn public_bind_failure_rolls_back_management_binding_and_node_state() -> anyhow:
     config.rpc.bind = address;
     config.rpc.public_bind = Some(public.local_addr()?);
     drop(management);
-    assert!(start_node(config.clone(), RuntimeInputs::default(), false).is_err());
+    let error = start_node(config.clone(), RuntimeInputs::default(), false)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("occupied public bind must fail startup"))?;
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "failed to bind public HTTP listener at {}",
+            public.local_addr()?
+        )
+    );
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::AddrInUse)
+    );
     let _management = std::net::TcpListener::bind(address)?;
     let _reopened = NodeState::open(config, None)?;
     Ok(())

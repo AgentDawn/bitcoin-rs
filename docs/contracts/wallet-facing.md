@@ -39,7 +39,10 @@ listener refuses JSON-RPC, including the legacy unknown-POST fallback, with
 same Context and authoritative services; routing, capability gates, broadcast
 origins and CORS inside the public namespaces are unchanged. Each binding
 owns its connection budget, dispatcher cancellation latch and blocking quota
-(API-34). Proof: `rpc::server::tests::listeners` and node lifecycle tests
+(API-34). Proof:
+`rpc::server::tests::listeners::split_listener_routes_are_closed_before_authentication_and_body_upload`,
+`rpc::server::tests::listeners::public_saturation_preserves_management_and_recovers`,
+and node lifecycle tests
 `split_rpc_listeners_start_and_join_through_node_services` and
 `public_bind_failure_rolls_back_management_binding_and_node_state`.
 

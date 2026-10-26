@@ -44,6 +44,38 @@ fn public_listener_is_opt_in_and_budgets_resolve_independently() -> Result<()> {
 }
 
 #[test]
+fn public_listener_bind_validation_handles_wildcards_and_ephemeral_ports() -> Result<()> {
+    for (management, public, valid) in [
+        ("127.0.0.1:8332", "127.0.0.1:8332", false),
+        ("0.0.0.0:8332", "127.0.0.1:8332", false),
+        ("127.0.0.1:8332", "0.0.0.0:8332", false),
+        ("[::]:8332", "[::1]:8332", false),
+        ("[::1]:8332", "[::]:8332", false),
+        ("127.0.0.1:8332", "127.0.0.2:8332", true),
+        ("127.0.0.1:8332", "127.0.0.1:8080", true),
+        ("0.0.0.0:0", "0.0.0.0:0", true),
+        ("127.0.0.1:0", "127.0.0.1:8332", true),
+        ("127.0.0.1:8332", "127.0.0.1:0", true),
+    ] {
+        let mut config = NodeConfig::default_for_network(Network::Regtest);
+        config.rpc.bind = management.parse()?;
+        config.rpc.public_bind = Some(public.parse()?);
+        config.rpc.auth = bitcoin_rs_node::Auth::basic("operator", "secret");
+        let result = config.validate();
+        assert_eq!(result.is_ok(), valid, "{management}, {public}: {result:?}");
+        if let Err(error) = result {
+            assert!(error.to_string().contains("must not overlap"), "{error}");
+        }
+    }
+    // Both sockets stay bound: the second port-zero bind must select a
+    // different available port rather than reuse the first listener's port.
+    let management = std::net::TcpListener::bind("0.0.0.0:0")?;
+    let public = std::net::TcpListener::bind("0.0.0.0:0")?;
+    assert_ne!(management.local_addr()?.port(), public.local_addr()?.port());
+    Ok(())
+}
+
+#[test]
 fn silent_payments_toml_overlay_preserves_explicit_disable() -> Result<()> {
     assert!(
         !NodeConfig::default_for_network(Network::Regtest)

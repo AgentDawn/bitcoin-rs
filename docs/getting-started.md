@@ -205,7 +205,11 @@ A Compose example runs the upstream mempool explorer against these endpoints: [b
 
 ### REST
 
-`--rest=true` (or `rest=1` in `bitcoin.conf`) serves Core-compatible REST on the RPC port without authentication. The CLI option takes an explicit boolean; bare `--rest` is not the enablement syntax. See [rest-interface.md](rest-interface.md).
+`--rest=true` (or `rest=1` in `bitcoin.conf`) serves Core-compatible REST without
+authentication on the combined `--rpc-bind` listener by default. With
+`--public-bind`, REST moves to that public listener and the RPC port serves
+management JSON-RPC only. The CLI option takes an explicit boolean; bare
+`--rest` is not the enablement syntax. See [rest-interface.md](rest-interface.md).
 
 ### ZMQ
 

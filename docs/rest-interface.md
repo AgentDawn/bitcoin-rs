@@ -11,10 +11,11 @@ see [public consumers](getting-started.md#public-consumers). Enable it on the CL
 rest=1
 ```
 
-The REST requests are unauthenticated, as in Bitcoin Core. JSON-RPC requests on
-the same listener continue to require their configured authentication. Select
-the listener with the existing `--rpc-bind` option (or its layered config
-equivalent; see [getting-started.md](getting-started.md#rest)).
+The REST requests are unauthenticated, as in Bitcoin Core. JSON-RPC requests
+continue to require their configured authentication. By default, `--rpc-bind`
+selects the combined listener. In split mode, `--public-bind` selects the REST
+listener and `--rpc-bind` serves management JSON-RPC only (or use the layered
+config equivalents; see [getting-started.md](getting-started.md#rest)).
 
 The gateway registers these Core REST prefixes:
 

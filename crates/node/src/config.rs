@@ -380,10 +380,20 @@ impl NodeConfig {
             "RPC and public connection limits must be positive"
         );
         anyhow::ensure!(
-            self.rpc
-                .public_bind
-                .is_none_or(|address| address.port() == 0 || address != self.rpc.bind),
-            "public-bind and rpc-bind must use different socket addresses"
+            self.rpc.public_bind.is_none_or(|address| {
+                let management = self.rpc.bind;
+                // Port zero asks the OS for an unused port. Distinct
+                // concrete IPs may share a port; a same-family wildcard
+                // overlaps every concrete address on that port.
+                // Cross-family dual-stack conflicts remain OS-checked at bind.
+                address.port() == 0
+                    || address.port() != management.port()
+                    || (address.ip() != management.ip()
+                        && (address.is_ipv4() != management.is_ipv4()
+                            || (!address.ip().is_unspecified()
+                                && !management.ip().is_unspecified())))
+            }),
+            "public-bind and rpc-bind must not overlap"
         );
         anyhow::ensure!(
             self.storage.backend.is_compiled_in(),

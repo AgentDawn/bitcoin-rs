@@ -1061,7 +1061,9 @@ evidence does not establish mainnet memory or throughput qualifications.
   bind before either starts; startup rollback and normal teardown own both.
   Proof: `rpc::server::tests::listeners::public_saturation_preserves_management_and_recovers`,
   `split_listener_routes_are_closed_before_authentication_and_body_upload`,
-  and the node lifecycle proofs cited by WF-02.
+  and node lifecycle tests
+  `split_rpc_listeners_start_and_join_through_node_services` and
+  `public_bind_failure_rolls_back_management_binding_and_node_state`.
   - Interrupted and aborted accepts retry immediately. Other accept errors,
     including descriptor exhaustion and Linux's pending-connection `EOPNOTSUPP`
     (`Unsupported`), warn and retry after 100 ms; shutdown is checked before
