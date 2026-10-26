@@ -1112,7 +1112,9 @@ evidence does not establish mainnet memory or throughput qualifications.
   with an implementation-specific diagnostic rather than identical error text.
 
   Proof: RPC `scantxoutset_tests::scan_ranged_keys_preserve_refusals_and_release_reservation`
-  and `e2e/tests/scantxoutset.rs::ranged_and_multipath_scans_match_core_and_fixed_scripts`.
+  and `scantxoutset_tests::scan_descriptor_limits_and_public_fixed_forms`,
+  plus `e2e/tests/scantxoutset.rs::ranged_and_multipath_scans_match_core_and_fixed_scripts`
+  and `fixed_descriptors_scan_identical_core_created_coins`.
 - One transient reservation belongs to the authoritative `UtxoSet`. A second
   start returns -8. Status is null when idle, otherwise approximate progress;
   abort requests cancellation and returns whether a reservation exists.
