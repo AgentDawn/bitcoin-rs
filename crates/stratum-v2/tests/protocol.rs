@@ -23,10 +23,14 @@ use bitcoin_rs_mempool::{
     AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolGateway,
     MempoolLimits, SubmitOutcome,
 };
-use bitcoin_rs_mining::{Candidate, CandidateContext, CoinbaseBudget, assemble_candidate};
+use bitcoin_rs_mining::{
+    BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, Candidate, CandidateContext,
+    CoinbaseBudget, GenerateRequest, GeneratedBlock, MiningControl, MiningControlError, MiningInfo,
+    STALE_PARENT_REASON, assemble_candidate,
+};
 use bitcoin_rs_primitives::{
-    Amount, CompactTarget, Hash256, LockTime, Network, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
-    Txid, Witness, encode::double_sha256,
+    Amount, BlockPayload, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
+    Sequence, Tx, TxIn, TxOut, Txid, Witness, encode::double_sha256,
 };
 use bitcoin_rs_script::VerifyFlags;
 use bitcoin_rs_stratum::{
@@ -2367,4 +2371,351 @@ fn the_installed_fact_set_is_what_the_adapter_consumes() {
     let (fresh, clean, invalidated, id) = contract(&installed);
     assert!(fresh && clean && invalidated == 0);
     assert!(book.current().is_some_and(|job| job.id() == id));
+}
+
+#[test]
+fn accepted_block_retirement_makes_second_same_job_submit_stale() {
+    let mut s = standard_with_job();
+    let version = s.job.version();
+    let first = block_nonce(&s.job, &s.opened.prefix, version);
+    s.wire.submit_standard(
+        s.opened.channel_id,
+        1,
+        s.job.id().get(),
+        first,
+        s.job.ntime(),
+        version,
+    );
+    let pending = s
+        .wire
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            Event::BlockFound(pending) => Some(pending),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("first winning nonce is a block candidate"));
+    // Session-level consequence only: this call stands in for the host's
+    // synchronous retire on `Applied`, whose wiring lives in the node's SV2
+    // `handle_events` and is not driven from this crate.
+    s.wire.book.invalidate_active();
+    drop(pending);
+    // A second, distinct winning nonce on the same job.
+    let (session, rolled) = s
+        .opened
+        .prefix
+        .split_at(s.job.extranonce_layout().session_len());
+    let second = (first + 1..u32::MAX)
+        .find(|nonce| {
+            let header = s
+                .job
+                .header(
+                    Extranonce { session, rolled },
+                    s.job.ntime(),
+                    version,
+                    *nonce,
+                )
+                .unwrap_or_else(|error| panic!("header builds: {error:?}"));
+            compact_is_met_by(s.job.bits(), Hash256::from(header.compute_hash()))
+        })
+        .unwrap_or_else(|| panic!("a second winning nonce exists"));
+    let mut frames = s.wire.submit_standard(
+        s.opened.channel_id,
+        2,
+        s.job.id().get(),
+        second,
+        s.job.ntime(),
+        version,
+    );
+    let (_, sequence, code) = share_error(&mut frames);
+    assert_eq!((sequence, code.as_str()), (2, "stale-share"));
+    let events = s.wire.events();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, Event::BlockFound(_))),
+        "stale share is never resubmitted to the node"
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [Event::ShareRejected {
+            code: "stale-share",
+            ..
+        }]
+    ));
+    // A new parent job is accepted on the same connection.
+    let installed = s
+        .wire
+        .book
+        .install(candidate(101, 0xcd, 2), Vec::new())
+        .unwrap_or_else(|error| panic!("install: {error:?}"));
+    s.wire
+        .conn
+        .announce(&installed)
+        .unwrap_or_else(|error| panic!("announce: {error:?}"));
+    s.wire.drain();
+    let nonce = share_nonce(&installed.job, &s.opened.prefix, installed.job.version());
+    s.wire.submit_standard(
+        s.opened.channel_id,
+        3,
+        installed.job.id().get(),
+        nonce,
+        installed.job.ntime(),
+        installed.job.version(),
+    );
+    assert!(matches!(
+        s.wire.events().as_slice(),
+        [Event::ShareAccepted(_)]
+    ));
+}
+
+fn unused_backend() -> MiningControlError {
+    MiningControlError::Unavailable("not used by this test".into())
+}
+
+/// Controlled backend boundary: answers every submitted block with the
+/// source-verified stale-parent verdict and serves nothing else.
+struct StaleParentControl;
+
+impl MiningControl for StaleParentControl {
+    fn get_block_template(
+        &self,
+        _request: BlockTemplateRequest,
+    ) -> Result<BlockTemplateResult, MiningControlError> {
+        Err(unused_backend())
+    }
+
+    fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
+        Err(unused_backend())
+    }
+
+    fn network_hash_ps(&self, _lookup: i64, _height: i64) -> Result<f64, MiningControlError> {
+        Err(unused_backend())
+    }
+
+    fn submit_block(
+        &self,
+        _payload: BlockPayload,
+    ) -> Result<BlockValidationResult, MiningControlError> {
+        Ok(BlockValidationResult::Rejected(STALE_PARENT_REASON.into()))
+    }
+
+    fn submit_header(&self, _header: Header) -> Result<(), MiningControlError> {
+        Err(unused_backend())
+    }
+
+    fn publish_generation(&self) {}
+
+    fn publish_fee_delta_generation(&self, _fee_delta_sequence: u64) {}
+
+    fn generate(
+        &self,
+        _request: GenerateRequest,
+    ) -> Result<Vec<GeneratedBlock>, MiningControlError> {
+        Err(unused_backend())
+    }
+}
+
+/// Session-level contract for a stale-parent receipt: the host answers the
+/// ticket with `stale-share`, the ticket retires, and the connection stays
+/// usable. Which receipts take this branch is decided by the node's SV2
+/// `handle_events`, not by this crate.
+#[test]
+fn stale_sibling_receipt_sends_stale_error_without_closing() {
+    let mut s = standard_with_job();
+    let version = s.job.version();
+    let nonce = block_nonce(&s.job, &s.opened.prefix, version);
+    s.wire.submit_standard(
+        s.opened.channel_id,
+        1,
+        s.job.id().get(),
+        nonce,
+        s.job.ntime(),
+        version,
+    );
+    let pending = s
+        .wire
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            Event::BlockFound(pending) => Some(pending),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a block is surfaced as pending host work"));
+    let control = StaleParentControl;
+    let submission = pending
+        .submit(&control)
+        .unwrap_or_else(|error| panic!("fake backend answers: {error:?}"));
+    assert!(matches!(
+        &submission.receipt().result,
+        BlockValidationResult::Rejected(reason)
+            if reason.as_str() == STALE_PARENT_REASON
+    ));
+    let sent = s
+        .wire
+        .conn
+        .reject_block(&submission, "stale-share")
+        .unwrap_or_else(|error| panic!("stale error queues: {error:?}"));
+    assert!(sent, "stale ticket produces one error frame");
+    assert!(
+        !s.wire.conn.is_closing(),
+        "stale sibling keeps the connection usable"
+    );
+    let mut frames = s.wire.drain();
+    let (_, sequence, code) = share_error(&mut frames);
+    assert_eq!((sequence, code.as_str()), (1, "stale-share"));
+    let retired = s
+        .wire
+        .conn
+        .reject_block(&submission, "stale-share")
+        .unwrap_or_else(|error| panic!("repeat reject: {error:?}"));
+    assert!(!retired, "block ticket retires with the error frame");
+    // A subsequent new job is still announced and usable.
+    let installed = s
+        .wire
+        .book
+        .install(candidate(101, 0xcd, 2), Vec::new())
+        .unwrap_or_else(|error| panic!("install: {error:?}"));
+    s.wire
+        .conn
+        .announce(&installed)
+        .unwrap_or_else(|error| panic!("announce: {error:?}"));
+    let announced = s.wire.drain();
+    assert!(!announced.is_empty(), "new parent job announced");
+    let nonce = share_nonce(&installed.job, &s.opened.prefix, installed.job.version());
+    s.wire.submit_standard(
+        s.opened.channel_id,
+        2,
+        installed.job.id().get(),
+        nonce,
+        installed.job.ntime(),
+        installed.job.version(),
+    );
+    assert!(matches!(
+        s.wire.events().as_slice(),
+        [Event::ShareAccepted(_)]
+    ));
+}
+
+#[test]
+fn malformed_reject_code_preserves_the_pending_ticket() {
+    // A malformed host code must not drop the acknowledgement: `reject_share`
+    // validates `code_str` before removing the ticket, so the pending share
+    // survives `BadErrorCode` and the valid refusal still lands.
+    let mut s = standard_with_job();
+    let version = s.job.version();
+    let nonce = share_nonce(&s.job, &s.opened.prefix, version);
+    s.wire.submit_standard(
+        s.opened.channel_id,
+        1,
+        s.job.id().get(),
+        nonce,
+        s.job.ntime(),
+        version,
+    );
+    let share = accepted(s.wire.events());
+    let pending_before = s.wire.conn.session().pending_acks();
+    assert_eq!(pending_before, 1);
+    assert!(matches!(
+        s.wire.conn.reject_share(share.ticket, "bad\ncode"),
+        Err(Error::Session(SessionError::BadErrorCode))
+    ));
+    assert_eq!(
+        s.wire.conn.session().pending_acks(),
+        1,
+        "malformed code leaves the ticket pending"
+    );
+    assert!(
+        s.wire
+            .conn
+            .reject_share(
+                share.ticket,
+                bitcoin_rs_stratum_v2::ERROR_CODE_SHARE_NOT_RECORDED
+            )
+            .unwrap_or_else(|error| panic!("valid refusal sends: {error:?}"))
+    );
+    let mut frames = s.wire.drain();
+    let (channel, sequence, code) = share_error(&mut frames);
+    assert_eq!(
+        (channel, sequence, code.as_str()),
+        (s.opened.channel_id, 1, "share-not-recorded")
+    );
+}
+
+#[test]
+fn full_event_queue_fails_before_share_validation_without_orphan_ticket() {
+    // `SetupCompleted` plus `ChannelOpened` fill both event slots, so `submit`
+    // must fail with `Backlog` before `book.validate` records dedup state or
+    // inserts a pending ticket. (A single slot would already panic at open:
+    // `setup_mining` queues `SetupCompleted` before `ChannelOpened`.)
+    let mut config = server_config();
+    config.limits.max_pending_events = 2;
+    config.limits.max_pending_acks = 8;
+    let mut wire = Wire::with(WHOLE, config, BIP320_VERSION_MASK);
+    let installed = wire
+        .book
+        .install(candidate(100, 0xab, 2), Vec::new())
+        .unwrap_or_else(|error| panic!("install: {error:?}"));
+    wire.setup_mining(FLAG_REQUIRES_STANDARD_JOBS);
+    let mut frames = wire.open_standard(7, "alice.rig1", ALL_ONES);
+    let opened = read_open_standard(&mut frames);
+    let job = read_std_job(&mut frames);
+    assert_eq!(job.job_id, installed.job.id().get());
+    read_prev_hash(&mut frames);
+    // Setup and open left both event slots occupied; do not drain them.
+    assert_eq!(wire.conn.session().pending_acks(), 0);
+    let version = installed.job.version();
+    let nonce = share_nonce(&installed.job, &opened.prefix, version);
+    let msg = SubmitSharesStandard {
+        channel_id: opened.channel_id,
+        sequence_number: 1,
+        job_id: installed.job.id().get(),
+        nonce,
+        ntime: installed.job.ntime(),
+        version,
+    };
+    // Both event slots are occupied, so validation cannot proceed and no
+    // pending ack is left behind.
+    assert!(matches!(
+        wire.try_exchange(MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, true, msg),
+        Err(Error::Session(SessionError::Backlog { queue: "event", .. }))
+    ));
+    assert_eq!(
+        wire.conn.session().pending_acks(),
+        0,
+        "no orphan ticket is inserted when the event queue is full"
+    );
+}
+
+#[test]
+fn announce_without_fresh_still_delivers_a_missing_job_and_parent() {
+    // `announce` is driven by per-connection delivery state, not the owner's
+    // `fresh` flag: a channel opened before the install still converges on
+    // the current job and its activating `SetNewPrevHash` when the owner
+    // reports `fresh == false` (same template re-install).
+    let mut wire = Wire::new();
+    wire.setup_mining(FLAG_REQUIRES_STANDARD_JOBS);
+    let mut frames = wire.open_standard(7, "late.rig1", ALL_ONES);
+    let opened = read_open_standard(&mut frames);
+    assert!(wire.drain().is_empty());
+    let first = wire
+        .book
+        .install(candidate(100, 0xab, 2), Vec::new())
+        .unwrap_or_else(|error| panic!("install: {error:?}"));
+    assert!(first.fresh);
+    // Same template, time, and outputs: the owner reports nothing new.
+    let second = wire
+        .book
+        .install(candidate(100, 0xab, 2), Vec::new())
+        .unwrap_or_else(|error| panic!("reinstall: {error:?}"));
+    assert!(!second.fresh);
+    wire.conn
+        .announce(&second)
+        .unwrap_or_else(|error| panic!("announce: {error:?}"));
+    let mut announced = wire.drain();
+    let job = read_std_job(&mut announced);
+    assert_eq!(job.job_id, first.job.id().get());
+    let prev = read_prev_hash(&mut announced);
+    assert_eq!(prev.job_id, first.job.id().get());
+    assert_eq!(opened.channel_id, prev.channel_id);
 }
