@@ -11,6 +11,39 @@ use bitcoin_rs_primitives::Network;
 use bitcoin_rs_rpc::zmq::ZmqTopic;
 
 #[test]
+fn public_listener_is_opt_in_and_budgets_resolve_independently() -> Result<()> {
+    let defaults = NodeConfig::default_for_network(Network::Regtest);
+    assert_eq!(defaults.rpc.public_bind, None);
+    assert_eq!(defaults.rpc.max_connections, 128);
+    assert_eq!(defaults.rpc.public_max_connections, 128);
+    let file: UserConfig = toml::from_str(
+        "public_bind = '0.0.0.0:8080'\nrpc_max_connections = 8\npublic_max_connections = 32",
+    )?;
+    let mut environment = UserConfig::default();
+    environment.apply_env(
+        "BITCOIN_RS_PUBLIC_BIND",
+        std::ffi::OsStr::new("127.0.0.1:9090"),
+    )?;
+    environment.apply_env(
+        "BITCOIN_RS_PUBLIC_MAX_CONNECTIONS",
+        std::ffi::OsStr::new("16"),
+    )?;
+    let config = resolve(&[&file, &environment])?;
+    assert_eq!(config.rpc.public_bind, Some("127.0.0.1:9090".parse()?));
+    assert_eq!(config.rpc.max_connections, 8);
+    assert_eq!(config.rpc.public_max_connections, 16);
+    for invalid in [
+        "rpc_max_connections = 0",
+        "public_max_connections = 0",
+        "rpc_bind = '127.0.0.1:8332'\npublic_bind = '127.0.0.1:8332'",
+    ] {
+        let layer: UserConfig = toml::from_str(invalid)?;
+        assert!(resolve(&[&layer]).is_err(), "{invalid}");
+    }
+    Ok(())
+}
+
+#[test]
 fn silent_payments_toml_overlay_preserves_explicit_disable() -> Result<()> {
     assert!(
         !NodeConfig::default_for_network(Network::Regtest)

@@ -159,6 +159,12 @@ pub struct P2pConfig {
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
     pub bind: SocketAddr,
+    /// Opt-in separate public REST/Esplora listener.
+    pub public_bind: Option<SocketAddr>,
+    /// Connection budget of the shared or management listener.
+    pub max_connections: usize,
+    /// Independent connection budget of the public listener.
+    pub public_max_connections: usize,
     pub rest: bool,
     /// Optional experimental keyless BIP352 read service, off by default.
     pub silent_payments: bool,
@@ -288,6 +294,9 @@ impl NodeConfig {
             },
             rpc: RpcConfig {
                 bind: settings.rpc.bind.unwrap_or(profile.rpc_bind),
+                public_bind: settings.rpc.public_bind,
+                max_connections: settings.rpc.max_connections.unwrap_or(128),
+                public_max_connections: settings.rpc.public_max_connections.unwrap_or(128),
                 rest: settings.rpc.rest.unwrap_or(false),
                 silent_payments: settings.rpc.silent_payments.unwrap_or(false),
                 auth: rpc_auth(settings),
@@ -365,6 +374,16 @@ impl NodeConfig {
         anyhow::ensure!(
             self.rpc.bind.ip().is_loopback() || self.rpc.auth != Auth::GeneratedCookie,
             "non-loopback RPC bind requires explicit credentials (--rpc-password or --rpc-cookie)"
+        );
+        anyhow::ensure!(
+            self.rpc.max_connections > 0 && self.rpc.public_max_connections > 0,
+            "RPC and public connection limits must be positive"
+        );
+        anyhow::ensure!(
+            self.rpc
+                .public_bind
+                .is_none_or(|address| address.port() == 0 || address != self.rpc.bind),
+            "public-bind and rpc-bind must use different socket addresses"
         );
         anyhow::ensure!(
             self.storage.backend.is_compiled_in(),

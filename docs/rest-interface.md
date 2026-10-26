@@ -1,8 +1,9 @@
 # REST interface
 
 bitcoin-rs can expose the small Bitcoin Core-compatible REST surface needed by
-remote chain validators. REST uses the existing JSON-RPC listener and port; it
-does not create a second listener. Enable it on the CLI (`--rest=true`), via
+remote chain validators. REST uses the existing JSON-RPC listener and port by
+default. With `--public-bind`, REST moves to that separate public listener;
+see [public consumers](getting-started.md#public-consumers). Enable it on the CLI (`--rest=true`), via
 `BITCOIN_RS_REST=true`, in TOML (`rest = true`), or with Core-style
 `bitcoin.conf` configuration:
 
