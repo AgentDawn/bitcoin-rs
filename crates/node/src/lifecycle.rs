@@ -165,10 +165,25 @@ struct RpcBindings {
 
 /// Binds every RPC/HTTP listener before spawning a worker. Startup records each
 /// worker immediately after spawning, so a later failure cannot detach it.
+#[cfg(test)]
 fn bind_rpc(
     state: &NodeState,
     mining_control: &Arc<dyn MiningControl>,
     block_body_source: Arc<dyn BlockBodySource>,
+) -> Result<RpcBindings> {
+    bind_rpc_with_pool(
+        state,
+        mining_control,
+        block_body_source,
+        bitcoin_rs_rpc::context::PoolHandles::default(),
+    )
+}
+
+fn bind_rpc_with_pool(
+    state: &NodeState,
+    mining_control: &Arc<dyn MiningControl>,
+    block_body_source: Arc<dyn BlockBodySource>,
+    pool: bitcoin_rs_rpc::context::PoolHandles,
 ) -> Result<RpcBindings> {
     let config = state.config();
     let rpc_auth = Arc::new(config.rpc.auth.to_rpc_auth(&config.data_dir)?);
@@ -212,6 +227,7 @@ fn bind_rpc(
         mining: MiningHandles {
             mining_control: Some(Arc::clone(mining_control)),
         },
+        pool,
         zmq_publisher: state.zmq_publisher(),
         debug_log_path: Some(state.data_dir().join("debug.log")),
     })
@@ -310,6 +326,8 @@ pub(crate) enum TeardownMode {
 /// shutdown followed by Drop safe, and prevents repeated lifecycle work.
 #[derive(Default)]
 pub(crate) struct NodeServices {
+    #[cfg(feature = "pool")]
+    pool: Option<crate::pool::PoolService>,
     event_loop: Option<std::thread::JoinHandle<()>>,
     event_loop_signal: Option<crossbeam_channel::Sender<()>>,
     /// Stops and joins its listener in Drop.
@@ -350,6 +368,12 @@ impl NodeServices {
             &*state
         });
         shutdown::mark_shutdown_stage();
+        #[cfg(feature = "pool")]
+        if let Some(mut pool) = self.pool.take() {
+            if let Err(error) = pool.shutdown(std::time::Instant::now() + DRAIN_DEADLINE) {
+                set_first_error(&mut first_error, error);
+            }
+        }
         if let Some(state) = state {
             state.request_shutdown();
             state.p2p().shutdown();
@@ -711,7 +735,7 @@ pub(crate) fn start_node(
         Arc::clone(&chainstate),
         state.stable_read(),
         state.chain_followers(),
-        state.config().mining.payout_script.clone(),
+        pool_reward_script(state.config()),
     ));
     let sequence_wake: Arc<dyn bitcoin_rs_mining::MempoolSequenceWake> = coordinator.clone();
     let mining_control: Arc<dyn bitcoin_rs_mining::MiningControl> = coordinator;
@@ -800,7 +824,20 @@ pub(crate) fn start_node(
     // state.
     crate::chain_effects::bootstrap_genesis(&chainstate, &state.chain_followers())
         .map_err(|error| anyhow::Error::new(error).context("failed to bootstrap genesis"))?;
-    let RpcBindings { context, listeners } = bind_rpc(state, &mining_control, block_body_source)?;
+    #[cfg(feature = "pool")]
+    {
+        guard.services.pool =
+            crate::pool::PoolService::prepare(state, Arc::clone(&mining_control))?;
+    }
+    #[cfg(feature = "pool")]
+    let pool_handles = guard.services.pool.as_ref().map_or_else(
+        bitcoin_rs_rpc::context::PoolHandles::default,
+        crate::pool::PoolService::handles,
+    );
+    #[cfg(not(feature = "pool"))]
+    let pool_handles = bitcoin_rs_rpc::context::PoolHandles::default();
+    let RpcBindings { context, listeners } =
+        bind_rpc_with_pool(state, &mining_control, block_body_source, pool_handles)?;
     for (rpc_server, surface) in listeners {
         let rpc_local_addr = rpc_server.local_addr()?;
         tracing::info!(addr = %rpc_local_addr, ?surface, "rpc listener bound");
@@ -815,6 +852,10 @@ pub(crate) fn start_node(
                 result
             })?;
         guard.services.rpc_threads.push(worker);
+    }
+    #[cfg(feature = "pool")]
+    if let Some(pool) = guard.services.pool.as_mut() {
+        pool.start()?;
     }
     let peer_ready: Arc<dyn Fn(bitcoin_rs_p2p::PeerSource) + Send + Sync> =
         Arc::new(move |source: bitcoin_rs_p2p::PeerSource| {
@@ -842,6 +883,13 @@ pub(crate) fn start_node(
     Ok(guard.finish(context))
 }
 
+fn pool_reward_script(config: &NodeConfig) -> Vec<u8> {
+    #[cfg(feature = "pool")]
+    if let Some(pool) = config.pool.as_ref() {
+        return pool.reward_script.clone();
+    }
+    config.mining.payout_script.clone()
+}
 /// Threads for the process-wide rayon pool.
 ///
 /// This pool runs coarse hashing and shard-commit jobs. Script verification
