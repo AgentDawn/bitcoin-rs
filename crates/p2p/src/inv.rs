@@ -46,7 +46,7 @@ pub fn request_missing_parents(
     let connection = lease.source(session.endpoint);
     if PeerToken::from(connection) != source {
         return false;
-    };
+    }
     let mut witness = false;
     peers.for_each_ready_lease(|addr, current, info| {
         if addr == source.endpoint && current.same_connection(&lease) {
@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_parents_resolve_unidentified_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    fn missing_parents_resolve_unidentified_sessions() {
         let table = PeerTable::new();
         let (sender, receiver) = crate::test_support::message_channel_bounded(2);
         let lease = PeerLease::new(sender);
@@ -359,6 +359,5 @@ mod tests {
         };
         assert!(!request_missing_parents(&table, stale, &[parent(1)]));
         assert!(receiver.try_recv().is_err());
-        Ok(())
     }
 }

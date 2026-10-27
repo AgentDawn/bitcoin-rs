@@ -654,7 +654,7 @@ mod tests {
             body_unavailable: UnavailableBodies::new(8),
             chain_sync: hashbrown::HashMap::new(),
             headers_sync: hashbrown::HashMap::new(),
-            stale_tip: Default::default(),
+            stale_tip: super::super::StaleTipState::default(),
             expected_apply_cache: None,
         };
         (scheduler, hash)

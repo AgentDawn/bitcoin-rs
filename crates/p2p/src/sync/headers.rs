@@ -128,12 +128,11 @@ impl BlockSync {
             // infer it from the tip movement and retain the old tip for
             // stale-tip relay instead of losing it.
             if matches!(&admission, HeaderAdmission::Rejected(_)) {
-                if let Some(demoted) =
-                    bitcoin_rs_chain::header_sync::demoted_tip_after_rejection(
-                        &self.chain.block_tree(),
-                        pre_tip,
-                    )
-                {
+                let demoted = bitcoin_rs_chain::header_sync::demoted_tip_after_rejection(
+                    &self.chain.block_tree(),
+                    pre_tip,
+                );
+                if let Some(demoted) = demoted {
                     self.record_demoted_tip(demoted);
                 }
             }
@@ -1293,12 +1292,13 @@ impl BlockSync {
         }
         let tree = self.chain.block_tree();
         let network = self.chain.network();
-        let Some(first_parent) =
-            tree.lookup(Hash256::from(headers[0].prev_blockhash))
-        else {
+        let Some(first_parent) = tree.lookup(Hash256::from(headers[0].prev_blockhash)) else {
             return true;
         };
-        if tree.node(first_parent).is_ok_and(|node| node.status == NodeStatus::Invalid) {
+        if tree
+            .node(first_parent)
+            .is_ok_and(|node| node.status == NodeStatus::Invalid)
+        {
             return true;
         }
         // Declared `bits` honesty and prev-to-hash continuity across the
@@ -1538,12 +1538,11 @@ mod stale_tip_routing_tests {
     //! minimum-work/fault hold as ordinary headers, preserve a displaced
     //! tip on rejection, and never double-fetch an owned body.
 
+    use super::super::BlockSync;
     use super::super::chain::HeaderAdmission;
     use super::super::chain::SyncChain;
     use super::super::chain::SyncChainError;
     use super::super::chain::WindowCommitError;
-    use super::super::BlockSync;
-    use bitcoin::hashes::Hash as _;
     use bitcoin_rs_chain::TipSnapshot;
     use bitcoin_rs_chain::{BlockTree, ChainWork, NodeStatus};
     use bitcoin_rs_primitives::{Hash256, Header, Network};
@@ -1588,10 +1587,7 @@ mod stale_tip_routing_tests {
 
         fn bootstrap_genesis(&self) {}
 
-        fn admit_headers(
-            &self,
-            headers: &[Header],
-        ) -> HeaderAdmission {
+        fn admit_headers(&self, headers: &[Header]) -> HeaderAdmission {
             let mut tree = self.tree.write();
             match bitcoin_rs_chain::accept_headers(
                 &mut tree,
@@ -1606,13 +1602,10 @@ mod stale_tip_routing_tests {
                         .last()
                         .and_then(|id| tree.node(*id).ok())
                         .map(|node| node.hash);
-                    let active_height = tree
-                        .tip()
-                        .zip(announced_tip)
-                        .and_then(|(tip, hash)| {
-                            tree.active_height_of(tip.tip_id, hash)
-                                .and_then(|h| i32::try_from(h).ok())
-                        });
+                    let active_height = tree.tip().zip(announced_tip).and_then(|(tip, hash)| {
+                        tree.active_height_of(tip.tip_id, hash)
+                            .and_then(|h| i32::try_from(h).ok())
+                    });
                     HeaderAdmission::Accepted {
                         accepted: admitted.ids.len(),
                         announced_tip,
@@ -1635,10 +1628,7 @@ mod stale_tip_routing_tests {
             Ok(())
         }
 
-        fn window_len(
-            &self,
-            _serialized_sizes: &mut dyn Iterator<Item = usize>,
-        ) -> usize {
+        fn window_len(&self, _serialized_sizes: &mut dyn Iterator<Item = usize>) -> usize {
             0
         }
 
@@ -1655,7 +1645,8 @@ mod stale_tip_routing_tests {
             _target: bitcoin_rs_chain::NodeId,
             _staged_body: &mut dyn FnMut(
                 Hash256,
-            ) -> Option<(bitcoin_rs_primitives::Block, bytes::Bytes)>,
+            )
+                -> Option<(bitcoin_rs_primitives::Block, bytes::Bytes)>,
             _connected_body: &mut dyn FnMut(Hash256),
         ) -> Result<(), bitcoin_rs_chainstate::reorg::ReorgError> {
             Ok(())
@@ -1673,8 +1664,7 @@ mod stale_tip_routing_tests {
         let peers = Arc::new(crate::PeerTable::new());
         let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
         let (_blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
-        let chain: Arc<dyn SyncChain> =
-            Arc::new(RoutingStubChain::with_floor(tree, floor));
+        let chain: Arc<dyn SyncChain> = Arc::new(RoutingStubChain::with_floor(tree, floor));
         let sync = BlockSync::new(
             chain,
             Arc::clone(&peers),
@@ -1689,10 +1679,7 @@ mod stale_tip_routing_tests {
         peers: &Arc<crate::PeerTable>,
         port: u16,
         best_height: i32,
-    ) -> (
-        crate::PeerSource,
-        crate::test_support::MessageReceiver,
-    ) {
+    ) -> (crate::PeerSource, crate::test_support::MessageReceiver) {
         let (tx, rx) = crate::test_support::message_channel();
         let lease = crate::PeerLease::new(tx);
         let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
@@ -1726,19 +1713,18 @@ mod stale_tip_routing_tests {
         let mut tree = BlockTree::new();
         let genesis = Network::Regtest.genesis_block();
         tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)
-            .expect("genesis inserts");
+            .unwrap_or_else(|error| panic!("genesis inserts: {error}"));
         let mut prev = genesis.block_hash();
         let mut tip_id = tree
             .lookup(Hash256::from(prev))
-            .expect("genesis indexed");
+            .unwrap_or_else(|| panic!("genesis indexed"));
         for height in 1..=2_u32 {
-            let header =
-                bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
-                    .expect("fixture mines");
+            let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
+                .unwrap_or_else(|error| panic!("fixture mines: {error}"));
             prev = header.compute_hash();
             tip_id = tree
                 .insert_node(Some(tip_id), header, NodeStatus::HeaderValid)
-                .expect("main header inserts");
+                .unwrap_or_else(|error| panic!("main header inserts: {error}"));
         }
         tree
     }
@@ -1751,15 +1737,12 @@ mod stale_tip_routing_tests {
         let tree = regtest_tree_with_main();
         let floor = ChainWork::from_be_bytes([0xFF_u8; 32]);
         let (sync, _peers, _headers_tx) = routing_sync(tree, floor);
-        let genesis_prev =
-            bitcoin_rs_primitives::BlockHash::from(Network::Regtest.genesis_block().block_hash());
+        let genesis_prev = Network::Regtest.genesis_block().block_hash();
         let first = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(genesis_prev, 101)
-            .expect("fixture mines");
-        let second = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(
-            first.compute_hash(),
-            102,
-        )
-        .expect("fixture mines");
+            .unwrap_or_else(|error| panic!("fixture mines: {error}"));
+        let second =
+            bitcoin_rs_chain::regtest_fixture::mined_regtest_header(first.compute_hash(), 102)
+                .unwrap_or_else(|error| panic!("fixture mines: {error}"));
         let valid_page = [first, second];
         // Below the floor with a known parent: the valid page is complete
         // and well-linked, so it defers rather than bypassing the hold.
@@ -1772,7 +1755,7 @@ mod stale_tip_routing_tests {
             "a valid low-work stale-tip page must defer, not admit past the hold"
         );
         // A broken page (unmet proof of work) needs admission to fault.
-        let mut broken = valid_page.clone();
+        let mut broken = valid_page;
         broken[1].nonce = broken[1].nonce.wrapping_add(1).wrapping_mul(7919);
         // The grind above almost surely breaks the target; if it somehow
         // still meets it, flip bits to force the failure deterministically.
@@ -1808,16 +1791,14 @@ mod stale_tip_routing_tests {
         let pre_tip = sync
             .chain
             .chain_tip()
-            .expect("tree has a tip")
+            .unwrap_or_else(|| panic!("tree has a tip"))
             .hash;
-        let genesis_prev =
-            bitcoin_rs_primitives::BlockHash::from(Network::Regtest.genesis_block().block_hash());
+        let genesis_prev = Network::Regtest.genesis_block().block_hash();
         let mut batch = Vec::new();
         let mut prev = genesis_prev;
         for height in [101_u32, 102, 103] {
-            let header =
-                bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
-                    .expect("fixture mines");
+            let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
+                .unwrap_or_else(|error| panic!("fixture mines: {error}"));
             prev = header.compute_hash();
             batch.push(header);
         }
@@ -1826,7 +1807,7 @@ mod stale_tip_routing_tests {
         );
         batch.push(
             bitcoin_rs_chain::regtest_fixture::mined_regtest_header(garbage, 104)
-                .expect("fixture mines"),
+                .unwrap_or_else(|error| panic!("fixture mines: {error}")),
         );
         headers_tx
             .send(crate::InboundHeaders {
@@ -1834,12 +1815,12 @@ mod stale_tip_routing_tests {
                 source: Some(source),
                 wire_response: false,
             })
-            .expect("queue stale-tip batch");
+            .unwrap_or_else(|error| panic!("queue stale-tip batch: {error}"));
         sync.drain_inbound_headers();
         let moved = sync
             .chain
             .chain_tip()
-            .expect("tree has a tip")
+            .unwrap_or_else(|| panic!("tree has a tip"))
             .hash;
         assert_ne!(
             moved, pre_tip,
@@ -1869,10 +1850,13 @@ mod stale_tip_routing_tests {
         let (sync, peers, headers_tx) = routing_sync(tree, floor);
         // Owned case: linear extension at height 3, pre-owned by announcer.
         let (source, rx) = connected_peer(&peers, 18446, 3);
-        let tip = sync.chain.chain_tip().expect("tree has a tip");
+        let tip = sync
+            .chain
+            .chain_tip()
+            .unwrap_or_else(|| panic!("tree has a tip"));
         let prev = bitcoin_rs_primitives::BlockHash::from(tip.hash);
         let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, 3)
-            .expect("fixture mines");
+            .unwrap_or_else(|error| panic!("fixture mines: {error}"));
         let tip_hash = Hash256::from(header.compute_hash());
         assert!(
             sync.enqueue_owned_body_fetch(source, tip_hash, || true),
@@ -1884,7 +1868,7 @@ mod stale_tip_routing_tests {
                 source: Some(source),
                 wire_response: true,
             })
-            .expect("queue owned announcement");
+            .unwrap_or_else(|error| panic!("queue owned announcement: {error}"));
         sync.drain_inbound_headers();
         assert!(
             sync.owns_body_fetch(source, tip_hash),
@@ -1903,18 +1887,20 @@ mod stale_tip_routing_tests {
         // Control: a fresh announcement without ownership must fetch,
         // proving this test drives the real direct-fetch path.
         let (control_source, control_rx) = connected_peer(&peers, 18447, 4);
-        let tip = sync.chain.chain_tip().expect("tree has a tip");
+        let tip = sync
+            .chain
+            .chain_tip()
+            .unwrap_or_else(|| panic!("tree has a tip"));
         let prev = bitcoin_rs_primitives::BlockHash::from(tip.hash);
-        let control_header =
-            bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, 4)
-                .expect("fixture mines");
+        let control_header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, 4)
+            .unwrap_or_else(|error| panic!("fixture mines: {error}"));
         headers_tx
             .send(crate::InboundHeaders {
                 headers: vec![control_header],
                 source: Some(control_source),
                 wire_response: true,
             })
-            .expect("queue control announcement");
+            .unwrap_or_else(|error| panic!("queue control announcement: {error}"));
         sync.drain_inbound_headers();
         let mut control_saw_getdata = false;
         while let Ok(message) = control_rx.try_recv() {

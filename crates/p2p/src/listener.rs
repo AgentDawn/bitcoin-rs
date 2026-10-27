@@ -2972,7 +2972,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 shared.send_headers(lease.source(endpoint), headers, true);
             }
             crate::Message::NotFound(items) => {
-                shared.block_not_found(lease.source_ip(peer_addr), &items);
+                shared.block_not_found(lease.source(endpoint), &items);
             }
             crate::Message::StaleTip(announcement) => {
                 let negotiated = peer.remote_feature(crate::feature::BIP332_ID).is_some();
@@ -6132,10 +6132,6 @@ mod block_forward_tests {
     /// applied chain or a body fetch this connection owns. Anything else is a
     /// header announcement only, and repeating an admitted hash never rescans.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep the complete compact reconstruction sequence together"
-    )]
     fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std::error::Error>>
     {
         // Genesis plus two blocks, all applied: the applied tip is block 2.
@@ -7512,8 +7508,8 @@ mod stale_tip_routing_tests {
     fn stale_tip_batch_keeps_identified_peer_without_wire_response() {
         let peer_table = Arc::new(crate::PeerTable::new());
         let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
-        let (_blocks_tx, _blocks_rx) = crossbeam_channel::unbounded::<crate::InboundBlock>();
-        let shared = test_shared(Arc::clone(&peer_table), headers_tx, _blocks_tx);
+        let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded::<crate::InboundBlock>();
+        let shared = test_shared(Arc::clone(&peer_table), headers_tx, blocks_tx);
         let addr: SocketAddr = ([127, 0, 0, 1], 18444).into();
         let endpoint = crate::PeerEndpoint::Ip(addr);
         let source = crate::PeerSource::for_test(addr);
