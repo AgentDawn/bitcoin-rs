@@ -582,6 +582,11 @@ pub struct ProtocolSession {
     phase: Phase,
     requires_standard_jobs: bool,
     reconnecting: bool,
+    /// Whether this connection has ever been given parent context (a
+    /// `SetNewPrevHash`). Until set, `announce` upgrades an `Active`
+    /// delivery to `Future` so a job never reaches a miner that never got a
+    /// parent.
+    parent_delivered: bool,
     channels: BTreeMap<u32, Channel>,
     group_id: Option<u32>,
     next_id: u32,
@@ -916,6 +921,7 @@ impl ProtocolSession {
             phase: Phase::AwaitSetup,
             requires_standard_jobs: false,
             reconnecting: false,
+            parent_delivered: false,
             channels: BTreeMap::new(),
             group_id: None,
             next_id: 1,
@@ -931,6 +937,12 @@ impl ProtocolSession {
     #[must_use]
     pub fn is_closing(&self) -> bool {
         self.phase == Phase::Closing
+    }
+
+    /// True once `SetupConnection` succeeded and the connection accepts channels.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.phase == Phase::Open
     }
 
     /// Frames with a non-zero `extension_type` discarded so far (§3.4.1: no
@@ -1339,10 +1351,19 @@ impl ProtocolSession {
         &mut self,
         installed: &bitcoin_rs_stratum::Installed,
     ) -> Result<(), SessionError> {
-        if self.phase != Phase::Open || !installed.fresh {
+        // Delivery is driven by per-connection channel state, not the
+        // owner's `fresh` flag: a channel opened after the install (or one
+        // whose `SetNewPrevHash` never landed) still needs the current job
+        // and its parent context. `distribute` is idempotent for channels
+        // that already hold the active job.
+        if self.phase != Phase::Open {
             return Ok(());
         }
-        let delivery = if installed.clean_jobs {
+        // Until this connection knows a parent, every announcement carries
+        // one: an `Active` job would otherwise reach a miner that never got
+        // `SetNewPrevHash` (for example a channel opened while the book was
+        // empty, then an `Active` refresh on the same parent).
+        let delivery = if installed.clean_jobs || !self.parent_delivered {
             Delivery::Future
         } else {
             Delivery::Active
@@ -1358,7 +1379,22 @@ impl ProtocolSession {
             .filter(|(_, channel)| !channel.jobs.contains_key(&job_id))
             .map(|(id, _)| *id)
             .collect();
-        if missing.is_empty() {
+        // Channels that recorded the job but never received the
+        // `SetNewPrevHash` that activates it (the job frame landed while the
+        // prev-hash frame hit a full outbound queue). They need only the
+        // parent announcement, not a second job.
+        let needs_parent: Vec<u32> = self
+            .channels
+            .iter()
+            .filter(|(_, channel)| {
+                channel
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|record| record.target.is_none())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if missing.is_empty() && needs_parent.is_empty() {
             return Ok(());
         }
         let group = match self.group_id {
@@ -1384,12 +1420,45 @@ impl ProtocolSession {
                 for channel in self.channels.values_mut() {
                     activate_job(channel, job_id);
                 }
+                self.parent_delivered = true;
             }
             return Ok(());
         }
         for channel_id in missing {
             self.send_to_channel(channel_id, job, delivery)?;
         }
+        // Retry parent-only delivery for jobs that stayed inactive. This also
+        // covers channels opened mid-install: `announce` no longer depends on
+        // the owner's `fresh` flag, so a late channel that recorded the job
+        // via `open_channel` still converges on the active parent here.
+        for channel_id in needs_parent {
+            // A channel served above already carries the active job.
+            if self
+                .channels
+                .get(&channel_id)
+                .and_then(|channel| channel.jobs.get(&job_id))
+                .is_some_and(|record| record.target.is_some())
+            {
+                continue;
+            }
+            self.send_prev_hash(channel_id, job)?;
+        }
+        Ok(())
+    }
+
+    /// Parent-only delivery: the `SetNewPrevHash` that activates an already
+    /// recorded future job.
+    fn send_prev_hash(&mut self, channel_id: u32, job: &Job) -> Result<(), SessionError> {
+        if !self.channels.contains_key(&channel_id) {
+            return Err(SessionError::UnknownChannel(channel_id));
+        }
+        let job_id = job.id().get();
+        let frame = prev_hash_frame(channel_id, job)?;
+        self.push_frame(frame)?;
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            activate_job(channel, job_id);
+        }
+        self.parent_delivered = true;
         Ok(())
     }
 
@@ -1436,6 +1505,7 @@ impl ProtocolSession {
             if let Some(channel) = self.channels.get_mut(&channel_id) {
                 activate_job(channel, job_id);
             }
+            self.parent_delivered = true;
         }
         Ok(())
     }
@@ -1687,6 +1757,15 @@ impl ProtocolSession {
             nonce,
             version,
         };
+        // Reserve the event slot before validation: `book.validate` records
+        // dedup state and the valid path inserts a pending ticket, so a full
+        // event queue must fail here rather than leave an unserviceable ticket.
+        if self.events.len() >= self.config.limits.max_pending_events {
+            return Err(SessionError::Backlog {
+                queue: "event",
+                limit: self.config.limits.max_pending_events,
+            });
+        }
         match book.validate(&submission, &prepared.target) {
             Ok(outcome) => {
                 let difficulty = target_difficulty(prepared.target);
@@ -1815,6 +1894,9 @@ impl ProtocolSession {
         submission: &BlockSubmission,
         code: &'static str,
     ) -> Result<bool, SessionError> {
+        // Validate the host-supplied code before touching ticket state: an
+        // unknown code must not silently drop the acknowledgement.
+        let error_code = code_str(code)?;
         let Some(pending) = self.pending.get(&submission.ticket.0) else {
             return Ok(false);
         };
@@ -1839,7 +1921,7 @@ impl ProtocolSession {
         let msg = SubmitSharesError {
             channel_id: pending.channel_id,
             sequence_number: pending.sequence_number,
-            error_code: code_str(code)?,
+            error_code,
         };
         self.queue(
             MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
@@ -1857,6 +1939,9 @@ impl ProtocolSession {
         ticket: ShareTicket,
         code: &'static str,
     ) -> Result<bool, SessionError> {
+        // Validate before mutating: a malformed host code returns
+        // `BadErrorCode` without dropping the pending ticket.
+        let error_code = code_str(code)?;
         let Some(pending) = self.pending.get(&ticket.0) else {
             return Ok(false);
         };
@@ -1872,7 +1957,7 @@ impl ProtocolSession {
         let msg = SubmitSharesError {
             channel_id: pending.channel_id,
             sequence_number: pending.sequence_number,
-            error_code: code_str(code)?,
+            error_code,
         };
         self.queue(
             MESSAGE_TYPE_SUBMIT_SHARES_ERROR,

@@ -55,6 +55,19 @@ impl NodeChainView {
         observe()
     }
 
+    /// Lock-free applied-tip generation for reconcile rechecks.
+    ///
+    /// The `StableRead` lock is not held while the ledger computes or
+    /// commits: its write transactions can block chain transitions. Callers
+    /// snapshot this before and after the lock-free reconcile and retry when
+    /// it moves, so a mid-reconcile reorg converges on the next attempt
+    /// instead of committing a torn view as final.
+    fn tip_generation(&self) -> Option<(u32, Hash256)> {
+        self.chainstate
+            .applied_tip_snapshot()
+            .map(|tip| (tip.height, tip.hash))
+    }
+
     fn load_block(&self, height: u32, hash: Hash256) -> Result<Block, ChainViewError> {
         let bytes = self
             .bodies
@@ -509,11 +522,43 @@ impl LedgerHost {
                 Err(error) => break Some(error),
             }
         };
-        chain.with_observation(|| {
+        // Ledger compute and commit run without holding `StableRead`: the
+        // ledger write transaction can stall on storage I/O while chain
+        // transitions wait. Chain reads use the lock-free `RawChainView`;
+        // both `reconcile_*` entry points are idempotent, so a tip move
+        // mid-reconcile is repaired by converging on the next attempt.
+        let mut attempts = 0;
+        let reconcile_result = loop {
+            let before = chain.tip_generation();
             let observation = RawChainView(chain);
-            self.ledger.reconcile_rounds(&observation)?;
-            self.ledger.reconcile_payouts(&observation)
-        })?;
+            let result = (|| {
+                self.ledger.reconcile_rounds(&observation)?;
+                self.ledger.reconcile_payouts(&observation)?;
+                Ok(())
+            })();
+            let after = chain.tip_generation();
+            match result {
+                Ok(()) if before == after => break Ok(()),
+                Ok(()) => {
+                    attempts += 1;
+                    if attempts >= 2 {
+                        // A continuously moving tip still made progress: the
+                        // last pass committed idempotent transitions and the
+                        // next scheduled reconcile converges.
+                        break Ok(());
+                    }
+                }
+                Err(error) => {
+                    // A chain-observation error may be a torn view from a
+                    // concurrent transition; retry once against the new tip.
+                    attempts += 1;
+                    if attempts >= 2 || before == after {
+                        break Err(error);
+                    }
+                }
+            }
+        };
+        reconcile_result?;
         match queue_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -595,6 +640,8 @@ fn share_credit(
         account,
         extranonce: share.extranonce.clone(),
         nonce: share.header.nonce,
+        version: share.header.version,
+        ntime: share.header.time,
         work,
     })
 }

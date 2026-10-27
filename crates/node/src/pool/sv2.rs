@@ -22,6 +22,13 @@ use crate::config::PoolConfig;
 const CERTIFICATE_VALIDITY: Duration = Duration::new(86_400, 0);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// A peer that never completes `SetupConnection` holds a job-book slot and a
+/// socket; drop it rather than waiting on `cancel` forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Drop a connection that shows no read, event, or transmit progress. Job
+/// announcements count as progress, so an idle-but-live miner waiting for
+/// work is not closed while templates keep flowing.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Owned SV2 listener and connection threads.
 pub(crate) struct Sv2Service {
@@ -148,9 +155,13 @@ pub(crate) fn start(
                         });
                         let mut server_config = ServerConfig::new(initial_target);
                         server_config.limits = Limits {
-                            max_pending_acks: 1,
-                            max_pending_events: 1,
-                            ..Limits::DEFAULT
+                            max_frame_payload: 8 * 1024,
+                            max_channels: 8,
+                            max_jobs_per_channel: 16,
+                            max_pending_acks: 16,
+                            max_outbound_frames: 256,
+                            max_pending_events: 32,
+                            max_outbound_bytes: 1_048_576,
                         };
                         server_config.admit_user = admit_user;
                         match thread::Builder::new()
@@ -214,17 +225,35 @@ fn serve_connection(
     let mut input = vec![0; MAX_FEED_LEN];
     let mut buffered_input = None;
     let mut transmit = PendingTransmit::default();
+    let start = Instant::now();
+    let mut last_progress = start;
     let result = (|| -> Result<()> {
         while !cancel.load(Ordering::Acquire) && !connection.is_closing() {
+            // A silent peer must not pin a connection thread past shutdown:
+            // without `SetupConnection` there is no channel, no event, and
+            // no transmit progress to observe.
+            if !connection.session().is_open() && start.elapsed() >= HANDSHAKE_TIMEOUT {
+                return Err(anyhow!("SV2 handshake timed out"));
+            }
+            if last_progress.elapsed() >= IDLE_TIMEOUT {
+                return Err(anyhow!("SV2 connection idle timed out"));
+            }
             announce_current_job(&mut connection, core)?;
             transmit.fill(&mut connection);
+            let pending_bytes = transmit.remaining();
             transmit.flush(&mut stream)?;
+            if pending_bytes != transmit.remaining() {
+                last_progress = Instant::now();
+            }
 
             if buffered_input.is_none() {
                 let read_len = connection.read_hint().clamp(1, MAX_FEED_LEN);
                 match stream.read(&mut input[..read_len]) {
                     Ok(0) => break,
-                    Ok(length) => buffered_input = Some(length),
+                    Ok(length) => {
+                        buffered_input = Some(length);
+                        last_progress = Instant::now();
+                    }
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -249,6 +278,7 @@ fn serve_connection(
                 .take()
                 .ok_or_else(|| anyhow!("SV2 buffered input length is missing"))?;
             core.with_job_book(|book| connection.feed(&input[..length], book))?;
+            let events_before = connection.session().pending_acks();
             handle_events(
                 &mut connection,
                 core,
@@ -257,8 +287,18 @@ fn serve_connection(
                 &mut accounts,
                 &mut block_permit,
             )?;
+            // Any consumed event or newly queued reply is progress: an idle
+            // miner that keeps submitting (or being announced to) never trips
+            // the idle deadline on a quiet socket alone.
+            if events_before != connection.session().pending_acks() {
+                last_progress = Instant::now();
+            }
             transmit.fill(&mut connection);
+            let queued_before = transmit.remaining();
             transmit.flush(&mut stream)?;
+            if transmit.remaining() != queued_before {
+                last_progress = Instant::now();
+            }
         }
         Ok(())
     })();
@@ -272,10 +312,11 @@ fn serve_connection(
 }
 
 fn announce_current_job(connection: &mut Connection, core: &PoolCore) -> Result<()> {
-    if let Some(mut installed) = core.current_installed() {
-        // `fresh` describes the owner's latest refresh, not whether this
-        // connection has received the job. Distribution itself is idempotent.
-        installed.fresh = true;
+    // The session tracks per-connection delivery (missing jobs plus parents
+    // whose `SetNewPrevHash` never landed), so the owner's `fresh` flag is
+    // passed through untouched: a late channel still converges on the current
+    // parent context without rebroadcasting to channels that already hold it.
+    if let Some(installed) = core.current_installed() {
         connection.announce(&installed)?;
     }
     Ok(())
@@ -405,6 +446,12 @@ fn reap_finished(connections: &Mutex<Vec<JoinHandle<()>>>) {
 struct PendingTransmit {
     bytes: Vec<u8>,
     offset: usize,
+}
+
+impl PendingTransmit {
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
 }
 
 impl PendingTransmit {
@@ -625,9 +672,13 @@ mod tests {
     fn server_config(ledger: &Arc<LedgerHost>) -> Result<ServerConfig, Box<dyn Error>> {
         let mut config = ServerConfig::new(ShareTarget::from_le_bytes([0xff; 32])?);
         config.limits = Limits {
-            max_pending_acks: 1,
-            max_pending_events: 1,
-            ..Limits::DEFAULT
+            max_frame_payload: 8 * 1024,
+            max_channels: 8,
+            max_jobs_per_channel: 16,
+            max_pending_acks: 16,
+            max_outbound_frames: 256,
+            max_pending_events: 32,
+            max_outbound_bytes: 1_048_576,
         };
         let ledger = Arc::clone(ledger);
         config.admit_user = Arc::new(move |identity: &[u8]| {
