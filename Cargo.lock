@@ -511,6 +511,7 @@ dependencies = [
  "bitcoin-rs-rpc",
  "bitcoin-rs-script",
  "bitcoin-rs-utxo",
+ "bytes",
  "cap-fs-ext",
  "cap-std",
  "compact_str",
