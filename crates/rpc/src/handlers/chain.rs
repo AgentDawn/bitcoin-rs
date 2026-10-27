@@ -21,8 +21,8 @@ use bitcoin::hex::DisplayHex as _;
 
 use crate::context::{AppliedView, ChainControlError, Context, TxQueryError, TxUnavailableCause};
 use crate::convert::{
-    self, compact_target_hex, i32_saturated, i64_saturated, i64_saturated_len, sat_to_btc,
-    typed_to_sonic, typed_to_sonic_omitting_nulls,
+    self, compact_target_hex, i32_saturated, i64_saturated, sat_to_btc, typed_to_sonic,
+    typed_to_sonic_omitting_nulls,
 };
 use crate::error::RpcError;
 use crate::handlers::{
@@ -1168,7 +1168,7 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     typed_to_sonic_omitting_nulls(&v31::GetTxOutSetInfo {
         height: i64::from(applied_height),
         best_block: best_block.to_string_be(),
-        transactions: Some(i64_saturated_len(transactions)),
+        transactions: Some(i64_saturated(transactions)),
         tx_outs: i64_saturated(u64::try_from(txouts).unwrap_or(u64::MAX)),
         bogo_size: i64_saturated(stats.bogo_size),
         hash_serialized_3,
@@ -1768,8 +1768,8 @@ fn block_verbose_typed(
         typed_to_sonic(&v31::GetBlockVerboseOne {
             hash: record.hash.to_string(),
             confirmations: block_confirmations,
-            size: i64_saturated_len(block.total_size()),
-            stripped_size: Some(i64_saturated_len(block.stripped_size())),
+            size: i64_saturated(block.total_size()),
+            stripped_size: Some(i64_saturated(block.stripped_size())),
             weight: block.weight(),
             coinbase_tx,
             height: i64::from(record.height),
@@ -1784,7 +1784,7 @@ fn block_verbose_typed(
             target: compact_target_hex(header.bits),
             difficulty: ctx.chain.difficulty_for_bits(header.bits),
             chain_work: chainwork_hex,
-            n_tx: i64_saturated_len(record.tx_count),
+            n_tx: i64_saturated(record.tx_count),
             previous_block_hash: Some(header.prev_blockhash.to_string()),
             next_block_hash: next_block_hash.map(|hash| hash.to_string()),
         })?
@@ -1792,8 +1792,8 @@ fn block_verbose_typed(
         let base = v31::GetBlockVerboseTwo {
             hash: record.hash.to_string(),
             confirmations: block_confirmations,
-            size: i64_saturated_len(block.total_size()),
-            stripped_size: Some(i64_saturated_len(block.stripped_size())),
+            size: i64_saturated(block.total_size()),
+            stripped_size: Some(i64_saturated(block.stripped_size())),
             weight: block.weight(),
             coinbase_tx,
             height: i64::from(record.height),
@@ -1808,7 +1808,7 @@ fn block_verbose_typed(
             target: compact_target_hex(header.bits),
             difficulty: ctx.chain.difficulty_for_bits(header.bits),
             chain_work: chainwork_hex,
-            n_tx: i64_saturated_len(block.txs.len()),
+            n_tx: i64_saturated(block.txs.len()),
             previous_block_hash: (record.height > 0).then(|| header.prev_blockhash.to_string()),
             next_block_hash: next_block_hash.map(|hash| hash.to_string()),
         };

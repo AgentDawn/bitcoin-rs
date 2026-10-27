@@ -6,7 +6,7 @@
 //! transported.
 
 #[cfg(feature = "zmq")]
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use anyhow::{Result, ensure};
 use bitcoin_rs_primitives::{Hash256, Txid};
 
@@ -14,8 +14,6 @@ use bitcoin_rs_primitives::{Hash256, Txid};
 use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
 #[cfg(feature = "zmq")]
 use core::fmt;
-#[cfg(feature = "zmq")]
-use hashbrown::HashSet;
 #[cfg(feature = "zmq")]
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -336,19 +334,14 @@ impl SocketZmqPublisher {
         validate_endpoint_configs(&deduped_configs)?;
         let context = zmq::Context::new();
         let mut endpoints = Vec::new();
-        let mut bound_endpoints = HashSet::<String>::new();
         let mut hashblock_endpoints = Vec::new();
         let mut hashtx_endpoints = Vec::new();
         let mut rawblock_endpoints = Vec::new();
         let mut rawtx_endpoints = Vec::new();
         let mut sequence_endpoints = Vec::new();
         let mut notifiers = Vec::new();
-        let mut seen_notifiers = HashSet::<(ZmqTopic, String)>::new();
 
         for endpoint_config in &deduped_configs {
-            if !bound_endpoints.insert(endpoint_config.endpoint.clone()) {
-                bail!("duplicate ZMQ endpoint {}", endpoint_config.endpoint);
-            }
             let hwm = endpoint_config.effective_hwm();
             let socket = context.socket(zmq::PUB).context("create ZMQ PUB socket")?;
             socket
@@ -373,9 +366,6 @@ impl SocketZmqPublisher {
                 socket: Mutex::new(socket),
             });
             for &topic in &endpoint_config.topics {
-                if !seen_notifiers.insert((topic, endpoint_config.endpoint.clone())) {
-                    continue;
-                }
                 notifiers.push(ZmqNotifier {
                     topic,
                     endpoint: endpoint_config.endpoint.clone(),

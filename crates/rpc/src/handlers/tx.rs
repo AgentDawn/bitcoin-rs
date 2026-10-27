@@ -233,7 +233,7 @@ fn txout_typed(
         script_pubkey: convert::script_pub_key_typed(
             &output.script_pubkey,
             ctx.chain.chain_network,
-        )?,
+        ),
         coinbase,
     })
 }
