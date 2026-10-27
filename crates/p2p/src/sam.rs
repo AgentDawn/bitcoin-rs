@@ -1487,10 +1487,11 @@ impl SamSession {
         }
         let deadline = Instant::now() + wait;
         let root = self.ensure_control(deadline)?;
-        // The ACCEPT bridge connect cannot be woken once started, so it is
-        // capped at one exchange budget instead of the long pending wait; a
-        // black-holed bridge delays shutdown by at most that. Every step
-        // after the registration below is wakeable through `accept_wake`.
+        // Setup shares one exchange budget instead of the long pending wait:
+        // the bridge connect cannot be woken once started, and a stalled
+        // bridge must fail fast into the bounded retry path rather than park
+        // setup for the whole wait. Only the inbound-announcement read below
+        // uses the long pending deadline (wakeable through `accept_wake`).
         let setup_deadline = (Instant::now() + EXCHANGE_BUDGET).min(deadline);
         let mut conn = SamConn::connect_with_deadline(self.sam, setup_deadline)?;
         // Register the ACCEPT bridge socket for wakeup before any blocking
@@ -1522,9 +1523,12 @@ impl SamSession {
                 error
             }
         };
-        conn.hello(deadline).map_err(close_mapped)?;
+        conn.hello(setup_deadline).map_err(close_mapped)?;
         let reply = conn
-            .command(&format!("STREAM ACCEPT ID={}", self.id), deadline)
+            .command(
+                &format!("STREAM ACCEPT ID={}", self.id),
+                setup_deadline,
+            )
             .map_err(close_mapped)?;
         let fields = parse_fields(&reply, "STREAM STATUS")?;
         if field(&fields, "RESULT") == Some("INVALID_ID") {
