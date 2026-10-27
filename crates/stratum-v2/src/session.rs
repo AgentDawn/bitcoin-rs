@@ -1341,11 +1341,14 @@ impl ProtocolSession {
 
     /// Announces a job the owner just installed to every channel.
     ///
-    /// `installed.fresh == false` sends nothing. `clean_jobs` sends a future
-    /// job and the `SetNewPrevHash` that activates it (earlier jobs are stale
-    /// in the owner and invalid on the miner); otherwise the job is active
-    /// immediately on the last announced previous hash. Connections that did
-    /// not set `REQUIRES_STANDARD_JOBS` receive one group-addressed
+    /// Delivery is driven by per-connection channel state, not the owner's
+    /// `fresh` flag: channels missing the job (or holding it inactive for
+    /// want of its `SetNewPrevHash`) still converge on it. `clean_jobs`
+    /// sends a future job and the `SetNewPrevHash` that activates it
+    /// (earlier jobs are stale in the owner and invalid on the miner);
+    /// otherwise the job is active immediately on the last announced
+    /// previous hash. Connections that did not set
+    /// `REQUIRES_STANDARD_JOBS` receive one group-addressed
     /// `NewExtendedMiningJob`; the others, one job per channel.
     pub fn announce(
         &mut self,
