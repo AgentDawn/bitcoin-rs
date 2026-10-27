@@ -964,9 +964,9 @@ mod tests {
             }
         });
         let mut controller = TorController::connect(&TorControlTarget::Tcp(addr), Some("pw"))?;
-        controller
-            .add_onion(None, 8333, "127.0.0.1:19000".parse()?)
-            .expect_err("dropped command must fail");
+        let Err(_) = controller.add_onion(None, 8333, "127.0.0.1:19000".parse()?) else {
+            return Err("dropped command must fail".into());
+        };
         let Err(poisoned) = controller.poll_alive() else {
             return Err("poisoned controller must refuse commands".into());
         };

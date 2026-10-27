@@ -175,7 +175,7 @@ fn read_connect_reply(stream: &mut TcpStream, deadline: Instant) -> Result<(), D
         // unreachable are evidence about the peer for addrman; general
         // failure, connection-not-allowed, and unknown codes stay local.
         return Err(match head[1] {
-            0x03 | 0x04 | 0x05 | 0x06 => DialFailure::PeerUnreachable(error),
+            0x03..=0x06 => DialFailure::PeerUnreachable(error),
             _ => DialFailure::Transport(error),
         });
     }
