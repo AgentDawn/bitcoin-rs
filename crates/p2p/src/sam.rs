@@ -858,6 +858,21 @@ struct Recovery {
     pending: Option<PendingRoot>,
 }
 
+/// Clears an ACCEPT wake registration when a `SamSession::accept` exchange
+/// ends, on every return path (including `?`). `close` may already have
+/// taken and shut down the clone; taking here then only drops our
+/// registration. At the call site the guard is declared after the
+/// connection, so it drops (and clears) before the socket closes.
+struct AcceptWakeGuard<'a> {
+    slot: &'a Mutex<Option<TcpStream>>,
+}
+
+impl Drop for AcceptWakeGuard<'_> {
+    fn drop(&mut self) {
+        self.slot.lock().take();
+    }
+}
+
 /// One persistent SAM STREAM session root.
 pub struct SamSession {
     sam: SocketAddr,
@@ -1484,21 +1499,7 @@ impl SamSession {
             if self.closed.load(Ordering::Acquire) {
                 return Err(session_closed());
             }
-            match conn.reader.try_clone() {
-                Ok(clone) => *slot = Some(clone),
-                Err(error) => return Err(error),
-            }
-        }
-        /// Clears the ACCEPT wake registration when this exchange ends, on
-        /// every return. `close` may already have taken and shut down the
-        /// clone; taking here then only drops our registration.
-        struct AcceptWakeGuard<'a> {
-            slot: &'a Mutex<Option<TcpStream>>,
-        }
-        impl Drop for AcceptWakeGuard<'_> {
-            fn drop(&mut self) {
-                self.slot.lock().take();
-            }
+            *slot = Some(conn.reader.try_clone()?);
         }
         let _accept_wake = AcceptWakeGuard {
             slot: &self.accept_wake,

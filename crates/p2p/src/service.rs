@@ -711,6 +711,65 @@ impl P2pService {
         Ok(())
     }
 
+    /// Spawns the one I2P accept worker for a service start.
+    ///
+    /// Each iteration pends one long `STREAM ACCEPT` on the bridge
+    /// (`I2P_ACCEPT_WAIT`) instead of churning one-second setups, and
+    /// `SamSession::close` wakes the pending socket so shutdown joins
+    /// promptly. Shutdown visibility across this worker is release-acquire
+    /// (causal): `close` and `cancel` release-store the flags and wake the
+    /// socket, this loop acquire-loads them between accepts, and the thread
+    /// join in `join_core_workers` is the linearizable teardown handoff. The
+    /// worker is never detached: it always ends before the join returns.
+    fn spawn_i2p_accept_worker(
+        session: Arc<crate::sam::SamSession>,
+        shared: crate::listener::ConnectionShared,
+        shutdown: Arc<AtomicBool>,
+        fallback_port: u16,
+    ) -> io::Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("bitcoin-rs-p2p-i2p-accept".to_owned())
+            .spawn(move || {
+                let mut attempt = 0u32;
+                while !shutdown.load(Ordering::Acquire) && !shared.session_cancel.load() {
+                    match crate::listener::accept_i2p_stream(
+                        &session,
+                        I2P_ACCEPT_WAIT,
+                        fallback_port,
+                        &shared,
+                    ) {
+                        Ok(true) => attempt = 0,
+                        Ok(false) => {
+                            // Shutdown/no-peer answer (inactive or full):
+                            // leave promptly when the epoch is over, else
+                            // back off like an accept error so a
+                            // persistently declining path cannot spin.
+                            if shutdown.load(Ordering::Acquire)
+                                || shared.session_cancel.load()
+                            {
+                                tracing::debug!("p2p i2p accept ended at shutdown");
+                                break;
+                            }
+                            attempt = attempt.saturating_add(1);
+                            tracing::debug!(attempt, "p2p i2p accept declined; backing off");
+                            interruptible_backoff(attempt, &shutdown);
+                        }
+                        Err(error) => {
+                            if shutdown.load(Ordering::Acquire)
+                                || shared.session_cancel.load()
+                            {
+                                tracing::debug!(%error, "p2p i2p accept ended at shutdown");
+                                break;
+                            }
+                            attempt = attempt.saturating_add(1);
+                            tracing::debug!(%error, attempt, "p2p i2p accept wait ended; backing off");
+                            interruptible_backoff(attempt, &shutdown);
+                        }
+                    }
+                }
+            })
+    }
+
     fn start_overlay_workers(
         &self,
         workers: &mut Workers,
@@ -784,77 +843,17 @@ impl P2pService {
             workers.overlay_threads.push(control_handle);
         }
 
-        // I2P inbound: one accept worker per service start. Each iteration
-        // pends one long `STREAM ACCEPT` on the bridge (`I2P_ACCEPT_WAIT`)
-        // instead of churning one-second setups, and `SamSession::close`
-        // wakes the pending socket so shutdown joins promptly. Shutdown
-        // visibility across this worker is release-acquire (causal): `close`
-        // and `cancel` release-store the flags and wake the socket, this loop
-        // acquire-loads them between accepts, and the thread join in
-        // `join_core_workers` is the linearizable teardown handoff. The
-        // worker is never detached: it always ends before the join returns.
+        // I2P inbound: one accept worker per service start (see
+        // `spawn_i2p_accept_worker` for the pending-wait contract).
         if overlay.i2p_accept_incoming
             && let Some(session) = &workers.sam_session
         {
-            let session = Arc::clone(session);
-            let accept_shared = shared.clone();
-            let shutdown_flag = Arc::clone(&workers.shutdown);
-            let fallback_port = service_port;
-            let i2p_handle = thread::Builder::new()
-                .name("bitcoin-rs-p2p-i2p-accept".to_owned())
-                .spawn(move || {
-                    let mut attempt = 0u32;
-                    while !shutdown_flag.load(Ordering::Acquire)
-                        && !accept_shared.session_cancel.load()
-                    {
-                        match crate::listener::accept_i2p_stream(
-                            &session,
-                            I2P_ACCEPT_WAIT,
-                            fallback_port,
-                            &accept_shared,
-                        ) {
-                            Ok(true) => attempt = 0,
-                            Ok(false) => {
-                                // Shutdown/no-peer answer (inactive or
-                                // full): leave promptly when the epoch is
-                                // over, else back off like an accept error
-                                // so a persistently declining path cannot
-                                // spin.
-                                if shutdown_flag.load(Ordering::Acquire)
-                                    || accept_shared.session_cancel.load()
-                                {
-                                    tracing::debug!("p2p i2p accept ended at shutdown");
-                                    break;
-                                }
-                                attempt = attempt.saturating_add(1);
-                                tracing::debug!(
-                                    attempt,
-                                    "p2p i2p accept declined; backing off"
-                                );
-                                interruptible_backoff(attempt, &shutdown_flag);
-                            }
-                            Err(error) => {
-                                if shutdown_flag.load(Ordering::Acquire)
-                                    || accept_shared.session_cancel.load()
-                                {
-                                    tracing::debug!(
-                                        %error,
-                                        "p2p i2p accept ended at shutdown"
-                                    );
-                                    break;
-                                }
-                                attempt = attempt.saturating_add(1);
-                                tracing::debug!(
-                                    %error,
-                                    attempt,
-                                    "p2p i2p accept wait ended; backing off"
-                                );
-                                interruptible_backoff(attempt, &shutdown_flag);
-                            }
-                        }
-                    }
-                })?;
-            workers.overlay_threads.push(i2p_handle);
+            workers.overlay_threads.push(Self::spawn_i2p_accept_worker(
+                Arc::clone(session),
+                shared.clone(),
+                Arc::clone(&workers.shutdown),
+                service_port,
+            )?);
         }
 
         Ok(())
