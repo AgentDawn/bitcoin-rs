@@ -62,10 +62,13 @@ impl NodeChainView {
     /// snapshot this before and after the lock-free reconcile and retry when
     /// it moves, so a mid-reconcile reorg converges on the next attempt
     /// instead of committing a torn view as final.
-    fn tip_generation(&self) -> Option<(u32, Hash256)> {
-        self.chainstate
-            .applied_tip_snapshot()
-            .map(|tip| (tip.height, tip.hash))
+    ///
+    /// The token is the stored snapshot `Arc` itself, compared by pointer
+    /// identity (see `tip_unchanged`): every applied transition stores a
+    /// fresh `Arc`, so an A→B→A round trip can never compare equal. A bare
+    /// `(height, hash)` token would miss exactly that interleaving.
+    fn tip_generation(&self) -> Option<Arc<bitcoin_rs_chain::TipSnapshot>> {
+        self.chainstate.applied_tip_snapshot()
     }
 
     fn load_block(&self, height: u32, hash: Hash256) -> Result<Block, ChainViewError> {
@@ -402,6 +405,20 @@ impl ChainView for NodeChainView {
     }
 }
 
+/// Generation equality by snapshot identity: the applied tip is stored as one
+/// `Arc` per transition, so pointer equality proves no transition landed
+/// between the two snapshots (and any A→B→A round trip compares unequal).
+fn tip_unchanged(
+    before: &Option<Arc<bitcoin_rs_chain::TipSnapshot>>,
+    after: &Option<Arc<bitcoin_rs_chain::TipSnapshot>>,
+) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(first), Some(second)) => Arc::ptr_eq(first, second),
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
 /// Shared durable accounting adapter for SV1, SV2, and operator RPC.
 pub(crate) struct LedgerHost {
     ledger: Arc<Ledger>,
@@ -538,7 +555,7 @@ impl LedgerHost {
             })();
             let after = chain.tip_generation();
             match result {
-                Ok(()) if before == after => break Ok(()),
+                Ok(()) if tip_unchanged(&before, &after) => break Ok(()),
                 Ok(()) => {
                     attempts += 1;
                     if attempts >= 2 {
@@ -552,7 +569,7 @@ impl LedgerHost {
                     // A chain-observation error may be a torn view from a
                     // concurrent transition; retry once against the new tip.
                     attempts += 1;
-                    if attempts >= 2 || before == after {
+                    if attempts >= 2 || tip_unchanged(&before, &after) {
                         break Err(error);
                     }
                 }
