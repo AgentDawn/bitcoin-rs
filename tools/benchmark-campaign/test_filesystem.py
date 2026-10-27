@@ -233,7 +233,9 @@ class EscapeTests(unittest.TestCase):
             )
             mounts = read_mountinfo(table)
             self.assertEqual([mount["majmin"] for mount in mounts], ["8:1"])
-            _handle, scope = identify_scope("/", mountinfo_path=table, sys_base=sys_base)
+            _handle, scope = identify_scope(
+                "/", mountinfo_path=table, sys_base=sys_base
+            )
             self.assertEqual(scope["status"], "available")
             self.assertEqual(scope["majmin"], "8:1")
 
