@@ -122,6 +122,10 @@ impl BlockPayload {
     /// which ignores
     /// bytes after the block; every other boundary uses [`BlockPayload::from_raw`] or
     /// [`BlockPayload::from_local`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Owning raw releases the ignored submitblock suffix after copying the consumed prefix"
+    )]
     pub fn from_prefix(raw: Bytes) -> Result<(Self, usize), DecodeError> {
         let mut reader: &[u8] = &raw;
         let block = Block::consensus_decode(&mut reader)?;
@@ -558,8 +562,7 @@ mod tests {
         // prefix is retained, byte for byte.
         let mut padded = read_test_fixture("0.bin")?;
         padded.extend_from_slice(&vec![0xA5; 1 << 20]);
-        let (payload, consumed) =
-            BlockPayload::from_prefix(bytes::Bytes::from(padded.clone()))?;
+        let (payload, consumed) = BlockPayload::from_prefix(bytes::Bytes::from(padded.clone()))?;
         assert_eq!(consumed, padded.len() - (1 << 20));
         assert_eq!(payload.bytes().len(), consumed);
         assert_eq!(payload.bytes().as_ref(), &padded[..consumed]);
