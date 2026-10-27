@@ -105,26 +105,13 @@ impl<'a> UtxoScanPermit<'a> {
     /// unchecked caller input. Duplicate scripts consume no additional needle budget.
     pub(crate) fn scan_scripts(&self, scripts: &[Vec<u8>]) -> Result<UtxoScan, UtxoScanError> {
         let mut needles = BTreeSet::<Vec<u8>>::new();
-        let mut script_bytes = 0usize;
         for script in scripts {
             if self.cancelled(|| false)? {
                 return Err(UtxoScanError::Aborted);
             }
-            if script.len() > MAX_SCAN_SCRIPT_BYTES {
-                return Err(UtxoScanError::Limit("1 MiB of scripts"));
-            }
             if needles.contains(script.as_slice()) {
                 continue;
             }
-            if needles.len() == MAX_SCAN_SCRIPTS {
-                return Err(UtxoScanError::Limit("1024 scripts"));
-            }
-            script_bytes = script_bytes
-                .checked_add(script.len())
-                .filter(|bytes| *bytes <= MAX_SCAN_SCRIPT_BYTES)
-                .ok_or(UtxoScanError::Limit("1 MiB of scripts"))?;
-            // Both the next payload and tree entry have been admitted before
-            // allocation. A repeated needle is never cloned speculatively.
             needles.insert(script.clone());
         }
         let (complete, scan) = self.scan(&needles, || false)?;
