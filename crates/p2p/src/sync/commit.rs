@@ -174,7 +174,7 @@ impl BlockSync {
             // is the canonical wire encoding, never re-encoded.
             let payloads: Vec<&BlockPayload> = chunk
                 .iter()
-                .map(|drained| drained.payload())
+                .map(super::super::block_stager::DrainedBlock::payload)
                 .collect();
             // The window reports how far it got rather than just failing,
             // because only the committed prefix may be marked applied; the rest
