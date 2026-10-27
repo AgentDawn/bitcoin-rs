@@ -1793,5 +1793,178 @@ class Census(unittest.TestCase):
             )
 
 
+_IDX_SUFFIX = b"indexed-tx-area!"
+
+
+def _idx_payload(header: bytes) -> bytes:
+    return header + _IDX_SUFFIX
+
+
+_IDX_LINKED = tuple(_idx_payload(header) for header in _LINKED)
+
+
+def _idx_fork() -> bytes:
+    return _branch_header(_dsha(_GENESIS), "33" * 32, 6) + _IDX_SUFFIX
+
+
+def _write_idx_sources(root: Path) -> Path:
+    source_dir = root / "blks"
+    source_dir.mkdir()
+    fork = _idx_fork()
+    (source_dir / "blk00000.dat").write_bytes(
+        b"".join(_frame(payload) for payload in (_IDX_LINKED[0], _IDX_LINKED[1], fork))
+    )
+    (source_dir / "blk00001.dat").write_bytes(_frame(_IDX_LINKED[2]))
+    return source_dir
+
+
+def _packed_from_payloads(root: Path, freeze, payloads) -> bytes:
+    archive = io.BytesIO()
+    entries = io.BytesIO()
+    writer = corpus.CorpusWriter(freeze, FIX_CORPUS, archive, entries)
+    for payload, expected in zip(payloads, _EXPECTED_HASHES):
+        writer.append(payload, expected_hash=expected)
+    manifest = io.BytesIO()
+    writer.finish(manifest)
+    return archive.getvalue()
+
+
+class IndexedParity(unittest.TestCase):
+    def test_indexed_logical_bytes_match_packed_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            summary = corpus.build_index_from_scan(
+                freeze, FIX_CORPUS, source_dir, index_path
+            )
+            self.assertEqual(summary.count, 3)
+            product = corpus.verify_index(freeze, index_path, source_dir)
+            self.assertEqual(product.corpus_id, FIX_CORPUS)
+            packed = _packed_from_payloads(root, freeze, _IDX_LINKED)
+            framed = b"".join(
+                corpus.iter_indexed_framed(freeze, index_path, source_dir)
+            )
+            self.assertEqual(framed, packed)
+            self.assertEqual(summary.logical_sha256, _sha256_hex(packed))
+            triples = list(corpus.iter_indexed_payloads(freeze, index_path, source_dir))
+            self.assertEqual([payload for _, _, payload in triples], list(_IDX_LINKED))
+            self.assertEqual([height for height, _, _ in triples], [0, 1, 2])
+            self.assertEqual(triples[2][1], FIX_STOP_HASH)
+
+    def test_kills_same_length_source_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, index_path)
+            replacement = bytearray((source_dir / "blk00001.dat").read_bytes())
+            replacement[10] ^= 0x01
+            self.assertEqual(len(replacement), len(_frame(_IDX_LINKED[2])))
+            (source_dir / "blk00001.dat").write_bytes(bytes(replacement))
+            with self.assertRaises(ContractError):
+                corpus.verify_index(freeze, index_path, source_dir)
+            with self.assertRaises(ContractError):
+                list(corpus.iter_indexed_payloads(freeze, index_path, source_dir))
+
+    def test_kills_tx_area_content_mutation_behind_stable_header_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, index_path)
+            victim = bytearray((source_dir / "blk00000.dat").read_bytes())
+            second_frame_at = 88 + len(_IDX_SUFFIX) + 8 + 80
+            victim[second_frame_at + 5] ^= 0x01
+            (source_dir / "blk00000.dat").write_bytes(bytes(victim))
+            mutated_payload = _IDX_LINKED[1][:80] + bytes(
+                b ^ 0x01 if index == 5 else b
+                for index, b in enumerate(_IDX_LINKED[1][80:])
+            )
+            self.assertEqual(corpus.header_block_hash(mutated_payload), FIX_B1_HASH)
+            with self.assertRaises(ContractError):
+                corpus.verify_index(freeze, index_path, source_dir)
+
+    def test_kills_source_order_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, index_path)
+            fork = _idx_fork()
+            (source_dir / "blk00000.dat").write_bytes(
+                b"".join(
+                    _frame(payload)
+                    for payload in (_IDX_LINKED[1], _IDX_LINKED[0], fork)
+                )
+            )
+            with self.assertRaises(ContractError):
+                corpus.verify_index(freeze, index_path, source_dir)
+
+    def test_kills_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, index_path)
+            data = (source_dir / "blk00001.dat").read_bytes()
+            (source_dir / "blk00001.dat").write_bytes(data[:-1])
+            with self.assertRaises(ContractError):
+                corpus.verify_index(freeze, index_path, source_dir)
+            with self.assertRaises(ContractError):
+                list(corpus.iter_indexed_payloads(freeze, index_path, source_dir))
+
+    def test_rejects_branch_only_sources_at_build(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = root / "blks"
+            source_dir.mkdir()
+            fork = _idx_fork()
+            (source_dir / "blk00000.dat").write_bytes(
+                _frame(_IDX_LINKED[0]) + _frame(fork)
+            )
+            with self.assertRaises(ContractError):
+                corpus.build_index_from_scan(
+                    freeze, FIX_CORPUS, source_dir, root / "bad.index"
+                )
+            self.assertFalse((root / "bad.index").exists())
+
+    def test_rejects_unsafe_source_name_at_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, index_path)
+            doc = json.loads(index_path.read_text(encoding="utf-8"))
+            doc["sources"][0]["name"] = "../evil.dat"
+            tampered = root / "unsafe.index"
+            tampered.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
+            with self.assertRaises(ContractError):
+                corpus.verify_index(freeze, tampered, source_dir)
+
+    def test_finish_rejects_overlapping_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            writer = corpus.IndexWriter(freeze, FIX_CORPUS)
+            writer.add_source(
+                corpus.IndexSource(name="blk00000.dat", size=1000, sha256="ab" * 32)
+            )
+            at_zero = corpus.SourceOffset(source=0, offset=0)
+            at_later = corpus.SourceOffset(source=0, offset=208)
+            writer.append(_IDX_LINKED[0], at_zero, expected_hash=GENESIS_HASH)
+            writer.append(_IDX_LINKED[1], at_zero, expected_hash=FIX_B1_HASH)
+            writer.append(_IDX_LINKED[2], at_later, expected_hash=FIX_STOP_HASH)
+            with self.assertRaises(ContractError):
+                writer.finish(io.BytesIO())
+
+
 if __name__ == "__main__":
     unittest.main()

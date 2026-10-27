@@ -29,6 +29,7 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import NoReturn, Protocol, runtime_checkable
 
 from evidence import (
@@ -46,10 +47,68 @@ from evidence import (
 )
 from p2p_loopback import _ChildSubreaperScope, _direct_children_pids
 
+
+def _campaign_corpus_path() -> Path:
+    """Single path to the sibling producer-owned corpus module."""
+    return Path(__file__).resolve().parent.parent / "campaign-corpus" / "corpus.py"
+
+
+def _load_campaign_corpus_module() -> ModuleType:
+    """Load the sibling producer module by path once, without any handoff gate.
+
+    Both the manifest-identity aliases and the indexed-reader handoff share
+    this loader so ``corpus.py`` executes at most once per process. Callers
+    apply their own validation: the identity reader checks the two constants
+    while ``_campaign_corpus`` keeps its indexed-handoff refusal.
+    """
+    cached = sys.modules.get("campaign_corpus")
+    if cached is not None:
+        return cached
+    path = _campaign_corpus_path()
+    spec = importlib.util.spec_from_file_location("campaign_corpus", path)
+    if spec is None or spec.loader is None:
+        raise ContractError(f"cannot load campaign corpus module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except OSError as error:
+        del sys.modules[spec.name]
+        raise ContractError(f"cannot load campaign corpus module: {error}") from error
+    except Exception as error:
+        del sys.modules[spec.name]
+        raise ContractError(
+            f"campaign corpus module failed to load: {error}"
+        ) from error
+    return module
+
+
+def _producer_manifest_identity() -> tuple[str, int]:
+    """Alias the producer-owned manifest schema tag and version.
+
+    The schema is owned by the sibling ``tools/campaign-corpus`` module; the
+    comparator only aliases its tag and version so the two can never drift.
+    Key sets stay local: the comparator validates its read-only projection
+    with its own field names. This reader checks constants only and never
+    touches the indexed-reader handoff (``_campaign_corpus``).
+    """
+    module = _load_campaign_corpus_module()
+    schema = getattr(module, "MANIFEST_SCHEMA", None)
+    version = getattr(module, "MANIFEST_VERSION", None)
+    if (
+        not isinstance(schema, str)
+        or not isinstance(version, int)
+        or isinstance(version, bool)
+    ):
+        if sys.modules.get("campaign_corpus") is module:
+            del sys.modules["campaign_corpus"]
+        raise ContractError("campaign corpus schema has an unusable manifest identity")
+    return schema, version
+
+
 CONFIG_SCHEMA = "offline-full-validation-config-v1"
 MANIFEST_SCHEMA = "core-framed-archive-manifest-v1"
-PRODUCER_MANIFEST_SCHEMA = "bitcoin-rs-corpus-manifest"
-PRODUCER_MANIFEST_VERSION = 1
+PRODUCER_MANIFEST_SCHEMA, PRODUCER_MANIFEST_VERSION = _producer_manifest_identity()
 RESULT_SCHEMA = "offline-full-validation-result-v1"
 PAIR_COUNT = 7
 HEADER_BYTES = 80
@@ -477,24 +536,8 @@ def _campaign_corpus() -> _CampaignCorpusReader:
     global _CAMPAIGN_CORPUS
     if _CAMPAIGN_CORPUS is not None:
         return _CAMPAIGN_CORPUS
-    path = Path(__file__).resolve().parent.parent / "campaign-corpus" / "corpus.py"
-    spec = importlib.util.spec_from_file_location("campaign_corpus", path)
-    if spec is None or spec.loader is None:
-        raise ContractError(f"cannot load campaign corpus reader: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except OSError as error:
-        del sys.modules[spec.name]
-        raise ContractError(f"cannot load campaign corpus reader: {error}") from error
-    except Exception as error:
-        del sys.modules[spec.name]
-        raise ContractError(
-            f"campaign corpus reader failed to load: {error}"
-        ) from error
+    module = _load_campaign_corpus_module()
     if not isinstance(module, _CampaignCorpusReader):
-        del sys.modules[spec.name]
         raise ContractError("campaign corpus reader lacks the indexed handoff")
     _CAMPAIGN_CORPUS = module
     return module
