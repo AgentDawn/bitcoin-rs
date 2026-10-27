@@ -1525,10 +1525,7 @@ impl SamSession {
         };
         conn.hello(setup_deadline).map_err(close_mapped)?;
         let reply = conn
-            .command(
-                &format!("STREAM ACCEPT ID={}", self.id),
-                setup_deadline,
-            )
+            .command(&format!("STREAM ACCEPT ID={}", self.id), setup_deadline)
             .map_err(close_mapped)?;
         let fields = parse_fields(&reply, "STREAM STATUS")?;
         if field(&fields, "RESULT") == Some("INVALID_ID") {

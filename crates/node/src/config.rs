@@ -449,6 +449,15 @@ impl NodeConfig {
         );
         self.validate_p2p_network()?;
         bitcoin_rs_rpc::zmq::validate_endpoint_configs(&self.notifications.zmq)?;
+        self.validate_chainstate_journal()?;
+        Ok(())
+    }
+
+    /// Validates chainstate journal sizing constraints.
+    ///
+    /// Split out of [`NodeConfig::validate`] for the line budget only;
+    /// checks and errors moved verbatim.
+    fn validate_chainstate_journal(&self) -> Result<()> {
         let journal = &self.chainstate_journal;
         anyhow::ensure!(
             journal.blocks > 0,
