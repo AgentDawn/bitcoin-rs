@@ -7,7 +7,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
-use bitcoin_rs_mempool::{LocalOrigin, MutationOutcome, SubmitError};
+use bitcoin_rs_mempool::{LocalOrigin, SubmitError};
 use bitcoin_rs_primitives::{
     Amount, Block as NativeBlock, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, deserialize as native_deserialize, unix_time_secs,
@@ -512,7 +512,7 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     }
     let txid = tx.txid();
 
-    let mutation = ctx
+    let _mutation = ctx
         .mempool
         .gateway
         .submit_local_transaction(
@@ -523,16 +523,9 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
             &ctx.chain.admission_chain(),
         )
         .map_err(submit_error_to_rpc_error)?;
-    // Already-known (duplicate) admissions commit nothing, so they publish
-    // nothing; only newly admitted changes notify.
-    crate::zmq::publish_admitted_hashtx(
-        ctx.zmq_publisher.as_ref(),
-        mutation
-            .changes
-            .iter()
-            .filter(|change| change.outcome == MutationOutcome::Accepted)
-            .map(|change| Txid::from(change.txid)),
-    );
+    // `hashtx` for newly admitted changes is published once by the gateway
+    // observer, in commit order ahead of `rawtx` and the `sequence` `A` event.
+    // Already-known (duplicate) admissions commit nothing, so they notify nothing.
     typed_to_sonic(&v31::SendRawTransaction(txid.to_string()))
 }
 

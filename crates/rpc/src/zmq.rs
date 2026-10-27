@@ -263,11 +263,11 @@ impl ZmqPublisher for NoOpZmqPublisher {
 
 /// Publish one `hashtx` notification per newly admitted transaction id.
 ///
-/// Callers pass only newly admitted transactions. Rejected submissions,
-/// already-known (duplicate) admissions, and removals must never reach
-/// this helper: single-transaction admission filters committed mutations
-/// to `Accepted` changes, and package admission publishes only `Accepted`
-/// rows that report an aggregate rate (residents carry none).
+/// The sole caller is [`MempoolSequenceObserver`]'s `Accepted` arm, which
+/// passes each committed `Accepted` change's txid in mutation order.
+/// Rejected submissions, already-known (duplicate) admissions, and removals
+/// never reach this helper: duplicates and refusals commit nothing, and
+/// block-inclusion removals publish nothing.
 pub fn publish_admitted_hashtx(
     publisher: &dyn ZmqPublisher,
     txids: impl IntoIterator<Item = Txid>,
@@ -554,6 +554,7 @@ impl bitcoin_rs_mempool::MempoolObserver for MempoolSequenceObserver {
             let txid = Txid(change.txid);
             match change.outcome {
                 bitcoin_rs_mempool::MutationOutcome::Accepted => {
+                    publish_admitted_hashtx(self.publisher.as_ref(), core::iter::once(txid));
                     if self.publisher.wants_rawtx()
                         && let Some((_, tx)) = envelope
                             .accepted_transactions
@@ -980,6 +981,7 @@ mod manifest_tests {
         sequence_bodies: parking_lot::Mutex<Vec<Vec<u8>>>,
         capture_rawtx: bool,
         raw_bodies: parking_lot::Mutex<Vec<Vec<u8>>>,
+        hashtx: parking_lot::Mutex<Vec<Txid>>,
     }
 
     impl core::fmt::Debug for RecordingPublisher {
@@ -1002,7 +1004,9 @@ mod manifest_tests {
             Vec::new()
         }
         fn publish_hashblock(&self, _hash: Hash256) {}
-        fn publish_hashtx(&self, _txid: Txid) {}
+        fn publish_hashtx(&self, txid: Txid) {
+            self.hashtx.lock().push(txid);
+        }
         fn publish_rawblock(&self, _bytes: &[u8]) {}
         fn publish_rawtx(&self, bytes: &[u8]) {
             self.raw_bodies.lock().push(bytes.to_vec());
@@ -1080,7 +1084,7 @@ mod manifest_tests {
         let address = format!("ipc://{}", dir.path().join("admission.sock").display());
         let publisher = Arc::new(SocketZmqPublisher::bind(&[ZmqEndpointConfig {
             endpoint: address.clone(),
-            topics: vec![ZmqTopic::RawTx, ZmqTopic::Sequence],
+            topics: vec![ZmqTopic::HashTx, ZmqTopic::RawTx, ZmqTopic::Sequence],
             hwm: Some(100),
         }])?);
         let context = zmq::Context::new();
@@ -1116,6 +1120,14 @@ mod manifest_tests {
         let tx = sequence_tx(91);
         let expected = consensus_bytes(&tx);
         gateway.insert_entry(AdmissionOrigin::Rpc, sequence_entry(&tx))?;
+        let announced = subscriber.recv_multipart(0)?;
+        assert_eq!(announced[0].as_slice(), b"hashtx");
+        assert_eq!(
+            announced[1],
+            reversed_hash_body(*tx.txid().as_bytes()),
+            "hashtx carries the admitted txid in wire byte order"
+        );
+        assert_eq!(announced[2], 0_u32.to_le_bytes());
         let raw = subscriber.recv_multipart(0)?;
         assert_eq!(raw[0].as_slice(), b"rawtx");
         assert_eq!(raw[1], expected);
@@ -1231,6 +1243,11 @@ mod manifest_tests {
                 consensus_bytes(first.as_ref()),
                 consensus_bytes(second.as_ref()),
             ]
+        );
+        assert_eq!(
+            *publisher.hashtx.lock(),
+            vec![first.txid(), second.txid()],
+            "hashtx fires once per Accepted change in commit order"
         );
         assert_eq!(
             *publisher.sequence_bodies.lock(),

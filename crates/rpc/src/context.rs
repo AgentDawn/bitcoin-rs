@@ -2997,7 +2997,9 @@ mod admission_chain_tests {
 
         let recording = Arc::new(RecordingPublisher::default());
         let publisher: Arc<dyn crate::zmq::ZmqPublisher> = recording.clone();
-        let mut fresh_ctx = Context::new();
+        let mut fresh_ctx = Context::new_with_mempool_observer(Arc::new(
+            crate::zmq::MempoolSequenceObserver::new(publisher.clone()),
+        ));
         fresh_ctx.zmq_publisher = publisher;
         let rpc_ctx = Arc::new(fresh_ctx);
         let published = || {
@@ -3084,7 +3086,9 @@ mod admission_chain_tests {
 
         let recording = Arc::new(RecordingPublisher::default());
         let publisher: Arc<dyn crate::zmq::ZmqPublisher> = recording.clone();
-        let mut fresh_ctx = Context::new();
+        let mut fresh_ctx = Context::new_with_mempool_observer(Arc::new(
+            crate::zmq::MempoolSequenceObserver::new(publisher.clone()),
+        ));
         fresh_ctx.zmq_publisher = publisher;
         let rpc_ctx = Arc::new(fresh_ctx);
         let published = || {

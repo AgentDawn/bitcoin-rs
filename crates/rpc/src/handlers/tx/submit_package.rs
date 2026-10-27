@@ -77,23 +77,8 @@ pub(crate) fn submitpackage(ctx: &Arc<Context>, params: &Value) -> Result<Value,
             }
             other => submit_error_to_rpc_error(other),
         })?;
-    // Only newly admitted members notify: residents report `Accepted`
-    // without an aggregate rate, and rejected rows never notify.
-    crate::zmq::publish_admitted_hashtx(
-        ctx.zmq_publisher.as_ref(),
-        txs.iter()
-            .zip(&facts.tx_results)
-            .filter(|(_, row)| {
-                matches!(
-                    row,
-                    PackageTxResult::Accepted {
-                        effective_fee_rate: Some(_),
-                        ..
-                    }
-                )
-            })
-            .map(|(tx, _)| tx.txid()),
-    );
+    // `hashtx` for newly admitted members is published once by the gateway
+    // observer, in commit order ahead of `rawtx` and the `sequence` `A` event.
     render_submission(&txs, facts)
 }
 

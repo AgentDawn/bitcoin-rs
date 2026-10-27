@@ -11,7 +11,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_mempool::{LocalOrigin, MutationOutcome};
+use bitcoin_rs_mempool::LocalOrigin;
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{
     Block, Hash256, OutPoint, Tx, Txid, consensus_bytes, deserialize, unix_time_secs,
@@ -161,18 +161,10 @@ pub(super) fn post(handler: &Handler, path: &str, body: &[u8]) -> Response {
                 unix_time_secs(),
                 &ctx.chain.admission_chain(),
             ) {
-                Ok(mutation) => {
-                    // Duplicates commit nothing, so they publish nothing.
-                    crate::zmq::publish_admitted_hashtx(
-                        ctx.zmq_publisher.as_ref(),
-                        mutation
-                            .changes
-                            .iter()
-                            .filter(|change| change.outcome == MutationOutcome::Accepted)
-                            .map(|change| Txid::from(change.txid)),
-                    );
-                    text_response("text/plain", txid.to_string().into_bytes())
-                }
+                // `hashtx` for a newly admitted transaction is published once
+                // by the gateway observer; duplicates commit nothing and
+                // notify nothing.
+                Ok(_) => text_response("text/plain", txid.to_string().into_bytes()),
                 Err(error) => admission_error(error),
             }
         }
