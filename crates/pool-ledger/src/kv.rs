@@ -394,9 +394,9 @@ impl<K: Value, V: Value> Table<'_, K, V> {
         let mut end = self.prefix.clone();
         match end.last_mut() {
             Some(tag) => {
-                *tag = tag.checked_add(1).ok_or(LedgerError::Invariant(
-                    "ledger table prefix overflow".into(),
-                ))?;
+                *tag = tag
+                    .checked_add(1)
+                    .ok_or_else(|| LedgerError::Invariant("ledger table prefix overflow".into()))?;
             }
             None => {
                 return Err(LedgerError::Invariant("empty ledger table prefix".into()));
