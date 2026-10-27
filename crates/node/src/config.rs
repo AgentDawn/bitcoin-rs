@@ -467,6 +467,12 @@ impl NodeConfig {
             );
         }
         bitcoin_rs_rpc::zmq::validate_endpoint_configs(&self.notifications.zmq)?;
+        self.validate_chainstate_journal()?;
+        Ok(())
+    }
+
+    /// Validates chainstate journal sizing and lag bounds.
+    fn validate_chainstate_journal(&self) -> Result<()> {
         let journal = &self.chainstate_journal;
         anyhow::ensure!(
             journal.blocks > 0,
