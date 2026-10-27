@@ -3182,8 +3182,8 @@ mod finalizepsbt_tests {
     }
 
     #[test]
-    fn exact_amount_parsing_honors_precision_and_overflow_invariants() {
-        use super::{optional_max_feerate, parse_btc_amount, sats_from_btc};
+    fn exact_amount_parsing_honors_precision_invariants() {
+        use super::sats_from_btc;
 
         // 1e-8 = 1 sat accepted, 1e-9 rejected as Invalid amount
         assert_eq!(
@@ -3241,6 +3241,11 @@ mod finalizepsbt_tests {
         assert!(sats_from_btc(&json!(".1"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("."), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1.2.3"), "Invalid amount").is_err());
+    }
+
+    #[test]
+    fn exact_amount_parsing_handles_zero_sign_and_malformed_inputs() {
+        use super::sats_from_btc;
 
         // Zero handling
         assert_eq!(
@@ -3281,6 +3286,11 @@ mod finalizepsbt_tests {
         assert!(sats_from_btc(&json!("."), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!(" 1"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1 "), "Invalid amount").is_err());
+    }
+
+    #[test]
+    fn exact_amount_parsing_enforces_overflow_exponent_and_feerate_ceilings() {
+        use super::{optional_max_feerate, parse_btc_amount, sats_from_btc};
 
         // Overflow safety
         assert_eq!(
