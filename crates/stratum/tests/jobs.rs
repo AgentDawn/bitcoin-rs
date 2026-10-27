@@ -708,6 +708,33 @@ fn rejected_input_cannot_fill_the_duplicate_set_and_capacity_never_refuses_a_blo
 }
 
 #[test]
+fn block_candidate_at_job_capacity_is_remembered_as_duplicate_on_replay() -> TestResult {
+    // A block bypasses the per-job capacity check, and it must still join
+    // the duplicate set: under the old tail the acceptance was not recorded,
+    // so a replay validated as a second block instead of `Duplicate`.
+    let mut tiny = config();
+    tiny.max_shares_per_job = 1;
+    let mut fx = fixture(tiny, 100, 1)?;
+    let target = easy()?;
+    let share = nonces(&fx.session, &fx.job, false, 1)?[0];
+    fx.book
+        .validate(&submit_for(&fx.session, &fx.job, share), &target)?;
+    let block = nonces(&fx.session, &fx.job, true, 1)?[0];
+    let outcome = fx
+        .book
+        .validate(&submit_for(&fx.session, &fx.job, block), &target)?;
+    assert!(matches!(outcome, ShareOutcome::Block(_)));
+    let replay = fx
+        .book
+        .validate(&submit_for(&fx.session, &fx.job, block), &target);
+    assert!(
+        matches!(replay, Err(ShareError::Duplicate { .. })),
+        "a block accepted at capacity must be remembered: {replay:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn extra_outputs_are_funded_from_the_payout_and_stay_valid() -> TestResult {
     let candidate = build_candidate(100, 0xab, 2)?;
     let extra = vec![TxOut {

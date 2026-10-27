@@ -14,7 +14,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -44,6 +44,7 @@ struct TestLedger {
     shares: Mutex<Vec<(String, AcceptedShare)>>,
     blocks: Mutex<Vec<(String, FoundBlock)>>,
     fail_shares: Mutex<Option<usize>>,
+    reject_shares: AtomicBool,
     share_calls: AtomicUsize,
 }
 
@@ -61,8 +62,27 @@ impl TestLedger {
             shares: Mutex::new(Vec::new()),
             blocks: Mutex::new(Vec::new()),
             fail_shares: Mutex::new(Some(count)),
+            reject_shares: AtomicBool::new(false),
             share_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Refuses every later share permanently, like a retired round or a
+    /// conflicting credit: the adapter must answer a rejection with no retry
+    /// and no buffering.
+    fn refuse_permanently(&self) {
+        self.set_reject(true);
+    }
+
+    /// Admits shares again after a permanent-refusal phase.
+    fn admit_again(&self) {
+        self.set_reject(false);
+    }
+
+    /// Mode change sequenced with `SeqCst` like the call counter so a racing
+    /// submit observes it.
+    fn set_reject(&self, reject: bool) {
+        self.reject_shares.store(reject, Ordering::SeqCst);
     }
 
     fn recorded_shares(&self) -> Vec<AcceptedShare> {
@@ -82,6 +102,9 @@ impl ShareLedger for TestLedger {
         share: &AcceptedShare,
     ) -> Result<RecordOutcome, bitcoin_rs_stratum::LedgerUnavailable> {
         self.share_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_shares.load(Ordering::SeqCst) {
+            return Ok(RecordOutcome::Rejected);
+        }
         let mut fail = self
             .fail_shares
             .lock()
@@ -167,6 +190,14 @@ fn sample_candidate(prev: Hash256, bits: CompactTarget, height: u32) -> Candidat
 }
 
 fn build_pool(control: Arc<dyn MiningControl>, ledger: Arc<dyn ShareLedger>) -> Arc<PoolCore> {
+    build_pool_with_outbox(control, ledger, None)
+}
+
+fn build_pool_with_outbox(
+    control: Arc<dyn MiningControl>,
+    ledger: Arc<dyn ShareLedger>,
+    outbox: Option<(usize, usize)>,
+) -> Arc<PoolCore> {
     let config = JobBookConfig {
         budget: CoinbaseBudget {
             additional_size: 100,
@@ -180,10 +211,12 @@ fn build_pool(control: Arc<dyn MiningControl>, ledger: Arc<dyn ShareLedger>) -> 
         max_sessions: 64,
         max_shares_per_job: 1024,
     };
-    Arc::new(
-        PoolCore::new(config, control, ledger)
-            .unwrap_or_else(|error| panic!("test operation failed: {error}")),
-    )
+    let pool = PoolCore::new(config, control, ledger)
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    match outbox {
+        Some((items, bytes)) => Arc::new(pool.with_outbox(items, bytes)),
+        None => Arc::new(pool),
+    }
 }
 
 struct TestClient {
@@ -807,14 +840,26 @@ impl MinerFixture {
     /// repeated, then walks one miner through configure, subscribe, authorize
     /// and the first `mining.notify`.
     fn start(parent: u8) -> Self {
+        Self::start_with(parent, None, None)
+    }
+
+    /// Like [`Self::start`], with an optional outbox override and an optional
+    /// shared ledger. Sharing the ledger across two fixtures simulates a
+    /// crash restore: the second pool's `JobBook` is empty while the ledger
+    /// still holds the first pool's rows.
+    fn start_with(
+        parent: u8,
+        outbox: Option<(usize, usize)>,
+        ledger: Option<Arc<TestLedger>>,
+    ) -> Self {
         let candidate = Arc::new(sample_candidate(
             Hash256::from_le_bytes(&[parent; 32]),
             CompactTarget::from_consensus(0x207f_ffff),
             1,
         ));
         let control = Arc::new(FakeMiningControl::default());
-        let ledger = Arc::new(TestLedger::default());
-        let pool = build_pool(control.clone(), ledger.clone());
+        let ledger = ledger.unwrap_or_default();
+        let pool = build_pool_with_outbox(control.clone(), ledger.clone(), outbox);
         let installed = pool
             .install(candidate, Vec::new())
             .unwrap_or_else(|error| panic!("test operation failed: {error}"));
@@ -907,6 +952,29 @@ impl MinerFixture {
                 compact_is_met_by(self.job.bits(), Hash256::from(header.compute_hash()))
             })
             .unwrap_or_else(|| panic!("a winning nonce exists"))
+    }
+
+    /// First nonce at or after `start` whose header is not a block: a plain
+    /// share that never reaches node submission, so the job stays installed
+    /// no matter how the ledger answers.
+    fn share_nonce(&self, start: u32) -> u32 {
+        (start..=u32::MAX)
+            .find(|nonce| {
+                let header = self
+                    .job
+                    .header(
+                        Extranonce {
+                            session: &self.prefix,
+                            rolled: &ROLLED,
+                        },
+                        self.job.ntime(),
+                        self.version,
+                        *nonce,
+                    )
+                    .unwrap_or_else(|error| panic!("header builds: {error:?}"));
+                !compact_is_met_by(self.job.bits(), Hash256::from(header.compute_hash()))
+            })
+            .unwrap_or_else(|| panic!("a plain share nonce exists"))
     }
 
     /// Sends `mining.submit` for `nonce` on `job` and returns the response
@@ -1029,4 +1097,300 @@ fn stale_parent_backend_verdict_is_stale_error() {
     );
 
     miner.server.shutdown();
+}
+
+#[test]
+fn configured_minima_cannot_fail_an_empty_outbox() -> TestResult {
+    // Degenerate bounds: one item, one share-sized byte budget. An empty
+    // outbox must still admit a submit; the old worst-case reservation
+    // failed every submit here before validation ran.
+    let mut miner = MinerFixture::start_with(0x22, Some((1, 1024)), None);
+    let job = Arc::clone(&miner.job);
+    let nonce = miner.share_nonce(0);
+    let response = miner.submit(100, &job, nonce);
+    assert!(
+        response.contains("\"error\":null"),
+        "minima must admit a share on an empty outbox: {response}"
+    );
+    assert_eq!(
+        miner.pool.pending_ledger_writes(),
+        0,
+        "inline delivery leaves nothing buffered"
+    );
+    assert_eq!(
+        miner.ledger.recorded_shares().len(),
+        1,
+        "the admitted share is credited exactly once"
+    );
+    miner.server.shutdown();
+    Ok(())
+}
+
+#[test]
+fn per_submit_reservation_does_not_cap_the_pool_at_one_share() -> TestResult {
+    // Node deployment bounds with a permanently failing ledger: the first
+    // share buffers, and the second must buffer too instead of shedding with
+    // backpressure while the outbox is nearly empty.
+    let ledger = Arc::new(TestLedger::armed_with_failures(usize::MAX));
+    let mut miner = MinerFixture::start_with(0x22, Some((1024, 8 * 1024 * 1024)), Some(ledger));
+    let first = miner.share_nonce(0);
+    let second = miner.share_nonce(first + 1);
+    assert_ne!(first, second);
+    miner.client.send(&format!(
+        "{{\"id\":101,\"method\":\"mining.submit\",\"params\":[\"alice.worker1\",\"{:08x}\",\"00000001\",\"{:08x}\",\"{:08x}\",\"00002000\"]}}\n",
+        miner.job.id().get(),
+        miner.job.ntime(),
+        first,
+    ));
+    miner.client.send(&format!(
+        "{{\"id\":102,\"method\":\"mining.submit\",\"params\":[\"alice.worker1\",\"{:08x}\",\"00000001\",\"{:08x}\",\"{:08x}\",\"00002000\"]}}\n",
+        miner.job.id().get(),
+        miner.job.ntime(),
+        second,
+    ));
+    // Both responses are withheld until the records are durable; any early
+    // frame is the old whole-pool reservation shedding the second submit.
+    miner
+        .client
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    let mut early = String::new();
+    let shed = TestClient::read_available(&mut miner.client.reader, &mut early);
+    assert!(
+        !shed,
+        "no shed may precede the durable records, got: {early:?}"
+    );
+    assert_eq!(
+        miner.pool.pending_ledger_writes(),
+        2,
+        "both shares buffer instead of capping the pool at one"
+    );
+    assert!(
+        miner.pool.current_installed().is_some(),
+        "plain shares never retire the job"
+    );
+
+    // Disarm the barrier, drain, and collect both deferred acceptances.
+    miner.ledger.disarm();
+    miner.pool.drain_outbox();
+    miner
+        .client
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    for id in [101, 102] {
+        let mut line = String::new();
+        for _ in 0..8 {
+            line = miner.client.read_line();
+            if line.contains(&format!("\"id\":{id}")) {
+                break;
+            }
+        }
+        assert!(
+            line.contains("\"error\":null"),
+            "buffered share {id} is accepted after drain: {line}"
+        );
+    }
+    assert_eq!(
+        miner.ledger.recorded_shares().len(),
+        2,
+        "both buffered shares are credited exactly once"
+    );
+    miner.server.shutdown();
+    Ok(())
+}
+
+#[test]
+fn crash_restored_share_still_delivers_its_block_record() -> TestResult {
+    // First pool finds a block: share and block record both durable.
+    let mut first = MinerFixture::start(0x22);
+    let job = Arc::clone(&first.job);
+    let winner = first.winning_nonce(0);
+    let accepted = first.submit(100, &job, winner);
+    assert!(
+        accepted.contains("\"error\":null"),
+        "winning nonce accepted: {accepted}"
+    );
+    assert_eq!(
+        first.ledger.recorded_shares().len(),
+        1,
+        "first pool credits the share"
+    );
+    {
+        let blocks = first
+            .ledger
+            .blocks
+            .lock()
+            .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+        assert_eq!(blocks.len(), 1, "first pool records the block");
+    }
+
+    // Second pool over the same ledger: an empty book, durable rows. The
+    // fresh session reuses slot zero, so the same winning nonce rebuilds the
+    // identical header hash the ledger already holds.
+    let mut second = MinerFixture::start_with(0x22, None, Some(Arc::clone(&first.ledger)));
+    assert_eq!(
+        second.prefix, first.prefix,
+        "fresh first sessions share the extranonce prefix"
+    );
+    let restored = second.winning_nonce(0);
+    assert_eq!(
+        restored, winner,
+        "same candidate and prefix rebuild the same winner"
+    );
+    let job_b = Arc::clone(&second.job);
+    let replay = second.submit(200, &job_b, restored);
+    assert!(
+        replay.contains("Duplicate share"),
+        "crash-restored share keeps its duplicate identity: {replay}"
+    );
+    {
+        let blocks = second
+            .ledger
+            .blocks
+            .lock()
+            .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+        assert_eq!(
+            blocks.len(),
+            2,
+            "the block record is still delivered for a restored share"
+        );
+    }
+    assert_eq!(
+        second.control.submit_calls.load(Ordering::SeqCst),
+        1,
+        "the restored block still reaches the node once"
+    );
+    first.server.shutdown();
+    second.server.shutdown();
+    Ok(())
+}
+
+#[test]
+fn permanently_refused_share_is_rejected_without_retry_or_buffer() -> TestResult {
+    let mut miner = MinerFixture::start(0x22);
+    miner.ledger.refuse_permanently();
+    let job = Arc::clone(&miner.job);
+    let nonce = miner.share_nonce(0);
+    let response = miner.submit(100, &job, nonce);
+    assert!(
+        response.contains("\"error\":[22,\"Duplicate share\",null]"),
+        "permanent refusal is a rejected share: {response}"
+    );
+    assert_eq!(
+        miner.ledger.share_calls.load(Ordering::SeqCst),
+        1,
+        "a permanent refusal is never retried"
+    );
+    assert_eq!(
+        miner.pool.pending_ledger_writes(),
+        0,
+        "a permanent refusal never buffers"
+    );
+    assert!(
+        miner.ledger.recorded_shares().is_empty(),
+        "a refused share credits nothing"
+    );
+    miner.server.shutdown();
+    Ok(())
+}
+
+#[test]
+fn permanently_refused_buffer_never_wedges_the_drain() -> TestResult {
+    // Buffer one share against a transient outage, then turn the ledger
+    // permanently refusing: the drain must drop the poisoned head instead of
+    // stalling behind it, and later shares must still be credited.
+    let ledger = Arc::new(TestLedger::armed_with_failures(usize::MAX));
+    let mut miner = MinerFixture::start_with(0x22, None, Some(ledger));
+    let job = Arc::clone(&miner.job);
+    let first = miner.share_nonce(0);
+    let second = miner.share_nonce(first + 1);
+    miner.client.send(&format!(
+        "{{\"id\":101,\"method\":\"mining.submit\",\"params\":[\"alice.worker1\",\"{:08x}\",\"00000001\",\"{:08x}\",\"{:08x}\",\"00002000\"]}}\n",
+        job.id().get(),
+        job.ntime(),
+        first,
+    ));
+    miner
+        .client
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    let mut early = String::new();
+    assert!(
+        !TestClient::read_available(&mut miner.client.reader, &mut early),
+        "transient outage buffers without answering: {early:?}"
+    );
+    assert_eq!(miner.pool.pending_ledger_writes(), 1);
+
+    miner.ledger.refuse_permanently();
+    miner.ledger.disarm();
+    miner.pool.drain_outbox();
+    assert_eq!(
+        miner.pool.pending_ledger_writes(),
+        0,
+        "the poisoned head drops instead of wedging the drain"
+    );
+    assert!(
+        miner.ledger.recorded_shares().is_empty(),
+        "a refused share credits nothing"
+    );
+
+    miner.ledger.admit_again();
+    let response = miner.submit(102, &job, second);
+    assert!(
+        response.contains("\"error\":null"),
+        "later shares still flow after the drop: {response}"
+    );
+    assert_eq!(
+        miner.ledger.recorded_shares().len(),
+        1,
+        "only the deliverable share is credited"
+    );
+    miner.server.shutdown();
+    Ok(())
+}
+
+#[test]
+fn sv1_wire_version_bits_normalize_to_the_job_version() -> TestResult {
+    let mut miner = MinerFixture::start(0x22);
+    let job = Arc::clone(&miner.job);
+    let nonce = miner.share_nonce(0);
+    let response = miner.submit(100, &job, nonce);
+    assert!(
+        response.contains("\"error\":null"),
+        "mask-clean version bits accepted: {response}"
+    );
+    let shares = miner.ledger.recorded_shares();
+    assert_eq!(shares.len(), 1);
+    assert_eq!(
+        shares[0].header.version,
+        i32::try_from(miner.version)
+            .unwrap_or_else(|error| { panic!("canonical job version fits i32: {error}") }),
+        "the edge normalizes rolled bits to the canonical job version"
+    );
+    assert_eq!(shares[0].job, job.id());
+    miner.server.shutdown();
+    Ok(())
+}
+
+#[test]
+fn unknown_wire_job_rejects_before_the_common_submit_owner() -> TestResult {
+    let mut miner = MinerFixture::start(0x22);
+    miner.client.send(&format!(
+        "{{\"id\":100,\"method\":\"mining.submit\",\"params\":[\"alice.worker1\",\"0000007b\",\"00000001\",\"{:08x}\",\"00000000\",\"00002000\"]}}\n",
+        miner.job.ntime(),
+    ));
+    let response = miner.client.read_line();
+    assert!(
+        response.contains("\"error\":[21,\"Job not found\",null]"),
+        "unknown job rejects with the owner verdict: {response}"
+    );
+    assert!(
+        miner.ledger.recorded_shares().is_empty(),
+        "an unknown job credits nothing"
+    );
+    miner.server.shutdown();
+    Ok(())
 }

@@ -668,6 +668,11 @@ impl AccountResolver for LedgerHost {
     }
 }
 
+/// SV1 settlement through the shared ledger. These two methods mirror
+/// [`LedgerHost::record_accepted_share`] and
+/// [`LedgerHost::record_submitted_block`] (which keep the SV2 contract), with
+/// one addition: permanent ledger conflicts surface here instead of
+/// collapsing into [`LedgerUnavailable`].
 impl ShareLedger for LedgerHost {
     fn record_share(
         &self,
@@ -675,17 +680,40 @@ impl ShareLedger for LedgerHost {
         share: &AcceptedShare,
     ) -> Result<RecordOutcome, LedgerUnavailable> {
         let account = self.account(&worker.account).ok_or(LedgerUnavailable)?;
-        self.record_accepted_share(account, share)
+        let credit = share_credit(self.run_epoch, account, share)?;
+        match self.ledger.record_share(&credit) {
+            Ok(receipt) => Ok(match receipt {
+                ShareReceipt::Credited { .. } => RecordOutcome::Recorded,
+                ShareReceipt::Duplicate { .. } => RecordOutcome::AlreadyRecorded,
+            }),
+            // Permanent conflicts are uncurable: report a rejected share with
+            // no retry and no outbox buffering, never an unavailable ledger.
+            // A poisoned head-of-queue would otherwise wedge the drain behind
+            // an item that can never be delivered. Delivery stays
+            // at-least-once; the ledger consumer is idempotent on the share
+            // hash.
+            Err(error) if error.is_permanent_share_conflict() => Ok(RecordOutcome::Rejected),
+            Err(_) => Err(LedgerUnavailable),
+        }
     }
 
     fn record_block(
         &self,
         worker: &WorkerIdentity,
         block: &FoundBlock,
-        submission: &Result<BlockReceipt, bitcoin_rs_mining::MiningControlError>,
+        _submission: &Result<BlockReceipt, bitcoin_rs_mining::MiningControlError>,
     ) -> Result<(), LedgerUnavailable> {
         let account = self.account(&worker.account).ok_or(LedgerUnavailable)?;
-        self.record_submitted_block(account, block, submission)
+        let found = ledger_block(self.run_epoch, account, block)?;
+        match self.ledger.record_found_block(&found) {
+            Ok(_) => Ok(()),
+            // A permanently refused block record is settled elsewhere (the
+            // round exists with a different claim): dropping it here keeps a
+            // poison head from wedging the drain behind shares that can still
+            // be recorded. The node already holds the submitted block.
+            Err(error) if error.is_permanent_share_conflict() => Ok(()),
+            Err(_) => Err(LedgerUnavailable),
+        }
     }
 }
 

@@ -1555,11 +1555,14 @@ impl JobBook {
             ShareOutcome::Share(Box::new(accepted))
         };
 
-        if room {
-            self.seen.insert(raw_hash, share.job);
-            if let Some(entry) = self.jobs.get_mut(index) {
-                entry.hashes.push(raw_hash);
-            }
+        // Block candidates bypass the per-job capacity check above, and they
+        // must still join the duplicate set: linearizable under the single
+        // `JobBook` borrow, so a replayed block reports `Duplicate` instead
+        // of validating as a second block, and crash recovery cannot credit
+        // it twice. Non-block shares that reach here always have room.
+        self.seen.insert(raw_hash, share.job);
+        if let Some(entry) = self.jobs.get_mut(index) {
+            entry.hashes.push(raw_hash);
         }
         Ok(outcome)
     }

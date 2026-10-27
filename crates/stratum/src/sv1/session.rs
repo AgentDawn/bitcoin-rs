@@ -441,8 +441,8 @@ impl Pending {
 
     fn bytes_cost(&self) -> usize {
         match self {
-            Self::Share { .. } => 256,
-            Self::BlockRecord { block, .. } => 512 + block.raw.len(),
+            Self::Share { .. } => SHARE_RECORD_BYTES,
+            Self::BlockRecord { block, .. } => BLOCK_RECORD_FRAMING_BYTES + block.raw.len(),
         }
     }
 }
@@ -506,7 +506,10 @@ impl Drop for DrainGuard<'_> {
 
 impl OutboxReservation<'_> {
     /// Commits an item into the outbox by consuming part of this reservation.
-    /// Capacity is guaranteed because it was pre-allocated.
+    /// Item slots are linearizable under the single outbox mutex, so the
+    /// pre-allocated slots are guaranteed. A block body is admitted over the
+    /// byte bound rather than shedding a found block, and still counts toward
+    /// `total_bytes`.
     fn commit_reserved(&mut self, item: Pending) {
         let cost = item.bytes_cost();
         let mut outbox = locked(&self.pool.outbox);
@@ -538,7 +541,9 @@ struct ShareRequest<'a> {
     rolled: &'a [u8],
     ntime: u32,
     nonce: u32,
-    version_bits: Option<u32>,
+    /// Canonical header version, normalized by the SV1 edge before the
+    /// common submit owner runs.
+    version: u32,
 }
 
 /// The pool: one `JobBook`, the node control it submits blocks to, and the
@@ -913,13 +918,19 @@ impl PoolCore {
 
     /// Atomically reserves outbox space for one share (and potential block).
     /// Returns `None` if the outbox has reached capacity.
-    /// Per-session bound for withheld submit responses: one outstanding
-    /// accounting completion. A second submit while the ledger is unavailable
-    /// is shed with a retryable accounting error, not buffered.
+    /// The check-and-hold is linearizable under the single outbox mutex. A
+    /// second submit while the ledger is unavailable is shed with a retryable
+    /// accounting error, not buffered.
     fn reserve_outbox_space(&self) -> Option<OutboxReservation<'_>> {
         self.drain_outbox();
-        let reserve_items = 2_usize;
-        let reserve_bytes = 8 * 1024 * 1024_usize;
+        // Two item slots, clamped so configured minima still admit one submit
+        // on an empty outbox. The byte half covers the share and the
+        // block-record framing only: the block body is admitted over the byte
+        // bound rather than shed, so one in-flight submit never spends the
+        // whole pool budget and stalls the pool at a single share.
+        let reserve_items = 2_usize.min(self.outbox_max_items);
+        let reserve_bytes =
+            (SHARE_RECORD_BYTES + BLOCK_RECORD_FRAMING_BYTES).min(self.outbox_max_bytes);
         let mut outbox = locked(&self.outbox);
         let committed_items = outbox.items.len() + outbox.reserved_items;
         let committed_bytes = outbox.total_bytes.saturating_add(outbox.reserved_bytes);
@@ -954,22 +965,15 @@ impl PoolCore {
 
         let outcome = {
             let mut book = locked(&self.book);
-            let version = match (book.job(request.job), request.version_bits) {
-                (Some(job), Some(bits)) => job
-                    .version_from_rolled_bits(bits)
-                    .map_err(SubmitFailure::Share)?,
-                (Some(job), None) => job.version(),
-                // The book rejects an unknown or retired job before it reads
-                // the version.
-                (None, _) => 0,
-            };
+            // `request.version` is already canonical: the edge normalized the
+            // wire bits, so this common path holds no wire branching.
             let submission = ShareSubmission {
                 session: request.session,
                 job: request.job,
                 rolled_extranonce: request.rolled,
                 ntime: request.ntime,
                 nonce: request.nonce,
-                version,
+                version: request.version,
             };
             book.validate(&submission, target)
                 .map_err(SubmitFailure::Share)?
@@ -985,9 +989,17 @@ impl PoolCore {
                     completion: Arc::clone(&completion),
                 };
                 // Attempt inline delivery first; otherwise the completion waits on the outbox.
+                // Delivery is at-least-once (inline plus drain) against the
+                // idempotent ledger consumer, which is keyed on `share.hash`.
                 match self.deliver_inline(&item) {
                     Ok(RecordOutcome::Recorded) => completion.record(),
                     Ok(RecordOutcome::AlreadyRecorded) => return Err(SubmitFailure::Duplicate),
+                    // Permanently refused: answer the duplicate identity at
+                    // once with no retry and no buffering. The book already
+                    // burned the hash, so a miner retry converges to the same
+                    // duplicate verdict instead of spinning on an uncurable
+                    // ledger refusal.
+                    Ok(RecordOutcome::Rejected) => return Err(SubmitFailure::Duplicate),
                     Err(LedgerUnavailable) => reservation.commit_reserved(item),
                 }
                 Ok(Credited {
@@ -1024,9 +1036,20 @@ impl PoolCore {
                     completion: Arc::clone(&completion),
                 };
 
+                // The share needs no further crediting when it is already
+                // durable (crash restore or post-eviction replay) or
+                // permanently refused (the ledger judged this work first).
+                // Either way the block record still needs delivery, so keep
+                // going and report the duplicate only after the block fate is
+                // known. No retry and no buffering on the settled path: a
+                // settled share can never become deliverable.
+                let mut share_settled = false;
                 match self.deliver_inline(&share_item) {
                     Ok(RecordOutcome::Recorded) => completion.record(),
-                    Ok(RecordOutcome::AlreadyRecorded) => return Err(SubmitFailure::Duplicate),
+                    Ok(RecordOutcome::AlreadyRecorded) | Ok(RecordOutcome::Rejected) => {
+                        completion.record();
+                        share_settled = true;
+                    }
                     Err(LedgerUnavailable) => reservation.commit_reserved(share_item),
                 }
 
@@ -1042,6 +1065,13 @@ impl PoolCore {
                         job,
                         reason: StaleReason::Invalidated,
                     }));
+                }
+
+                if share_settled {
+                    // The share earned no new credit, but the block round is
+                    // now durable: the replay keeps its duplicate identity,
+                    // exactly as a book-level duplicate would.
+                    return Err(SubmitFailure::Duplicate);
                 }
 
                 Ok(Credited {
@@ -1567,6 +1597,40 @@ impl SessionState {
             );
             return Verdict::Ignored;
         }
+        // Normalize the wire version bits to the canonical header version
+        // before the common submit owner: rolled-bits interpretation lives in
+        // this SV1 edge (read through the single authoritative `JobBook`,
+        // which stays the sole owner of the share predicate), so
+        // `PoolCore::submit` and settlement below see only canonical
+        // submissions and hold no wire branching.
+        let version = match self.shared.pool.with_job_book(|book| {
+            let job_ref = book.job(job)?;
+            Some(match submit.version_bits {
+                Some(bits) => job_ref.version_from_rolled_bits(bits),
+                None => Ok(job_ref.version()),
+            })
+        }) {
+            Some(Ok(version)) => version,
+            Some(Err(error)) => {
+                let wire = share_error_wire(&error);
+                if matches!(error, ShareError::ExtranonceLength { .. }) {
+                    emit_reply(request, out, &encode_error(&request.id, &wire));
+                    return Verdict::Violation;
+                }
+                emit_reply(request, out, &encode_reject(&request.id, &wire));
+                return Verdict::Rejected;
+            }
+            // The book rejects an unknown job before it reads the version;
+            // answer here with the same verdict the owner would produce.
+            None => {
+                emit_reply(
+                    request,
+                    out,
+                    &encode_reject(&request.id, &errors::JOB_NOT_FOUND_ERROR),
+                );
+                return Verdict::Rejected;
+            }
+        };
         let target = self.effective_target(Instant::now());
         let share_request = ShareRequest {
             session: lease.session.id(),
@@ -1574,7 +1638,7 @@ impl SessionState {
             rolled: &submit.extranonce2,
             ntime: submit.ntime,
             nonce: submit.nonce,
-            version_bits: submit.version_bits,
+            version,
         };
         let session = share_request.session;
         match self.shared.pool.submit(&identity, &share_request, &target) {

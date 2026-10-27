@@ -878,6 +878,10 @@ pub enum RecordOutcome {
     Recorded,
     /// A row with this header hash already exists; nothing changed.
     AlreadyRecorded,
+    /// The ledger refused the share permanently (retired round, conflicting
+    /// credit, or claimed block): never retry and never buffer. Adapters
+    /// report a rejected share, not an unavailable ledger.
+    Rejected,
 }
 
 /// Pool accounting, separate from this adapter.
