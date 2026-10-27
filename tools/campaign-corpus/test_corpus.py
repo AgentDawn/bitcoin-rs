@@ -71,10 +71,6 @@ class _Writable(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:
-    return isinstance(value, dict)
-
-
 def _is_binary_stream(value: object) -> TypeGuard[BinaryIO]:
     return (
         hasattr(value, "read")
@@ -261,7 +257,6 @@ def _isolated_products():
             return original_loader(path)
 
         corpus.PRODUCTS_PATH = products
-
 
         try:
             with mock.patch.object(corpus, "load_freeze", _isolated_load):

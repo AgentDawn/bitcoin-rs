@@ -22,13 +22,17 @@
 //! `sources` directory: that directory holds multiple `blkNNNNN.dat` files
 //! while the timed command expects one regular corpus file.
 //!
-//! Guarantees: exact bytes (framing walk plus manifest binding plus archive
-//! digest), full validation (`--assume-valid-height 0`, indexes off),
-//! durable bodies plus undo (authoritative commit path), production clean
-//! checkpoint (nonzero when publication fails), foreground only (no fork,
-//! no daemonize, no spawned descendants), and an eight-field certified
-//! state. Reopen against the same data directory is idempotent: when the
-//! applied tip already equals the manifest stop, no block is reconnected.
+//! Guarantees: exact bytes (framing walk plus per-record manifest binding
+//! plus archive digest, verified for skipped prefix records and on reopen
+//! too), full validation (`--assume-valid-height 0` with the validation mode
+//! pinned to `Full` instead of any inherited live mode, indexes off, and no
+//! stale persisted derived-index namespace), durable bodies plus undo
+//! (authoritative commit path), production clean checkpoint (nonzero when
+//! publication fails), foreground only (no fork, no daemonize, no spawned
+//! descendants), and an eight-field certified state. Reopen against the same
+//! data directory is idempotent: when the applied tip already equals the
+//! manifest stop, no block is reconnected, but the archive is still walked
+//! and rebound.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -141,7 +145,7 @@ const MAX_PAYLOAD: usize = 4_000_000;
 /// refusal fails closed with a nonzero exit (the caller maps `Err` to
 /// `ExitCode::FAILURE`).
 pub fn run_offline_import(
-    config: NodeConfig,
+    mut config: NodeConfig,
     corpus: &Path,
     manifest: &Path,
     state: &Path,
@@ -149,9 +153,18 @@ pub fn run_offline_import(
     if config.validation.assume_valid_height != 0 {
         bail!("offline import requires --assume-valid-height 0 for full validation");
     }
-    if config.indexes.txindex || config.indexes.blockfilterindex {
+    // Offline fast-forward never inherits a live validation mode: the
+    // comparator contract carries no validation-mode token and the default
+    // mode skips scripts, so the mode is pinned here, before the chainstate
+    // opens, instead of flowing from operator config.
+    config.validation.mode = resolve_offline_validation_mode(config.validation.mode);
+    if config.indexes.txindex
+        || config.indexes.blockfilterindex
+        || config.indexes.script_index.is_enabled()
+    {
         bail!("offline import requires auxiliary indexes off");
     }
+    refuse_stale_persisted_indexes(&config.data_dir)?;
     let manifest_doc = read_manifest(manifest)?;
     let expected_magic = config.network.magic();
     let manifest_magic = parse_magic_hex(&manifest_doc.network_magic)?;
@@ -181,11 +194,14 @@ pub fn run_offline_import(
                 bail!("applied tip hash does not match the manifest entry");
             }
             if height == manifest_doc.stop_height {
-                verify_and_certify(&node, &manifest_doc, state)?;
-                return Ok(());
+                // Tip already current: connect nothing, but still walk the
+                // archive below so the reopen re-binds every record and the
+                // digest instead of trusting the bytes it skips.
+                manifest_doc.blocks.len()
+            } else {
+                let next = height.checked_add(1).context("applied tip overflow")?;
+                block_index_for_height(manifest_doc.start_height, next)?
             }
-            let next = height.checked_add(1).context("applied tip overflow")?;
-            block_index_for_height(manifest_doc.start_height, next)?
         }
     };
 
@@ -195,6 +211,10 @@ pub fn run_offline_import(
     let mut payloads: Vec<bitcoin_rs_primitives::BlockPayload> = Vec::new();
     for (index, entry) in manifest_doc.blocks.iter().enumerate() {
         let record = read_record(&mut stream, expected_magic, entry)?;
+        // Per-record binding runs before the resume skip: already-applied
+        // prefix bytes stay bound to their indexed entry instead of coasting
+        // on framing plus the trailing digest.
+        check_payload_against_entry(entry, &record.payload)?;
         hasher.update(&record.framed);
         total += u64::try_from(record.framed.len()).context("record length does not fit")?;
         if index < skip {
@@ -413,6 +433,75 @@ fn block_index_for_height(start_height: u32, height: u32) -> Result<usize> {
         .checked_sub(start_height)
         .with_context(|| format!("applied tip height {height} is outside the manifest range"))?;
     usize::try_from(offset).context("tip height does not fit")
+}
+
+/// Pins the offline-import validation mode, refusing to inherit.
+///
+/// Every incoming mode maps to `Full`: the certified state claims full
+/// script validation, so fast-forward must execute every script regardless
+/// of the live posture the operator config carries. There is no refusal
+/// here because the comparator contract carries no validation-mode token
+/// (its default resolves to `AssumeValid`); silently inheriting that
+/// default would be the accident this pin prevents.
+fn resolve_offline_validation_mode(
+    _inherited: bitcoin_rs_chainstate::ValidationMode,
+) -> bitcoin_rs_chainstate::ValidationMode {
+    bitcoin_rs_chainstate::ValidationMode::Full
+}
+
+/// Binds one archive record to its manifest block index.
+///
+/// Framing (`read_record`) proves network magic and length only, and the
+/// trailing archive digest binds bytes late. This check binds early and per
+/// record: the payload's header hash must equal the indexed entry hash,
+/// including records the resume cursor skips.
+fn check_payload_against_entry(entry: &ManifestBlock, payload: &[u8]) -> Result<()> {
+    let header = payload.get(..HEADER_LEN).with_context(|| {
+        format!(
+            "block at height {} is shorter than a header",
+            entry.height
+        )
+    })?;
+    // The same computation `Block::block_hash` performs, in `Display` order
+    // to match the indexed entry hash.
+    let hash = bitcoin_rs_primitives::encode::double_sha256(header);
+    if !hash.to_string().eq_ignore_ascii_case(&entry.hash) {
+        bail!("block at height {} header hash diverged", entry.height);
+    }
+    Ok(())
+}
+
+/// Refuses when the data dir carries persisted derived-index content that
+/// this index-off import will neither maintain nor revalidate.
+///
+/// [`crate::state::NodeState::open`] leaves the derived-index host disabled
+/// under the posture gate above, so a `<data_dir>/txindex` namespace left by
+/// an earlier index-enabled run would sit untouched while the chainstate tip
+/// moves underneath it. The documented revalidation path is a normal indexed
+/// start, whose worker startup reconciles (rewind or rebuild from retained
+/// canonical chainstate) the namespace back to the applied tip; this
+/// foreground import runs no workers, so it refuses instead. Remove or
+/// quarantine the namespace, or revalidate it first, then re-run.
+fn refuse_stale_persisted_indexes(data_dir: &Path) -> Result<()> {
+    let namespace = data_dir.join("txindex");
+    if !namespace_has_content(&namespace) {
+        return Ok(());
+    }
+    bail!(
+        "stale persisted derived index at {}: remove it or revalidate with an indexed start, then re-run",
+        namespace.display()
+    );
+}
+
+/// True when `path` holds persisted content: a missing path or an empty
+/// directory holds nothing stale; anything else (rows, a stray file, a
+/// symlink, or an unreadable directory) is state this import will not
+/// revalidate.
+fn namespace_has_content(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => std::fs::symlink_metadata(path).is_ok(),
+    }
 }
 
 fn parse_magic_hex(text: &str) -> Result<[u8; 4]> {
@@ -764,6 +853,79 @@ mod tests {
         };
         assert!(check_manifest_network(&doc, regtest).is_ok());
         assert!(check_manifest_network(&doc, "mainnet").is_err());
+    }
+
+    #[test]
+    fn offline_import_pins_full_validation_mode() {
+        use bitcoin_rs_chainstate::ValidationMode;
+        // The pin refuses to inherit: every incoming live mode maps to Full,
+        // so an operator default (AssumeValid) or a fast sync posture can
+        // never leak script skipping into the certified state.
+        for inherited in [
+            ValidationMode::Full,
+            ValidationMode::AssumeValid,
+            ValidationMode::Fast,
+        ] {
+            assert_eq!(
+                resolve_offline_validation_mode(inherited),
+                ValidationMode::Full
+            );
+        }
+    }
+
+    fn binding_entry(height: u32, hash: &str) -> ManifestBlock {
+        entry(height, hash, 0, HEADER_LEN)
+    }
+
+    fn header_hash_hex(header: &[u8; HEADER_LEN]) -> String {
+        // Same computation the binding check performs, so the fixture hash
+        // is pinned to the indexed display order rather than the helper.
+        bitcoin_rs_primitives::encode::double_sha256(header).to_string()
+    }
+
+    #[test]
+    fn skipped_prefix_records_stay_bound_to_the_manifest() {
+        // The per-record binding covers records the resume cursor skips, so a
+        // corrupted prefix of the right length is still refused.
+        let header = [7u8; HEADER_LEN];
+        let doc_hash = header_hash_hex(&header);
+        let good = binding_entry(3, &doc_hash);
+        let mut payload = header.to_vec();
+        check_payload_against_entry(&good, &payload).expect("bound record");
+        // Uppercase manifest hashes normalize the same way.
+        let upper = binding_entry(3, &doc_hash.to_ascii_uppercase());
+        check_payload_against_entry(&upper, &payload).expect("case-insensitive");
+        // One flipped payload bit diverges from the indexed entry.
+        payload[10] ^= 0x01;
+        assert!(check_payload_against_entry(&good, &payload).is_err());
+        // A wrong entry hash refuses even with intact bytes.
+        let wrong = binding_entry(3, &"ab".repeat(32));
+        assert!(check_payload_against_entry(&wrong, &header).is_err());
+        // A runt that framing would already reject never binds.
+        let runt = binding_entry(3, &doc_hash);
+        assert!(check_payload_against_entry(&runt, &header[..HEADER_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn offline_import_refuses_stale_persisted_index_namespace() {
+        // No namespace, or an empty one, holds nothing stale.
+        let fresh = tempfile::tempdir().expect("tempdir");
+        refuse_stale_persisted_indexes(fresh.path()).expect("absent namespace");
+        std::fs::create_dir(fresh.path().join("txindex")).expect("empty namespace");
+        refuse_stale_persisted_indexes(fresh.path()).expect("empty namespace");
+        // Rows left by an earlier index-enabled run refuse, even though the
+        // config posture gate already passed with indexes off.
+        std::fs::write(
+            fresh.path().join("txindex").join("CURRENT"),
+            b"stale",
+        )
+        .expect("seed stale row");
+        assert!(refuse_stale_persisted_indexes(fresh.path()).is_err());
+        // A stray non-directory artifact is state this import will not
+        // revalidate either.
+        let stray = tempfile::tempdir().expect("tempdir");
+        std::fs::write(stray.path().join("txindex"), b"stale").expect("seed stray file");
+        assert!(refuse_stale_persisted_indexes(stray.path()).is_err());
     }
 
     #[test]
