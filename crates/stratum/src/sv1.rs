@@ -1248,7 +1248,8 @@ mod notification_tests {
     #[test]
     fn calls_carry_has_id_and_notifications_do_not() {
         let call = br#"{"id":7,"method":"mining.subscribe","params":[]}"#;
-        let decoded = decode_line(call).expect("a call with an id decodes");
+        let decoded = decode_line(call)
+            .unwrap_or_else(|error| panic!("a call with an id decodes: {error:?}"));
         match decoded {
             Incoming::Request(request) => {
                 assert!(request.has_id);
@@ -1258,7 +1259,8 @@ mod notification_tests {
         }
 
         let notification = br#"{"method":"mining.subscribe","params":[]}"#;
-        let decoded = decode_line(notification).expect("a notification decodes");
+        let decoded = decode_line(notification)
+            .unwrap_or_else(|error| panic!("a notification decodes: {error:?}"));
         match decoded {
             Incoming::Request(request) => {
                 assert!(!request.has_id);
