@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bitcoin::hashes::{Hash as _, HashEngine, hmac, sha256};
-use bitcoin::secp256k1::rand::{RngCore, thread_rng};
+use bitcoin::secp256k1::rand::{Rng, RngCore, thread_rng};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REPLY_LINE: usize = 16_384;
@@ -156,6 +156,68 @@ fn connect_unix(
     }
     rustix::io::ioctl_fionbio(&fd, false).map_err(io::Error::from)?;
     Ok(std::os::unix::net::UnixStream::from(fd))
+}
+
+/// Whether a control-connect failure is transient (a restarting Tor, a
+/// slow listener backlog) rather than permanent (a missing socket path,
+/// bad config, refused auth). Transient failures merit bounded retry
+/// inside the connect deadline; permanent ones fail at once, so a
+/// missing socket or bad password never waits out a budget. The service
+/// layer uses the same split to decide between backing off and retiring
+/// the onion service.
+#[must_use]
+pub(crate) fn is_transient_control_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Open the control stream, retrying transient connect failures a bounded
+/// number of times inside the connect deadline. Pauses are jittered and
+/// clipped to the remaining budget on a monotonic clock, so a down Tor
+/// delays but never stalls the caller past its budget.
+fn connect_stream(target: &TorControlTarget, deadline: Instant) -> io::Result<ControlStream> {
+    const MAX_CONNECT_ATTEMPTS: u32 = 3;
+    let mut attempts = 0u32;
+    loop {
+        let attempt = match target {
+            TorControlTarget::Tcp(addr) => {
+                let rem = socket_timeout(deadline)?;
+                TcpStream::connect_timeout(addr, rem).map(ControlStream::Tcp)
+            }
+            #[cfg(unix)]
+            TorControlTarget::Unix(path) => connect_unix(path, deadline).map(ControlStream::Unix),
+        };
+        match attempt {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if is_transient_control_error(&error) && attempts + 1 < MAX_CONNECT_ATTEMPTS =>
+            {
+                attempts += 1;
+                let cap = socket_timeout(deadline)?.min(Duration::from_millis(100));
+                // The `min` above caps this at 100ms, so the widening
+                // conversion cannot fail; a failure would be a bug.
+                let cap_ms = u64::try_from(cap.as_millis()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tor control retry cap overflow",
+                    )
+                })?;
+                let pause = cap / 2 + Duration::from_millis(thread_rng().gen_range(0..=cap_ms / 2));
+                std::thread::sleep(pause);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn write_all_with_deadline(
@@ -304,6 +366,10 @@ pub(crate) struct TorController {
     service_id: Option<String>,
     deadline: Option<Instant>,
     command_timeout: Duration,
+    /// Set after any command failure: the reply framing may be desynced,
+    /// so the connection accepts no further commands and must be
+    /// re-established.
+    poisoned: bool,
 }
 
 impl std::fmt::Debug for TorController {
@@ -385,22 +451,10 @@ impl TorController {
                 "tor control connect timeout overflow",
             )
         })?;
+        let stream = connect_stream(target, deadline)?;
         let rem = socket_timeout(deadline)?;
-        let stream = match target {
-            TorControlTarget::Tcp(addr) => {
-                let stream = TcpStream::connect_timeout(addr, rem)?;
-                stream.set_read_timeout(Some(rem))?;
-                stream.set_write_timeout(Some(rem))?;
-                ControlStream::Tcp(stream)
-            }
-            #[cfg(unix)]
-            TorControlTarget::Unix(path) => {
-                let stream = connect_unix(path, deadline)?;
-                stream.set_read_timeout(Some(rem))?;
-                stream.set_write_timeout(Some(rem))?;
-                ControlStream::Unix(stream)
-            }
-        };
+        stream.set_read_timeout(Some(rem))?;
+        stream.set_write_timeout(Some(rem))?;
         let writer = match &stream {
             ControlStream::Tcp(stream) => ControlStream::Tcp(stream.try_clone()?),
             #[cfg(unix)]
@@ -412,6 +466,7 @@ impl TorController {
             service_id: None,
             deadline: Some(deadline),
             command_timeout,
+            poisoned: false,
         };
         controller.authenticate(password)?;
         controller.deadline = None;
@@ -424,6 +479,12 @@ impl TorController {
     }
 
     fn command(&mut self, command: &str) -> io::Result<Vec<String>> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "tor control connection is poisoned after a command error",
+            ));
+        }
         let deadline = match self.deadline {
             Some(deadline) => {
                 remaining_timeout(deadline)?;
@@ -448,6 +509,9 @@ impl TorController {
             .get_mut()
             .set_read_timeout(Some(self.command_timeout));
         let _ = self.writer.set_write_timeout(Some(self.command_timeout));
+        if res.is_err() {
+            self.poisoned = true;
+        }
         res
     }
 
@@ -541,6 +605,13 @@ impl TorController {
             service_id.ok_or_else(|| invalid("tor ADD_ONION reply has no service id"))?;
         if !valid_service_id(&service_id) {
             return Err(invalid("tor ADD_ONION reply carries invalid service id"));
+        }
+        // A fresh `NEW` key must come back with its private blob: without
+        // it there is nothing to persist and the service could not be
+        // re-registered after a restart. A reused persisted key
+        // legitimately carries no blob.
+        if key_blob.is_none() && private_key.is_none() {
+            return Err(invalid("tor ADD_ONION with NEW key returned no private key"));
         }
         if let Some(pk) = &private_key {
             if !valid_key_blob(pk) {
@@ -822,6 +893,146 @@ mod tests {
             commands
                 .iter()
                 .any(|c| c.starts_with("ADD_ONION ED25519-V3:") && c.contains("Port=8333"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn new_key_without_private_key_is_rejected_without_poisoning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Control server that answers ADD_ONION NEW with a service id but
+        // no PrivateKey blob: the fresh key would be unpersistable, so the
+        // registration must fail instead of returning a keyless service.
+        // The reply itself is well-formed, so the controller stays usable.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        std::thread::spawn(move || -> io::Result<()> {
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let stream_clone = stream.try_clone()?;
+            let mut reader = BufReader::new(stream_clone);
+            let mut writer = stream;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return Ok(());
+                }
+                let reply = if line.starts_with("ADD_ONION") {
+                    "250-ServiceID=aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead.onion\r\n250 OK\r\n".to_owned()
+                } else {
+                    "250 OK\r\n".to_owned()
+                };
+                if writer.write_all(reply.as_bytes()).is_err() {
+                    return Ok(());
+                }
+            }
+        });
+        let mut controller = TorController::connect(&TorControlTarget::Tcp(addr), Some("pw"))?;
+        let Err(error) = controller.add_onion(None, 8333, "127.0.0.1:19000".parse()?) else {
+            return Err("NEW without PrivateKey must fail".into());
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        controller.poll_alive()?;
+        Ok(())
+    }
+
+    #[test]
+    fn command_error_poisons_the_controller() -> Result<(), Box<dyn std::error::Error>> {
+        // Control server that drops the connection mid-command: the reply
+        // framing may be desynced, so the controller must refuse every
+        // further command instead of sending on a broken stream.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        std::thread::spawn(move || -> io::Result<()> {
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let stream_clone = stream.try_clone()?;
+            let mut reader = BufReader::new(stream_clone);
+            let mut writer = stream;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return Ok(());
+                }
+                if line.starts_with("ADD_ONION") {
+                    // No reply: drop the connection mid-command.
+                    return Ok(());
+                }
+                if writer.write_all(b"250 OK\r\n").is_err() {
+                    return Ok(());
+                }
+            }
+        });
+        let mut controller = TorController::connect(&TorControlTarget::Tcp(addr), Some("pw"))?;
+        controller
+            .add_onion(None, 8333, "127.0.0.1:19000".parse()?)
+            .expect_err("dropped command must fail");
+        let Err(poisoned) = controller.poll_alive() else {
+            return Err("poisoned controller must refuse commands".into());
+        };
+        assert_eq!(poisoned.kind(), io::ErrorKind::NotConnected);
+        assert!(
+            poisoned.to_string().contains("poisoned"),
+            "unexpected poison error: {poisoned}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transient_control_error_classification() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                is_transient_control_error(&io::Error::new(kind, "transient")),
+                "{kind:?} must be transient"
+            );
+        }
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Unsupported,
+        ] {
+            assert!(
+                !is_transient_control_error(&io::Error::new(kind, "permanent")),
+                "{kind:?} must be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_control_port_fails_inside_its_budget() -> Result<(), Box<dyn std::error::Error>> {
+        // Closed loopback port: refusal is transient and retried, but the
+        // whole attempt stays inside the connect budget.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            listener.local_addr()?.port()
+        };
+        let target = TorControlTarget::Tcp(format!("127.0.0.1:{port}").parse()?);
+        let start = Instant::now();
+        let Err(error) =
+            TorController::connect_with_budget(&target, None, Duration::from_millis(500), Duration::from_secs(5))
+        else {
+            return Err("refused control port must fail".into());
+        };
+        assert!(
+            is_transient_control_error(&error),
+            "refused control connect must stay transient, got {error:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "bounded retry must not stall past the budget, took {:?}",
+            start.elapsed()
         );
         Ok(())
     }

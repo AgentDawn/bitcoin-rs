@@ -97,9 +97,13 @@ fn random_credentials() -> ([u8; 16], [u8; 16]) {
 }
 
 fn authenticate_isolated(stream: &mut TcpStream, deadline: Instant) -> Result<(), DialFailure> {
-    // The handshake must not offer or accept SOCKS no-auth (0x00).
-    // Only RFC1929 username/password auth (0x02) is offered.
-    write_all_deadline(stream, &[0x05, 0x01, 0x02], deadline)?;
+    // Offer both no-auth (0x00) and RFC1929 username/password auth (0x02)
+    // so isolation-required dials still work through proxies without auth
+    // support (`proxyrandomize` compatibility). When the proxy selects
+    // 0x02, fresh per-dial credentials isolate the stream (Tor stream
+    // isolation); when it selects 0x00 there is no isolation to provide,
+    // and the dial proceeds unauthenticated rather than failing.
+    write_all_deadline(stream, &[0x05, 0x02, 0x00, 0x02], deadline)?;
     let mut selection = [0u8; 2];
     read_exact_deadline(stream, &mut selection, deadline)?;
     if selection[0] != 0x05 {
@@ -108,13 +112,9 @@ fn authenticate_isolated(stream: &mut TcpStream, deadline: Instant) -> Result<()
         )));
     }
     match selection[1] {
-        0x00 => {
-            // Isolation-required dials must not silently downgrade
-            // to an unauthenticated, non-isolated stream.
-            Err(DialFailure::Transport(invalid(
-                "socks proxy selected no-authentication for an isolation-required dial",
-            )))
-        }
+        // No-auth proxy: no per-dial isolation is possible, but the dial
+        // itself is still valid.
+        0x00 => Ok(()),
         0x02 => {
             let (user, password) = random_credentials();
             let mut auth = [0u8; AUTH_LEN];
@@ -170,10 +170,12 @@ fn read_connect_reply(stream: &mut TcpStream, deadline: Instant) -> Result<(), D
             reply_kind(head[1]),
             format!("socks connect failed with reply code {}", head[1]),
         );
-        // Only 0x05 (ConnectionRefused) is genuine peer evidence;
-        // route/network unreachable, TTL expired, and local proxy failures are Transport.
+        // Reply codes past a working proxy distinguish peer failures from
+        // local ones: refusal, timeout (TTL expired), and host/network
+        // unreachable are evidence about the peer for addrman; general
+        // failure, connection-not-allowed, and unknown codes stay local.
         return Err(match head[1] {
-            0x05 => DialFailure::PeerUnreachable(error),
+            0x03 | 0x04 | 0x05 | 0x06 => DialFailure::PeerUnreachable(error),
             _ => DialFailure::Transport(error),
         });
     }
@@ -199,10 +201,12 @@ fn read_connect_reply(stream: &mut TcpStream, deadline: Instant) -> Result<(), D
 /// Dial `target` through the SOCKS5 proxy at `proxy`.
 ///
 /// When `isolate` is set, RFC 1929 authentication with fresh per-dial
-/// credentials is required (Tor stream isolation). Otherwise no-auth is
-/// used. The whole exchange is bounded by `timeout` socket deadlines.
-/// Local proxy failures are [`DialFailure::Transport`]; only a proxy
-/// report that the peer itself is unreachable is
+/// credentials is used whenever the proxy supports it (Tor stream
+/// isolation); proxies that select no-auth are still usable, without
+/// isolation. Otherwise no-auth is used. The whole exchange is bounded
+/// by `timeout` socket deadlines. Local proxy failures are
+/// [`DialFailure::Transport`]; only a proxy report that the peer itself
+/// is unreachable (refused, timed out, or host/network unreachable) is
 /// [`DialFailure::PeerUnreachable`].
 pub(crate) fn socks_connect(
     proxy: SocketAddr,
@@ -393,10 +397,12 @@ mod tests {
     }
 
     #[test]
-    fn isolation_dial_refuses_no_auth_selection_and_sends_no_connect()
+    fn isolation_dial_offers_both_methods_and_tolerates_no_auth_proxy()
     -> Result<(), Box<dyn std::error::Error>> {
-        // Fake proxy that offers only no-auth selection even when the
-        // client offered credentials: the dial must fail before CONNECT.
+        // Fake proxy without auth support: it records the offered methods,
+        // selects no-auth (0x00), then answers CONNECT successfully. The
+        // isolation dial must offer both methods and proceed to CONNECT
+        // without credentials (`proxyrandomize` compatibility).
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let proxy = listener.local_addr()?;
         let (tx, rx) = mpsc::channel();
@@ -405,27 +411,38 @@ mod tests {
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut greeting = [0u8; 2];
             stream.read_exact(&mut greeting)?;
+            assert_eq!(greeting[0], 0x05);
             let mut methods = vec![0u8; usize::from(greeting[1])];
             stream.read_exact(&mut methods)?;
-            assert_eq!(methods, vec![0x02], "isolation dial must offer only 0x02");
+            let _ = tx.send(methods);
             stream.write_all(&[0x05, 0x00])?;
-            // Any further byte would be a CONNECT or auth attempt.
-            let mut byte = [0u8; 1];
-            let extra = stream.read(&mut byte).unwrap_or(0);
-            let _ = tx.send(extra);
+            // CONNECT with a domain target: ATYP=0x03, len, name, port.
+            let mut head = [0u8; 4];
+            stream.read_exact(&mut head)?;
+            assert_eq!(head, [0x05, 0x01, 0x00, 0x03]);
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len)?;
+            let mut rest = vec![0u8; usize::from(len[0]) + 2];
+            stream.read_exact(&mut rest)?;
+            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x20, 0x8d])?;
+            // Keep the bridged stream open briefly.
+            std::thread::sleep(Duration::from_millis(200));
             Ok(())
         });
         let onion = format!("{}.onion", "a".repeat(56));
-        let Err(error) = socks_connect(
+        let stream = socks_connect(
             proxy,
             &SocksTarget::Domain(onion, 8333),
             true,
             Duration::from_secs(5),
-        ) else {
-            return Err("no-auth selection must fail an isolation dial".into());
-        };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(rx.recv()?, 0, "no CONNECT may be sent");
+        )?;
+        assert_eq!(stream.read_timeout()?, None);
+        drop(stream);
+        assert_eq!(
+            rx.recv()?,
+            vec![0x00, 0x02],
+            "isolation dial must offer no-auth and user/pass together"
+        );
         Ok(())
     }
 
@@ -464,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_connect_is_a_transport_error() -> Result<(), Box<dyn std::error::Error>> {
+    fn refused_connect_reports_connection_refused() -> Result<(), Box<dyn std::error::Error>> {
         let (proxy, _rx) = fake_socks_no_auth(0x05)?;
         let target: SocketAddr = "203.0.113.7:8333".parse()?;
         let Err(error) = socks_connect(
@@ -531,9 +548,29 @@ mod tests {
     }
 
     #[test]
-    fn network_unreachable_and_ttl_expired_are_transport_not_peer_unreachable()
+    fn unreachable_and_timeout_replies_are_peer_unreachable()
     -> Result<(), Box<dyn std::error::Error>> {
-        for reply_code in [0x03, 0x04, 0x06] {
+        // Refusal, network/host unreachable, and TTL-expired (timeout)
+        // past a working proxy are evidence about the peer for addrman.
+        for reply_code in [0x03, 0x04, 0x05, 0x06] {
+            let (proxy, _rx) = fake_socks_no_auth(reply_code)?;
+            let target: SocketAddr = "203.0.113.7:8333".parse()?;
+            let Err(error) = socks_connect(
+                proxy,
+                &SocksTarget::Ip(target),
+                false,
+                Duration::from_secs(5),
+            ) else {
+                return Err("must fail".into());
+            };
+            assert!(
+                error.counts_as_peer_failure(),
+                "reply code {reply_code:#x} must be peer failure, not transport error"
+            );
+        }
+        // General failure and connection-not-allowed stay local: they
+        // describe the proxy or its policy, not the peer.
+        for reply_code in [0x01, 0x02] {
             let (proxy, _rx) = fake_socks_no_auth(reply_code)?;
             let target: SocketAddr = "203.0.113.7:8333".parse()?;
             let Err(error) = socks_connect(

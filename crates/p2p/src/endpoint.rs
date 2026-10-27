@@ -125,11 +125,11 @@ pub fn classify_endpoint(text: &str) -> ClassifiedEndpoint {
     let Ok(port) = port_str.parse::<u16>() else {
         return ClassifiedEndpoint::InvalidOverlay;
     };
-    if port == 0 {
-        return ClassifiedEndpoint::InvalidOverlay;
-    }
 
     if let Some(onion) = host.strip_suffix(".onion") {
+        if port == 0 {
+            return ClassifiedEndpoint::InvalidOverlay;
+        }
         if onion.len() != 56 {
             return ClassifiedEndpoint::InvalidOverlay;
         }
@@ -190,7 +190,9 @@ pub fn format_endpoint(endpoint: PeerEndpoint) -> String {
 #[must_use]
 pub fn endpoint_from_addrv2(message: &AddrV2Message) -> Option<PeerEndpoint> {
     let port = message.port;
-    if port == 0 {
+    // I2P SAM accepts port 0 (unspecified/default service port); every
+    // other network still requires a nonzero port.
+    if port == 0 && !matches!(message.addr, AddrV2::I2p(_)) {
         return None;
     }
     match message.addr {
@@ -377,8 +379,9 @@ impl DialRoutes {
 /// naming failure, local policy (`onlynet`), and missing routes. None of
 /// these is evidence about the peer and none may move addrman failure
 /// accounting. `PeerUnreachable` is reserved for outcomes reported past
-/// a working transport (direct TCP refusal, SOCKS peer-unreachable reply
-/// codes, SAM `CANT_REACH_PEER`/`TIMEOUT`).
+/// a working transport (direct TCP refusal, timeout, or host/network
+/// unreachable; SOCKS refusal/timeout/unreachable reply codes;
+/// SAM `CANT_REACH_PEER`/`TIMEOUT`).
 #[derive(Debug)]
 pub enum DialFailure {
     /// Local transport failure; never peer evidence.
@@ -464,7 +467,15 @@ pub fn connect_peer_stream(
             None => match TcpStream::connect_timeout(&addr, timeout) {
                 Ok(stream) => Ok(stream),
                 Err(error) => Err(match error.kind() {
-                    io::ErrorKind::ConnectionRefused => DialFailure::PeerUnreachable(error),
+                    // A dial that reached the network and failed there is
+                    // evidence about the peer (Core `addrman.Attempt`
+                    // failure accounting): refusal, timeout, and host or
+                    // network unreachable all count. Anything else (local
+                    // permission, aborted, or unknown I/O) stays local.
+                    io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::TimedOut => DialFailure::PeerUnreachable(error),
                     _ => DialFailure::Transport(error),
                 }),
             },
@@ -492,7 +503,7 @@ pub fn connect_peer_stream(
                     "overlay transport unavailable: no I2P SAM session is configured",
                 )));
             };
-            session.connect(hash, port)
+            session.connect(hash, port, timeout)
         }
     }
 }
@@ -696,6 +707,67 @@ mod tests {
     }
 
     #[test]
+    fn i2p_port_zero_is_valid_but_tor_and_ip_are_not() {
+        // I2P SAM accepts port 0 (unspecified/default service port).
+        let i2p_zero = format!("{}.b32.i2p:0", "a".repeat(52));
+        assert_eq!(
+            classify_endpoint(&i2p_zero),
+            ClassifiedEndpoint::Valid(PeerEndpoint::I2p {
+                hash: [0u8; 32],
+                port: 0
+            })
+        );
+        assert_eq!(
+            parse_endpoint(&i2p_zero),
+            Some(PeerEndpoint::I2p {
+                hash: [0u8; 32],
+                port: 0
+            })
+        );
+
+        // Tor v3 and IP still require a nonzero port.
+        let tor_zero = format_endpoint(tor_endpoint()).replace("8333", "0");
+        assert_eq!(
+            classify_endpoint(&tor_zero),
+            ClassifiedEndpoint::InvalidOverlay
+        );
+        assert_eq!(parse_endpoint(&tor_zero), None);
+        assert_eq!(parse_endpoint("127.0.0.1:0"), None);
+    }
+
+    #[test]
+    fn addrv2_accepts_i2p_port_zero_only() {
+        let i2p_zero = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::I2p([7u8; 32]),
+            port: 0,
+        };
+        assert_eq!(
+            endpoint_from_addrv2(&i2p_zero),
+            Some(PeerEndpoint::I2p {
+                hash: [7u8; 32],
+                port: 0
+            })
+        );
+        // Every other network with port 0 is still rejected.
+        for addr in [
+            AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
+            AddrV2::TorV3([3u8; 32]),
+        ] {
+            assert_eq!(
+                endpoint_from_addrv2(&AddrV2Message {
+                    time: 1,
+                    services: ServiceFlags::NETWORK,
+                    addr,
+                    port: 0,
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn addrv2_round_trip_and_rejections() {
         for endpoint in [
             PeerEndpoint::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333)),
@@ -773,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_tcp_classifies_only_refusal_as_peer_unreachable()
+    fn direct_tcp_refusal_timeout_and_unreachable_are_peer_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
         // Unused local port yields ConnectionRefused -> PeerUnreachable
         let unused_port: SocketAddr = "127.0.0.1:1".parse()?;
@@ -784,24 +856,17 @@ mod tests {
         ) else {
             panic!("refused dial must fail");
         };
-        match &error {
-            DialFailure::PeerUnreachable(io_err) => {
-                assert_eq!(io_err.kind(), io::ErrorKind::ConnectionRefused);
-                assert!(
-                    error.counts_as_peer_failure(),
-                    "ConnectionRefused must count as peer failure"
-                );
-            }
-            DialFailure::Transport(_) => {
-                assert_ne!(error.kind(), io::ErrorKind::ConnectionRefused);
-                assert!(
-                    !error.counts_as_peer_failure(),
-                    "Non-refusal must not count as peer failure"
-                );
-            }
-        }
+        assert!(
+            matches!(error, DialFailure::PeerUnreachable(_)),
+            "refused dial must be peer evidence, got {error:?}"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(error.counts_as_peer_failure());
 
-        // Non-routable address with tiny timeout yields TimedOut or NetworkUnreachable -> Transport
+        // Non-routable address with a tiny timeout yields TimedOut (or, on
+        // some platforms, NetworkUnreachable): a dial that reached the
+        // network and failed there is peer evidence for addrman, exactly
+        // like a refusal.
         let blackhole: SocketAddr = "192.0.2.1:8333".parse()?;
         let Err(error) = connect_peer_stream(
             PeerEndpoint::Ip(blackhole),
@@ -810,22 +875,22 @@ mod tests {
         ) else {
             panic!("timed out dial must fail");
         };
-        match &error {
-            DialFailure::Transport(_) => {
-                assert_ne!(error.kind(), io::ErrorKind::ConnectionRefused);
-                assert!(
-                    !error.counts_as_peer_failure(),
-                    "Timeout or network error must remain Transport failure"
-                );
-            }
-            DialFailure::PeerUnreachable(io_err) => {
-                assert_eq!(io_err.kind(), io::ErrorKind::ConnectionRefused);
-                assert!(
-                    error.counts_as_peer_failure(),
-                    "ConnectionRefused must count as peer failure"
-                );
-            }
-        }
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::ConnectionRefused
+            ),
+            "blackhole dial must report a network outcome, got {:?}",
+            error.kind()
+        );
+        assert!(
+            matches!(error, DialFailure::PeerUnreachable(_)),
+            "timeout/unreachable dial must be peer evidence, got {error:?}"
+        );
+        assert!(error.counts_as_peer_failure());
         Ok(())
     }
 
