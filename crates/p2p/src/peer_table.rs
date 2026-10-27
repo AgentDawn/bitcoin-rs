@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bitcoin::p2p::ServiceFlags;
-use bitcoin_rs_primitives::{Hash256, Wtxid};
+use bitcoin_rs_primitives::{Hash256, Txid, Wtxid};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 
@@ -670,6 +670,7 @@ impl PeerTable {
         &self,
         source: bitcoin_rs_mempool::PeerToken,
         subject: Wtxid,
+        parents: &[Txid],
     ) -> bool {
         let source = self.entries.read().iter().find_map(|(key, entry)| {
             let current = entry.lease.source(key.endpoint());
@@ -678,7 +679,7 @@ impl PeerTable {
                 && !entry.lease.is_cancelled())
             .then_some(current)
         });
-        source.is_some_and(|source| self.request_package_info(source, subject))
+        source.is_some_and(|source| self.request_package_info(source, subject, parents))
     }
 
     /// Publishes `versions` as `source`'s negotiated package-relay bits
@@ -1280,9 +1281,23 @@ impl PeerTable {
         true
     }
 
+    /// Whether `source`'s connection published BIP144 witness relay: parent
+    /// requests to it carry the witness flag, others do not.
+    pub(crate) fn transaction_witness(&self, source: PeerSource) -> bool {
+        let entries = self.entries.read();
+        let Some(entry) = entries.get(&SessionKey::from_source(source)) else {
+            return false;
+        };
+        !entry.lease.is_cancelled()
+            && entry.lease.is_current(source)
+            && entry
+                .info
+                .as_ref()
+                .is_some_and(|info| info.services & ServiceFlags::WITNESS.to_u64() != 0)
+    }
+
     /// Clones the lease only when it is still the connection identified by
     /// `source` and has not been cancelled.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn lease_source(&self, source: PeerSource) -> Option<PeerLease> {
         self.entries

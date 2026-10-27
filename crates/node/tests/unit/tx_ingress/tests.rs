@@ -2,6 +2,7 @@
 // orphan/reject lifecycle, connection attribution, generation fencing, and retries.
 use super::*;
 use arc_swap::ArcSwapOption;
+use bitcoin::hashes::Hash as _;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_mempool::{
@@ -471,7 +472,7 @@ fn consumer_processes_admitted_package_and_publishes_generation() {
     // The ancestor-package lifecycle: the node solicits `ancpkginfo` for the
     // subject, the answer names the missing ancestors, and `getpkgtxns` claims
     // the request for exactly that sequence.
-    assert!(table.request_package_info(source, child_wtxid));
+    assert!(table.request_package_info(source, child_wtxid, &[]));
     assert!(table.request_package_transactions(
         source,
         child_wtxid,
@@ -510,4 +511,240 @@ fn consumer_processes_admitted_package_and_publishes_generation() {
     assert_eq!(capacity.held(), 0);
     let teardown = table.clear_package_claims(&capacity);
     assert_eq!(teardown.claims_cleared, 0);
+}
+
+fn publish_peer_info(
+    table: &bitcoin_rs_p2p::PeerTable,
+    endpoint: bitcoin_rs_p2p::PeerEndpoint,
+    lease: &bitcoin_rs_p2p::PeerLease,
+    addr: SocketAddr,
+) {
+    // The poll reconcile only keeps peers with a published handshake; without
+    // this it would treat the peer as gone and retire its requests.
+    let version = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    table.publish_info(
+        endpoint,
+        lease,
+        bitcoin_rs_p2p::PeerInfo::inbound_from_version(
+            addr,
+            addr,
+            &version,
+            0,
+            0,
+            std::sync::Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
+        ),
+    );
+}
+
+fn negotiated_peer(
+    table: &bitcoin_rs_p2p::PeerTable,
+    port: u16,
+) -> (
+    bitcoin_rs_p2p::PeerSource,
+    crossbeam_channel::Receiver<bitcoin_rs_p2p::QueuedFrame>,
+) {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let (sender, receiver) = crossbeam_channel::unbounded::<bitcoin_rs_p2p::QueuedFrame>();
+    let lease = bitcoin_rs_p2p::PeerLease::new(sender);
+    let source = lease.source_ip(addr);
+    let endpoint = bitcoin_rs_p2p::PeerEndpoint::Ip(addr);
+    assert!(!table.register(endpoint, lease.clone()));
+    publish_peer_info(table, endpoint, &lease, addr);
+    assert!(table.seed_package_relay(source, bitcoin_rs_p2p::packages::PKG_RELAY_ANC));
+    (source, receiver)
+}
+
+fn orphan_spending(parent: Txid) -> Tx {
+    let mut orphan = spending_tx();
+    orphan.inputs[0].previous_output = OutPoint::new(parent, 0);
+    orphan
+}
+
+fn parent_getdata(parent: Txid) -> bitcoin_rs_p2p::Message {
+    bitcoin_rs_p2p::Message::GetData(vec![
+        bitcoin::p2p::message_blockdata::Inventory::Transaction(bitcoin::Txid::from_byte_array(
+            *parent.as_bytes(),
+        )),
+    ])
+}
+
+fn parent_witness_getdata(parent: Txid) -> bitcoin_rs_p2p::Message {
+    bitcoin_rs_p2p::Message::GetData(vec![
+        bitcoin::p2p::message_blockdata::Inventory::WitnessTransaction(
+            bitcoin::Txid::from_byte_array(*parent.as_bytes()),
+        ),
+    ])
+}
+
+#[test]
+fn refused_solicitation_at_in_flight_cap_queues_parents_for_retry() {
+    let gateway = zero_fee_gateway();
+    let mining = FakeMiningControl::unavailable("not implemented");
+    let consumer = make_consumer(&gateway, &mining);
+    let table = Arc::clone(&consumer.peer_table);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_336);
+    let (sender, receiver) = crossbeam_channel::unbounded::<bitcoin_rs_p2p::QueuedFrame>();
+    let lease = bitcoin_rs_p2p::PeerLease::new(sender);
+    let source = lease.source_ip(addr);
+    let endpoint = bitcoin_rs_p2p::PeerEndpoint::Ip(addr);
+    assert!(!table.register(endpoint, lease.clone()));
+    publish_peer_info(&table, endpoint, &lease, addr);
+    assert!(table.seed_package_relay(source, bitcoin_rs_p2p::packages::PKG_RELAY_ANC));
+
+    // Fill the peer's shared in-flight budget with live solicitations.
+    let mut fillers = Vec::new();
+    for n in 0u32..100 {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&n.to_le_bytes());
+        let filler = Wtxid(Hash256::from_le_bytes(&hash));
+        fillers.push(filler);
+        assert!(table.request_package_info(source, filler, &[]));
+    }
+    for _ in 0..100 {
+        let _ = receiver
+            .try_recv()
+            .expect("filler solicitation queued")
+            .into_message();
+    }
+
+    // A held orphan from the saturated peer cannot solicit: the refusal must
+    // leave nothing owned and queue no `ancpkginfo` for it.
+    let parent = Txid::from(Hash256::from_le_bytes(&[0xCC; 32]));
+    let subject = orphan_spending(parent).wtxid();
+    consumer.process_one(bitcoin_rs_p2p::InboundTx::new(
+        orphan_spending(parent),
+        source,
+    ));
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(consumer.mempool_gateway.orphan_count(), 1);
+    // The subject stays recoverable: another peer may still solicit it.
+    let (other, other_receiver) = negotiated_peer(&table, 18_341);
+    assert!(table.request_package_info(other, subject, &[]));
+    assert!(matches!(
+        other_receiver
+            .try_recv()
+            .expect("alternate solicitation queued")
+            .into_message(),
+        bitcoin_rs_p2p::Message::GetData(_)
+    ));
+
+    // Free one slot, and the paced poll delivers the queued parents.
+    assert!(table.release_package_info(source, fillers[0], consumer.mempool_gateway.as_ref()));
+    table.poll_transaction_requests(consumer.mempool_gateway.as_ref());
+    assert_eq!(
+        receiver
+            .try_recv()
+            .expect("queued parents are retried")
+            .into_message(),
+        parent_witness_getdata(parent)
+    );
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn unanswered_solicitation_suppresses_duplicate_parent_requests() {
+    let gateway = zero_fee_gateway();
+    let mining = FakeMiningControl::unavailable("not implemented");
+    let consumer = make_consumer(&gateway, &mining);
+    let table = Arc::clone(&consumer.peer_table);
+    let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_337);
+    let (sender_a, receiver_a) = crossbeam_channel::unbounded::<bitcoin_rs_p2p::QueuedFrame>();
+    let lease_a = bitcoin_rs_p2p::PeerLease::new(sender_a);
+    let source_a = lease_a.source_ip(addr_a);
+    assert!(!table.register(bitcoin_rs_p2p::PeerEndpoint::Ip(addr_a), lease_a));
+    assert!(table.seed_package_relay(source_a, bitcoin_rs_p2p::packages::PKG_RELAY_ANC));
+    let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_338);
+    let (sender_b, receiver_b) = crossbeam_channel::unbounded::<bitcoin_rs_p2p::QueuedFrame>();
+    let lease_b = bitcoin_rs_p2p::PeerLease::new(sender_b);
+    let source_b = lease_b.source_ip(addr_b);
+    assert!(!table.register(bitcoin_rs_p2p::PeerEndpoint::Ip(addr_b), lease_b));
+    assert!(table.seed_package_relay(source_b, bitcoin_rs_p2p::packages::PKG_RELAY_ANC));
+
+    // `b` solicits first and waits unanswered with the parents riding along.
+    let parent = Txid::from(Hash256::from_le_bytes(&[0xCC; 32]));
+    let subject = orphan_spending(parent).wtxid();
+    assert!(table.request_package_info(source_b, subject, &[parent]));
+    assert!(matches!(
+        receiver_b
+            .try_recv()
+            .expect("solicitation queued")
+            .into_message(),
+        bitcoin_rs_p2p::Message::GetData(_)
+    ));
+
+    // The same child arrives from `a`: the live package fetch must not be
+    // raced by duplicate parent requests.
+    consumer.process_one(bitcoin_rs_p2p::InboundTx::new(
+        orphan_spending(parent),
+        source_a,
+    ));
+    assert!(receiver_a.try_recv().is_err());
+    assert_eq!(consumer.mempool_gateway.orphan_count(), 1);
+    // The successful solicitation is untouched and still owns the subject.
+    assert!(table.release_package_info(source_b, subject, consumer.mempool_gateway.as_ref()));
+    assert!(receiver_b.try_recv().is_err());
+}
+
+#[test]
+fn closed_owner_solicitation_falls_back_to_live_supplier_parents() {
+    let gateway = zero_fee_gateway();
+    let mining = FakeMiningControl::unavailable("not implemented");
+    let consumer = make_consumer(&gateway, &mining);
+    let table = Arc::clone(&consumer.peer_table);
+    let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_339);
+    let (sender_a, receiver_a) = crossbeam_channel::unbounded::<bitcoin_rs_p2p::QueuedFrame>();
+    let lease_a = bitcoin_rs_p2p::PeerLease::new(sender_a);
+    let source_a = lease_a.source_ip(addr_a);
+    assert!(!table.register(bitcoin_rs_p2p::PeerEndpoint::Ip(addr_a), lease_a.clone()));
+    assert!(table.seed_package_relay(source_a, bitcoin_rs_p2p::packages::PKG_RELAY_ANC));
+    let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_340);
+    let (sender_b, receiver_b) = crossbeam_channel::unbounded::<bitcoin_rs_p2p::QueuedFrame>();
+    let lease_b = bitcoin_rs_p2p::PeerLease::new(sender_b);
+    let source_b = lease_b.source_ip(addr_b);
+    assert!(!table.register(bitcoin_rs_p2p::PeerEndpoint::Ip(addr_b), lease_b));
+    assert!(table.seed_package_relay(source_b, bitcoin_rs_p2p::packages::PKG_RELAY_ANC));
+
+    // `a` solicits, then closes with its solicitation unanswered.
+    let parent = Txid::from(Hash256::from_le_bytes(&[0xCC; 32]));
+    let subject = orphan_spending(parent).wtxid();
+    assert!(table.request_package_info(source_a, subject, &[parent]));
+    assert!(matches!(
+        receiver_a
+            .try_recv()
+            .expect("solicitation queued")
+            .into_message(),
+        bitcoin_rs_p2p::Message::GetData(_)
+    ));
+    lease_a.cancel();
+
+    // The child arrives from live `b`: the dead solicitation blocks nothing
+    // and the riding parents fall back to the live supplier.
+    consumer.process_one(bitcoin_rs_p2p::InboundTx::new(
+        orphan_spending(parent),
+        source_b,
+    ));
+    assert_eq!(
+        receiver_b
+            .try_recv()
+            .expect("live supplier gets the parents")
+            .into_message(),
+        parent_getdata(parent)
+    );
+    assert!(receiver_a.try_recv().is_err() && receiver_b.try_recv().is_err());
+    assert_eq!(consumer.mempool_gateway.orphan_count(), 1);
+    assert_eq!(
+        subject,
+        orphan_spending(parent).wtxid(),
+        "subject identity is stable across the fallback"
+    );
 }

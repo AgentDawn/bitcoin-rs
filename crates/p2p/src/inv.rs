@@ -74,13 +74,15 @@ pub fn request_missing_parents(
 ///
 /// The caller gates this path on the published `PKG_RELAY_ANC` bit. This
 /// adapter only resolves the token and applies existing bounds and ownership
-/// rules.
+/// rules. `parents` ride the solicitation so its terminal outcomes can fall
+/// back to them instead of stranding them.
 pub fn request_package_info(
     peers: &crate::PeerTable,
     source: PeerToken,
     subject: bitcoin_rs_primitives::Wtxid,
+    parents: &[Txid],
 ) -> bool {
-    peers.request_package_info_from_token(source, subject)
+    peers.request_package_info_from_token(source, subject, parents)
 }
 
 /// Applies BIP144's witness request flag to transaction vectors without

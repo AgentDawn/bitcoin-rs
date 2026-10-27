@@ -40,6 +40,14 @@ This page assigns ownership and cites proof under the
   tip; the empty-locator single-header direct lookup stays on the header-best
   chain. The decoder
   still types inbound `block` as `Message::Block`.
+- Proof: `crates/p2p/src/chain_query.rs` tests
+  `getheaders_after_locator_stops_at_stop_hash`,
+  `applied_prefix_when_headers_lead`, `applied_fork_off_best_serves_own_ancestry`,
+  `best_only_locator_does_not_skip_applied_fork`, and
+  `stop_hash_bounds_applied_response` pin applied-chain locator behavior;
+  `crates/p2p/src/wire.rs::block_payload_writes_the_same_frame_as_decoded_block`
+  and `chain_query.rs::getdata_decodes_active_body_from_source_and_reports_missing_inventory`
+  pin exact payload encoding and single-decode serving.
 
 ### `P2P-02`: Connection lifecycle and peer lease ownership
 

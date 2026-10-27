@@ -255,13 +255,22 @@ impl TxIngressConsumer {
                 true
             }
             Ok(SubmitOutcome::Held { missing_parents }) => {
-                if allow_package_request
+                // Only a live solicitation suppresses the legacy parent
+                // requests. A refused solicitation with no live owner falls
+                // back so a dying package path never strands the parents; a
+                // live one is left to answer instead of being raced by
+                // duplicate parent requests.
+                let package_requested = allow_package_request
                     && self.peer_table.package_relay_versions(source)
                         & bitcoin_rs_p2p::packages::PKG_RELAY_ANC
                         != 0
-                {
-                    bitcoin_rs_p2p::inv::request_package_info(&self.peer_table, source, wtxid);
-                } else {
+                    && bitcoin_rs_p2p::inv::request_package_info(
+                        &self.peer_table,
+                        source,
+                        wtxid,
+                        &missing_parents,
+                    );
+                if !package_requested && !self.peer_table.has_live_package_solicitation(wtxid) {
                     bitcoin_rs_p2p::request_missing_parents(
                         &self.peer_table,
                         source,

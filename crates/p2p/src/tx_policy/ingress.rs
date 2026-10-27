@@ -1212,7 +1212,7 @@ mod tests {
         let subject = child.wtxid();
 
         // The solicited `ancpkginfo` names parent then child (subject).
-        assert!(table.request_package_info(peer, subject));
+        assert!(table.request_package_info(peer, subject, &[]));
         assert!(table.request_package_transactions(peer, subject, vec![parent.wtxid(), subject]));
 
         // Peer replies with reordered sequence [child, parent].
@@ -1264,7 +1264,7 @@ mod tests {
         let tx = sample_tx(1, 1, 10_000);
         let subject = tx.wtxid();
 
-        assert!(table.request_package_info(peer, subject));
+        assert!(table.request_package_info(peer, subject, &[]));
         assert!(table.request_package_transactions(peer, subject, vec![subject]));
 
         let payload = make_payload(std::slice::from_ref(&tx));
@@ -1321,7 +1321,7 @@ mod tests {
 
         let stranded = sample_tx(1, 1, 10_000);
         let stranded_subject = stranded.wtxid();
-        assert!(table.request_package_info(peer, stranded_subject));
+        assert!(table.request_package_info(peer, stranded_subject, &[]));
         assert!(table.request_package_transactions(peer, stranded_subject, vec![stranded_subject]));
 
         // Claim is Awaiting. Teardown clears it.
@@ -1332,7 +1332,7 @@ mod tests {
 
         let queued = sample_tx(1, 2, 20_000);
         let queued_subject = queued.wtxid();
-        assert!(table.request_package_info(peer, queued_subject));
+        assert!(table.request_package_info(peer, queued_subject, &[]));
         assert!(table.request_package_transactions(peer, queued_subject, vec![queued_subject]));
         let inbound = table
             .admit_package(&capacity, &inventory, peer, make_payload(&[queued]))
@@ -1366,7 +1366,7 @@ mod tests {
 
         let tx = sample_tx(1, 1, 10_000);
         let subject = tx.wtxid();
-        assert!(table.request_package_info(peer, subject));
+        assert!(table.request_package_info(peer, subject, &[]));
         assert!(table.request_package_transactions(peer, subject, vec![subject]));
 
         let refused = table.admit_package(
@@ -1394,7 +1394,7 @@ mod tests {
         assert_eq!(ample.held(), 0);
 
         assert!(
-            table.request_package_info(peer, subject),
+            table.request_package_info(peer, subject, &[]),
             "the retired solicitation frees its hash and in-flight slot"
         );
     }
@@ -1410,7 +1410,7 @@ mod tests {
         let parent = sample_tx(1, 1, 50_000);
         let child = sample_tx(1, 2, 40_000);
         let subject = child.wtxid();
-        assert!(table.request_package_info(owner, subject));
+        assert!(table.request_package_info(owner, subject, &[]));
         assert!(table.request_package_transactions(owner, subject, vec![parent.wtxid(), subject]));
 
         // 26 members ending at the solicited subject: oversized for admission.
@@ -1434,7 +1434,7 @@ mod tests {
 
         // A forged oversized body from a stranger must not release an ordinary
         // owner: solicit again, then send oversized from the stranger.
-        assert!(table.request_package_info(owner, subject));
+        assert!(table.request_package_info(owner, subject, &[]));
         assert!(table.request_package_transactions(owner, subject, vec![parent.wtxid(), subject]));
         assert_eq!(
             table
