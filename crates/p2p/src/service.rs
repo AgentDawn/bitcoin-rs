@@ -719,6 +719,13 @@ impl P2pService {
         shared: &mut crate::listener::ConnectionShared,
     ) -> Result<(), P2pServiceError> {
         shared.dial_routes = overlay.dial_routes();
+        // Single owner for the shared Bitcoin service port advertised on all
+        // transports: `NodeConfig::materialize_overlay` is the only place
+        // that sets `tor_virtual_port`, from the winning network's default
+        // P2P port. The onion `ADD_ONION` virtual port and the I2P local
+        // endpoint / inbound `TO_PORT` fallback below read the same value, so
+        // Tor and I2P can never diverge onto separate ports.
+        let service_port = overlay.tor_virtual_port;
         if overlay.i2p_sam.is_some() {
             // Startup is cancelled by the process latch, by any `shutdown`
             // call after this start began, or by this epoch's own tokens.
@@ -738,7 +745,7 @@ impl P2pService {
                 establish_i2p_session(overlay, &cancelled).map_err(P2pServiceError::Overlay)?;
             workers.sam_session = Some(Arc::clone(&session));
             let endpoint = session
-                .local_endpoint(overlay.tor_virtual_port)
+                .local_endpoint(service_port)
                 .map_err(P2pServiceError::Overlay)?;
             tracing::info!(i2p = %endpoint, "p2p i2p session established");
             let mut addresses = self.overlay_addresses.lock();
@@ -764,7 +771,7 @@ impl P2pService {
                 target,
                 password: overlay.tor_password.clone(),
                 key_path: overlay.onion_key_path.clone(),
-                virtual_port: overlay.tor_virtual_port,
+                virtual_port: service_port,
                 addresses: Arc::clone(&self.overlay_addresses),
                 shutdown: Arc::clone(&workers.shutdown),
                 peer_table: Arc::clone(&self.peer_table),
@@ -777,31 +784,72 @@ impl P2pService {
             workers.overlay_threads.push(control_handle);
         }
 
-        // I2P inbound: one accept worker per service start, bounded by
-        // short accept waits so shutdown is observed promptly.
+        // I2P inbound: one accept worker per service start. Each iteration
+        // pends one long `STREAM ACCEPT` on the bridge (`I2P_ACCEPT_WAIT`)
+        // instead of churning one-second setups, and `SamSession::close`
+        // wakes the pending socket so shutdown joins promptly. Shutdown
+        // visibility across this worker is release-acquire (causal): `close`
+        // and `cancel` release-store the flags and wake the socket, this loop
+        // acquire-loads them between accepts, and the thread join in
+        // `join_core_workers` is the linearizable teardown handoff. The
+        // worker is never detached: it always ends before the join returns.
         if overlay.i2p_accept_incoming
             && let Some(session) = &workers.sam_session
         {
             let session = Arc::clone(session);
             let accept_shared = shared.clone();
             let shutdown_flag = Arc::clone(&workers.shutdown);
-            let fallback_port = overlay.tor_virtual_port;
+            let fallback_port = service_port;
             let i2p_handle = thread::Builder::new()
                 .name("bitcoin-rs-p2p-i2p-accept".to_owned())
                 .spawn(move || {
+                    let mut attempt = 0u32;
                     while !shutdown_flag.load(Ordering::Acquire)
                         && !accept_shared.session_cancel.load()
                     {
                         match crate::listener::accept_i2p_stream(
                             &session,
-                            Duration::from_secs(1),
+                            I2P_ACCEPT_WAIT,
                             fallback_port,
                             &accept_shared,
                         ) {
-                            Ok(_) => {}
+                            Ok(true) => attempt = 0,
+                            Ok(false) => {
+                                // Shutdown/no-peer answer (inactive or
+                                // full): leave promptly when the epoch is
+                                // over, else back off like an accept error
+                                // so a persistently declining path cannot
+                                // spin.
+                                if shutdown_flag.load(Ordering::Acquire)
+                                    || accept_shared.session_cancel.load()
+                                {
+                                    tracing::debug!("p2p i2p accept ended at shutdown");
+                                    break;
+                                }
+                                attempt = attempt.saturating_add(1);
+                                tracing::debug!(
+                                    attempt,
+                                    "p2p i2p accept declined; backing off"
+                                );
+                                interruptible_backoff(attempt, &shutdown_flag);
+                            }
                             Err(error) => {
-                                tracing::debug!(%error, "p2p i2p accept wait ended");
-                                thread::sleep(Duration::from_millis(250));
+                                if shutdown_flag.load(Ordering::Acquire)
+                                    || accept_shared.session_cancel.load()
+                                {
+                                    tracing::debug!(
+                                        %error,
+                                        "p2p i2p accept ended at shutdown"
+                                    );
+                                    break;
+                                }
+                                attempt = attempt.saturating_add(1);
+                                tracing::debug!(
+                                    %error,
+                                    attempt,
+                                    "p2p i2p accept wait ended; backing off"
+                                );
+                                interruptible_backoff(attempt, &shutdown_flag);
                             }
                         }
                     }
@@ -1968,6 +2016,16 @@ const I2P_STARTUP_BUDGET: Duration = crate::sam::EXCHANGE_BUDGET
     .saturating_add(crate::sam::ROOT_READINESS_BUDGET)
     .saturating_add(crate::sam::MAX_RETRY_PAUSE);
 
+/// Long I2P ACCEPT pending wait: one `STREAM ACCEPT` stays on the bridge for
+/// up to this long, so an idle node re-issues ACCEPT rarely instead of
+/// churning a full bridge setup every second. Shutdown never waits it out:
+/// `SamSession::close` wakes the pending ACCEPT socket (see the accept-wake
+/// registration in `crate::sam::SamSession::accept`), and the worker also
+/// observes `shutdown`/`session_cancel` between accepts. Error pauses use
+/// [`interruptible_backoff`], which polls shutdown, so a dead bridge never
+/// spins.
+const I2P_ACCEPT_WAIT: Duration = Duration::from_secs(600);
+
 /// Establish the persistent SAM session under one absolute owner deadline
 /// ([`I2P_STARTUP_BUDGET`], monotonic) and `cancelled`. The identity is
 /// loaded or generated once; every network step and every pause is clipped to
@@ -2099,14 +2157,23 @@ impl TorControlOwner {
                     // Normal loop exit (e.g. shutdown).
                 }
                 Err(error) => {
-                    consecutive_failures += 1;
-                    tracing::warn!(%error, failures = consecutive_failures, "tor control connection ended; retiring onion service");
-                    if consecutive_failures >= 10 {
-                        tracing::error!(
-                            "tor control reconnect budget exhausted; onion service retired"
-                        );
-                        self.authority.mark_exhausted(&self.peer_table);
-                        return;
+                    // Transient control failures (a restarting Tor, a slow
+                    // listener backlog) merit a backoff without touching the
+                    // permanent-failure retirement budget; only permanent
+                    // ones (a missing socket, bad auth) count toward the
+                    // 10-strike `mark_exhausted` retirement.
+                    if crate::tor_control::is_transient_control_error(&error) {
+                        tracing::warn!(%error, "tor control transient failure; backing off without retiring");
+                    } else {
+                        consecutive_failures += 1;
+                        tracing::warn!(%error, failures = consecutive_failures, "tor control connection ended; retiring onion service");
+                        if consecutive_failures >= 10 {
+                            tracing::error!(
+                                "tor control reconnect budget exhausted; onion service retired"
+                            );
+                            self.authority.mark_exhausted(&self.peer_table);
+                            return;
+                        }
                     }
                 }
             }
@@ -4757,7 +4824,12 @@ mod tests {
                 let trimmed = line.trim_end_matches(['\r', '\n']).to_owned();
                 let _ = tx.send(trimmed.clone());
                 let reply = if trimmed.starts_with("ADD_ONION") {
-                    format!("250-ServiceID={service_id}\r\n250 OK\r\n")
+                    // A fresh `NEW` key must come back with its private
+                    // blob (mirroring the tor_control fixture blob, never a
+                    // real key); without it the controller rejects the
+                    // registration.
+                    let blob = "A".repeat(86) + "==";
+                    format!("250-ServiceID={service_id}\r\n250-PrivateKey=ED25519-V3:{blob}\r\n250 OK\r\n")
                 } else {
                     "250 OK\r\n".to_owned()
                 };
@@ -5163,6 +5235,80 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
+    /// The I2P accept worker pends one long `STREAM ACCEPT` per iteration
+    /// instead of churning one-second bridge setups. This pins the
+    /// order-of-minutes pending wait now that `SamSession::close` wakes it;
+    /// shrinking it back to seconds reintroduces the churn this lane
+    /// removes.
+    #[test]
+    fn i2p_accept_wait_is_a_long_pending_wait_not_one_second_churn() {
+        assert!(
+            I2P_ACCEPT_WAIT >= Duration::from_secs(60),
+            "I2P ACCEPT must pend long (order of minutes) now that close() wakes it; got {I2P_ACCEPT_WAIT:?}",
+        );
+    }
+
+    /// A `shutdown` must join the I2P accept worker pended in its long wait
+    /// without waiting the wait out: `SamSession::close` wakes the pending
+    /// ACCEPT socket. The fixture answers `STREAM ACCEPT` STATUS at once but
+    /// withholds the inbound announcement, so the worker is blocked in
+    /// `I2P_ACCEPT_WAIT` when `shutdown` arrives.
+    ///
+    /// Without the accept-wake registration this test waits out the full
+    /// pending wait; with it the join is prompt.
+    #[test]
+    fn shutdown_joins_a_pending_i2p_accept_without_waiting_out_the_long_wait() {
+        let bridge = SamBridge::holding_stream_accept();
+        let service = P2pService::new(
+            P2pServiceConfig {
+                overlay: crate::OverlayConfig {
+                    i2p_sam: Some(bridge.addr),
+                    i2p_accept_incoming: true,
+                    tor_virtual_port: 8333,
+                    ..crate::OverlayConfig::default()
+                },
+                ..P2pServiceConfig::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        service
+            .start(
+                None,
+                None,
+                &idle_ready(),
+                crate::listener::ListenerExtras::default(),
+            )
+            .expect("start with a pending i2p accept");
+        assert_eq!(
+            service.overlay_addresses(),
+            vec![sam_endpoint()],
+            "the established session publishes its I2P endpoint"
+        );
+        assert!(
+            bridge
+                .accept_seen
+                .recv_timeout(Duration::from_secs(10))
+                .is_ok(),
+            "the accept worker must reach STREAM ACCEPT"
+        );
+        service.shutdown();
+        thread::scope(|scope| {
+            let joiner = scope.spawn(|| service.join());
+            assert!(
+                wait_until(Duration::from_secs(10), || joiner.is_finished()),
+                "shutdown must join a pending i2p accept without waiting out the long wait",
+            );
+            joiner
+                .join()
+                .expect("joiner thread")
+                .expect("clean join after shutdown");
+        });
+        assert!(
+            service.overlay_addresses().is_empty(),
+            "shutdown clears published overlay addresses"
+        );
+    }
+
     /// Structurally valid I2P destination (384 zero key bytes plus an
     /// Ed25519/X25519 key certificate), base64-encoded.
     fn sam_destination() -> String {
@@ -5197,6 +5343,11 @@ mod tests {
         unsupported_hellos: AtomicUsize,
         create_seen: Sender<()>,
         hung_up: Sender<()>,
+        /// While false, the `STREAM ACCEPT` inbound announcement is withheld
+        /// (the `STREAM STATUS` reply itself is answered at once).
+        release_accept: AtomicBool,
+        /// One signal per `STREAM ACCEPT` the bridge received.
+        accept_seen: Sender<()>,
     }
 
     /// Scripted SAM bridge. It answers every command at once, except that
@@ -5211,6 +5362,8 @@ mod tests {
         /// One signal per client that closed its connection while the
         /// `SESSION CREATE` reply was held.
         hung_up: Receiver<()>,
+        /// One signal per `STREAM ACCEPT` the bridge received.
+        accept_seen: Receiver<()>,
         accept: Option<JoinHandle<()>>,
         connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
     }
@@ -5231,6 +5384,15 @@ mod tests {
             bridge
         }
 
+        /// A bridge that answers `SESSION CREATE` at once but withholds the
+        /// `STREAM ACCEPT` inbound announcement until released.
+        fn holding_stream_accept() -> Self {
+            // No client has connected yet, so releasing here is not a race.
+            let bridge = Self::spawn(0);
+            bridge.release();
+            bridge
+        }
+
         /// Starts a bridge that holds `SESSION CREATE` replies until
         /// [`SamBridge::release`].
         fn spawn(unsupported_hellos: usize) -> Self {
@@ -5239,12 +5401,15 @@ mod tests {
             let addr = listener.local_addr().expect("sam bridge address");
             let (create_seen_tx, create_seen) = crossbeam_channel::unbounded();
             let (hung_up_tx, hung_up) = crossbeam_channel::unbounded();
+            let (accept_seen_tx, accept_seen) = crossbeam_channel::unbounded();
             let state = Arc::new(BridgeState {
                 release: AtomicBool::new(false),
                 stop: AtomicBool::new(false),
                 unsupported_hellos: AtomicUsize::new(unsupported_hellos),
                 create_seen: create_seen_tx,
                 hung_up: hung_up_tx,
+                release_accept: AtomicBool::new(false),
+                accept_seen: accept_seen_tx,
             });
             let connections = Arc::new(Mutex::new(Vec::new()));
             let accept = {
@@ -5268,6 +5433,7 @@ mod tests {
                 state,
                 create_seen,
                 hung_up,
+                accept_seen,
                 accept: Some(accept),
                 connections,
             }
@@ -5369,7 +5535,7 @@ mod tests {
 
     /// Serves one bridge connection until the client or the bridge ends it.
     fn serve_sam_connection(stream: &TcpStream, state: &BridgeState) {
-        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 
         // A short read timeout lets the worker notice `stop`, and a client
         // that closed its end while a reply is held.
@@ -5397,6 +5563,39 @@ mod tests {
             }
             let command = String::from_utf8_lossy(&pending).trim_end().to_owned();
             pending.clear();
+            // A `STREAM ACCEPT` is answered in two phases: the `STATUS`
+            // reply goes out at once, then the inbound announcement waits
+            // for `release_accept`. The client pends in its long accept wait
+            // meanwhile; a shutdown wakes it via `SamSession::close`, which
+            // the bridge observes here as a hung-up connection.
+            if command.starts_with("STREAM ACCEPT") {
+                let _ = state.accept_seen.send(());
+                if writer.write_all(b"STREAM STATUS RESULT=OK\n").is_err() {
+                    return;
+                }
+                let mut byte = [0u8; 1];
+                loop {
+                    if state.release_accept.load(Ordering::Acquire) {
+                        let announcement =
+                            format!("{} FROM_PORT=1 TO_PORT=8333\n", sam_destination());
+                        if writer.write_all(announcement.as_bytes()).is_err() {
+                            return;
+                        }
+                        break;
+                    }
+                    if state.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match reader.read(&mut byte) {
+                        Ok(read) if read > 0 => {}
+                        Err(error) if timed_out(&error) => {}
+                        // End of stream or a reset: the client gave up on
+                        // the pending announcement.
+                        Ok(_) | Err(_) => return,
+                    }
+                }
+                continue;
+            }
             let Some(reply) = bridge_reply(&command, state, &mut reader) else {
                 return;
             };

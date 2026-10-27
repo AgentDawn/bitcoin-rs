@@ -883,6 +883,16 @@ pub struct SamSession {
     /// the socket here or the holder finds `closed`. No lock is taken while
     /// it is held.
     wake: Mutex<Option<TcpStream>>,
+    /// Leaf lock for the one pending `STREAM ACCEPT` bridge socket, if any.
+    /// `close` shuts it down so a worker pended in its long accept wait
+    /// wakes at once instead of waiting the wait out. Separate from `wake`
+    /// (root recovery) because an accept and a root recovery may run
+    /// concurrently; sharing one slot would let one operation clear the
+    /// other's registration. Registration and the `closed` check share this
+    /// lock, and `close` stores `closed` before taking it, so a close either
+    /// finds the socket here or the holder finds `closed`: no missed wake.
+    /// No lock is taken while it is held.
+    accept_wake: Mutex<Option<TcpStream>>,
     closed: AtomicBool,
     /// Budget of one stream exchange (`connect`, `accept`'s recovery step).
     timeout: Duration,
@@ -1004,6 +1014,7 @@ impl SamSession {
             }),
             recovery: Mutex::new(Recovery { pending: None }),
             wake: Mutex::new(None),
+            accept_wake: Mutex::new(None),
             closed: AtomicBool::new(false),
             timeout,
             root_budget: ROOT_READINESS_BUDGET,
@@ -1456,7 +1467,42 @@ impl SamSession {
         }
         let deadline = Instant::now() + wait;
         let root = self.ensure_control(deadline)?;
-        let mut conn = SamConn::connect_with_deadline(self.sam, deadline)?;
+        // The ACCEPT bridge connect cannot be woken once started, so it is
+        // capped at one exchange budget instead of the long pending wait; a
+        // black-holed bridge delays shutdown by at most that. Every step
+        // after the registration below is wakeable through `accept_wake`.
+        let setup_deadline = (Instant::now() + EXCHANGE_BUDGET).min(deadline);
+        let mut conn = SamConn::connect_with_deadline(self.sam, setup_deadline)?;
+        // Register the ACCEPT bridge socket for wakeup before any blocking
+        // exchange step: `close` shuts this clone down, so every read below
+        // — the short setup replies and the long inbound-announcement wait —
+        // wakes at once instead of waiting out its deadline. The `closed`
+        // check shares `accept_wake`, so a close cannot slip between the
+        // check and the registration (no missed wake).
+        {
+            let mut slot = self.accept_wake.lock();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(session_closed());
+            }
+            match conn.reader.try_clone() {
+                Ok(clone) => *slot = Some(clone),
+                Err(error) => return Err(error),
+            }
+        }
+        /// Clears the ACCEPT wake registration when this exchange ends, on
+        /// every return. `close` may already have taken and shut down the
+        /// clone; taking here then only drops our registration.
+        struct AcceptWakeGuard<'a> {
+            slot: &'a Mutex<Option<TcpStream>>,
+        }
+        impl Drop for AcceptWakeGuard<'_> {
+            fn drop(&mut self) {
+                self.slot.lock().take();
+            }
+        }
+        let _accept_wake = AcceptWakeGuard {
+            slot: &self.accept_wake,
+        };
         conn.hello(deadline)?;
         let reply = conn.command(&format!("STREAM ACCEPT ID={}", self.id), deadline)?;
         let fields = parse_fields(&reply, "STREAM STATUS")?;
@@ -1475,7 +1521,13 @@ impl SamSession {
                 format!("sam request failed: STREAM STATUS RESULT={res}"),
             ));
         }
-        let line = conn.read_line(deadline)?;
+        // A wake-induced read failure is the close, not a bridge fault: the
+        // release-store in `close` pairs with this acquire-load.
+        let line = match conn.read_line(deadline) {
+            Ok(line) => line,
+            Err(_error) if self.closed.load(Ordering::Acquire) => return Err(session_closed()),
+            Err(error) => return Err(error),
+        };
         let mut parts = line.split_whitespace();
         let destination = parts
             .next()
@@ -1503,11 +1555,12 @@ impl SamSession {
 
     /// Close the session root; later dials fail closed.
     ///
-    /// Order: store `closed`; wake root I/O in progress through `wake`
-    /// (released before anything else is taken); then take `recovery` and
-    /// drain the pending root and, under `control`, the installed one. No
-    /// root can be installed after the drain: every install holds `recovery`
-    /// and re-checks `closed`.
+    /// Order: store `closed`; wake root I/O in progress through `wake` and
+    /// a pending `STREAM ACCEPT` through `accept_wake` (both released before
+    /// anything else is taken); then take `recovery` and drain the pending
+    /// root and, under `control`, the installed one. No root can be installed
+    /// after the drain: every install holds `recovery` and re-checks
+    /// `closed`.
     ///
     /// Waiting for `recovery` ends in one of two ways. Once the holder's root
     /// socket exists, the wake interrupts its read or write at once and the
@@ -1521,6 +1574,12 @@ impl SamSession {
         {
             let wake = self.wake.lock();
             if let Some(socket) = wake.as_ref() {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        {
+            let accept_wake = self.accept_wake.lock();
+            if let Some(socket) = accept_wake.as_ref() {
                 let _ = socket.shutdown(std::net::Shutdown::Both);
             }
         }

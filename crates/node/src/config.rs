@@ -253,18 +253,32 @@ impl NodeConfig {
         Self::materialize(&UserConfig::default(), NetworkSelection::from(network))
     }
 
+    /// Resolves the overlay transport configuration with one owner for the
+    /// Bitcoin service port.
+    ///
+    /// Core advertises a single P2P service port on every transport: the same
+    /// port answers on clearnet, on the onion hidden service's virtual port,
+    /// and on the I2P destination (local endpoint and inbound `TO_PORT`
+    /// fallback). `OverlayConfig::tor_virtual_port` carries that shared port
+    /// (named for its first consumer; the field lives in the endpoint lane
+    /// and is not renamed here). This function is the only place that sets
+    /// it, from the winning network's default P2P port, so Tor and I2P can
+    /// never diverge onto separate ports.
     fn materialize_overlay(
         settings: &UserConfig,
         selection: NetworkSelection,
         data_dir: &Path,
     ) -> bitcoin_rs_p2p::OverlayConfig {
+        // Single owner for the shared Bitcoin service port advertised on all
+        // transports (clearnet `listen`, onion virtual port, I2P endpoint).
+        let service_port = selection.consensus_network().default_p2p_port();
         bitcoin_rs_p2p::OverlayConfig {
             proxy: settings.p2p.proxy,
             onion: settings.p2p.onion,
             proxy_randomize_credentials: settings.p2p.proxy_randomize_credentials.unwrap_or(true),
             tor_control: settings.p2p.torcontrol.clone(),
             tor_password: settings.p2p.torpassword.clone(),
-            tor_virtual_port: selection.consensus_network().default_p2p_port(),
+            tor_virtual_port: service_port,
             onion_key_path: Some(data_dir.join("onion_v3_private_key")),
             i2p_sam: settings.p2p.i2psam,
             i2p_accept_incoming: settings.p2p.i2pacceptincoming.unwrap_or(false),
@@ -870,3 +884,33 @@ impl RuntimeInputs {
 #[cfg(test)]
 #[path = "../tests/unit/config/tests.rs"]
 mod tests;
+
+/// Regression: the shared Bitcoin service port follows the winning network on
+/// every selection, so Tor and I2P can never diverge onto separate ports.
+#[cfg(test)]
+mod shared_service_port_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_service_port_is_the_network_default_p2p_port_on_every_network() {
+        for selection in [
+            NetworkSelection::Mainnet,
+            NetworkSelection::Testnet3,
+            NetworkSelection::Testnet4,
+            NetworkSelection::Signet,
+            NetworkSelection::Regtest,
+            NetworkSelection::Drynet4,
+        ] {
+            let overlay = NodeConfig::materialize_overlay(
+                &UserConfig::default(),
+                selection,
+                Path::new("test-data-dir"),
+            );
+            assert_eq!(
+                overlay.tor_virtual_port,
+                selection.consensus_network().default_p2p_port(),
+                "shared Bitcoin service port must follow {selection:?}",
+            );
+        }
+    }
+}
