@@ -128,10 +128,12 @@ impl BlockSync {
             // infer it from the tip movement and retain the old tip for
             // stale-tip relay instead of losing it.
             if matches!(&admission, HeaderAdmission::Rejected(_)) {
-                if let Some(demoted) = bitcoin_rs_chain::header_sync::demoted_tip_after_rejection(
-                    &self.chain.block_tree(),
-                    pre_tip,
-                ) {
+                if let Some(demoted) =
+                    bitcoin_rs_chain::header_sync::demoted_tip_after_rejection(
+                        &self.chain.block_tree(),
+                        pre_tip,
+                    )
+                {
                     self.record_demoted_tip(demoted);
                 }
             }
@@ -1291,13 +1293,12 @@ impl BlockSync {
         }
         let tree = self.chain.block_tree();
         let network = self.chain.network();
-        let Some(first_parent) = tree.lookup(Hash256::from(headers[0].prev_blockhash)) else {
+        let Some(first_parent) =
+            tree.lookup(Hash256::from(headers[0].prev_blockhash))
+        else {
             return true;
         };
-        if tree
-            .node(first_parent)
-            .is_ok_and(|node| node.status == NodeStatus::Invalid)
-        {
+        if tree.node(first_parent).is_ok_and(|node| node.status == NodeStatus::Invalid) {
             return true;
         }
         // Declared `bits` honesty and prev-to-hash continuity across the
@@ -1537,13 +1538,13 @@ mod stale_tip_routing_tests {
     //! minimum-work/fault hold as ordinary headers, preserve a displaced
     //! tip on rejection, and never double-fetch an owned body.
 
-    use super::super::BlockSync;
     use super::super::chain::HeaderAdmission;
     use super::super::chain::SyncChain;
     use super::super::chain::SyncChainError;
     use super::super::chain::WindowCommitError;
+    use super::super::BlockSync;
+    use bitcoin::hashes::Hash as _;
     use bitcoin_rs_chain::TipSnapshot;
-    use bitcoin_rs_chain::header_sync::demoted_tip_after_rejection;
     use bitcoin_rs_chain::{BlockTree, ChainWork, NodeStatus};
     use bitcoin_rs_primitives::{Hash256, Header, Network};
     use parking_lot::RwLockReadGuard;
@@ -1553,14 +1554,17 @@ mod stale_tip_routing_tests {
         tree: parking_lot::RwLock<BlockTree>,
         network: Network,
         floor: ChainWork,
+        applied: parking_lot::RwLock<Option<Arc<TipSnapshot>>>,
     }
 
     impl RoutingStubChain {
         fn with_floor(tree: BlockTree, floor: ChainWork) -> Self {
+            let applied = tree.tip();
             Self {
                 tree: parking_lot::RwLock::new(tree),
                 network: Network::Regtest,
                 floor,
+                applied: parking_lot::RwLock::new(applied),
             }
         }
     }
@@ -1579,12 +1583,15 @@ mod stale_tip_routing_tests {
         }
 
         fn applied_tip(&self) -> Option<Arc<TipSnapshot>> {
-            None
+            self.applied.read().clone()
         }
 
         fn bootstrap_genesis(&self) {}
 
-        fn admit_headers(&self, headers: &[Header]) -> HeaderAdmission {
+        fn admit_headers(
+            &self,
+            headers: &[Header],
+        ) -> HeaderAdmission {
             let mut tree = self.tree.write();
             match bitcoin_rs_chain::accept_headers(
                 &mut tree,
@@ -1599,10 +1606,13 @@ mod stale_tip_routing_tests {
                         .last()
                         .and_then(|id| tree.node(*id).ok())
                         .map(|node| node.hash);
-                    let active_height = tree.tip().zip(announced_tip).and_then(|(tip, hash)| {
-                        tree.active_height_of(tip.tip_id, hash)
-                            .and_then(|h| i32::try_from(h).ok())
-                    });
+                    let active_height = tree
+                        .tip()
+                        .zip(announced_tip)
+                        .and_then(|(tip, hash)| {
+                            tree.active_height_of(tip.tip_id, hash)
+                                .and_then(|h| i32::try_from(h).ok())
+                        });
                     HeaderAdmission::Accepted {
                         accepted: admitted.ids.len(),
                         announced_tip,
@@ -1625,7 +1635,10 @@ mod stale_tip_routing_tests {
             Ok(())
         }
 
-        fn window_len(&self, _serialized_sizes: &mut dyn Iterator<Item = usize>) -> usize {
+        fn window_len(
+            &self,
+            _serialized_sizes: &mut dyn Iterator<Item = usize>,
+        ) -> usize {
             0
         }
 
@@ -1642,19 +1655,26 @@ mod stale_tip_routing_tests {
             _target: bitcoin_rs_chain::NodeId,
             _staged_body: &mut dyn FnMut(
                 Hash256,
-            )
-                -> Option<(bitcoin_rs_primitives::Block, bytes::Bytes)>,
+            ) -> Option<(bitcoin_rs_primitives::Block, bytes::Bytes)>,
             _connected_body: &mut dyn FnMut(Hash256),
         ) -> Result<(), bitcoin_rs_chainstate::reorg::ReorgError> {
             Ok(())
         }
     }
 
-    fn routing_sync(tree: BlockTree, floor: ChainWork) -> (BlockSync, Arc<crate::PeerTable>) {
+    fn routing_sync(
+        tree: BlockTree,
+        floor: ChainWork,
+    ) -> (
+        BlockSync,
+        Arc<crate::PeerTable>,
+        crossbeam_channel::Sender<crate::InboundHeaders>,
+    ) {
         let peers = Arc::new(crate::PeerTable::new());
-        let (_headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
         let (_blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
-        let chain: Arc<dyn SyncChain> = Arc::new(RoutingStubChain::with_floor(tree, floor));
+        let chain: Arc<dyn SyncChain> =
+            Arc::new(RoutingStubChain::with_floor(tree, floor));
         let sync = BlockSync::new(
             chain,
             Arc::clone(&peers),
@@ -1662,15 +1682,44 @@ mod stale_tip_routing_tests {
             blocks_rx,
             crate::sync::syncing_ibd_latch(),
         );
-        (sync, peers)
+        (sync, peers, headers_tx)
     }
 
-    fn peer_source(peers: &Arc<crate::PeerTable>) -> crate::PeerSource {
-        let (tx, _rx) = crate::test_support::message_channel();
+    fn connected_peer(
+        peers: &Arc<crate::PeerTable>,
+        port: u16,
+        best_height: i32,
+    ) -> (
+        crate::PeerSource,
+        crate::test_support::MessageReceiver,
+    ) {
+        let (tx, rx) = crate::test_support::message_channel();
         let lease = crate::PeerLease::new(tx);
-        let addr: std::net::SocketAddr = ([127, 0, 0, 1], 18444).into();
-        peers.register(crate::PeerEndpoint::Ip(addr), lease.clone());
-        lease.source_ip(addr)
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let endpoint = crate::PeerEndpoint::Ip(addr);
+        peers.register(endpoint, lease.clone());
+        let info = crate::peer_info::PeerInfo {
+            endpoint: Some(endpoint),
+            network: endpoint.net(),
+            version: 70016,
+            wtxid_relay: false,
+            relay_transactions: true,
+            compact_block_relay: false,
+            send_headers: false,
+            services: bitcoin::p2p::ServiceFlags::NETWORK.to_u64()
+                | bitcoin::p2p::ServiceFlags::WITNESS.to_u64(),
+            user_agent: String::from("/test/"),
+            start_height: best_height,
+            best_known_height: best_height,
+            conn_time: 0,
+            inbound: false,
+            addr_bind: crate::TransportRemote::new(addr),
+            time_offset: 0,
+            counters: Arc::new(crate::PeerCounters::default()),
+            transport: crate::TransportProtocol::V1,
+        };
+        peers.publish_info(endpoint, &lease, info);
+        (lease.source_ip(addr), rx)
     }
 
     fn regtest_tree_with_main() -> BlockTree {
@@ -1679,10 +1728,13 @@ mod stale_tip_routing_tests {
         tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)
             .expect("genesis inserts");
         let mut prev = genesis.block_hash();
-        let mut tip_id = tree.lookup(Hash256::from(prev)).expect("genesis indexed");
+        let mut tip_id = tree
+            .lookup(Hash256::from(prev))
+            .expect("genesis indexed");
         for height in 1..=2_u32 {
-            let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
-                .expect("fixture mines");
+            let header =
+                bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
+                    .expect("fixture mines");
             prev = header.compute_hash();
             tip_id = tree
                 .insert_node(Some(tip_id), header, NodeStatus::HeaderValid)
@@ -1698,14 +1750,16 @@ mod stale_tip_routing_tests {
     fn low_work_stale_tip_page_defers_while_broken_page_admits() {
         let tree = regtest_tree_with_main();
         let floor = ChainWork::from_be_bytes([0xFF_u8; 32]);
-        let (sync, _peers) = routing_sync(tree, floor);
+        let (sync, _peers, _headers_tx) = routing_sync(tree, floor);
         let genesis_prev =
             bitcoin_rs_primitives::BlockHash::from(Network::Regtest.genesis_block().block_hash());
         let first = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(genesis_prev, 101)
             .expect("fixture mines");
-        let second =
-            bitcoin_rs_chain::regtest_fixture::mined_regtest_header(first.compute_hash(), 102)
-                .expect("fixture mines");
+        let second = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(
+            first.compute_hash(),
+            102,
+        )
+        .expect("fixture mines");
         let valid_page = [first, second];
         // Below the floor with a known parent: the valid page is complete
         // and well-linked, so it defers rather than bypassing the hold.
@@ -1738,18 +1792,32 @@ mod stale_tip_routing_tests {
     }
 
     /// A rejected batch whose valid prefix displaced the tip preserves the
-    /// old tip through the tip-movement helper instead of losing it.
+    /// old tip through the drain's tip-movement wiring instead of losing it.
+    ///
+    /// Drives a stale-tip-style batch (identified peer, non-wire) through
+    /// `drain_inbound_headers`: the above-floor prefix moves the tip, the
+    /// garbage tail rejects, and the retainer must hold the pre-batch tip.
+    /// Deleting the drain's `Rejected -> record_demoted_tip` wiring leaves
+    /// the retainer empty and fails this test.
     #[test]
     fn partial_prefix_rejection_preserves_demoted_tip() {
-        let mut tree = regtest_tree_with_main();
-        let pre_tip = tree.tip().map(|tip| tip.hash);
+        let tree = regtest_tree_with_main();
+        let floor = ChainWork::from_be_bytes(Network::Regtest.minimum_chain_work());
+        let (sync, peers, headers_tx) = routing_sync(tree, floor);
+        let (source, _rx) = connected_peer(&peers, 18445, 3);
+        let pre_tip = sync
+            .chain
+            .chain_tip()
+            .expect("tree has a tip")
+            .hash;
         let genesis_prev =
             bitcoin_rs_primitives::BlockHash::from(Network::Regtest.genesis_block().block_hash());
         let mut batch = Vec::new();
         let mut prev = genesis_prev;
         for height in [101_u32, 102, 103] {
-            let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
-                .expect("fixture mines");
+            let header =
+                bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
+                    .expect("fixture mines");
             prev = header.compute_hash();
             batch.push(header);
         }
@@ -1760,59 +1828,103 @@ mod stale_tip_routing_tests {
             bitcoin_rs_chain::regtest_fixture::mined_regtest_header(garbage, 104)
                 .expect("fixture mines"),
         );
-        let result = bitcoin_rs_chain::accept_headers(
-            &mut tree,
-            &batch,
-            Network::Regtest,
-            bitcoin_rs_chain::current_unix_seconds(),
-            bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+        headers_tx
+            .send(crate::InboundHeaders {
+                headers: batch,
+                source: Some(source),
+                wire_response: false,
+            })
+            .expect("queue stale-tip batch");
+        sync.drain_inbound_headers();
+        let moved = sync
+            .chain
+            .chain_tip()
+            .expect("tree has a tip")
+            .hash;
+        assert_ne!(
+            moved, pre_tip,
+            "the above-floor prefix must move the tip before the tail fails"
         );
+        let fresh = crate::PeerSource::for_test(([127, 0, 0, 1], 18499).into());
+        let pending = sync.stale_tips().pending_for(fresh, |_| true);
         assert!(
-            matches!(
-                result,
-                Err(bitcoin_rs_chain::ChainError::MissingParent { .. })
-            ),
-            "the tail must fail after the prefix moved the tip, got {result:?}"
-        );
-        assert_eq!(
-            demoted_tip_after_rejection(&tree, pre_tip),
-            pre_tip,
-            "the pre-batch tip is the preserved demotion"
+            pending.contains(&pre_tip),
+            "the drain must retain the displaced tip for stale relay, got {pending:?}"
         );
     }
 
     /// A body the compact path already owns is never direct-fetched twice:
     /// both drain branches gate on `owns_body_fetch`.
+    ///
+    /// Drives a linear-extension announcement through
+    /// `drain_inbound_headers` with the tip body pre-owned by the announcer:
+    /// the drain must resolve the owned mark and send no `getdata` for it.
+    /// A control announcement without ownership must fetch, proving the
+    /// test exercises the real direct-fetch path. Deleting either drain
+    /// guard turns the owned case into a fetch and fails.
     #[test]
     fn duplicate_fetch_skips_owned_body() {
         let tree = regtest_tree_with_main();
         let floor = ChainWork::from_be_bytes(Network::Regtest.minimum_chain_work());
-        let (sync, peers) = routing_sync(tree, floor);
-        let source = peer_source(&peers);
-        let tip_hash = sync.chain.chain_tip().expect("tree has a tip").hash;
-        let tree = sync.chain.block_tree();
-        let height = tree
-            .lookup(tip_hash)
-            .and_then(|id| tree.node(id).ok())
-            .map(|node| node.height)
-            .expect("tip height resolves");
-        assert!(
-            !sync.owns_body_fetch(source, tip_hash),
-            "nothing owns the tip body yet"
-        );
+        let (sync, peers, headers_tx) = routing_sync(tree, floor);
+        // Owned case: linear extension at height 3, pre-owned by announcer.
+        let (source, rx) = connected_peer(&peers, 18446, 3);
+        let tip = sync.chain.chain_tip().expect("tree has a tip");
+        let prev = bitcoin_rs_primitives::BlockHash::from(tip.hash);
+        let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, 3)
+            .expect("fixture mines");
+        let tip_hash = Hash256::from(header.compute_hash());
         assert!(
             sync.enqueue_owned_body_fetch(source, tip_hash, || true),
             "the compact follow-up publishes ownership"
         );
+        headers_tx
+            .send(crate::InboundHeaders {
+                headers: vec![header],
+                source: Some(source),
+                wire_response: true,
+            })
+            .expect("queue owned announcement");
+        sync.drain_inbound_headers();
         assert!(
             sync.owns_body_fetch(source, tip_hash),
-            "the owned mark must resolve for the exact owner"
+            "the owned mark must survive the drain that admitted its header"
         );
-        let wire_response = true;
+        let mut saw_getdata = false;
+        while let Ok(message) = rx.try_recv() {
+            if matches!(message, crate::Message::GetData(_)) {
+                saw_getdata = true;
+            }
+        }
         assert!(
-            !(wire_response && !sync.owns_body_fetch(source, tip_hash)),
-            "the direct-fetch guard must skip a body the compact path owns"
+            !saw_getdata,
+            "the owned body must not be direct-fetched twice"
         );
-        let _ = height;
+        // Control: a fresh announcement without ownership must fetch,
+        // proving this test drives the real direct-fetch path.
+        let (control_source, control_rx) = connected_peer(&peers, 18447, 4);
+        let tip = sync.chain.chain_tip().expect("tree has a tip");
+        let prev = bitcoin_rs_primitives::BlockHash::from(tip.hash);
+        let control_header =
+            bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, 4)
+                .expect("fixture mines");
+        headers_tx
+            .send(crate::InboundHeaders {
+                headers: vec![control_header],
+                source: Some(control_source),
+                wire_response: true,
+            })
+            .expect("queue control announcement");
+        sync.drain_inbound_headers();
+        let mut control_saw_getdata = false;
+        while let Ok(message) = control_rx.try_recv() {
+            if matches!(message, crate::Message::GetData(_)) {
+                control_saw_getdata = true;
+            }
+        }
+        assert!(
+            control_saw_getdata,
+            "the unowned control announcement must direct-fetch its body"
+        );
     }
 }
