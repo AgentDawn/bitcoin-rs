@@ -548,7 +548,7 @@ impl LedgerHost {
         let reconcile_result = loop {
             let before = chain.tip_generation();
             let observation = RawChainView(chain);
-            let result = (|| {
+            let result: Result<(), pool_ledger::LedgerError> = (|| {
                 self.ledger.reconcile_rounds(&observation)?;
                 self.ledger.reconcile_payouts(&observation)?;
                 Ok(())
