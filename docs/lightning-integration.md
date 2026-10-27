@@ -2,8 +2,7 @@
 
 This document records the architectural assessment and upstream status for
 in-process Lightning integration in `bitcoin-rs`, covering [issue #1631](https://github.com/gosuda/bitcoin-rs/issues/1631)
-(`ENG-83` and `ENG-96`), grounded in David Parnas's module boundary principles
-and Richard Feynman's observational discipline.
+(`ENG-83` and `ENG-96`).
 
 In-process integration divides into two distinct phases, each blocked on an
 independent upstream component:

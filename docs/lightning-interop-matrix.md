@@ -1,7 +1,6 @@
 # Lightning Interoperability Verification Matrix
 
 *Scope*: Issue #1488, Plan Step 30 (`ENG-94`).  
-*Anchors*: Richard Feynman (truthful observation, no self-deception), Edward Tufte (high data density, explicit comparisons).  
 *Authoritative Policy*: [`docs/contracts/ecosystem-compatibility.md`](contracts/ecosystem-compatibility.md) (`ECO-01`–`ECO-09`).  
 *Executable Runner*: [`scripts/verify-lightning-interop.sh`](../scripts/verify-lightning-interop.sh).  
 *Related In-Tree Embedding Boundary*: [`docs/lightning-integration.md`](lightning-integration.md) (`ENG-83`, `ENG-96`, Issue #1631).
@@ -16,7 +15,7 @@ In strict compliance with `ECO-08` and `ECO-09`:
 1. **Unmodified Binaries Only**: Verification requires released or revision-pinned upstream binaries running unmodified. No downstream forks, mock shims, or monkey patches are permitted.
 2. **No Version Spoofing or Fake RPCs**: `bitcoin-rs` reports its truthful `client_version()` (`1400` from crate version `0.14.0`). We strictly refuse to spoof Core version numbers (e.g. `290000`) or synthesize mock wallet RPCs to force external tools to pass.
 3. **No Wallet Emulation**: `bitcoin-rs` strictly maintains a [`NO_WALLET`](contracts/wallet-facing.md) boundary. Targets requiring Core wallet RPCs (such as `gettransaction`) are recorded as blocked under `NO_WALLET`.
-4. **Differential Oracle Comparison**: Bitcoin Core 31.1 (`/home/alpha/bitcoin-core-31.1/bin/bitcoind`) serves solely as a differential comparator for suspected failures to distinguish target-side defects from node discrepancies. Core 31.1 is never a fallback, replacement, or surrogate pass.
+4. **Differential Oracle Comparison**: Bitcoin Core 31.1 (`<bitcoind-bin>`) serves solely as a differential comparator for suspected failures to distinguish target-side defects from node discrepancies. Core 31.1 is never a fallback, replacement, or surrogate pass.
 5. **No Nearest-Version Substitution**: Targets without approved pins in the Step 30 specification must remain `not exercised` naming the missing pin prerequisite. Substituting unapproved newer releases is forbidden.
 
 ---
@@ -134,7 +133,7 @@ Each target scenario is evaluated across five distinct observable behaviors:
   - Client CLI invocation: `lncli --network=regtest --lnddir=<dir> getinfo`
 - **Configuration**: `bitcoin.node=bitcoind` with standard ZMQ endpoints (`bitcoind.zmqpubrawblock`, `bitcoind.zmqpubrawtx`). Never use `rpcpolling`.
 - **Prerequisites**: `bitcoin-rs` must configure `[[notifications.zmq]]` in its TOML configuration. Requires `--txindex=true` for confirmation queries.
-- **Static ZMQ Gap as Run-Contemporary Code Fact**: At the `parent-live-4` commit `ce94561`, static code analysis showed `crates/node/src/chain_effects.rs` invoking `zmq.publish_hashtx` and `publish_rawtx` only during block connection, with mempool admission attaching only `MempoolSequenceObserver` (emitting the `sequence` topic, not `rawtx`/`hashtx`). HEAD commit `4aeb37e3d` ("Publish admitted mempool transactions over ZMQ") changed this: `MempoolSequenceObserver::on_mutation` now publishes `rawtx` for accepted transactions when the subscriber wants it (`crates/rpc/src/zmq.rs:536-559`; attached at `crates/node/src/state/open.rs:585`). This bullet is retained as the run-contemporary fact. Per Richard Feynman's observational discipline, it was not a reproduced external LND failure until an actual run of the unmodified `lnd` binary was executed against `bitcoin-rs`; the retained `parent-live-4` run below now supplies that external observation, and the code fact stands as context, never as a verdict.
+- **Static ZMQ Gap as Run-Contemporary Code Fact**: At the `parent-live-4` commit `ce94561`, static code analysis showed `crates/node/src/chain_effects.rs` invoking `zmq.publish_hashtx` and `publish_rawtx` only during block connection, with mempool admission attaching only `MempoolSequenceObserver` (emitting the `sequence` topic, not `rawtx`/`hashtx`). HEAD commit `4aeb37e3d` ("Publish admitted mempool transactions over ZMQ") changed this: `MempoolSequenceObserver::on_mutation` now publishes `rawtx` for accepted transactions when the subscriber wants it (`crates/rpc/src/zmq.rs:536-559`; attached at `crates/node/src/state/open.rs:585`). This bullet is retained as the run-contemporary fact. It was not a reproduced external LND failure until an actual run of the unmodified `lnd` binary was executed against `bitcoin-rs`; the retained `parent-live-4` run below now supplies that external observation, and the code fact stands as context, never as a verdict.
 - **Provenance Limits of the Retained `parent-live-4` Run** (`.outline/evidence/lightning-live-lnd/parent-live-4/`, verdict `all_cells_passed`, `summary.json`): pinned-scenario evidence only, not a clean-HEAD or fresh-Core comparison claim.
   - `bitcoin-rs` at git HEAD `ce94561` with **61 dirty entries**; node binary sha256 `eeb1afd3…` (mtime `2026-10-25T22:20:50Z`); no rebuild from a clean tree was performed.
   - The run used the `.outline` runner copy (`sha256 a79fc245…`), **not** `scripts/verify-lightning-interop.sh` (whose sha256 at run time was `79cf7195…` per `summary.json` `runner_original_sha256`; see `runner-delta.diff`); results do not transfer silently to the tracked runner.
@@ -239,8 +238,8 @@ scripts/verify-lightning-interop.sh \
 scripts/verify-lightning-interop.sh \
   --bitcoin-rs-bin target/release/bitcoin-rs \
   --target lnd \
-  --lnd-bin /opt/lnd/v0.21.4-beta/lnd \
-  --bitcoind-bin /home/alpha/bitcoin-core-31.1/bin/bitcoind \
+  --lnd-bin <lnd-dir>/lnd \
+  --bitcoind-bin <bitcoind-bin> \
   --output-json target/lnd-evidence.json
 
 # Qualify provisioned artifacts only: no bitcoin-rs node, no Core comparator, no target daemon, no
@@ -252,25 +251,22 @@ scripts/verify-lightning-interop.sh --verify-pins-only --target cln \
   --cln-release-archive <dir>/clightning-v26.06.9-Ubuntu-26.04-amd64.tar.xz
 
 # Live CLN cell (starts a bitcoin-rs regtest node and, if needed, the Core 31.1 comparator).
-# Exact bounded command with the pinned artifacts on this host (--cln-library-path scopes the
+# Portable command shape with caller-provided artifacts (--cln-library-path scopes a
 # privately extracted libpq5 to CLN commands only; no outer LD_LIBRARY_PATH is needed).
 # `timeout` is the wall-clock bound (`--timeout-seconds` bounds each wait only); TERM runs the
 # runner's exit trap, which reaps the node and daemon groups (exit 124 on timeout).
-# Retained qualified run `run-2` used the frozen runner (`86eba76…`, before==after) with the
-# frozen node binary below; parent job `bg_543` ran checksum before plus `bash -n` plus private
-# `ShellCheck` plus real campaign plus checksum after in one chain with exit `0`, recorded in
-# `.outline/evidence/lightning-live-cln/run-2/verification.json` with exact `86eba76…` hash.
-# `run-1` is retained raw only (mixed runner revision, no claim). Re-running requires the
-# parent's rebuild and a new retained run.
+# Historical evidence for this shape is retained in Section 4 prose (`run-2` with its
+# frozen runner digest and verification record); the command below is the portable
+# contract, not the host-specific retained run.
 timeout --signal=TERM --kill-after=30 900 bash scripts/verify-lightning-interop.sh \
-  --bitcoin-rs-bin /home/alpha/blockchain/btcrs/.outline/evidence/lightning-live-cln/bin/bitcoin-rs-aab50bd64 \
-  --bitcoind-bin /home/alpha/bitcoin-core-31.1/bin/bitcoind \
+  --bitcoin-rs-bin <bitcoin-rs-bin> \
+  --bitcoind-bin <bitcoind-bin> \
   --target cln \
-  --cln-bin /home/alpha/blockchain/btcrs/.outline/evidence/lightning-runner-20261025/cln-extract/usr/bin/lightningd \
-  --cln-release-archive /home/alpha/blockchain/btcrs/.outline/evidence/lightning-artifacts/clightning-v26.06.9-Ubuntu-26.04-amd64.tar.xz \
-  --cln-library-path /home/alpha/blockchain/btcrs/.outline/evidence/lightning-runner-20261025/libpq-probe/root/usr/lib/x86_64-linux-gnu \
-  --workdir /home/alpha/blockchain/btcrs/.outline/evidence/lightning-live-cln/run-2/work \
-  --output-json /home/alpha/blockchain/btcrs/.outline/evidence/lightning-live-cln/run-2/evidence.json \
+  --cln-bin <cln-extract-dir>/usr/bin/lightningd \
+  --cln-release-archive <artifact-dir>/clightning-v26.06.9-Ubuntu-26.04-amd64.tar.xz \
+  --cln-library-path <libpq-dir> \
+  --workdir <workdir> \
+  --output-json <output-json> \
   --timeout-seconds 60
 # Source/files needed: scripts/verify-lightning-interop.sh (tracked) + the bitcoin-rs checkout it
 # was built from (source-identity guard, default: the checkout holding the script) + the four
