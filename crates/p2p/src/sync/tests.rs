@@ -254,7 +254,7 @@ impl SyncChain for TestChain {
         count
     }
 
-    fn commit_window(&self, payloads: &[BlockPayload]) -> Result<usize, WindowCommitError> {
+    fn commit_window(&self, payloads: &[&BlockPayload]) -> Result<usize, WindowCommitError> {
         let mut tree = self.block_tree.write();
         let mut applied = 0_usize;
         for payload in payloads {
@@ -419,7 +419,7 @@ impl SyncChain for RefusingChain {
         self.0.window_len(serialized_sizes)
     }
 
-    fn commit_window(&self, payloads: &[BlockPayload]) -> Result<usize, WindowCommitError> {
+    fn commit_window(&self, payloads: &[&BlockPayload]) -> Result<usize, WindowCommitError> {
         self.0.commit_window(payloads)
     }
 
@@ -1794,8 +1794,9 @@ fn historical_delivery_retries_corruption_and_does_not_rewind_foreground() -> Te
     // Model an active snapshot at height two, with ordinary work above it.
     chain.bootstrap_genesis();
     for block in &blocks[..2] {
+        let fixture_payload = BlockPayload::from_local(block.clone());
         chain
-            .commit_window(&[BlockPayload::from_local(block.clone())])
+            .commit_window(&[&fixture_payload])
             .map_err(|error| format!("fixture commit: {error:?}"))?;
     }
     chain
@@ -3305,7 +3306,7 @@ impl SyncChain for TreeReadHook {
         self.chain.window_len(serialized_sizes)
     }
 
-    fn commit_window(&self, payloads: &[BlockPayload]) -> Result<usize, WindowCommitError> {
+    fn commit_window(&self, payloads: &[&BlockPayload]) -> Result<usize, WindowCommitError> {
         self.chain.commit_window(payloads)
     }
 

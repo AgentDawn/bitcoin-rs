@@ -234,7 +234,7 @@ impl SyncChain for NodeSyncChain {
         bitcoin_rs_chainstate::window_len(serialized_sizes)
     }
 
-    fn commit_window(&self, payloads: &[BlockPayload]) -> Result<usize, WindowCommitError> {
+    fn commit_window(&self, payloads: &[&BlockPayload]) -> Result<usize, WindowCommitError> {
         let transition = self
             .handles
             .begin_transition()

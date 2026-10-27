@@ -55,7 +55,6 @@ use bitcoin_rs_primitives::CompactTarget;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::Header;
 use bitcoin_rs_primitives::Network;
-use bitcoin_rs_primitives::consensus_bytes;
 use compact_str::CompactString;
 
 /// Production mining coordinator owned by the node process.
@@ -125,12 +124,12 @@ impl MiningCoordinator {
         self.service.wait_for_prepared_candidate(tip_hash, timeout)
     }
 
-    fn propose(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
+    fn propose(&self, payload: &BlockPayload) -> Result<BlockValidationResult, MiningControlError> {
         // Core GBT proposal looks the hash up before TestBlockValidity.
-        if let Some(known) = self.known_block_result(block.block_hash().into()) {
+        if let Some(known) = self.known_block_result(payload.block().block_hash().into()) {
             return Ok(known);
         }
-        match self.chainstate.validate_block(block) {
+        match self.chainstate.validate_block(payload) {
             Ok(()) => Ok(BlockValidationResult::Accepted),
             Err(error) => map_apply_error(error),
         }
@@ -433,7 +432,8 @@ impl MiningControl for MiningCoordinator {
     ) -> Result<BlockTemplateResult, MiningControlError> {
         match request.mode {
             BlockTemplateMode::Proposal(block) => {
-                Ok(BlockTemplateResult::Proposal(self.propose(&block)?))
+                let payload = BlockPayload::from_local(block);
+                Ok(BlockTemplateResult::Proposal(self.propose(&payload)?))
             }
             BlockTemplateMode::Template => Ok(BlockTemplateResult::Template(
                 self.service
@@ -585,16 +585,25 @@ impl MiningControl for MiningCoordinator {
             })?;
             if matches!(request.selection, GenerateSelection::Ordered(_)) {
                 // CONTRACT: docs/contracts/external-api.md#API-30
+                // Move into payload (no clone) for validation, then recover
+                // via `into_block` for solving; exact bytes preserved.
+                let payload = BlockPayload::from_local(block);
                 self.chainstate
-                    .validate_block(&block)
+                    .validate_block(&payload)
                     .map_err(|error| test_block_validity_error(&error))?;
+                block = payload.into_block();
             }
             solve_block(&mut block, request.max_tries).map_err(|error| {
                 MiningControlError::Failed(CompactString::from(error.to_string()))
             })?;
             let hash = block.block_hash();
             if request.submit {
-                match self.submit(&BlockPayload::from_local(block.clone()))? {
+                // Move into payload (no clone); `bytes()` is the exact
+                // serialization, no re-encode for the hex beyond the required
+                // hex string itself.
+                let payload = BlockPayload::from_local(block);
+                let hex = bitcoin_rs_primitives::encode::hex_encode(payload.bytes());
+                match self.submit(&payload)? {
                     BlockValidationResult::Accepted => {}
                     other => {
                         return Err(MiningControlError::Failed(CompactString::from(format!(
@@ -602,18 +611,18 @@ impl MiningControl for MiningCoordinator {
                         ))));
                     }
                 }
+                generated.push(GeneratedBlock { hash, hex });
             } else {
-                let validation = self.propose(&block)?;
+                let payload = BlockPayload::from_local(block);
+                let validation = self.propose(&payload)?;
                 if validation != BlockValidationResult::Accepted {
                     return Err(MiningControlError::Failed(CompactString::from(format!(
                         "generated block failed validation: {validation:?}"
                     ))));
                 }
+                let hex = bitcoin_rs_primitives::encode::hex_encode(payload.bytes());
+                generated.push(GeneratedBlock { hash, hex });
             }
-            generated.push(GeneratedBlock {
-                hash,
-                hex: bitcoin_rs_primitives::encode::hex_encode(&consensus_bytes(&block)),
-            });
         }
         Ok(generated)
     }

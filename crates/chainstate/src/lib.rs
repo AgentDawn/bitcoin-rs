@@ -639,7 +639,7 @@ impl<'a> ChainTransition<'a> {
     #[expect(clippy::result_large_err)]
     pub fn connect_window(
         &self,
-        payloads: &[BlockPayload],
+        payloads: &[&BlockPayload],
     ) -> core::result::Result<Vec<ConnectOutcome>, WindowApplyError> {
         let mut result = apply_window_admitted(self.chainstate, payloads);
         if let Err(error) = &mut result
@@ -1473,7 +1473,7 @@ impl Chainstate {
     #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_window(
         &self,
-        payloads: &[BlockPayload],
+        payloads: &[&BlockPayload],
     ) -> core::result::Result<Vec<ConnectOutcome>, WindowApplyError> {
         let transition = self.begin_transition().map_err(|source| WindowApplyError {
             applied: 0,
@@ -1488,12 +1488,17 @@ impl Chainstate {
     }
 
     /// See `ARCH-07` in `docs/contracts/architecture.md`.
-    pub fn validate_block(&self, block: &Block) -> core::result::Result<(), ApplyError> {
+    ///
+    /// Takes a borrowed payload to avoid cloning template blocks on the hot
+    /// path. The borrowed slice preserves the exact-serialization invariant;
+    /// no payload bytes are copied. Callers with owned blocks create one
+    /// payload via `BlockPayload::from_local` (moves, no clone) and reuse the
+    /// borrow for validation and application.
+    pub fn validate_block(&self, payload: &BlockPayload) -> core::result::Result<(), ApplyError> {
         let _lock = self.lock_transition()?;
-        let payload = BlockPayload::from_local(block.clone());
         match apply_block_admitted(
             self,
-            &payload,
+            payload,
             None,
             BlockProvenance::Network,
             ApplyIntent::Propose,

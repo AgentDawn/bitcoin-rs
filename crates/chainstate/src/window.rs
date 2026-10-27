@@ -221,7 +221,7 @@ fn restore_uncommitted_takes(
 #[expect(clippy::result_large_err)]
 pub(super) fn apply_window_admitted(
     handles: &Chainstate,
-    payloads: &[BlockPayload],
+    payloads: &[&BlockPayload],
 ) -> core::result::Result<Vec<ConnectOutcome>, WindowApplyError> {
     // A single slice has one length: the parallel-length mismatch is
     // unrepresentable and its `Operational` source is gone with the second
@@ -233,7 +233,7 @@ pub(super) fn apply_window_admitted(
     let take_starts = window.take_starts;
     let mut group = WindowGroup::default();
     let mut committed: Vec<ConnectOutcome> = Vec::with_capacity(payloads.len());
-    for payload in payloads {
+    for &payload in payloads {
         let block = payload.block();
         match apply_committed_block_admitted(
             handles,
@@ -325,7 +325,7 @@ fn flush_group(
     group: &mut WindowGroup,
     handles: &Chainstate,
     committed: &mut Vec<ConnectOutcome>,
-    payloads: &[BlockPayload],
+    payloads: &[&BlockPayload],
 ) -> core::result::Result<(), WindowApplyError> {
     // The staged prefix is a contiguous suffix starting at `committed.len()`,
     // so the newest staged block is borrowed straight from the caller's apply
@@ -337,7 +337,7 @@ fn flush_group(
     } else {
         payloads
             .get(committed.len() + group.pending.len() - 1)
-            .map(bitcoin_rs_primitives::BlockPayload::block)
+            .map(|payload| payload.block())
     };
     let flush_started = quanta::Instant::now();
     let pending_blocks = group.pending.len();
@@ -447,7 +447,7 @@ pub fn classify_apply_error(error: &ApplyError) -> WindowApplyDisposition {
 #[expect(clippy::too_many_lines)]
 fn prove_window<'a, 'h>(
     handles: &'h Chainstate,
-    payloads: &'a [BlockPayload],
+    payloads: &[&'a BlockPayload],
 ) -> ProvenWindow<'a, 'h> {
     // Empty input proves nothing: silent default, same as every other
     // fallback below (missing tip, chain break, missing tree node, parse or
@@ -469,7 +469,7 @@ fn prove_window<'a, 'h>(
         let tree = handles.block_tree.read();
         let mut parent_id = applied.tip_id;
         let mut parent_hash = applied.hash;
-        for (index, payload) in payloads.iter().enumerate() {
+        for (index, &payload) in payloads.iter().enumerate() {
             let block = payload.block();
             let hash = block.block_hash().0;
             if block.header.prev_blockhash.0 != parent_hash {
@@ -515,6 +515,7 @@ fn prove_window<'a, 'h>(
     let parse_started = quanta::Instant::now();
     let parsed: Vec<core::result::Result<_, ApplyError>> = payloads
         .par_iter()
+        .copied()
         .map(|payload| parse_block_for_apply(payload, handles.validation_engine))
         .collect();
     metrics::histogram!("node.window.parse_seconds").record(parse_started.elapsed().as_secs_f64());
@@ -525,7 +526,7 @@ fn prove_window<'a, 'h>(
         bitcoin_rs_consensus::MAX_SCRIPT_SIZE,
     );
     let mut prepared = Vec::with_capacity(payloads.len());
-    for ((payload, parsed), context) in payloads.iter().zip(parsed).zip(&contexts) {
+    for ((&payload, parsed), context) in payloads.iter().zip(parsed).zip(&contexts) {
         let block = payload.block();
         let Ok((script_source, facts)) = parsed else {
             return ProvenWindow::default();
@@ -556,7 +557,7 @@ fn prove_window<'a, 'h>(
         .record(prepare_started.elapsed().as_secs_f64());
 
     // Cheap structural checks before any script runs.
-    for ((payload, unit), context) in payloads.iter().zip(prepared.iter_mut()).zip(&contexts) {
+    for ((&payload, unit), context) in payloads.iter().zip(prepared.iter_mut()).zip(&contexts) {
         let block = payload.block();
         // The one-pass derivation already reduced these txids through the
         // production walker; comparing the stored root is the same verdict
@@ -610,7 +611,7 @@ fn prove_window<'a, 'h>(
         // same reason the script checks are batched across blocks rather than
         // split within one.
         let mut units = Vec::with_capacity(prepared.len());
-        for (index, ((payload, unit), context)) in payloads
+        for (index, ((&payload, unit), context)) in payloads
             .iter()
             .zip(prepared.iter_mut())
             .zip(&contexts)

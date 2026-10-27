@@ -61,11 +61,10 @@ fn a_grouped_window_publishes_each_blocks_own_prefix_count()
             bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
         )?;
     }
-    let payloads = [
-        BlockPayload::from_local(first),
-        BlockPayload::from_local(second),
-        BlockPayload::from_local(third),
-    ];
+    let first_payload = BlockPayload::from_local(first);
+    let second_payload = BlockPayload::from_local(second);
+    let third_payload = BlockPayload::from_local(third);
+    let payloads = [&first_payload, &second_payload, &third_payload];
 
     let transition = handles.begin_transition()?;
     let outcomes = transition.connect_window(&payloads)?;
@@ -157,11 +156,10 @@ fn a_grouped_window_stages_only_its_newest_block_before_the_sync()
             bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
         )?;
     }
-    let payloads = [
-        BlockPayload::from_local(first),
-        BlockPayload::from_local(second),
-        BlockPayload::from_local(third),
-    ];
+    let first_payload = BlockPayload::from_local(first);
+    let second_payload = BlockPayload::from_local(second);
+    let third_payload = BlockPayload::from_local(third);
+    let payloads = [&first_payload, &second_payload, &third_payload];
 
     let fires: Arc<Mutex<Vec<StagedFire>>> = Arc::new(Mutex::new(Vec::new()));
     handles

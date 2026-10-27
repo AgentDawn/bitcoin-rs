@@ -265,9 +265,12 @@ fn signet_solution_is_checked_on_commit_not_proposal() -> TestResult {
 
     // A proposal skips the solution, as Core does when it is not checking
     // proof of work; a commit refuses it and leaves the chain usable.
-    handles.validate_block(&invalid)?;
+    // One payload reused borrowed for validation and application: no clone,
+    // exact bytes preserved via `from_local` move.
+    let invalid_payload = BlockPayload::from_local(invalid);
+    handles.validate_block(&invalid_payload)?;
     let error = handles
-        .apply_block(&BlockPayload::from_local(invalid))
+        .apply_block(&invalid_payload)
         .err()
         .ok_or("a bad solution must not commit")?;
     assert!(
@@ -280,8 +283,9 @@ fn signet_solution_is_checked_on_commit_not_proposal() -> TestResult {
         "a bad solution invalidates the header branch; it is not retryable"
     );
 
-    handles.validate_block(&valid)?;
-    handles.apply_block(&BlockPayload::from_local(valid))?;
+    let valid_payload = BlockPayload::from_local(valid);
+    handles.validate_block(&valid_payload)?;
+    handles.apply_block(&valid_payload)?;
     Ok(())
 }
 

@@ -70,10 +70,11 @@ fn window_failure_keeps_committed_followers_and_native_retry_policy()
             invalid_hashes,
         ),
     ] {
-        let payloads = blocks
+        let owned_payloads = blocks
             .iter()
             .map(|block| BlockPayload::from_local((*block).clone()))
             .collect::<Vec<_>>();
+        let payloads: Vec<&BlockPayload> = owned_payloads.iter().collect();
         let error = match adapter.commit_window(&payloads) {
             Ok(count) => panic!("invalid window committed {count} blocks"),
             Err(error) => error,

@@ -144,7 +144,7 @@ fn window_commit_consumes_verified_script_cache_entry() -> Result<(), Box<dyn st
 
     let payload = BlockPayload::from_local(block);
     let outcomes = handles
-        .apply_window(&[payload])
+        .apply_window(&[&payload])
         .map_err(|error| error.to_string())?;
     assert_eq!(outcomes.len(), 1, "window must commit its one block");
     assert_eq!(outcomes[0].tip.height, next_height);
@@ -217,10 +217,9 @@ fn a_failed_window_restores_the_script_cache_entries_it_took()
     .map_err(|error| error.to_string())?;
     cache.insert(good_wtxid, flags);
 
-    let payloads = [
-        BlockPayload::from_local(first.clone()),
-        BlockPayload::from_local(second),
-    ];
+    let first_payload = BlockPayload::from_local(first);
+    let second_payload = BlockPayload::from_local(second);
+    let payloads = [&first_payload, &second_payload];
     // Rollback witness: bad script at 103 fails the pre-proof after the checks took the entry.
     let proven = super::prove_window(&handles, &payloads).proven;
     assert!(
@@ -241,7 +240,10 @@ fn a_failed_window_restores_the_script_cache_entries_it_took()
     assert_eq!(err.applied, 1, "one block committed before the failure");
     assert_eq!(err.committed.len(), 1);
     assert_eq!(err.committed[0].tip.height, 102);
-    assert_eq!(err.committed[0].hash, Hash256::from(first.block_hash()));
+    assert_eq!(
+        err.committed[0].hash,
+        Hash256::from(first_payload.block().block_hash())
+    );
     assert!(
         matches!(
             err.source,
@@ -353,10 +355,9 @@ fn a_window_refused_after_proof_restores_only_uncommitted_takes()
     .map_err(|error| error.to_string())?;
     cache.insert(second_wtxid, flags_second);
 
-    let payloads = [
-        BlockPayload::from_local(first),
-        BlockPayload::from_local(second),
-    ];
+    let first_payload = BlockPayload::from_local(first);
+    let second_payload = BlockPayload::from_local(second);
+    let payloads = [&first_payload, &second_payload];
     let err = handles
         .apply_window(&payloads)
         .err()

@@ -127,9 +127,10 @@ pub trait SyncChain: Send + Sync {
     /// (apply-side batch policy).
     fn window_len(&self, serialized_sizes: &mut dyn Iterator<Item = usize>) -> usize;
 
-    /// Commits `payloads` in order as one chain transition. `Ok(n)` = all `n`
-    /// committed and settled.
-    fn commit_window(&self, payloads: &[BlockPayload]) -> Result<usize, WindowCommitError>;
+    /// Commits borrowed `payloads` in order as one chain transition without
+    /// cloning. `Ok(n)` = all `n` committed and settled. Borrowing preserves
+    /// the exact-serialization invariant; no payload bytes are copied.
+    fn commit_window(&self, payloads: &[&BlockPayload]) -> Result<usize, WindowCommitError>;
 
     /// Moves the applied chain onto `target`'s branch. `staged_body`
     /// resolves connect-side bodies from bounded staging; `connected_body`

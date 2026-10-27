@@ -169,10 +169,12 @@ impl BlockSync {
             );
             let chunk = &drained[chunk_start..chunk_end];
             // Borrow the payloads in the same drained order; no per-window
-            // block or body reconstruction is needed.
-            let payloads: Vec<BlockPayload> = chunk
+            // clone, block or body reconstruction is needed. The borrowed
+            // slice preserves the exact-serialization invariant: `payload.bytes()`
+            // is the canonical wire encoding, never re-encoded.
+            let payloads: Vec<&BlockPayload> = chunk
                 .iter()
-                .map(|drained| drained.payload().clone())
+                .map(|drained| drained.payload())
                 .collect();
             // The window reports how far it got rather than just failing,
             // because only the committed prefix may be marked applied; the rest

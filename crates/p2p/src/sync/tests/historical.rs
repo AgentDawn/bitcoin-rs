@@ -170,14 +170,14 @@ fn historical_archive_replay_retires_overtaken_downloads() -> TestResult {
 fn late_retired_history_cannot_enter_foreground_staging() -> TestResult {
     let (harness, chain, blocks) = fixture(6)?;
     chain.bootstrap_genesis();
+    let owned_payloads: Vec<BlockPayload> = blocks
+        .iter()
+        .cloned()
+        .map(BlockPayload::from_local)
+        .collect();
+    let payloads: Vec<&BlockPayload> = owned_payloads.iter().collect();
     chain
-        .commit_window(
-            &blocks
-                .iter()
-                .cloned()
-                .map(BlockPayload::from_local)
-                .collect::<Vec<_>>(),
-        )
+        .commit_window(&payloads)
         .map_err(|error| format!("fixture commit: {error:?}"))?;
     let addr = test_addr(28205, 0)?;
     let _rx = connect_peer(&harness.peers, synthetic_peer(addr, 7));

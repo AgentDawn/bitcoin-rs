@@ -175,10 +175,9 @@ fn retired_group_and_check_timings_stay_off_caller_thread_metrics()
                 bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
             )?;
         }
-        let payloads = [
-            BlockPayload::from_local(first),
-            BlockPayload::from_local(second),
-        ];
+        let first_payload = BlockPayload::from_local(first);
+        let second_payload = BlockPayload::from_local(second);
+        let payloads = [&first_payload, &second_payload];
         let transition = handles.begin_transition()?;
         transition.connect_window(&payloads)?;
         Ok(())
@@ -221,10 +220,9 @@ fn window_commit_emits_transition_and_flush_diagnostics() -> Result<(), Box<dyn 
                 bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
             )?;
         }
-        let payloads = [
-            BlockPayload::from_local(first),
-            BlockPayload::from_local(second),
-        ];
+        let first_payload = BlockPayload::from_local(first);
+        let second_payload = BlockPayload::from_local(second);
+        let payloads = [&first_payload, &second_payload];
         let transition = handles.begin_transition()?;
         transition.connect_window(&payloads)?;
         Ok(())
@@ -288,7 +286,8 @@ fn proposal_emits_completed_validation_timings() -> Result<(), Box<dyn std::erro
     seed_genesis(&handles)?;
     let block = mined_child(Network::Regtest.genesis_block().block_hash(), 1)?;
     let fields = ProfileFields::default();
-    capture_profile(&fields, || handles.validate_block(&block))?;
+    let payload = bitcoin_rs_primitives::BlockPayload::from_local(block);
+    capture_profile(&fields, || handles.validate_block(&payload))?;
     for field in [
         "contextual_header_us",
         "pow_self_us",
@@ -315,7 +314,8 @@ fn rejected_header_emits_only_completed_validation_timings()
     let mut block = mined_child(genesis.block_hash(), 1)?;
     block.header.time = genesis.header.time;
     let fields = ProfileFields::default();
-    let result = capture_profile(&fields, || handles.validate_block(&block));
+    let payload = bitcoin_rs_primitives::BlockPayload::from_local(block);
+    let result = capture_profile(&fields, || handles.validate_block(&payload));
     assert!(matches!(
         result,
         Err(super::ApplyError::Chain(
@@ -344,7 +344,8 @@ fn rejected_spend_keeps_resolution_and_dispatch_timings() -> Result<(), Box<dyn 
         .ok_or("test merkle root missing")?;
     block.header.merkle_root = bitcoin_rs_primitives::Hash256::from_le_bytes(&root);
     let fields = ProfileFields::default();
-    let result = capture_profile(&fields, || handles.validate_block(&block));
+    let payload = bitcoin_rs_primitives::BlockPayload::from_local(block);
+    let result = capture_profile(&fields, || handles.validate_block(&payload));
     assert!(matches!(
         result,
         Err(super::ApplyError::Consensus(
