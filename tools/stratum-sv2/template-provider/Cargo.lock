@@ -426,6 +426,7 @@ dependencies = [
  "corepc-types",
  "crossbeam-channel",
  "hashbrown 0.17.1",
+ "metrics",
  "miniscript",
  "parking_lot",
  "serde",
