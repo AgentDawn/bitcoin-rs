@@ -972,19 +972,19 @@ impl MinerFixture {
     /// share that never reaches node submission, so the job stays installed
     /// no matter how the ledger answers.
     fn share_nonce(&self, start: u32) -> u32 {
-        self.share_nonce_for(&self.prefix, start)
+        self.share_nonce_for(self.prefix, start)
     }
 
     /// [`Self::share_nonce`] under an explicit session prefix, for shares
     /// submitted on a second session.
-    fn share_nonce_for(&self, prefix: &[u8; 4], start: u32) -> u32 {
+    fn share_nonce_for(&self, prefix: [u8; 4], start: u32) -> u32 {
         (start..=u32::MAX)
             .find(|nonce| {
                 let header = self
                     .job
                     .header(
                         Extranonce {
-                            session: prefix,
+                            session: &prefix,
                             rolled: &ROLLED,
                         },
                         self.job.ntime(),
@@ -1194,7 +1194,7 @@ fn per_submit_reservation_does_not_cap_the_pool_at_one_share() {
     let mut miner = MinerFixture::start_with(0x22, Some((1024, 8 * 1024 * 1024)), Some(ledger));
     let first = miner.share_nonce(0);
     let (mut second_client, second_prefix) = miner.second_client("alice.worker2");
-    let second = miner.share_nonce_for(&second_prefix, 0);
+    let second = miner.share_nonce_for(second_prefix, 0);
     miner.client.send(&format!(
         "{{\"id\":101,\"method\":\"mining.submit\",\"params\":[\"alice.worker1\",\"{:08x}\",\"00000001\",\"{:08x}\",\"{:08x}\",\"00002000\"]}}\n",
         miner.job.id().get(),
