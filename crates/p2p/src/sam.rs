@@ -1532,8 +1532,10 @@ impl SamSession {
             .map_err(close_mapped)?;
         let fields = parse_fields(&reply, "STREAM STATUS")?;
         if field(&fields, "RESULT") == Some("INVALID_ID") {
-            let _ = self.retire_root(root, deadline);
-            let _ = self.ensure_control(deadline);
+            // Bounded like the rest of setup: a dead root recovers across
+            // retries (the pending root is preserved), not inside this wait.
+            let _ = self.retire_root(root, setup_deadline);
+            let _ = self.ensure_control(setup_deadline);
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "sam stream accept failed: STREAM STATUS RESULT=INVALID_ID",
