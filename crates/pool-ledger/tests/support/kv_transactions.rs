@@ -69,3 +69,78 @@ fn fjall_snapshot_and_cross_handle_conditional_commit() -> Result<(), Box<dyn st
     let store: Arc<dyn KvStore> = Arc::new(FjallStore::open(dir.path().join("store"))?);
     exercise(&store)
 }
+fn tail_cases(store: &Arc<dyn KvStore>) -> Result<(), Box<dyn std::error::Error>> {
+    let missing = || std::io::Error::other("missing tail row");
+    let db = Database::new(Arc::clone(store));
+    let setup = db.begin_write()?;
+    let shares = setup.open_table(SHARES)?;
+    shares.insert(1u64, b"one".as_slice())?;
+    shares.insert(2u64, b"two".as_slice())?;
+    shares.insert(3u64, b"three".as_slice())?;
+    drop(shares);
+    setup.commit()?;
+    // Committed tail with no overlay.
+    let read = db.begin_read()?;
+    let (key, value) = read.open_table(SHARES)?.last()?.ok_or_else(missing)?;
+    assert_eq!(key.value(), 3u64);
+    assert_eq!(value.value(), b"three");
+    drop(read);
+    // Overlay put beyond the committed tail wins.
+    let staged = db.begin_write()?;
+    staged
+        .open_table(SHARES)?
+        .insert(5u64, b"five".as_slice())?;
+    let (key, value) = staged.open_table(SHARES)?.last()?.ok_or_else(missing)?;
+    assert_eq!(key.value(), 5u64);
+    assert_eq!(value.value(), b"five");
+    drop(staged);
+    // Overlay update of the tail key shadows the committed row.
+    let staged = db.begin_write()?;
+    staged
+        .open_table(SHARES)?
+        .insert(3u64, b"three-new".as_slice())?;
+    let (key, value) = staged.open_table(SHARES)?.last()?.ok_or_else(missing)?;
+    assert_eq!(key.value(), 3u64);
+    assert_eq!(value.value(), b"three-new");
+    drop(staged);
+    // Overlay delete of the tail falls back to the predecessor.
+    let staged = db.begin_write()?;
+    staged.open_table(SHARES)?.remove(3u64)?;
+    let (key, value) = staged.open_table(SHARES)?.last()?.ok_or_else(missing)?;
+    assert_eq!(key.value(), 2u64);
+    assert_eq!(value.value(), b"two");
+    drop(staged);
+    // Overlay tombstone beyond the tail deletes nothing.
+    let staged = db.begin_write()?;
+    staged.open_table(SHARES)?.remove(7u64)?;
+    let (key, value) = staged.open_table(SHARES)?.last()?.ok_or_else(missing)?;
+    assert_eq!(key.value(), 3u64);
+    assert_eq!(value.value(), b"three");
+    drop(staged);
+    // Empty table reports no tail; overlay-only rows still surface.
+    let read = db.begin_read()?;
+    assert!(read.open_table(BALANCES)?.last()?.is_none());
+    drop(read);
+    let staged = db.begin_write()?;
+    staged
+        .open_table(BALANCES)?
+        .insert(9u64, b"nine".as_slice())?;
+    let (key, _) = staged.open_table(BALANCES)?.last()?.ok_or_else(missing)?;
+    assert_eq!(key.value(), 9u64);
+    drop(staged);
+    Ok(())
+}
+
+#[test]
+fn redb_last_merges_overlay_tail() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn KvStore> = Arc::new(RedbStore::open(dir.path().join("store.redb"))?);
+    tail_cases(&store)
+}
+
+#[test]
+fn fjall_last_merges_overlay_tail() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn KvStore> = Arc::new(FjallStore::open(dir.path().join("store"))?);
+    tail_cases(&store)
+}

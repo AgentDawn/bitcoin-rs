@@ -360,6 +360,30 @@ impl KvSnapshot for FjallSnapshot<'_> {
         Ok(Box::new(iterator))
     }
 
+    fn last_prefix(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<Option<crate::KvPair>, StorageError> {
+        let keyspace = self.store.keyspace(cf)?;
+        // The bounded range holds exactly the prefixed rows, and an unbounded
+        // range past an all-`0xFF` (or empty) prefix can only hold prefixed
+        // rows, so the range tail needs no prefix check.
+        let mut range = match prefix_end(prefix) {
+            Some(end) => self.snapshot.range(keyspace, prefix.to_vec()..end),
+            None => self.snapshot.range(keyspace, prefix.to_vec()..),
+        };
+        range
+            .next_back()
+            .map(|guard| {
+                guard
+                    .into_inner()
+                    .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                    .map_err(StorageError::backend)
+            })
+            .transpose()
+    }
+
     fn scan_prefix_from_bounded(
         &self,
         cf: ColumnFamily,
@@ -373,4 +397,18 @@ impl KvSnapshot for FjallSnapshot<'_> {
             .map(|guard| guard.into_inner().map_err(StorageError::backend));
         crate::trait_::collect_bounded_prefix(rows, prefix, limit)
     }
+}
+
+/// Exclusive upper bound of a prefix range, if the prefix is not all `0xFF`.
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(byte) = end.last_mut() {
+        if *byte == u8::MAX {
+            end.pop();
+        } else {
+            *byte = byte.saturating_add(1);
+            return Some(end);
+        }
+    }
+    None
 }

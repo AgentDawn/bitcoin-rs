@@ -740,6 +740,14 @@ impl KvSnapshot for RedbSnapshot {
         Ok(Box::new(rows.into_iter().map(Ok)))
     }
 
+    fn last_prefix(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<Option<crate::KvPair>, StorageError> {
+        greatest_prefix(&self.read_txn, table_for(cf), prefix)
+    }
+
     fn scan_prefix_bounded(
         &self,
         cf: ColumnFamily,
@@ -796,6 +804,14 @@ impl KvSnapshot for RedbTxIndexSnapshot {
     ) -> Result<crate::trait_::KvIter<'a>, StorageError> {
         let rows = scan_txindex_prefix(&self.read_txn, cf, prefix, &[], UNBOUNDED)?.rows;
         Ok(Box::new(rows.into_iter().map(Ok)))
+    }
+
+    fn last_prefix(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<Option<crate::KvPair>, StorageError> {
+        txindex_greatest_prefix(&self.read_txn, cf, prefix)
     }
 
     fn scan_prefix_bounded(
@@ -885,6 +901,36 @@ fn scan_prefix(
         rows,
         complete: true,
     })
+}
+
+/// Returns the greatest row with the given prefix via one reverse cursor step.
+///
+/// The bounded range holds exactly the prefixed rows, and an unbounded range
+/// past an all-`0xFF` (or empty) prefix can only hold prefixed rows, so the
+/// range tail needs no prefix check.
+fn greatest_prefix(
+    read_txn: &redb::ReadTransaction,
+    table_def: ByteTable,
+    prefix: &[u8],
+) -> Result<Option<crate::KvPair>, StorageError> {
+    let table = read_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    let tail = match prefix_end(prefix) {
+        Some(end) => table
+            .range(prefix..end.as_slice())
+            .map_err(StorageError::backend)?
+            .next_back(),
+        None => table
+            .range(prefix..)
+            .map_err(StorageError::backend)?
+            .next_back(),
+    };
+    tail.map(|entry| {
+        let (key, value) = entry.map_err(StorageError::backend)?;
+        Ok((key.value().to_vec(), value.value().to_vec()))
+    })
+    .transpose()
 }
 
 fn database_path(path: &Path) -> Result<PathBuf, StorageError> {
@@ -1195,6 +1241,88 @@ fn scan_txindex_prefix(
             limit,
         ),
         ColumnFamily::UtxoMeta => scan_prefix(read_txn, TXINDEX_META, prefix, start, limit),
+        _ => Err(invalid_txindex_cf()),
+    }
+}
+
+/// Returns the greatest fixed-width row with the given prefix via one reverse
+/// cursor step. Every key inside the width-padded bounds carries the prefix.
+fn fixed_greatest_prefix<const N: usize>(
+    read_txn: &ReadTransaction,
+    table_def: FixedTable<N>,
+    prefix: &[u8],
+) -> Result<Option<crate::KvPair>, StorageError> {
+    let (start, end) = fixed_prefix_bounds::<N>(prefix)?;
+    let table = read_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    table
+        .range::<&[u8; N]>(&start..=&end)
+        .map_err(StorageError::backend)?
+        .next_back()
+        .map(|entry| {
+            let (key, _) = entry.map_err(StorageError::backend)?;
+            Ok((key.value().to_vec(), Vec::new()))
+        })
+        .transpose()
+}
+
+/// Returns the greatest fixed-width value row with the given prefix via one
+/// reverse cursor step on the membership table plus one point lookup.
+fn fixed_value_greatest_prefix(
+    read_txn: &ReadTransaction,
+    main_def: FixedTable<12>,
+    value_def: TxIndexValueTable,
+    prefix: &[u8],
+) -> Result<Option<crate::KvPair>, StorageError> {
+    let (start, end) = fixed_prefix_bounds::<12>(prefix)?;
+    let main = read_txn
+        .open_table(main_def)
+        .map_err(StorageError::backend)?;
+    let tail = main
+        .range::<&[u8; 12]>(&start..=&end)
+        .map_err(StorageError::backend)?
+        .next_back()
+        .transpose()
+        .map_err(StorageError::backend)?;
+    let Some((key, _)) = tail else {
+        return Ok(None);
+    };
+    let values = read_txn
+        .open_table(value_def)
+        .map_err(StorageError::backend)?;
+    let value = values
+        .get(key.value())
+        .map_err(StorageError::backend)?
+        .map_or_else(Vec::new, |bytes| bytes.value().to_vec());
+    Ok(Some((key.value().to_vec(), value)))
+}
+
+fn txindex_greatest_prefix(
+    read_txn: &ReadTransaction,
+    cf: ColumnFamily,
+    prefix: &[u8],
+) -> Result<Option<crate::KvPair>, StorageError> {
+    match cf {
+        ColumnFamily::TxConfirmed => fixed_value_greatest_prefix(
+            read_txn,
+            TXINDEX_TX_CONFIRMED,
+            TXINDEX_TX_CONFIRMED_VALUES,
+            prefix,
+        ),
+        ColumnFamily::Funding => {
+            fixed_value_greatest_prefix(read_txn, TXINDEX_FUNDING, TXINDEX_FUNDING_VALUES, prefix)
+        }
+        ColumnFamily::Spending => {
+            fixed_value_greatest_prefix(read_txn, TXINDEX_SPENDING, TXINDEX_SPENDING_VALUES, prefix)
+        }
+        ColumnFamily::BlockHeaders => {
+            fixed_greatest_prefix::<80>(read_txn, TXINDEX_BLOCK_HEADERS, prefix)
+        }
+        ColumnFamily::ScriptLive => {
+            fixed_greatest_prefix::<SCRIPT_LIVE_KEY_LEN>(read_txn, TXINDEX_SCRIPT_LIVE, prefix)
+        }
+        ColumnFamily::UtxoMeta => greatest_prefix(read_txn, TXINDEX_META, prefix),
         _ => Err(invalid_txindex_cf()),
     }
 }

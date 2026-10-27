@@ -371,14 +371,66 @@ impl<K: Value, V: Value> Table<'_, K, V> {
         }
         Ok(result.into_iter())
     }
-    /// Greatest row in key order without materializing the table. The snapshot iterator is
-    /// lazy, so the single pass below retains one row no matter how large the table is;
-    /// the uncommitted overlay is already in memory and merges by direct key comparison.
-    /// Callers that only need the tail (for example the newest share) never materialize
-    /// the rows before it. Reaching the tail still walks the table because the storage
-    /// backend exposes forward iteration only; a sublinear reverse seek would need a
-    /// backend reverse cursor, which is outside this crate's table layer.
+    /// Greatest live row in key order without materializing the table. The snapshot reverse
+    /// seek is lazy, so a single lookup fetches the committed tail while the uncommitted
+    /// overlay contributes its greatest put by direct key comparison; tombstones decide
+    /// liveness and an overlay put shadows a committed row under the same key. Callers
+    /// that only need the tail (for example the newest share) never materialize the rows
+    /// before it. A reverse seek cannot see past a deleted committed tail, so the rare
+    /// case where the tail itself is staged for deletion falls back to an exact forward
+    /// merge that recovers the predecessor.
     pub(crate) fn last(&self) -> Result<Option<GuardPair<K, V>>, LedgerError> {
+        let backend = self.snapshot.last_prefix(CF, &self.prefix)?;
+        let changes = self.changes.borrow();
+        let tombstoned = |key: &[u8]| changes.get(key).is_some_and(Option::is_none);
+        if backend.as_ref().is_some_and(|(key, _)| tombstoned(key)) {
+            drop(changes);
+            return self.last_scanned();
+        }
+        // Greatest overlay put in this table. Table prefixes are `PREFIX + [tag]`, so the
+        // trailing tag plus one bounds the scan to this table's keys: the seek is
+        // logarithmic and never walks later tables. Tombstones delete without
+        // contributing a row, so only puts can win.
+        let mut end = self.prefix.clone();
+        match end.last_mut() {
+            Some(tag) => {
+                *tag = tag.checked_add(1).ok_or(LedgerError::Invariant(
+                    "ledger table prefix overflow".into(),
+                ))?;
+            }
+            None => {
+                return Err(LedgerError::Invariant("empty ledger table prefix".into()));
+            }
+        }
+        let mut overlay: Option<(&[u8], &[u8])> = None;
+        for (key, value) in changes.range(self.prefix.clone()..end).rev() {
+            if let Some(put) = value {
+                overlay = Some((key.as_slice(), put.as_slice()));
+                break;
+            }
+        }
+        let tail: Option<(Vec<u8>, Vec<u8>)> = match (backend, overlay) {
+            (backend, None) => backend,
+            (None, Some((key, value))) => Some((key.to_vec(), value.to_vec())),
+            (Some((committed, stored)), Some((staged, put))) => {
+                if staged < committed.as_slice() {
+                    Some((committed, stored))
+                } else {
+                    // Equal keys shadow: the overlay put replaces the committed row.
+                    Some((staged.to_vec(), put.to_vec()))
+                }
+            }
+        };
+        drop(changes);
+        tail.map(|(key, value)| {
+            let logical = key[self.prefix.len()..].to_vec();
+            Ok((Guard(K::decode(logical)?), Guard(V::decode(value)?)))
+        })
+        .transpose()
+    }
+    /// Exact greatest live row via a forward merge. Only used when the committed tail is
+    /// staged for deletion, which a single reverse seek cannot see past.
+    fn last_scanned(&self) -> Result<Option<GuardPair<K, V>>, LedgerError> {
         let changes = self.changes.borrow();
         let deleted = |key: &[u8]| changes.get(key).is_some_and(Option::is_none);
         let mut last: Option<(Vec<u8>, Vec<u8>)> = None;
