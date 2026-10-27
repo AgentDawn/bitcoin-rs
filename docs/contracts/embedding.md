@@ -258,7 +258,8 @@ is already public and nothing here is re-exported. `Txid`, `Tx`, and
 
 ## Error behavior
 
-Errors at the typed lifecycle, readiness, mining, and broadcast boundary are
+Errors at the typed lifecycle, readiness, typed reads (`tx_by_id` and
+`block_by_hash`, EMB-06), mining, and broadcast boundary are
 `NodeError`: `Startup` (configuration, storage, recovery, or service-bind
 failure, with rollback as described above), `Shutdown` (join or checkpoint
 failure, reported only by consuming shutdown, never by Drop), `Unavailable`
