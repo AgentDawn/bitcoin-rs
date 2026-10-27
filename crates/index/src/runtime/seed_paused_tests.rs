@@ -577,11 +577,7 @@ impl SeedHarness {
     /// artifact was minted from. Concurrent applies in the paused-seed proof
     /// commit into this same set, so the proof exercises the real
     /// source-state concurrency instead of an unrelated empty set.
-    fn new(
-        fixture: &SeedFixture,
-        enabled: IndexCapabilities,
-        source: Arc<UtxoSet>,
-    ) -> Self {
+    fn new(fixture: &SeedFixture, enabled: IndexCapabilities, source: Arc<UtxoSet>) -> Self {
         let index_dir = tempfile::tempdir().expect("index dir");
         let store = Arc::new(FjallStore::open(index_dir.path()).expect("fjall open"));
         let inner: Arc<dyn TxIndexWriter> = Arc::new(RwLock::new(

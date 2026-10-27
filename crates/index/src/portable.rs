@@ -136,9 +136,7 @@ pub enum IndexBundleError {
     },
     /// The bundle omits transactions in the covered range; stamping its base
     /// would claim a completeness the rows do not have.
-    #[error(
-        "bundle omits transactions at height {height}: expected {expected}, found {actual}"
-    )]
+    #[error("bundle omits transactions at height {height}: expected {expected}, found {actual}")]
     Incomplete {
         /// First height where the bundle's count differs from the chain.
         height: u32,
@@ -315,7 +313,7 @@ mod tests {
             actual: 4,
         };
         let text = error.to_string();
-        assert!(text.contains("3"), "missing height in {text}");
+        assert!(text.contains('3'), "missing height in {text}");
         assert!(text.contains('5'), "expected count in {text}");
         assert!(text.contains('4'), "actual count in {text}");
     }

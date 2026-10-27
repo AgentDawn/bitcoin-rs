@@ -39,6 +39,7 @@ use super::{
     io_error,
 };
 use crate::index::PortableImportRow;
+use crate::types::TxPosition;
 use crate::writer::TxIndexWriter;
 use crate::{
     IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark, IndexWatermarks,
@@ -46,7 +47,6 @@ use crate::{
 };
 use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipSnapshot};
 use bitcoin_rs_primitives::{BlockHash, Hash256, layout::ParsedBlock};
-use crate::types::TxPosition;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -311,14 +311,12 @@ impl LocatorCheck<'_> {
         let body = self
             .cached
             .as_ref()
-            .map(|(_, _, body)| body.as_slice())
-            .unwrap_or(&[]);
-        let parsed = ParsedBlock::parse_exact(body).map_err(|error| {
-            IndexBundleError::BodyRead {
+            .map_or(&[][..], |(_, _, body)| body.as_slice());
+        let parsed =
+            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
                 height,
                 reason: format!("block does not parse: {error}"),
-            }
-        })?;
+            })?;
         for tx in parsed.transactions() {
             let span = tx.span();
             if is_top_level_span(position, span.start(), span.len()) {
@@ -351,13 +349,11 @@ impl LocatorCheck<'_> {
                     "the receiver chain has no block at a covered height".to_owned(),
                 )
             })?;
-            let expected = match self.block_tx_count(height, hash)? {
-                Some(count) => count,
-                None => {
-                    self.outcome =
-                        LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
-                    return Ok(());
-                }
+            let expected = if let Some(count) = self.block_tx_count(height, hash)? {
+                count
+            } else {
+                self.outcome = LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
+                return Ok(());
             };
             if let Some(error) = incomplete_at(&self.counts, height, expected) {
                 return Err(error);
@@ -406,14 +402,12 @@ impl LocatorCheck<'_> {
         let body = self
             .cached
             .as_ref()
-            .map(|(_, _, body)| body.as_slice())
-            .unwrap_or(&[]);
-        let parsed = ParsedBlock::parse_exact(body).map_err(|error| {
-            IndexBundleError::BodyRead {
+            .map_or(&[][..], |(_, _, body)| body.as_slice());
+        let parsed =
+            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
                 height,
                 reason: format!("block does not parse: {error}"),
-            }
-        })?;
+            })?;
         Ok(Some(u64::try_from(parsed.tx_count()).unwrap_or(u64::MAX)))
     }
 }

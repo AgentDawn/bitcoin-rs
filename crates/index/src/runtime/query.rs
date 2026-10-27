@@ -511,7 +511,7 @@ impl DerivedIndexQueryEngine {
                 .map_err(|_| HistoricalQueryError::Retry)?;
             if watermark_node.height != watermark.height {
                 return Err(HistoricalQueryError::Retry);
-            };
+            }
             match Self::bounded_common_ancestor(&tree, anchor_id, watermark_id, remaining) {
                 Ok(Some(joined)) => anchor_id = joined,
                 Ok(None) => return Err(HistoricalQueryError::Retry),
@@ -1060,8 +1060,10 @@ mod tests {
         let mut tree = bitcoin_rs_chain::BlockTree::new();
         let genesis_id = tree
             .insert_header(genesis.header, NodeStatus::HeaderValid)
-            .expect("genesis header");
-        let node = tree.node(genesis_id).expect("genesis node");
+            .unwrap_or_else(|error| panic!("genesis header: {error:?}"));
+        let node = tree
+            .node(genesis_id)
+            .unwrap_or_else(|error| panic!("genesis node: {error:?}"));
         let (height, hash) = (node.height, node.hash);
         let engine = anchor_test_engine(tree);
 
@@ -1077,7 +1079,7 @@ mod tests {
                 &[(IndexCapability::TxLookup, matching)],
                 &mut remaining,
             )
-            .expect("matching watermark joins");
+            .unwrap_or_else(|error| panic!("matching watermark joins: {error:?}"));
         assert_eq!(anchor_id, genesis_id);
         assert_eq!(anchor_height, height);
 
@@ -1088,15 +1090,13 @@ mod tests {
             height: height.saturating_add(1),
             hash: *hash.as_byte_array(),
         };
-        assert!(
-            matches!(
-                engine.covered_anchor(
-                    genesis_id,
-                    &[(IndexCapability::TxLookup, mismatched)],
-                    &mut remaining
-                ),
-                Err(HistoricalQueryError::Retry)
-            )
-        );
+        assert!(matches!(
+            engine.covered_anchor(
+                genesis_id,
+                &[(IndexCapability::TxLookup, mismatched)],
+                &mut remaining
+            ),
+            Err(HistoricalQueryError::Retry)
+        ));
     }
 }
