@@ -353,6 +353,21 @@ Proof: these tests establish the memo-retention rule:
   `undo_read_failure_is_not_a_missing_undo`, which proves a storage-error
   undo read fails the worker with its own error while an absent record
   resets and reseeds.
+  Reseeding sources (`IDX-07` artifact-or-retained-history, never the live
+  UTXO set): `crates/index/src/runtime/recovery_tests.rs`
+  `forward_script_live_follows_undo_present_missing_or_corrupt` (a
+  missing/corrupt undo resets only `ScriptLive` while siblings keep their
+  rows, then reseeds at the tip) and
+  `seed_first_leg_consumes_held_lease` (the forward leg consumes the bundle
+  pin with at most one live lease, stalled legs park it back, progress
+  releases it); `crates/index/src/runtime/seed_paused_tests.rs`
+  `seed_paused_write_permits_apply_and_retires_generation` (concurrent
+  applies land while the seed stream holds its pin, then retire to zero
+  leases), `catch_up_drops_subsumed_seed_lease_for_lower_start`
+  (single-holder drain), `seed_reorg_below_h_rolls_back_through_pinned_undo`
+  (sub-`H` reorg rewinds through the pinned undo), and
+  `seed_prune_while_paused_refuses_at_or_above_floor` (pruned history yields
+  scoped terminal `Unavailable` while the worker stays alive).
 
 ### `IDX-11`: Portable index bundle
 
@@ -391,7 +406,10 @@ Proof: these tests establish the memo-retention rule:
   `TxConfirmed` rows of one snapshot at the applied tip. Export never writes a
   `ScriptHistory` artifact, and restore refuses a manifest that declares one
   (`UnsupportedCapability`). `ScriptLive` is never a bundle capability and is
-  reseeded from the UTXO set. `CompactFilters` is not a bundle family. A bundle
+  never reseeded from the live UTXO set; after restore or reset it first
+  accepts a verified immutable snapshot artifact, then replays complete
+  retained history, and otherwise reports `Unavailable` (`IDX-07`).
+  `CompactFilters` is not a bundle family. A bundle
   carries no block bodies, undo records, or chainstate.
 - **Export** publishes a manifest only when all of these hold:
   - `TxLookup` is enabled (`TxLookupDisabled`).
@@ -645,129 +663,36 @@ consumer usage and defers to this clause for every consistency rule.
   | Positive floor on full script history | `Unavailable(Shared(HistoryUnproven { floor }))` |
   | Row, scan, body-read, and body-byte budgets, truncated scans, `BlockBodyMissing`, disabled capability, worker failure/stop, missing authority, lifecycle causes | `Unavailable(Shared(...))` with the identical wrapped variant |
   | Snapshot-open and body-read storage failures | `Storage(...)` |
-- Provenance: the surface above is implemented in this change. Executable
-  proof references for its gate, floor, ancestry, reset, reorg, and error
-  behavior are recorded by the parent after runs; this clause makes no
-  pass/fail claim about them.
-
-### `IDX-12`: Historical prefix queries (one-shot, server-selected)
-
-This clause owns historical-prefix consistency. The embedding surface that
-exposes it is linked from [embedding.md](embedding.md); that document gives
-consumer usage and defers to this clause for every consistency rule.
-
-- Additive surface: three synchronous `Node` operations read confirmed
-  history at a server-selected covered prefix. Each returns its answer
-  qualified by the prefix it was proven against:
-  ```rust
-  impl Node {
-      pub fn transaction_at_prefix(&self, txid: &Txid)
-          -> Result<AtPrefix<Option<(u32, Tx)>>, HistoricalQueryError>;
-      pub fn script_history_at_prefix(&self, script: ScriptHash)
-          -> Result<AtPrefix<ScriptIndexSnapshot>, HistoricalQueryError>;
-      pub fn spender_at_prefix(&self, outpoint: OutPoint)
-          -> Result<AtPrefix<Option<SpendingRecord>>, HistoricalQueryError>;
-  }
-  ```
-  The new public types live in `bitcoin_rs_index::query_api` (already public;
-  no re-export is added):
-  ```rust
-  pub struct CoveredPrefix { pub floor: u32, pub height: u32, pub hash: Hash256 }
-  pub struct AtPrefix<T> { pub prefix: CoveredPrefix, pub answer: T }
-  pub enum HistoricalQueryError {
-      Retry,
-      Unavailable(HistoricalUnavailableCause),
-      Storage(CompactString),
-  }
-  pub enum HistoricalUnavailableCause {
-      Shared(TxUnavailableCause),
-      NoCoveredPrefix { capability: IndexCapability },
-      AncestryBudgetExhausted { capability: IndexCapability, watermark_height: u32 },
-      PrefixBelowFloor { floor: u32 },
-  }
-  ```
-  `CoveredPrefix.hash` is the full chain hash at `height`; `floor` is the
-  lowest provable height (`0` means genesis, positive means a pruned prefix).
-  `Txid`, `Tx`, and `OutPoint` are `bitcoin_rs_primitives` types; `Hash256` is
-  `bitcoin_rs_primitives::Hash256`; `CompactString` is
-  `compact_str::CompactString`; `ScriptHash`, `IndexCapability`,
-  `ScriptIndexSnapshot`, and `SpendingRecord` keep their existing paths.
-  `TxQueryError` and `TxUnavailableCause` are byte-for-byte unchanged: no new
-  variant there, no text change, and strict exact-tip paths stay identical.
-  Matchers match the variant, never the rendered string.
-- Per-call capabilities: each call consumes only the capabilities its
-  answer depends on: `transaction_at_prefix` needs `TxLookup` only, and
-  tx-only nodes serve it without `ScriptHistory`; `script_history_at_prefix`
-  and `spender_at_prefix` need `ScriptHistory`. A disabled required capability
-  is `Shared(CapabilityDisabled)`, preserving typed visibility.
-- One snapshot, server-selected anchor: each call takes one immutable DB
-  snapshot holding rows, watermarks, and floors, checks worker health before
-  and after, and derives the common covered ancestor of its required
-  capability watermarks and the published tip under one shared bounded
-  ancestry budget. There is no client anchor parameter, no cursor, and no
-  paging. Independent calls never share an anchor automatically: each returns
-  its own prefix, and callers that compose answers compare the returned
-  `floor`/`height`/`hash` metadata themselves.
-- Floor and range: `floor` equals the maximum consumed floor for the call.
-  Only rows in `[floor, anchor]` on `chain(anchor)` are read; rows outside
-  the range are skipped. An anchor below the floor is
-  `Unavailable(PrefixBelowFloor { floor })`. Record identity and position
-  verification and the existing query budgets apply unchanged. Historical
-  queries take no live-UTXO or chain-transition lock; the tree guard is held
-  only for the bounded ancestry walk and released before body reads.
-- Post-read freshness: after the read the call checks health again and
-  requires the anchor to still be an ancestor of the newly published tip.
-  Ordinary extension, index forward progress mid-read, a reorganization above
-  the anchor, and a reset completing after the snapshot was taken keep a
-  coherent answer valid. A reorganization below the anchor, an absent tip, or
-  a watermark hash unknown to the tree is `Retry`. A reset claim visible in
-  the snapshot (required watermark absent) is
-  `Unavailable(NoCoveredPrefix)`, so rebuilds do not spin on `Retry`. A stale
-  branch deeper than the shared hop budget is
-  `Unavailable(AncestryBudgetExhausted)`, distinct from an absent watermark.
-- Scoped absence, no mempool: absence means "not present in
-  `[floor, anchor]` on `chain(anchor)`", never a global claim. Historical
-  calls read the confirmed index only; mempool contents are never merged in.
-- Duplicates keep existing order: prefix-bounded scans still return one
-  transaction id's rows in ascending height order, and each candidate is
-  verified against the chain hash at its height through the existing
-  positioned-then-full-block ladder. `transaction_at_prefix` reports the
-  earliest verified occurrence on `chain(anchor)`; unverified rows on other
-  branches, prefix collisions, and corrupt positions are skipped, never
-  reported.
-- Positive-floor split (shared context with `IDX-02`): spend discovery for
-  a script starts from funding outputs, so a funding discovery over
-  `[floor, anchor]` cannot see spends of funding below `floor` even when the
-  spend height itself is in range. The full `script_history_at_prefix` answer
-  therefore stays unproven on a positive floor and returns
-  `Shared(HistoryUnproven { floor })` rather than a silently partial history.
-  The standalone `spender_at_prefix` takes the exact `OutPoint`, whose
-  spending rows are keyed directly by outpoint prefix and height and verified
-  per candidate, so it needs no funding discovery and may return a scoped
-  `Ok(None)` above a positive floor after verifying every matching spending
-  row in range. That `None` means no verified spend in `[floor, anchor]`,
-  not that the coin is unspent and not that the outpoint exists.
-- Unchanged and not added: strict `ScriptLive` reads, current Core RPC
-  handlers, compact-filter serving, and the existing exact-tip methods keep
-  their behavior. Nothing here adds a runtime, a framework, persistent query
-  state, a durable format, a full-scan compatibility path, an arbitrary
-  historical anchor, or HTTP routes. The three operations are synchronous
-  bounded blocking reads; embedders choose the blocking context, as detailed
-  in [embedding.md](embedding.md).
-- Error shape:
-  | Case | Result |
-  |---|---|
-  | Reorg below anchor, absent tip, watermark hash unknown to tree | `Retry` |
-  | Required watermark absent in snapshot (reset claim, rebuild) | `Unavailable(NoCoveredPrefix { capability })` |
-  | Stale branch deeper than the shared hop budget | `Unavailable(AncestryBudgetExhausted { capability, watermark_height })` |
-  | Anchor below max floor | `Unavailable(PrefixBelowFloor { floor })` |
-  | Positive floor on full script history | `Unavailable(Shared(HistoryUnproven { floor }))` |
-  | Row, scan, body-read, and body-byte budgets, truncated scans, `BlockBodyMissing`, disabled capability, worker failure/stop, missing authority, lifecycle causes | `Unavailable(Shared(...))` with the identical wrapped variant |
-  | Snapshot-open and body-read storage failures | `Storage(...)` |
-- Provenance: the surface above is implemented in this change. Executable
-  proof references for its gate, floor, ancestry, reset, reorg, and error
-  behavior are recorded by the parent after runs; this clause makes no
-  pass/fail claim about them.
+- Proof: `crates/index/src/runtime/query_tests.rs`
+  `historical_extension_during_read_keeps_same_anchor` (tip extension
+  mid-read keeps the same anchor),
+  `historical_wake_without_tip_move_stays_valid_while_strict_retries`
+  (a wake without a tip move stays valid for history while strict retries),
+  `historical_reorg_above_anchor_stays_valid` and
+  `historical_reorg_below_anchor_retries` plus
+  `historical_unknown_watermark_hash_retries` (reorg placement decides
+  valid versus `Retry`),
+  `historical_reset_completing_after_snapshot_stays_valid` and
+  `historical_no_covered_prefix_for_reset_claim` (reset mid-read versus
+  reset claim in the snapshot),
+  `historical_stale_watermark_anchors_at_fork_and_excludes_orphans` and
+  `historical_deep_stale_branch_exhausts_shared_ancestry_budget` (fork
+  anchor versus shared ancestry-budget exhaustion),
+  `historical_tx_positive_floor_scopes_absence_and_rejects_anchor_below_floor`,
+  `historical_full_history_positive_floor_is_unproven`, and
+  `historical_standalone_spender_scoped_none_above_floor` (floor scoping
+  and the positive-floor history split),
+  `historical_mixed_cap_script_anchors_at_sh_watermark` and
+  `historical_mixed_cap_tx_anchors_at_tx_watermark` (per-call capability
+  anchors), `historical_duplicate_txid_returns_earliest_verified_and_skips_stale`
+  (earliest verified occurrence),
+  `historical_budgets_truncation_and_missing_map_to_shared` and
+  `historical_budgets_health_and_capability_map_to_shared` (truncation,
+  missing body, worker failure, and disabled capability map to shared
+  `Unavailable`); `crates/index/src/runtime/query.rs`
+  `covered_anchor_rejects_watermark_height_mismatch` (a watermark whose
+  height disagrees with its hash retries instead of joining an uncovered
+  prefix).
 
 ### Compact-filter data and serving
 

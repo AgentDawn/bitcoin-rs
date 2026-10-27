@@ -553,6 +553,18 @@ persists branch state.
   needs a fresh resync into a separate datadir.
 - Journal replay reuses a restored node with the record's hash and parent
   instead of inserting a duplicate, as block connection does.
+- Proof: `crates/chainstate/src/checkpoint/tests/side_branches.rs`
+  `valid_side_branches_survive_restart_in_learn_order` (two restarts keep
+  the valid side leaves in relative learn order while invalid subtrees stay
+  excluded and the best/applied tips are unchanged),
+  `active_only_artifact_still_loads_without_side_branches` (a version-1
+  active-only artifact restores with no side branches), and
+  `reader_rejects_malformed_side_sections` (truncated, inflated, duplicate,
+  orphan, tip-displacing, and version-mismatched side sections are
+  rejected); `crates/chainstate/tests/unit/chainstate_journal_replay.rs`
+  `replay_reuses_a_header_the_checkpoint_tree_already_holds` (journal
+  replay over a restored node reuses the held header instead of inserting
+  a duplicate).
 
 ## Proven by
 
