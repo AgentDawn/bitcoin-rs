@@ -82,13 +82,21 @@ impl fmt::Display for NetworkLabel {
 
 impl PeerEndpoint {
     /// BIP155 network id: 1 `IPv4`, 2 `IPv6`, 4 `TorV3`, 5 `I2P`.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) reports 1; it is the same
+    /// IPv4 peer over a v6 socket, matching AddrMan canonical handling
+    /// downstream.
     #[must_use]
     pub const fn network_id(self) -> u8 {
         match self {
-            Self::Ip(addr) => match addr {
-                SocketAddr::V4(_) => 1,
-                SocketAddr::V6(_) => 2,
-            },
+            Self::Ip(SocketAddr::V4(_)) => 1,
+            Self::Ip(SocketAddr::V6(addr)) => {
+                if addr.ip().to_ipv4_mapped().is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             Self::TorV3 { .. } => 4,
             Self::I2p { .. } => 5,
         }
@@ -114,11 +122,19 @@ impl PeerEndpoint {
     }
 
     /// Network classification.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) classifies as [`NetworkLabel::Ipv4`].
     #[must_use]
     pub const fn net(self) -> NetworkLabel {
         match self {
             Self::Ip(SocketAddr::V4(_)) => NetworkLabel::Ipv4,
-            Self::Ip(SocketAddr::V6(_)) => NetworkLabel::Ipv6,
+            Self::Ip(SocketAddr::V6(addr)) => {
+                if addr.ip().to_ipv4_mapped().is_some() {
+                    NetworkLabel::Ipv4
+                } else {
+                    NetworkLabel::Ipv6
+                }
+            }
             Self::TorV3 { .. } => NetworkLabel::Onion,
             Self::I2p { .. } => NetworkLabel::I2p,
         }
@@ -169,22 +185,38 @@ impl EndpointHost {
     }
 
     /// Network classification.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) classifies as [`NetworkLabel::Ipv4`].
     #[must_use]
     pub const fn net(self) -> NetworkLabel {
         match self {
             Self::Ip(IpAddr::V4(_)) => NetworkLabel::Ipv4,
-            Self::Ip(IpAddr::V6(_)) => NetworkLabel::Ipv6,
+            Self::Ip(IpAddr::V6(ip)) => {
+                if ip.to_ipv4_mapped().is_some() {
+                    NetworkLabel::Ipv4
+                } else {
+                    NetworkLabel::Ipv6
+                }
+            }
             Self::TorV3 { .. } => NetworkLabel::Onion,
             Self::I2p { .. } => NetworkLabel::I2p,
         }
     }
 
     /// BIP155 network id of the host family.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) reports 1.
     #[must_use]
     pub const fn network_id(self) -> u8 {
         match self {
             Self::Ip(IpAddr::V4(_)) => 1,
-            Self::Ip(IpAddr::V6(_)) => 2,
+            Self::Ip(IpAddr::V6(ip)) => {
+                if ip.to_ipv4_mapped().is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             Self::TorV3 { .. } => 4,
             Self::I2p { .. } => 5,
         }
@@ -369,6 +401,24 @@ mod tests {
         let host = PeerEndpoint::tor_onion_hostname(&key);
         assert_eq!(host.len(), 56);
         assert_eq!(base32_decode(&host).as_deref(), Some(&payload[..]));
+    }
+
+    #[test]
+    fn mapped_ipv6_classifies_as_ipv4() {
+        let mapped = PeerEndpoint::Ip(SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()),
+            8333,
+        ));
+        assert_eq!(mapped.network_id(), 1);
+        assert_eq!(mapped.net(), NetworkLabel::Ipv4);
+        assert_eq!(mapped.host().network_id(), 1);
+        assert_eq!(mapped.host().net(), NetworkLabel::Ipv4);
+        // Genuine IPv6 keeps its classification on both projections.
+        let v6 = PeerEndpoint::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8333));
+        assert_eq!(v6.network_id(), 2);
+        assert_eq!(v6.net(), NetworkLabel::Ipv6);
+        assert_eq!(v6.host().network_id(), 2);
+        assert_eq!(v6.host().net(), NetworkLabel::Ipv6);
     }
 
     #[test]

@@ -363,6 +363,48 @@ fn gossip_cache_is_shared_stable_until_expiry_and_rotates_new_discoveries() {
 }
 
 #[test]
+fn gossip_cursor_cache_shared_across_projections() {
+    let book = book();
+    for n in 1..=5u8 {
+        book.learn_dns("seed", &[addr(n)], 10_000);
+    }
+    let tor = crate::PeerEndpoint::TorV3 {
+        key: [7u8; 32],
+        port: 8333,
+    };
+    book.learn_dns("seed", &[tor], 10_000);
+    assert_eq!(book.len(), 6);
+    book.set_addrv2_gossip(true, false);
+    let tick = Instant::now();
+    let legacy = book.gossip_at(10_000, tick);
+    assert_eq!(legacy.len(), 5, "legacy addr stays IP-only");
+    let cursor = book.state.lock().gossip_cursor;
+    let v2 = book.gossip_addrv2_at(10_000, tick);
+    assert_eq!(
+        v2.len(),
+        6,
+        "addrv2 projects the same cached selection with overlay"
+    );
+    assert_eq!(
+        book.state.lock().gossip_cursor,
+        cursor,
+        "projecting the cache must not re-rotate the shared cursor"
+    );
+    assert_eq!(
+        book.gossip_at(10_000, tick),
+        legacy,
+        "shared cache keeps both replies stable until expiry"
+    );
+    // Same cached rows, overlay disabled: IP-only projection.
+    book.set_addrv2_gossip(false, false);
+    assert_eq!(book.gossip_addrv2_at(10_000, tick).len(), 5);
+    // After TTL expiry both projections refresh from one new selection.
+    let refreshed = book.gossip_addrv2_at(10_000, tick + GOSSIP_CACHE_TTL);
+    assert_eq!(refreshed.len(), 5);
+    assert_eq!(book.gossip_at(10_000, tick + GOSSIP_CACHE_TTL).len(), 5);
+}
+
+#[test]
 fn pending_attempts_keep_endpoint_and_network_group_ownership_until_released() {
     let book = book();
     book.learn_dns("seed", &[addr(1)], 10_000);

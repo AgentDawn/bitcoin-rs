@@ -217,9 +217,23 @@ struct Manager {
     saved_revision: u64,
     published: bool,
     gossip_cursor: usize,
-    gossip_cache: Option<(Instant, Vec<(u32, bitcoin::p2p::address::Address)>)>,
+    /// Shared gossip selection backing both wire projections: the raw
+    /// rows picked on the last rotation, cached until `GOSSIP_CACHE_TTL`.
+    /// [`AddressBook::gossip`] projects IP rows as legacy `addr`;
+    /// [`AddressBook::gossip_addrv2`] projects enabled transports as `addrv2`.
+    gossip_cache: Option<(Instant, Vec<GossipRow>)>,
     pending: HashMap<PeerEndpoint, PendingClaim>,
     collisions: Vec<PeerEndpoint>,
+}
+
+/// One transport-neutral gossip row: the shared selection both wire
+/// projections filter. Raw endpoint identity is kept so each reply can
+/// project without re-rotating the cursor.
+#[derive(Clone, Copy, Debug)]
+struct GossipRow {
+    endpoint: PeerEndpoint,
+    last_seen: u32,
+    services: u64,
 }
 
 pub(crate) struct AddressBook {
@@ -943,25 +957,30 @@ impl AddressBook {
         self.addrv2_gossip[1].store(i2p_enabled, std::sync::atomic::Ordering::Release);
     }
 
-    /// One `addrv2` gossip round: every non-terrible record whose
-    /// transport is enabled, as BIP155 rows. IP is always carried;
-    /// overlay endpoints only when their transport is configured.
+    /// One `addrv2` gossip round over the shared cursor/cache selection,
+    /// projected to the enabled transports as BIP155 rows. IP is always
+    /// carried; overlay endpoints only when their transport is configured.
+    /// Shares rotation and TTL with [`AddressBook::gossip`]: a cached
+    /// selection is projected, not re-rotated, until expiry.
     pub(crate) fn gossip_addrv2(&self, now: u64) -> Vec<bitcoin::p2p::address::AddrV2Message> {
+        self.gossip_addrv2_at(now, Instant::now())
+    }
+    fn gossip_addrv2_at(
+        &self,
+        now: u64,
+        tick: Instant,
+    ) -> Vec<bitcoin::p2p::address::AddrV2Message> {
         let tor = self.addrv2_gossip[0].load(std::sync::atomic::Ordering::Acquire);
         let i2p = self.addrv2_gossip[1].load(std::sync::atomic::Ordering::Acquire);
-        let manager = self.state.lock();
-        manager
-            .stored
-            .records
-            .iter()
-            .filter(|entry| !entry.terrible(now))
-            .filter(|entry| crate::endpoint::addrv2_gossip_enabled(entry.endpoint, tor, i2p))
-            .take(MAX_GOSSIP)
-            .map(|entry| {
+        let mut manager = self.state.lock();
+        Self::shared_rows(&mut manager, now, tick)
+            .into_iter()
+            .filter(|row| crate::endpoint::addrv2_gossip_enabled(row.endpoint, tor, i2p))
+            .map(|row| {
                 crate::endpoint::endpoint_to_addrv2(
-                    entry.endpoint,
-                    u32::try_from(entry.last_seen).unwrap_or(u32::MAX),
-                    bitcoin::p2p::ServiceFlags::from(entry.services.unwrap_or(0)),
+                    row.endpoint,
+                    row.last_seen,
+                    bitcoin::p2p::ServiceFlags::from(row.services),
                 )
             })
             .collect()
@@ -1514,14 +1533,32 @@ impl AddressBook {
     }
     fn gossip_at(&self, now: u64, tick: Instant) -> Vec<(u32, bitcoin::p2p::address::Address)> {
         let mut manager = self.state.lock();
-        if let Some((expires, response)) = &manager.gossip_cache {
+        Self::shared_rows(&mut manager, now, tick)
+            .into_iter()
+            .filter_map(|row| {
+                let socket = row.endpoint.as_ip()?;
+                Some((
+                    row.last_seen,
+                    bitcoin::p2p::address::Address::new(
+                        &socket,
+                        bitcoin::p2p::ServiceFlags::from(row.services),
+                    ),
+                ))
+            })
+            .collect()
+    }
+    /// Single rotating selection backing both wire projections. The cursor
+    /// advances only on a cache miss; cache hits project the stored rows
+    /// without touching rotation. Holds one state lock; callers project.
+    fn shared_rows(manager: &mut Manager, now: u64, tick: Instant) -> Vec<GossipRow> {
+        if let Some((expires, rows)) = &manager.gossip_cache {
             if tick < *expires {
-                return response.clone();
+                return rows.clone();
             }
         }
         let len = manager.stored.records.len();
         let start = manager.gossip_cursor.checked_rem(len).unwrap_or_default();
-        let mut gossip = Vec::with_capacity(MAX_GOSSIP.min(len));
+        let mut rows = Vec::with_capacity(MAX_GOSSIP.min(len));
         for offset in 0..len {
             let index = (start + offset) % len;
             manager.gossip_cursor = (index + 1) % len;
@@ -1529,22 +1566,17 @@ impl AddressBook {
             if entry.terrible(now) {
                 continue;
             }
-            let Some(socket) = entry.endpoint.as_ip() else {
-                continue;
-            };
-            gossip.push((
-                u32::try_from(entry.last_seen).unwrap_or(u32::MAX),
-                bitcoin::p2p::address::Address::new(
-                    &socket,
-                    bitcoin::p2p::ServiceFlags::from(entry.services.unwrap_or(0)),
-                ),
-            ));
-            if gossip.len() == MAX_GOSSIP {
+            rows.push(GossipRow {
+                endpoint: entry.endpoint,
+                last_seen: u32::try_from(entry.last_seen).unwrap_or(u32::MAX),
+                services: entry.services.unwrap_or(0),
+            });
+            if rows.len() == MAX_GOSSIP {
                 break;
             }
         }
-        manager.gossip_cache = Some((tick + GOSSIP_CACHE_TTL, gossip.clone()));
-        gossip
+        manager.gossip_cache = Some((tick + GOSSIP_CACHE_TTL, rows.clone()));
+        rows
     }
     pub(crate) fn save(&self) {
         let _publication = self.publication.lock();
