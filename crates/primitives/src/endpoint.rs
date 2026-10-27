@@ -84,7 +84,7 @@ impl PeerEndpoint {
     /// BIP155 network id: 1 `IPv4`, 2 `IPv6`, 4 `TorV3`, 5 `I2P`.
     ///
     /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) reports 1; it is the same
-    /// IPv4 peer over a v6 socket, matching AddrMan canonical handling
+    /// IPv4 peer over a v6 socket, matching `AddrMan` canonical handling
     /// downstream.
     #[must_use]
     pub const fn network_id(self) -> u8 {
