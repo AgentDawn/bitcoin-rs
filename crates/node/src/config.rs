@@ -447,21 +447,7 @@ impl NodeConfig {
              support is not compiled in (enable the `kernel` feature)",
             self.validation.engine
         );
-        self.validate_overlay()?;
-        if self.p2p.magic != self.network.magic() {
-            anyhow::ensure!(
-                self.network == Network::Mainnet,
-                "P2P magic overrides currently require --network mainnet"
-            );
-            anyhow::ensure!(
-                !self.p2p.connect.is_empty(),
-                "P2P magic overrides require at least one --connect peer"
-            );
-            anyhow::ensure!(
-                !self.p2p.dns_seeds_enabled,
-                "P2P magic overrides require --dns-seeds-enabled=false"
-            );
-        }
+        self.validate_p2p_network()?;
         bitcoin_rs_rpc::zmq::validate_endpoint_configs(&self.notifications.zmq)?;
         let journal = &self.chainstate_journal;
         anyhow::ensure!(
@@ -488,6 +474,32 @@ impl NodeConfig {
             journal.max_lag_seconds > 0,
             "chainstate_journal.max_lag_seconds must be positive"
         );
+        Ok(())
+    }
+
+    /// Validates P2P network identity and overlay/privacy routing.
+    ///
+    /// Split out of [`NodeConfig::validate`] for the line budget only;
+    /// checks and errors moved verbatim: the overlay transport constraints
+    /// (routes for overlay targets, no local DNS under a privacy route),
+    /// then the magic-override requirements (mainnet, a `--connect` peer,
+    /// DNS seeds off).
+    fn validate_p2p_network(&self) -> Result<()> {
+        self.validate_overlay()?;
+        if self.p2p.magic != self.network.magic() {
+            anyhow::ensure!(
+                self.network == Network::Mainnet,
+                "P2P magic overrides currently require --network mainnet"
+            );
+            anyhow::ensure!(
+                !self.p2p.connect.is_empty(),
+                "P2P magic overrides require at least one --connect peer"
+            );
+            anyhow::ensure!(
+                !self.p2p.dns_seeds_enabled,
+                "P2P magic overrides require --dns-seeds-enabled=false"
+            );
+        }
         Ok(())
     }
 
