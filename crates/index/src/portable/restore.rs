@@ -30,7 +30,7 @@ use super::artifact::{
     ARTIFACT_VERSION, ArtifactHeader, CANCEL_POLL_RECORDS, HEADER_LEN, ReadFault, RecordReader,
     RowAssembler, TxLookupRecord, into_digest, open_hashed,
 };
-use super::chain::{BaseCount, ChainBase, Located};
+use super::chain::{BaseCount, BodyReader, ChainBase, Located};
 use super::manifest::{
     BundleFamily, IndexBundleManifestV1, MANIFEST_FILE, MAX_MANIFEST_BYTES, ValidatedManifest,
 };
@@ -39,14 +39,13 @@ use super::{
     io_error,
 };
 use crate::index::PortableImportRow;
-use crate::types::TxPosition;
 use crate::writer::TxIndexWriter;
 use crate::{
     IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark, IndexWatermarks,
     TxIndexFamily,
 };
-use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipSnapshot};
-use bitcoin_rs_primitives::{BlockHash, Hash256, layout::ParsedBlock};
+use bitcoin_rs_chain::BlockTreeReader;
+use bitcoin_rs_chain::TipSnapshot;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -239,8 +238,7 @@ enum LocatorOutcome {
 struct LocatorCheck<'a> {
     chain: &'a ChainBase,
     tree: &'a BlockTreeReader,
-    source: &'a dyn BlockBodySource,
-    cached: Option<(u32, Hash256, Vec<u8>)>,
+    bodies: BodyReader<'a>,
     /// Positions the bundle carries per height, for the completeness check.
     counts: HashMap<u32, u64>,
     outcome: LocatorOutcome,
@@ -261,7 +259,7 @@ impl LocatorCheck<'_> {
             )
         })?;
         for &position in record.positions {
-            match self.resolve_strict(height, hash, position)? {
+            match self.bodies.transaction(height, hash, position)? {
                 Located::Found(tx) if tx.txid().0.to_le_bytes() == record.txid => {
                     *self.counts.entry(height).or_default() += 1;
                 }
@@ -276,54 +274,6 @@ impl LocatorCheck<'_> {
             }
         }
         Ok(())
-    }
-
-    /// Resolves `position` to the top-level transaction at that exact span.
-    ///
-    /// A ranged read that merely decodes is not enough: the offset and length
-    /// must equal one parsed transaction span of the receiver's whole body.
-    /// An out-of-range position or bytes that decode away from any boundary
-    /// report `Mismatch`; an absent or pruned body reports `BodyMissing`.
-    fn resolve_strict(
-        &mut self,
-        height: u32,
-        hash: Hash256,
-        position: TxPosition,
-    ) -> Result<Located, IndexBundleError> {
-        let hit = self
-            .cached
-            .as_ref()
-            .is_some_and(|(held_height, held_hash, _)| {
-                *held_height == height && *held_hash == hash
-            });
-        if !hit {
-            match self.source.block_body(height, BlockHash::from(hash)) {
-                Ok(Some(body)) => self.cached = Some((height, hash, body)),
-                Ok(None) => return Ok(Located::BodyMissing),
-                Err(error) => {
-                    return Err(IndexBundleError::BodyRead {
-                        height,
-                        reason: error.to_string(),
-                    });
-                }
-            }
-        }
-        let body = self
-            .cached
-            .as_ref()
-            .map_or(&[][..], |(_, _, body)| body.as_slice());
-        let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
-                height,
-                reason: format!("block does not parse: {error}"),
-            })?;
-        for tx in parsed.transactions() {
-            let span = tx.span();
-            if is_top_level_span(position, span.start(), span.len()) {
-                return Ok(Located::Found(tx.materialize()));
-            }
-        }
-        Ok(Located::Mismatch)
     }
 
     /// Compares all transactions in the covered range.
@@ -349,7 +299,7 @@ impl LocatorCheck<'_> {
                     "the receiver chain has no block at a covered height".to_owned(),
                 )
             })?;
-            let expected = if let Some(count) = self.block_tx_count(height, hash)? {
+            let expected = if let Some(count) = self.bodies.block_tx_count(height, hash)? {
                 count
             } else {
                 self.outcome = LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
@@ -361,63 +311,6 @@ impl LocatorCheck<'_> {
         }
         Ok(())
     }
-
-    /// Transactions the receiver holds in `(height, hash)`, or `None` when the
-    /// body is absent or pruned. Metadata answers without I/O when the source
-    /// keeps it; otherwise the whole body is parsed for its count.
-    fn block_tx_count(
-        &mut self,
-        height: u32,
-        hash: Hash256,
-    ) -> Result<Option<u64>, IndexBundleError> {
-        if let Some(metadata) = self
-            .source
-            .block_body_metadata(height, BlockHash::from(hash))
-        {
-            return u64::try_from(metadata.tx_count).map(Some).map_err(|_| {
-                IndexBundleError::BodyRead {
-                    height,
-                    reason: "the transaction count does not fit u64".to_owned(),
-                }
-            });
-        }
-        let hit = self
-            .cached
-            .as_ref()
-            .is_some_and(|(held_height, held_hash, _)| {
-                *held_height == height && *held_hash == hash
-            });
-        if !hit {
-            match self.source.block_body(height, BlockHash::from(hash)) {
-                Ok(Some(body)) => self.cached = Some((height, hash, body)),
-                Ok(None) => return Ok(None),
-                Err(error) => {
-                    return Err(IndexBundleError::BodyRead {
-                        height,
-                        reason: error.to_string(),
-                    });
-                }
-            }
-        }
-        let body = self
-            .cached
-            .as_ref()
-            .map_or(&[][..], |(_, _, body)| body.as_slice());
-        let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
-                height,
-                reason: format!("block does not parse: {error}"),
-            })?;
-        Ok(Some(u64::try_from(parsed.tx_count()).unwrap_or(u64::MAX)))
-    }
-}
-
-/// Reports whether `position` equals the top-level transaction span
-/// `[start, start + len)`. Offsets inside a transaction (an embedded
-/// serialization in a script or witness) and overlapping or truncated spans
-/// never match, even when the bytes there decode to a transaction.
-fn is_top_level_span(position: TxPosition, start: u32, len: u32) -> bool {
-    position.offset() == start && position.byte_len() == len
 }
 
 /// Reports the first height where the bundle's position count differs from
@@ -463,8 +356,7 @@ fn validate_artifact(
         (Some(chain), Some(source)) => Some(LocatorCheck {
             chain,
             tree: host.block_tree,
-            source,
-            cached: None,
+            bodies: BodyReader::new(source),
             counts: HashMap::new(),
             outcome: LocatorOutcome::Verified,
         }),
@@ -699,6 +591,8 @@ fn discard_partial_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::portable::chain::is_top_level_span;
+    use crate::types::TxPosition;
 
     /// A locator must equal its top-level span exactly. An offset shifted
     /// into the transaction body (an embedded serialization), a truncated

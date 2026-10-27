@@ -1,6 +1,10 @@
 //! Export: stream the `TxLookup` family of one coherent snapshot into a
 //! hashed artifact, then publish the manifest last.
 //!
+//! Every exported locator must equal a real top-level block transaction
+//! boundary: the recorded offset and length must match one parsed transaction
+//! span of the block body, the same rule restore enforces.
+//!
 //! Consistency: the row stream is read from one point-in-time key-value
 //! snapshot whose `TxLookup` watermark is the applied tip (snapshot
 //! isolation). The writer's fenced watermark capture before and after the
@@ -397,8 +401,9 @@ impl RowExporter<'_> {
     }
 
     /// Resolves every position of `row` to its full transaction id, refusing
-    /// any position that does not decode to a transaction whose id carries the
-    /// row's prefix.
+    /// any position that is not a top-level transaction span whose id carries
+    /// the row's prefix. Bytes that merely decode to a transaction elsewhere
+    /// in the block never resolve a locator.
     fn locate(&mut self, row: HashPrefixRow, value: &[u8]) -> Result<(), IndexBundleError> {
         let height = row.height();
         let corrupt = |reason: &'static str| IndexBundleError::SourceRow { height, reason };
@@ -418,7 +423,7 @@ impl RowExporter<'_> {
                 Located::Found(tx) => tx,
                 Located::BodyMissing => return Err(IndexBundleError::BodyUnavailable { height }),
                 Located::Mismatch => {
-                    return Err(corrupt("position does not decode to a transaction"));
+                    return Err(corrupt("position is not a top-level transaction span"));
                 }
             };
             let txid = tx.txid().0.to_le_bytes();
