@@ -3738,6 +3738,10 @@ mod tests {
         fake.root_closed
             .recv_timeout(Duration::from_secs(5))
             .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e))?;
+        // The fixture signals its close action, not FIN delivery: wait
+        // until the client-side probe observes the dead root so the first
+        // dial deterministically recovers instead of racing the FIN.
+        wait_until_root_is_dead(&session)?;
 
         for _ in 0..2 {
             let mut stream = session
