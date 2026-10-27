@@ -752,9 +752,20 @@ fn compressed_signature(input: &TxIn, kind: &PrevoutKind) -> Option<CompressedSi
             }
         }
         PrevoutKind::P2pkh(expected) => {
-            let (sig_item, pos) = read_push(input.script_sig.as_bytes(), 0)?;
-            let (pubkey, end) = read_push(input.script_sig.as_bytes(), pos)?;
-            if end != input.script_sig.len() {
+            let script = input.script_sig.as_bytes();
+            let (sig_item, pos) = read_push(script, 0)?;
+            let (pubkey, end) = read_push(script, pos)?;
+            if end != script.len() {
+                return None;
+            }
+            // Exact canonical push shape: both pushes must re-encode
+            // byte-for-byte via `push_data`. Non-minimal PUSHDATA1/2/4
+            // spellings carry the same payloads but rebuild to different
+            // bytes through `push_data` on decompress, so they fall back
+            // to the uncompressed envelope.
+            let mut canonical = push_data(sig_item);
+            canonical.extend_from_slice(&push_data(pubkey));
+            if canonical != script {
                 return None;
             }
             // Decompression rebuilds the scriptSig from a recovered key, so
@@ -763,7 +774,7 @@ fn compressed_signature(input: &TxIn, kind: &PrevoutKind) -> Option<CompressedSi
             // form hashing to the prevout commitment. Hybrid keys, misc
             // pushes, and foreign keys fall back to the uncompressed
             // envelope rather than changing the signer on rebuild.
-            let compressed = pubkey.len() == 33;
+            let compressed = pubkey.len() == 33 && (pubkey[0] == 0x02 || pubkey[0] == 0x03);
             if !compressed && (pubkey.len() != 65 || pubkey.first() != Some(&0x04)) {
                 return None;
             }

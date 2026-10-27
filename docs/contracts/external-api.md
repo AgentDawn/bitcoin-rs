@@ -70,9 +70,9 @@ scanning and wallet interoperability remain unverified.
   after a clean `"2.0"` keeps the v2 envelope. Dispatch errors then
   follow the dialect: a legacy request answers with an HTTP error status
   (`-32600` → 400, `-32601` → 404, every other code → 500), and a v2
-  request stays inside HTTP 200. Every batch answers HTTP 200: a
-  non-empty batch carries per-member errors in its array, an empty batch
-  answers `[]`, and an all-notification batch answers 204.
+  request stays inside HTTP 200. A batch that produces replies answers HTTP 200
+  with per-member errors carried in its array; an empty batch answers HTTP 200
+  `[]`; an all-notification batch answers 204 with no body.
 - Failures map through `RpcError` (`crates/rpc/src/error.rs`): standard
   JSON-RPC codes (`-32700`, `-32600`..=`-32603`) and Core codes `-1`
   (miscellaneous runtime failure), `-3` (invalid type), `-5` (not found), `-8` (invalid parameter), `-9`

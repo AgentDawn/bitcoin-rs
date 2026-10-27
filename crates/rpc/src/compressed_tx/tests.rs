@@ -536,6 +536,81 @@ fn foreign_p2pkh_key_falls_back_instead_of_changing_signer() {
 }
 
 #[test]
+fn nonminimal_p2pkh_pushes_fall_back_to_uncompressed_envelope() {
+    // Non-minimal PUSHDATA spellings carry the same payloads but rebuild
+    // to different bytes via `push_data` on decompress, so they must not
+    // take the compressed path. They fall back to the uncompressed
+    // envelope and survive the round trip byte-for-byte.
+    fn pushdata1(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x4c, u8::try_from(data.len()).unwrap()];
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn pushdata2(data: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(data.len()).unwrap().to_le_bytes();
+        let mut out = vec![0x4d, len[0], len[1]];
+        out.extend_from_slice(data);
+        out
+    }
+
+    let signer = Signer::new(7);
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2pkh_script(signer.pubkey_hash()),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let mut canonical = spend_of(&prev_tx, Script::new(), Witness::new());
+    let digest = SighashCache::new(&canonical)
+        .legacy_signature_hash(0, prevout.script_pubkey.as_bytes(), 1)
+        .unwrap();
+    let sig_item = signer.ecdsa_item(digest, false);
+    let pubkey = signer.compressed_pubkey();
+    // Positive control: the canonical spelling still compresses.
+    let mut script_sig = super::push_data(&sig_item);
+    script_sig.extend_from_slice(&super::push_data(&pubkey));
+    canonical.inputs[0].script_sig = Script::from_bytes(script_sig);
+    let kind = super::prevout_kind(prevout.script_pubkey.as_bytes());
+    assert!(
+        super::compressed_signature(&canonical.inputs[0], &kind).is_some(),
+        "canonical P2PKH pushes must take the compressed path"
+    );
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 3);
+    roundtrip(&canonical, &mut resolver, true);
+
+    // The legacy sighash does not commit to the scriptSig framing, so this
+    // payload-identical `sig_item` stays valid across push spellings.
+    for script_sig in [
+        {
+            let mut raw = pushdata1(&sig_item);
+            raw.extend_from_slice(&pushdata1(&pubkey));
+            raw
+        },
+        {
+            let mut raw = pushdata2(&sig_item);
+            raw.extend_from_slice(&pushdata2(&pubkey));
+            raw
+        },
+        {
+            let mut raw = pushdata1(&sig_item);
+            raw.extend_from_slice(&super::push_data(&pubkey));
+            raw
+        },
+    ] {
+        let tx = spend_of(&prev_tx, Script::from_bytes(script_sig), Witness::new());
+        let kind = super::prevout_kind(prevout.script_pubkey.as_bytes());
+        assert!(
+            super::compressed_signature(&tx.inputs[0], &kind).is_none(),
+            "non-minimal P2PKH pushes must fall back to the uncompressed envelope"
+        );
+        let mut resolver = MapResolver::default();
+        resolver.register_tx(100, &prev_tx, 3);
+        roundtrip(&tx, &mut resolver, true);
+    }
+}
+
+#[test]
 fn decompress_prepare_finalize_matches_single_pass() {
     // The handler recovers outside the stable chainstate lock; the split
     // entry points must agree with the single-pass wrapper exactly.
