@@ -509,6 +509,28 @@ pub fn plan_package_charge(payload: &[u8]) -> Result<PackagePlan, PackageRefusal
     Ok(plan)
 }
 
+/// The subject of an oversized `pkgtxns` body, for claim retirement: the last
+/// member's wtxid when the payload is a well-formed list of `1..=MAX_GETPKGTXNS`
+/// transactions, even when the count or weight exceeds admission. `None` for
+/// any malformed payload, which has no attributable claim to retire. Work is
+/// bounded by the payload length and allocates nothing.
+fn oversized_subject(payload: &[u8]) -> Option<Wtxid> {
+    let mut reader = Reader::new(payload);
+    let count = reader.compact().ok()?;
+    if count == 0 || count > wide(MAX_GETPKGTXNS) {
+        return None;
+    }
+    let count = usize::try_from(count).ok()?;
+    let mut last = None;
+    for _ in 0..count {
+        last = Some(scan_tx(&mut reader).ok()?.wtxid);
+    }
+    if !reader.is_empty() {
+        return None;
+    }
+    last
+}
+
 // ---------------------------------------------------------------------------
 // Decode
 // ---------------------------------------------------------------------------
@@ -842,7 +864,9 @@ impl PeerTable {
     ///   and `source`'s package slot; the caller must queue the package and
     ///   end in one release. A refusal holds nothing and mutates nothing,
     ///   except that a body already compared and then refused for capacity
-    ///   releases its claim through [`Self::package_response_rejected`].
+    ///   releases its claim through [`Self::package_response_rejected`],
+    ///   and an oversized body retires `source`'s solicited claim so an
+    ///   alternate source is offered the request without waiting for expiry.
     /// INVARIANT: nothing is decoded and nothing is reserved before the
     ///   claim comparison succeeds.
     pub fn admit_package(
@@ -852,7 +876,14 @@ impl PeerTable {
         source: PeerSource,
         payload: bytes::Bytes,
     ) -> Result<InboundPackage, PackageRefusal> {
-        let plan = plan_package_charge(&payload)?;
+        let plan = match plan_package_charge(&payload) {
+            Ok(plan) => plan,
+            Err(refusal @ (PackageRefusal::OverCount | PackageRefusal::OverWeight)) => {
+                Self::retire_oversized_solicitation(self, source, &payload);
+                return Err(refusal);
+            }
+            Err(other) => return Err(other),
+        };
         let subject = plan.subject();
         let combined = combined_package_hash(plan.wtxids());
         if !self.begin_package_resolution(source, subject, combined, plan.wtxids()) {
@@ -882,6 +913,33 @@ impl PeerTable {
                 );
                 Err(refusal)
             }
+        }
+    }
+
+    /// Retires `source`'s solicited claim when its `pkgtxns` body is
+    /// oversized for admission. The body cannot be admitted, but leaving the
+    /// `Awaiting` claim until expiry would hold the request's in-flight slot
+    /// and block alternates; retiring offers the request promptly like any
+    /// other failure. Malformed bodies have no attributable subject and
+    /// retire nothing; a source without an `Awaiting` claim is a no-op.
+    fn retire_oversized_solicitation(&self, source: PeerSource, payload: &[u8]) {
+        let Some(subject) = oversized_subject(payload) else {
+            return;
+        };
+        let key = super::Identity::Wtxid(subject.0);
+        let now = std::time::Instant::now();
+        let mut policy = self.tx_policy.lock();
+        // Only an `Awaiting` package claim owned by this source may retire
+        // here. An ordinary WTXID download for the same hash, another source's
+        // claim, or an already-`Enqueued` body must keep its owner and retry
+        // path; a forged oversized body must not release them.
+        let awaiting = policy.requests.get(&key).is_some_and(|request| {
+            request.package.as_ref().is_some_and(|claim| {
+                claim.state == super::PackagePhase::Awaiting
+            }) && request.owner.is_some_and(|(owner, _)| owner == source)
+        });
+        if awaiting {
+            policy.failed(key, source, now);
         }
     }
 
@@ -1337,5 +1395,68 @@ mod tests {
             table.request_package_info(peer, subject),
             "the retired solicitation frees its hash and in-flight slot"
         );
+    }
+
+    #[test]
+    fn oversized_body_retires_awaiting_claim_but_not_ordinary_requests() {
+        let table = PeerTable::new();
+        let capacity = PackageCapacity::new(10_000_000);
+        let inventory = CountingInventory::default();
+        let (owner, _rx) = registered_source(&table, 8333);
+        let (stranger, _) = registered_source(&table, 8334);
+
+        let parent = sample_tx(1, 1, 50_000);
+        let child = sample_tx(1, 2, 40_000);
+        let subject = child.wtxid();
+        assert!(table.request_package_info(owner, subject));
+        assert!(table.request_package_transactions(
+            owner,
+            subject,
+            vec![parent.wtxid(), subject]
+        ));
+
+        // 26 members ending at the solicited subject: oversized for admission.
+        let mut oversized: Vec<Tx> = (0..25u32).map(|i| sample_tx(3, i, 1_000)).collect();
+        oversized.push(child.clone());
+        let oversized_payload = make_payload(&oversized);
+        assert_eq!(
+            table
+                .admit_package(&capacity, &inventory, owner, oversized_payload.clone())
+                .err(),
+            Some(PackageRefusal::OverCount)
+        );
+        // The `Awaiting` claim retired: the right-sized body is now unsolicited.
+        let right_sized = make_payload(&[parent.clone(), child.clone()]);
+        assert_eq!(
+            table
+                .admit_package(&capacity, &inventory, owner, right_sized)
+                .err(),
+            Some(PackageRefusal::Unsolicited)
+        );
+
+        // A forged oversized body from a stranger must not release an ordinary
+        // owner: solicit again, then send oversized from the stranger.
+        assert!(table.request_package_info(owner, subject));
+        assert!(table.request_package_transactions(
+            owner,
+            subject,
+            vec![parent.wtxid(), subject]
+        ));
+        assert_eq!(
+            table
+                .admit_package(&capacity, &inventory, stranger, oversized_payload)
+                .err(),
+            Some(PackageRefusal::OverCount)
+        );
+        // The owner's claim survives the stranger's forgery.
+        let admitted = table
+            .admit_package(
+                &capacity,
+                &inventory,
+                owner,
+                make_payload(&[parent, child]),
+            )
+            .expect("owner claim survives a stranger oversized body");
+        table.package_response_rejected(admitted.into_token(), &inventory);
     }
 }

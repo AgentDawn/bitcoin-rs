@@ -283,6 +283,9 @@ fn live_pending_header_request_awaits_its_connection() {
 
 #[test]
 fn probe_rotates_past_the_dead_pending_owner() {
+    // Rotation orders by connection id, not endpoint: the dead owner is
+    // allocated first so both usable peers sort after it, and the smallest
+    // usable id (the 9001 peer) wins despite its lower endpoint.
     let dead_owner = PeerSource::for_test(addr_of(9005));
     let mut frontier = frontier(
         chain_frontier(5, false),
@@ -307,7 +310,7 @@ fn probe_rotates_past_the_dead_pending_owner() {
         HeaderAction::Probe(source) => {
             assert_eq!(
                 source.endpoint,
-                Some(crate::PeerEndpoint::Ip(addr_of(9007)))
+                Some(crate::PeerEndpoint::Ip(addr_of(9001)))
             );
             assert_ne!(source, dead_owner);
         }

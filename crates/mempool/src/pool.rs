@@ -502,14 +502,15 @@ impl VisitMarks for HashSet<EntryId> {
     }
 }
 
-/// Membership for walks confined to one connected component. A component
-/// holds at most the cluster-entry limit, so a small inline list does the
-/// work in time and space bounded by the cluster, where [`VisitSet`]'s bitset
-/// grows to the highest arena slot and zero-fills arena-scale words on every
-/// call.
+/// Membership for walks confined to one connected component or one package.
+/// A component holds at most the cluster-entry limit and a package at most
+/// [`crate::standardness::MAX_PACKAGE_COUNT`], so a small inline list does
+/// the work in time and space bounded by the visited entries, where
+/// [`VisitSet`]'s bitset grows to the highest arena slot and zero-fills
+/// arena-scale words on every call.
 #[derive(Debug, Default)]
 struct WalkSet {
-    seen: SmallVec<[EntryId; 16]>,
+    seen: SmallVec<[EntryId; 25]>,
 }
 
 impl WalkSet {
@@ -519,6 +520,10 @@ impl WalkSet {
 
     fn test(&self, id: EntryId) -> bool {
         self.seen.contains(&id)
+    }
+
+    fn len(&self) -> usize {
+        self.seen.len()
     }
 }
 
@@ -2156,7 +2161,10 @@ impl Mempool {
     #[must_use]
     pub(crate) fn ancestor_package_wtxids(&self, tip: &Wtxid) -> Option<Vec<Wtxid>> {
         let tip_id = *self.derived.by_wtxid.get(tip)?;
-        let mut seen = VisitSet::new();
+        // Bounded by the package limit (at most 25 visited entries), not by
+        // the arena: `VisitSet` would grow its bitset to the highest slot and
+        // zero-fill arena-scale words for a walk that stops at 26 members.
+        let mut seen = WalkSet::new();
         seen.insert(tip_id);
         let mut order = Vec::new();
         // Iterative post-order over the cached parent links: a node is emitted
@@ -2168,7 +2176,7 @@ impl Mempool {
                     frame.1 += 1;
                 }
                 if seen.insert(parent) {
-                    if seen.members().len() > crate::standardness::MAX_PACKAGE_COUNT {
+                    if seen.len() > crate::standardness::MAX_PACKAGE_COUNT {
                         return None;
                     }
                     stack.push((parent, 0));
@@ -2929,6 +2937,21 @@ mod package_tests {
             Some(count)
         );
         assert_eq!(pool.ancestor_package_wtxids(&past_bound.wtxid()), None);
+        Ok(())
+    }
+
+    #[test]
+    fn package_walk_stays_bounded_by_visited_entries() -> TestResult {
+        // The ancestor-package walk stops at the package bound, so its visited
+        // set must hold at most `MAX_PACKAGE_COUNT` entries inline rather than
+        // a bitset sized to the highest arena slot.
+        let mut seen = WalkSet::new();
+        for tag in 0..crate::standardness::MAX_PACKAGE_COUNT {
+            let id = EntryId::try_from(u32::try_from(tag)?)?;
+            assert!(seen.insert(id), "distinct ids insert once");
+            assert!(!seen.insert(id), "reinserting is a no-op");
+        }
+        assert_eq!(seen.len(), crate::standardness::MAX_PACKAGE_COUNT);
         Ok(())
     }
 

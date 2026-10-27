@@ -98,17 +98,20 @@ fn rounded_filter(floor: u64, minimum: u64, rng: &mut impl RngCore) -> u64 {
 impl RelayPeer {
     fn new(
         now: Instant,
-        inbound: Option<InboundClockKey>,
+        inbound: bool,
+        key: Option<InboundClockKey>,
         clocks: &mut HashMap<InboundClockKey, Instant>,
         rng: &mut impl RngCore,
     ) -> Self {
         // Joining an existing key adopts its clock, even if already due.
         // Admission must not postpone a cycle that existing peers can send.
-        let next_inv = match inbound {
+        // An inbound peer without an IP key keeps its inbound cadence; only
+        // the shared clock needs a key.
+        let next_inv = match key {
             Some(key) => *clocks
                 .entry(key)
                 .or_insert_with(|| next_inv(now, true, rng)),
-            None => next_inv(now, false, rng),
+            None => next_inv(now, inbound, rng),
         };
         Self {
             pending: HashMap::new(),
@@ -198,9 +201,8 @@ impl PeerTable {
                 continue;
             }
             outcome.attempted += 1;
-            let inbound = session
-                .lease
-                .is_inbound()
+            let is_inbound = session.lease.is_inbound();
+            let inbound = is_inbound
                 .then(|| {
                     session
                         .endpoint
@@ -215,7 +217,7 @@ impl PeerTable {
             } = &mut *policy;
             let peer = relay
                 .entry(session.lease.source(session.endpoint))
-                .or_insert_with(|| RelayPeer::new(now, inbound, inbound_inv, rng));
+                .or_insert_with(|| RelayPeer::new(now, is_inbound, inbound, inbound_inv, rng));
             if request.source == Some(session.lease.node_id()) {
                 peer.note_known(Identity::Txid(request.txid.0));
                 peer.note_known(Identity::Wtxid(request.wtxid.0));
@@ -263,9 +265,8 @@ impl PeerTable {
             return;
         }
         let Some(info) = &session.info else { return };
-        let inbound = session
-            .lease
-            .is_inbound()
+        let is_inbound = session.lease.is_inbound();
+        let inbound = is_inbound
             .then(|| {
                 session
                     .endpoint
@@ -290,7 +291,7 @@ impl PeerTable {
         } = &mut *policy;
         let peer = relay
             .entry(source)
-            .or_insert_with(|| RelayPeer::new(Instant::now(), inbound, inbound_inv, &mut rng));
+            .or_insert_with(|| RelayPeer::new(Instant::now(), is_inbound, inbound, inbound_inv, &mut rng));
         for identity in identities {
             peer.note_known(identity);
         }
@@ -314,9 +315,8 @@ impl PeerTable {
             return;
         }
         let Some(info) = &session.info else { return };
-        let inbound = session
-            .lease
-            .is_inbound()
+        let is_inbound = session.lease.is_inbound();
+        let inbound = is_inbound
             .then(|| {
                 session
                     .endpoint
@@ -338,7 +338,7 @@ impl PeerTable {
         } = &mut *policy;
         relay
             .entry(source)
-            .or_insert_with(|| RelayPeer::new(Instant::now(), inbound, inbound_inv, &mut rng))
+            .or_insert_with(|| RelayPeer::new(Instant::now(), is_inbound, inbound, inbound_inv, &mut rng))
             .fee_filter = rate;
     }
 
@@ -379,9 +379,8 @@ impl PeerTable {
                 continue;
             }
             let source = session.lease.source(session.endpoint);
-            let inbound = session
-                .lease
-                .is_inbound()
+            let is_inbound = session.lease.is_inbound();
+            let inbound = is_inbound
                 .then(|| {
                     session
                         .endpoint
@@ -398,7 +397,7 @@ impl PeerTable {
                 } = &mut *policy;
                 let peer = relay
                     .entry(source)
-                    .or_insert_with(|| RelayPeer::new(now, inbound, inbound_inv, rng));
+                    .or_insert_with(|| RelayPeer::new(now, is_inbound, inbound, inbound_inv, rng));
                 if info.version >= 70_013 && minimum <= Amount::MAX_MONEY.to_sat() {
                     // `filter_due` advances the schedule and the sent state
                     // before the send is known to have queued anything, so
@@ -434,7 +433,7 @@ impl PeerTable {
                         // an earlier sibling already advanced the shared clock.
                         *shared
                     }
-                    None => next_inv(now, false, rng),
+                    None => next_inv(now, is_inbound, rng),
                 };
                 if !info.relay_transactions {
                     peer.pending.clear();
@@ -1308,7 +1307,7 @@ mod tests {
         );
         assert!(dropped > 0);
         drop(policy);
-        let mut peer = RelayPeer::new(now, None, &mut HashMap::new(), &mut rng);
+        let mut peer = RelayPeer::new(now, false, None, &mut HashMap::new(), &mut rng);
         for marker in 0u32..5_001 {
             let mut bytes = [0; 32];
             bytes[..4].copy_from_slice(&marker.to_le_bytes());
@@ -1364,7 +1363,7 @@ mod tests {
             "Core 1.1-spaced bucket boundaries"
         );
         assert!((0..100).all(|_| rounded_filter(500, 1000, &mut rng) >= 1000));
-        let mut peer = RelayPeer::new(now, None, &mut HashMap::new(), &mut rng);
+        let mut peer = RelayPeer::new(now, false, None, &mut HashMap::new(), &mut rng);
         assert!(peer.filter_due(now, 1500, 1000, false, &mut rng).is_some());
         let scheduled = peer.next_filter;
         assert!(peer.filter_due(now, 1501, 1000, false, &mut rng).is_none());
@@ -1481,5 +1480,25 @@ mod tests {
             "positive rates charge at least one satoshi"
         );
         Ok(())
+    }
+
+    #[test]
+    fn inbound_without_ip_key_keeps_inbound_cadence() {
+        let now = Instant::now();
+        let mut clocks = HashMap::new();
+        // Same deterministic draw for both: inbound mean (5s) must exceed
+        // outbound mean (2s) for the same uniform sample.
+        let mut rng_in = StdRng::seed_from_u64(42);
+        let mut rng_out = StdRng::seed_from_u64(42);
+        let inbound = RelayPeer::new(now, true, None, &mut clocks, &mut rng_in);
+        let outbound = RelayPeer::new(now, false, None, &mut clocks, &mut rng_out);
+        assert!(
+            inbound.next_inv > outbound.next_inv,
+            "an inbound peer without an IP key must keep its inbound cadence, not degrade to outbound"
+        );
+        assert!(
+            clocks.is_empty(),
+            "a missing IP key shares no clock but must not create one"
+        );
     }
 }
