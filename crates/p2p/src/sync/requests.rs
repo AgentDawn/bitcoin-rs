@@ -190,7 +190,11 @@ impl BlockSync {
     ///   offers it to `source` until [`BODY_UNAVAILABLE_RETRY`] passes — the
     ///   one record in `SchedulerState::body_unavailable` serves all three
     ///   paths. Returns whether anything was released, so the caller can
-    ///   wake the sync loop.
+    ///   wake the sync loop. A vector for a hash `source` was never asked
+    ///   for — not its request, and neither a probe nor a hedge offer — is
+    ///   ignored entirely: it neither releases nor is remembered, so a
+    ///   racing alternate or a replacement cannot poison the owner's or its
+    ///   own retry record.
     /// INVARIANT: the peer table's `with_current` authority is held across
     ///   the scheduler mutation, so a stale connection or a same-address
     ///   replacement can neither release its predecessor's request nor be
@@ -216,6 +220,16 @@ impl BlockSync {
                 released += 1;
             }
             for hash in items.iter().filter_map(not_found_block_hash) {
+                let asked = scheduler.window.pending_owner(&hash) == Some(source)
+                    || scheduler
+                        .owned_body_fetches
+                        .iter()
+                        .any(|(owner, owned)| *owner == source && *owned == hash)
+                    || scheduler.window.probe_offered(source, &hash)
+                    || scheduler.window.hedge_offered(source, &hash);
+                if !asked {
+                    continue;
+                }
                 if release_unavailable_body(&mut scheduler, source, hash, now) {
                     released += 1;
                 }

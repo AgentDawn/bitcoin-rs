@@ -1277,6 +1277,29 @@ impl DownloadWindow {
     pub(crate) fn clear_preferred_peer(&mut self) {
         self.preferred_peer = None;
     }
+
+    /// Whether `source` was offered `hash` as a prefix-probe racer: its
+    /// `notfound` answers a question the node asked, so the scheduler
+    /// remembers it even though the owner keeps the request.
+    pub(crate) fn probe_offered(&self, source: PeerSource, hash: &Hash256) -> bool {
+        self.prefix_probe
+            .as_ref()
+            .is_some_and(|probe| probe.hashes.contains(hash) && probe.racers.contains_key(&source))
+    }
+
+    /// Whether `source` is the recorded hedge alternate racing for `hash`:
+    /// its `notfound` answers the duplicate request the node sent, so the
+    /// scheduler remembers it even though the owner keeps the request.
+    pub(crate) fn hedge_offered(&self, source: PeerSource, hash: &Hash256) -> bool {
+        matches!(
+            self.cold_front,
+            Some(ColdFrontState::Racing {
+                alternate,
+                hash: front,
+                owner: _,
+            }) if alternate == source && front == *hash
+        )
+    }
     /// Builds the one-shot common-prefix probe after a deep fallback request.
     pub(crate) fn prefix_probe_plan(
         &self,
