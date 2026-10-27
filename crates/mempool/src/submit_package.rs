@@ -12,42 +12,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitcoin_rs_primitives::{Tx, Txid, Wtxid, unix_time_secs};
 
-/// One submitted transaction's result. Identities follow the submitted order.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PackageTxResult {
-    /// Accepted or already resident. Resident entries have no effective rate.
-    Accepted {
-        /// Sigop-adjusted virtual size.
-        vsize: u32,
-        /// Actual transaction fee, without operator deltas.
-        base_fee: u64,
-        /// Modified fee rate of the newly accepted subpackage, in sat/kvB.
-        effective_fee_rate: Option<u64>,
-        /// Witnesses of the subpackage this admission committed with.
-        effective_includes: Vec<Wtxid>,
-    },
-    /// The resident transaction has the same txid and another witness.
-    DifferentWitness(Wtxid),
-    /// No membership was committed for this transaction by this attempt.
-    Rejected(SubmitError),
-    /// Package-wide validation stopped before this transaction was evaluated.
-    Unvalidated,
-}
-
-/// Scoped submitpackage results, including independently accepted members.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PackageSubmission {
-    /// A structural or combined-policy failure, if any.
-    pub package_error: Option<AcceptanceRejectReason>,
-    /// One result per submitted transaction, in input order.
-    pub tx_results: Vec<PackageTxResult>,
-}
-
 struct PackageAttempt {
     mutation: MutationResult,
-    results: Vec<PackageTxResult>,
     error: Option<SubmitError>,
-    package_error: Option<AcceptanceRejectReason>,
 }
 
 fn ordered(mut txs: Vec<Tx>) -> Result<Vec<Tx>, SubmitError> {
@@ -122,10 +89,6 @@ impl MempoolGateway {
         self.submit_package_with_times(&txs, origin, max_rate, |_| time, chain)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep package capture, verification, stamp revalidation and atomic commit in one auditable owner"
-    )]
     pub(crate) fn submit_package_with_times(
         &self,
         txs: &[Tx],
@@ -224,7 +187,7 @@ impl MempoolGateway {
             let Some(generation) = self.stable_generation() else {
                 continue;
             };
-            let (pending, sequence, stamp, inputs, mut results) = {
+            let (pending, sequence, stamp, inputs) = {
                 let pool = self.read();
                 let pending: Vec<_> = txs
                     .iter()
@@ -244,39 +207,17 @@ impl MempoolGateway {
                 {
                     continue;
                 }
-                let results = txs
-                    .iter()
-                    .map(|tx| {
-                        pool.entry_by_txid(&tx.txid()).map_or(
-                            PackageTxResult::Unvalidated,
-                            |entry| {
-                                if entry.wtxid == tx.wtxid() {
-                                    PackageTxResult::Accepted {
-                                        vsize: entry.vsize,
-                                        base_fee: entry.fee,
-                                        effective_fee_rate: None,
-                                        effective_includes: Vec::new(),
-                                    }
-                                } else {
-                                    PackageTxResult::DifferentWitness(entry.wtxid)
-                                }
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>();
                 if pending.is_empty() {
                     return Ok(PackageAttempt {
                         mutation: MutationResult::empty(),
-                        results,
                         error: None,
-                        package_error: None,
                     });
                 }
                 let inputs = pending
                     .iter()
                     .map(|tx| resolve_mempool_inputs(&pool, tx))
                     .collect();
-                (pending, sequence, pool.policy_stamp(), inputs, results)
+                (pending, sequence, pool.policy_stamp(), inputs)
             };
             let Some(mut requests) = batch_requests(
                 &pending,
@@ -299,7 +240,7 @@ impl MempoolGateway {
                 .iter()
                 .map(|request| (*request.tx).clone())
                 .collect();
-            let (mut prepared, checks, plan, entry_fees) = {
+            let (mut prepared, checks, plan) = {
                 let pool = self.read();
                 if self
                     .check_admission_state(
@@ -316,9 +257,7 @@ impl MempoolGateway {
                 if pending.is_empty() {
                     return Ok(PackageAttempt {
                         mutation: MutationResult::empty(),
-                        results,
                         error: None,
-                        package_error: None,
                     });
                 }
                 let prepared: Vec<_> = requests
@@ -334,23 +273,11 @@ impl MempoolGateway {
                     })
                     .collect();
                 let entries = crate::package::package_entries(&requests, &prepared);
-                // Modified fees decide effective rates; base fees miss the
-                // deltas the pool applies (standardness.rs). A failed lookup
-                // nulls the rates rather than reporting a base-fee quote.
-                let entry_fees: Option<Vec<_>> = entries
-                    .iter()
-                    .map(|entry| {
-                        pool.modified_fee_for(entry.txid, entry.fee)
-                            .ok()
-                            .map(|fee| (entry.txid, fee, entry.vsize))
-                    })
-                    .collect();
                 let checks = crate::package::capture_package_checks(&pool, &pending, &entries);
                 (
                     prepared,
                     checks,
                     pool.prepare_package(entries, unix_time_secs()),
-                    entry_fees,
                 )
             };
             // Unlike a single preview, even one new package member must use
@@ -386,40 +313,6 @@ impl MempoolGateway {
                 .iter()
                 .filter_map(|job| job.script_cache_key)
                 .collect();
-            // One atomic commit enters the pool as a single subpackage: Core
-            // reports every committed member at the package's aggregate rate
-            // and lists the whole package in `effective-includes`.
-            let effective_rate = entry_fees.as_ref().and_then(|fees| {
-                let (fee, size): (i128, u64) =
-                    fees.iter()
-                        .fold((0, 0), |(fee, size), (_, member_fee, vsize)| {
-                            (fee + member_fee, size + u64::from(*vsize))
-                        });
-                fee.max(0)
-                    .checked_mul(1_000)
-                    .and_then(|total| (size != 0).then(|| total / i128::from(size)))
-                    .and_then(|rate| u64::try_from(rate).ok())
-            });
-            let includes: Vec<_> = pending.iter().map(Tx::wtxid).collect();
-            for ((tx, row), job) in pending.iter().zip(&facts.results).zip(&prepared) {
-                if let Some(index) = txs.iter().position(|original| original.txid() == tx.txid()) {
-                    results[index] = if let Some(reason) = row.reject_reason {
-                        PackageTxResult::Rejected(match job.rejection {
-                            Some((crate::AdmitError::Consensus, _)) => SubmitError::Consensus,
-                            _ => SubmitError::Policy(reason),
-                        })
-                    } else if verdict.is_none() {
-                        PackageTxResult::Accepted {
-                            vsize: row.vsize,
-                            base_fee: row.base_fee.unwrap_or(0),
-                            effective_fee_rate: effective_rate,
-                            effective_includes: includes.clone(),
-                        }
-                    } else {
-                        PackageTxResult::Unvalidated
-                    };
-                }
-            }
             let result = self.commit(
                 origin,
                 |pool| {
@@ -458,9 +351,7 @@ impl MempoolGateway {
                     self.check_admitted_residency(origin, AdmissionFence::Stable, &admitted)?;
                     return Ok(PackageAttempt {
                         mutation: result,
-                        results,
                         error: None,
-                        package_error: None,
                     });
                 }
                 Err(crate::AdmitError::GenerationChanged | crate::AdmitError::MempoolChanged) => {
@@ -471,24 +362,9 @@ impl MempoolGateway {
                         crate::AdmitError::Policy(reason) => SubmitError::Policy(reason),
                         _ => SubmitError::Consensus,
                     };
-                    // A package floor failure is attributed to the paying child.
-                    if facts.package_error == Some(AcceptanceRejectReason::MinRelayFeeNotMet) {
-                        if let Some(index) = txs.iter().position(|tx| {
-                            pending.last().is_some_and(|last| last.txid() == tx.txid())
-                        }) {
-                            results[index] = PackageTxResult::Rejected(error);
-                        }
-                    }
-                    // A singleton always has an individual refusal, even when
-                    // the atomic package planner supplies the reason.
-                    if txs.len() == 1 {
-                        results[0] = PackageTxResult::Rejected(error);
-                    }
                     return Ok(PackageAttempt {
                         mutation: MutationResult::empty(),
-                        results,
                         error: Some(error),
-                        package_error: facts.package_error,
                     });
                 }
             }
