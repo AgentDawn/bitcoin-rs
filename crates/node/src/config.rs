@@ -430,6 +430,16 @@ impl NodeConfig {
             );
         }
         bitcoin_rs_rpc::zmq::validate_endpoint_configs(&self.notifications.zmq)?;
+        self.validate_chainstate_journal()?;
+        Ok(())
+    }
+
+    /// Validates chainstate journal retention bounds.
+    ///
+    /// PRE: none; this reads only resolved fields and opens no path.
+    /// POST: journal retention counters are internally consistent and positive
+    /// where rotation depends on them.
+    fn validate_chainstate_journal(&self) -> Result<()> {
         let journal = &self.chainstate_journal;
         anyhow::ensure!(
             journal.blocks > 0,

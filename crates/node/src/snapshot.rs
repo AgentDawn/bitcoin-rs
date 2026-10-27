@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bitcoin_rs_chainstate::{
     AssumeUtxoDiskStatus, AssumeUtxoError, AssumeUtxoManager, Chainstate, ChainstateRole,
 };
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::Network;
 use bitcoin_rs_rpc::context::{
     ChainstateInfo, ChainstatesInfo, SnapshotControlError, SnapshotImport,
 };
