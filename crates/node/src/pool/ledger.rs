@@ -588,13 +588,18 @@ impl LedgerHost {
         share: &AcceptedShare,
     ) -> Result<RecordOutcome, LedgerUnavailable> {
         let credit = share_credit(self.run_epoch, account, share)?;
-        self.ledger
-            .record_share(&credit)
-            .map(|receipt| match receipt {
+        match self.ledger.record_share(&credit) {
+            Ok(receipt) => Ok(match receipt {
                 ShareReceipt::Credited { .. } => RecordOutcome::Recorded,
                 ShareReceipt::Duplicate { .. } => RecordOutcome::AlreadyRecorded,
-            })
-            .map_err(|_| LedgerUnavailable)
+            }),
+            // Permanent conflicts are uncurable: report a rejected share with
+            // no retry, never an unavailable ledger. This mirrors the SV1
+            // `ShareLedger` mapping below; every other ledger error stays a
+            // transient `LedgerUnavailable`.
+            Err(error) if error.is_permanent_share_conflict() => Ok(RecordOutcome::Rejected),
+            Err(_) => Err(LedgerUnavailable),
+        }
     }
 
     /// Records a found block after any submission result.
@@ -687,8 +692,8 @@ impl AccountResolver for LedgerHost {
 
 /// SV1 settlement through the shared ledger. These two methods mirror
 /// [`LedgerHost::record_accepted_share`] and
-/// [`LedgerHost::record_submitted_block`] (which keep the SV2 contract), with
-/// one addition: permanent ledger conflicts surface here instead of
+/// [`LedgerHost::record_submitted_block`] (which keep the SV2 contract):
+/// permanent ledger conflicts surface as settled outcomes instead of
 /// collapsing into [`LedgerUnavailable`].
 impl ShareLedger for LedgerHost {
     fn record_share(

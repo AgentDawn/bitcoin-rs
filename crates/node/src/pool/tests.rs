@@ -7,8 +7,8 @@ use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, Txid};
 use bitcoin_rs_rpc::context::PoolOperator;
 use bitcoin_rs_storage::KvStore;
 use bitcoin_rs_stratum::{
-    AcceptedShare, AccountResolver, BlockReceipt, FoundBlock, JobId, Password, RecordOutcome,
-    SessionId, ShareClass, ShareLedger, ShareTarget, WorkerIdentity,
+    AcceptedShare, AccountResolver, BlockReceipt, FoundBlock, JobId, LedgerUnavailable, Password,
+    RecordOutcome, SessionId, ShareClass, ShareLedger, ShareTarget, WorkerIdentity,
 };
 use pool_ledger::{
     Balance, Ledger, MinerId, PayoutPolicy, PoolConfig, RoundState, ShareCredit, ShareReceipt,
@@ -256,6 +256,55 @@ fn rejected_block_receipt_stays_pending(open: OpenStore) -> TestResult {
     Ok(())
 }
 
+fn sv2_permanent_share_conflict_is_rejected(open: OpenStore) -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let host = registered_host(open, directory.path(), EPOCH)?;
+    let account = MinerId(42);
+    let first = share()?;
+    assert_eq!(
+        host.record_accepted_share(account, &first)
+            .unwrap_or_else(|_| panic!("first SV2 share record unavailable")),
+        RecordOutcome::Recorded
+    );
+    // Same header hash with a different nonce: an uncurable identity conflict,
+    // never an unavailable ledger.
+    let mut same_hash = first.clone();
+    same_hash.header.nonce = same_hash.header.nonce.wrapping_add(1);
+    assert_eq!(
+        host.record_accepted_share(account, &same_hash)
+            .unwrap_or_else(|error| panic!("share conflict surfaced as unavailable: {error:?}")),
+        RecordOutcome::Rejected
+    );
+    // Same identity with a different header hash collides the other way.
+    let mut same_identity = first.clone();
+    same_identity.hash = BlockHash::from(Hash256::from_le_bytes(&[9; 32]));
+    assert_eq!(
+        host.record_accepted_share(account, &same_identity)
+            .unwrap_or_else(|error| panic!("identity conflict surfaced as unavailable: {error:?}")),
+        RecordOutcome::Rejected
+    );
+    assert_eq!(host.ledger().share_count()?, 1);
+    Ok(())
+}
+
+fn sv2_non_conflict_ledger_error_is_unavailable(open: OpenStore) -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let host = registered_host(open, directory.path(), EPOCH)?;
+    // Oversized extranonce fails ledger validation: not a permanent share
+    // conflict, so the SV2 seam must keep the infrastructure error.
+    let mut bad = share()?;
+    bad.extranonce = vec![0u8; pool_ledger::MAX_EXTRANONCE_LEN + 1];
+    assert!(
+        matches!(
+            host.record_accepted_share(MinerId(42), &bad),
+            Err(LedgerUnavailable)
+        ),
+        "non-conflict ledger refusal must stay unavailable"
+    );
+    assert_eq!(host.ledger().share_count()?, 0);
+    Ok(())
+}
+
 fn block_record_reservations_are_bounded_and_released(open: OpenStore) -> TestResult {
     let directory = tempfile::tempdir()?;
     let host = Arc::new(registered_host(open, directory.path(), EPOCH)?);
@@ -369,6 +418,16 @@ macro_rules! backend_tests {
             #[test]
             fn restart_epoch_prevents_reused_wire_job_identity_collision() -> TestResult {
                 restart_epoch_separates_reused_wire_job(open)
+            }
+
+            #[test]
+            fn sv2_permanent_share_conflict_reports_rejected() -> TestResult {
+                sv2_permanent_share_conflict_is_rejected(open)
+            }
+
+            #[test]
+            fn sv2_non_conflict_ledger_error_stays_unavailable() -> TestResult {
+                sv2_non_conflict_ledger_error_is_unavailable(open)
             }
 
             #[test]
@@ -497,8 +556,6 @@ fn pool_prepare_create_open_and_epoch_run_under_the_directory_lock_fjall() -> Te
 
 #[test]
 fn node_chain_view_reports_missing_index_observer_errors() -> TestResult {
-    use pool_ledger::ChainView as _;
-
     let directory = tempfile::tempdir()?;
     let mut config = crate::config::NodeConfig::default_for_network(crate::Network::Regtest);
     config.data_dir = directory.path().to_owned();

@@ -867,6 +867,55 @@ fn payout_request_and_receipt_round_trip_and_reject_corruption() {
     ));
 }
 
+#[test]
+fn payout_request_encode_rejects_invalid_change_scripts_before_emitting_bytes() {
+    fn request(change: Vec<Vec<u8>>) -> PayoutRequest {
+        PayoutRequest {
+            batch_id: hash(0xAB),
+            outputs: vec![PayoutOutput {
+                account: MinerId(1),
+                script_pubkey: account_script(1),
+                amount_sat: 1_000,
+            }],
+            total_sat: 1_000,
+            allowed_change_scripts: change,
+        }
+    }
+
+    // Valid scripts (and the empty allow-list decode accepts) round-trip.
+    let valid = request(vec![change_script(), script(0xD0)]);
+    let encoded = valid.encode().fixture("encode valid change scripts");
+    assert_eq!(PayoutRequest::decode(&encoded).fixture("decode"), valid);
+    let empty_list = request(Vec::new());
+    let encoded_empty = empty_list.encode().fixture("encode empty change list");
+    assert_eq!(
+        PayoutRequest::decode(&encoded_empty).fixture("decode empty change list"),
+        empty_list
+    );
+
+    // Over-count.
+    let too_many = request(vec![change_script(); MAX_CHANGE_SCRIPTS + 1]);
+    assert!(matches!(
+        too_many.encode(),
+        Err(LedgerError::InvalidInput(_))
+    ));
+    // Empty entry.
+    assert!(matches!(
+        request(vec![Vec::new()]).encode(),
+        Err(LedgerError::InvalidInput(_))
+    ));
+    // Oversized entry.
+    assert!(matches!(
+        request(vec![vec![0x51; MAX_SCRIPT_LEN + 1]]).encode(),
+        Err(LedgerError::InvalidInput(_))
+    ));
+    // OP_RETURN-leading entry.
+    assert!(matches!(
+        request(vec![vec![0x6a, 0x01]]).encode(),
+        Err(LedgerError::InvalidInput(_))
+    ));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Lifecycle, configuration, storage
 // ---------------------------------------------------------------------------------------------

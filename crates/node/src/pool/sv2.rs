@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use bitcoin_rs_mining::MiningControl;
-use bitcoin_rs_stratum::{BlockStatus, ConnectionLimiter, PoolCore};
+use bitcoin_rs_stratum::{BlockStatus, ConnectionLimiter, PoolCore, RecordOutcome};
 use bitcoin_rs_stratum_v2::{
     AdmitError, AuthorityKeypair, Connection, ERROR_CODE_SHARE_NOT_RECORDED,
     ERROR_CODE_SUBMIT_SHARES_STALE_SHARE, Event, Limits, MAX_FEED_LEN, ServerConfig,
@@ -347,13 +347,18 @@ fn handle_events(
                 accounts.remove(&channel_id);
             }
             Event::ShareAccepted(event) => {
+                // Only credited shares confirm: a permanent ledger conflict
+                // (`RecordOutcome::Rejected`) rejects like any unavailable
+                // ledger, keeping the seam's rejected-vs-unavailable
+                // distinction while the wire keeps refusing the share.
                 let recorded = accounts
                     .get(&event.channel_id)
                     .copied()
                     .is_some_and(|account| {
-                        ledger
-                            .record_accepted_share(account, &event.outcome)
-                            .is_ok()
+                        matches!(
+                            ledger.record_accepted_share(account, &event.outcome),
+                            Ok(RecordOutcome::Recorded | RecordOutcome::AlreadyRecorded)
+                        )
                     });
                 if recorded {
                     connection.confirm_share(event.ticket)?;

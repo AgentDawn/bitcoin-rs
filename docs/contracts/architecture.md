@@ -155,8 +155,8 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
     `TxUnavailableCause::PrefixScanTruncated` or `LivePrefixScanTruncated`
     instead of returning a partial answer. The index capability reset
     (`crates/index/src/index/state.rs`) calls `KvStore::scan_prefix_bounded`
-    under `RESET_SCAN_LIMIT` and deletes one page at a time. No production
-    code calls `scan_prefix_from_bounded`; storage tests do.
+    under `RESET_SCAN_LIMIT` and deletes one page at a time. No production code
+    calls `scan_prefix_from_bounded`; storage tests cover it.
   - Proof: `crates/storage/tests/bounded_prefix_scan.rs` tests
     `fjall_bounded_prefix_scan`, `rocksdb_bounded_prefix_scan`, and
     `redb_bounded_prefix_scan` (feature-gated; limit semantics, prefix

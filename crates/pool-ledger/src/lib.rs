@@ -941,6 +941,12 @@ impl PayoutRequest {
                 "request total does not match outputs",
             ));
         }
+        if self.allowed_change_scripts.len() > MAX_CHANGE_SCRIPTS {
+            return Err(LedgerError::InvalidInput("too many change scripts"));
+        }
+        for script in &self.allowed_change_scripts {
+            validate_script(script)?;
+        }
         let mut enc = codec::Enc::new();
         enc.raw(REQUEST_MAGIC);
         enc.u8(WIRE_VERSION);
