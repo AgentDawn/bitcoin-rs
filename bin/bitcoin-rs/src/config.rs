@@ -457,6 +457,7 @@ mod compat_tests {
             r"
 proxy=127.0.0.1:9050
 onion=127.0.0.1:9051
+dnsseed=0
 proxyrandomize=1
 torcontrol=127.0.0.1:9052
 torpassword=secret

@@ -148,6 +148,12 @@ struct Request {
     /// `true`; [`TxPolicy::claim_package`] consumes the solicitation and
     /// clears them, and every owner-clearing path clears them with it.
     package_parents: Vec<Txid>,
+    /// Marks a legacy parent request created or adopted by the package-info
+    /// fallback. Only marked requests get the sender's BIP144 witness flag
+    /// at the send boundary; ordinary requests keep their announced form.
+    /// Set when the fallback announces, never cleared: adaptation matches
+    /// the legacy parent path for every sender.
+    fallback_parent: bool,
 }
 
 impl Request {
@@ -540,9 +546,10 @@ impl TxPolicy {
 
     /// Announces `parents` as preferred parent requests from `source` for
     /// immediate planning, upgrading existing candidates instead of
-    /// duplicating them, and returns the plannable keys. An `announce`
-    /// refusal (bounds) simply drops that parent: the next announcement of
-    /// it retries.
+    /// duplicating them, and returns the plannable keys. Announced parents
+    /// are marked for sender-side witness adaptation; ordinary requests are
+    /// never marked. An `announce` refusal (bounds) simply drops that
+    /// parent: the next announcement of it retries.
     fn announce_parents(
         &mut self,
         source: PeerSource,
@@ -562,6 +569,9 @@ impl TxPolicy {
                 preferred: true,
                 priority: u64::try_from(index).unwrap_or(u64::MAX),
             }) {
+                if let Some(request) = self.requests.get_mut(&key) {
+                    request.fallback_parent = true;
+                }
                 keys.push(key);
             }
         }
@@ -1383,11 +1393,25 @@ impl PeerTable {
                 .push((key, announcement.item));
         }
         for (source, batch) in batches {
-            let mut items: Vec<Inventory> = batch.iter().map(|(_, item)| *item).collect();
-            // The fallback announces canonical `Transaction` parents; the
-            // wire form is decided here, where the sending source is known,
-            // exactly as the legacy parent path flags it.
-            crate::inv::request_witness(&mut items, self.transaction_witness(source));
+            // Only fallback parents are adapted: ordinary requests keep
+            // their announced wire form.
+            let witness = self.transaction_witness(source);
+            let items = batch
+                .iter()
+                .map(|(key, item)| {
+                    let mut item = *item;
+                    if witness
+                        && policy
+                            .requests
+                            .get(key)
+                            .is_some_and(|request| request.fallback_parent)
+                        && let Inventory::Transaction(txid) = item
+                    {
+                        item = Inventory::WitnessTransaction(txid);
+                    }
+                    item
+                })
+                .collect();
             match self.send(source, Message::GetData(items)) {
                 Ok(()) => {}
                 // The node's aggregate budget is full while the source is
