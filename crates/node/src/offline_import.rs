@@ -456,12 +456,9 @@ fn resolve_offline_validation_mode(
 /// record: the payload's header hash must equal the indexed entry hash,
 /// including records the resume cursor skips.
 fn check_payload_against_entry(entry: &ManifestBlock, payload: &[u8]) -> Result<()> {
-    let header = payload.get(..HEADER_LEN).with_context(|| {
-        format!(
-            "block at height {} is shorter than a header",
-            entry.height
-        )
-    })?;
+    let header = payload
+        .get(..HEADER_LEN)
+        .with_context(|| format!("block at height {} is shorter than a header", entry.height))?;
     // The same computation `Block::block_hash` performs, in `Display` order
     // to match the indexed entry hash.
     let hash = bitcoin_rs_primitives::encode::double_sha256(header);
@@ -915,11 +912,8 @@ mod tests {
         refuse_stale_persisted_indexes(fresh.path()).expect("empty namespace");
         // Rows left by an earlier index-enabled run refuse, even though the
         // config posture gate already passed with indexes off.
-        std::fs::write(
-            fresh.path().join("txindex").join("CURRENT"),
-            b"stale",
-        )
-        .expect("seed stale row");
+        std::fs::write(fresh.path().join("txindex").join("CURRENT"), b"stale")
+            .expect("seed stale row");
         assert!(refuse_stale_persisted_indexes(fresh.path()).is_err());
         // A stray non-directory artifact is state this import will not
         // revalidate either.
