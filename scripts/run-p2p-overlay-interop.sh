@@ -18,7 +18,7 @@
 #            [--bitcoin-rs-command <command>] [--workdir <dir>]
 #            [--evidence <path>] [--timeout-seconds <n>] [--keep]
 #
-# Pinned externals: Tor 0.4.9.14 release; official i2pd 3.0.0 release.
+# Pinned externals: Tor 0.4.9.14 release (tor and tor-gencert matched); official i2pd 3.0.0 release.
 # Any prerequisite mismatch or missing metadata
 # fails closed (non-zero exit).
 #
@@ -490,6 +490,19 @@ if [[ ! -x "${TOR_GENCERT_BIN}" ]]; then
   echo "error: tor-gencert binary not found or not executable: ${TOR_GENCERT_BIN}" >&2
   exit 1
 fi
+read -r -a TOR_GENCERT_CMD <<<"${TOR_GENCERT_COMMAND}"
+TOR_GENCERT_VER_RAW=$("${TOR_GENCERT_CMD[@]}" --version 2>/dev/null || true)
+TOR_GENCERT_FIRST_LINE=$(printf '%s\n' "${TOR_GENCERT_VER_RAW}" | head -n1 | tr -d '\r')
+TOR_GENCERT_RELEASE_OK=$(python3 -c '
+import sys, re
+line = sys.argv[1].strip()
+pattern = r"^Tor version 0\.4\.9\.14(?:\s+\(git-[0-9a-fA-F]+\))?\.?$"
+sys.exit(0 if re.match(pattern, line) else 1)
+' "${TOR_GENCERT_FIRST_LINE}" && echo 1 || echo 0)
+if [[ "${TOR_GENCERT_RELEASE_OK}" -ne 1 ]]; then
+  echo "error: tor-gencert pin mismatch: expected release 0.4.9.14 (without dev/alpha/rc suffixes), got: '${TOR_GENCERT_FIRST_LINE}'" >&2
+  exit 1
+fi
 TOR_GENCERT_SHA=$(sha256sum "${TOR_GENCERT_BIN}" | awk '{print $1}')
 
 # 3. bitcoin-rs binary check
@@ -576,6 +589,8 @@ R1_SAM_PORT="$(printf '%s' "${FIXTURE_I2PD_PORTS}" | python3 -c 'import sys; pri
 
 cleanup() {
   local status=$?
+  local evidence_in_workdir
+  local _evidence_abs
   # Stop every child still owned, which covers every early exit: SIGTERM all
   # through validated handles, wait up to 5 s, SIGKILL the survivors through the
   # same handles, wait up to 5 s more. A child that cannot be shown to have
@@ -589,7 +604,17 @@ cleanup() {
   fi
   # Clean up workdir only on success, only if automatically created and
   # --keep not set. Failed runs always retain the workdir for diagnosis.
-  if ((status == 0)) && [[ "${AUTO_WORKDIR}" -eq 1 && "${KEEP}" -eq 0 && -z "${!OWNED[*]}" ]]; then
+  # The evidence JSON is the proof of a PASS: when it lives inside the workdir
+  # (the default <workdir>/evidence.json or any explicit --evidence under it),
+  # deleting the workdir would delete the proof, so success must keep it.
+  evidence_in_workdir=0
+  if [[ -n "${EVIDENCE:-}" && -n "${WORKDIR:-}" ]]; then
+    _evidence_abs=$(realpath -m -- "${EVIDENCE}" 2>/dev/null || true)
+    if [[ "${_evidence_abs}" == "${WORKDIR}" || "${_evidence_abs}" == "${WORKDIR}/"* ]]; then
+      evidence_in_workdir=1
+    fi
+  fi
+  if ((status == 0)) && [[ "${AUTO_WORKDIR}" -eq 1 && "${KEEP}" -eq 0 && -z "${!OWNED[*]}" ]] && ((evidence_in_workdir == 0)); then
     rm -rf -- "${WORKDIR:?workdir unset}"
   elif [[ -n "${WORKDIR:-}" ]]; then
     echo "workdir kept: ${WORKDIR}"

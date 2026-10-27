@@ -8,7 +8,7 @@ import re
 import signal
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, TypeVar
 
 
 class SocksRecord(TypedDict, total=False):
@@ -34,9 +34,10 @@ class SamRecord(TypedDict, total=False):
     error: str
 
 
-type SamCommand = Literal["hello", "session_create", "naming_lookup", "stream_connect", "stream_accept"]
-type SamPhase = Literal["root", "stream"]
-type Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Coroutine[None, None, None]]
+SamCommand = Literal["hello", "session_create", "naming_lookup", "stream_connect", "stream_accept"]
+SamPhase = Literal["root", "stream"]
+Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Coroutine[None, None, None]]
+T = TypeVar("T")
 
 # One handshake step (connect, a command, a reply, a drain) waits at most IO_TIMEOUT. The reply to
 # SESSION CREATE is the one exception: the node's whole root budget. HANDSHAKE_TIMEOUT bounds a
@@ -150,7 +151,7 @@ def record_negotiated_version(sam: SamRecord, reply: bytes) -> None:
         sam["negotiated_version"] = version
 
 
-async def bounded[T](awaitable: Awaitable[T], timeout: float, what: str) -> T:
+async def bounded(awaitable: Awaitable[T], timeout: float, what: str) -> T:
     try:
         async with asyncio.timeout(timeout):
             return await awaitable
