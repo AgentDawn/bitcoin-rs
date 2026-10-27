@@ -2132,58 +2132,60 @@ fn decide(batch: &PayoutBatch, observation: &BatchObservation, config: &PoolConf
     }
 }
 
-fn settle_paid(tables: &Tables<'_>, batch: &PayoutBatch) -> Result<(), LedgerError> {
-    for output in &batch.outputs {
+/// Applies `mutate` to the balance of every batch output, loading and storing
+/// each account exactly once. The closure receives the loaded balance and the
+/// output amount and performs the checked debit/credit; this keeps the
+/// load-mutate-store loop in one place.
+fn apply_to_outputs(
+    tables: &Tables<'_>,
+    outputs: &[PayoutOutput],
+    mut mutate: impl FnMut(&mut Balance, u64) -> Result<(), LedgerError>,
+) -> Result<(), LedgerError> {
+    for output in outputs {
         let mut balance = load_balance(&tables.balances, output.account)?;
-        balance.reserved_sat = balance
-            .reserved_sat
-            .checked_sub(output.amount_sat)
-            .ok_or_else(|| {
-                LedgerError::Corrupt("confirming a payout exceeds the reservation".into())
-            })?;
-        balance.paid_sat = balance
-            .paid_sat
-            .checked_add(output.amount_sat)
-            .ok_or(LedgerError::Overflow("paid balance"))?;
+        mutate(&mut balance, output.amount_sat)?;
         store_balance(&tables.balances, output.account, &balance)?;
     }
     Ok(())
+}
+
+fn settle_paid(tables: &Tables<'_>, batch: &PayoutBatch) -> Result<(), LedgerError> {
+    apply_to_outputs(tables, &batch.outputs, |balance, amount| {
+        balance.reserved_sat = balance.reserved_sat.checked_sub(amount).ok_or_else(|| {
+            LedgerError::Corrupt("confirming a payout exceeds the reservation".into())
+        })?;
+        balance.paid_sat = balance
+            .paid_sat
+            .checked_add(amount)
+            .ok_or(LedgerError::Overflow("paid balance"))?;
+        Ok(())
+    })
 }
 
 fn unsettle_paid(tables: &Tables<'_>, batch: &PayoutBatch) -> Result<(), LedgerError> {
-    for output in &batch.outputs {
-        let mut balance = load_balance(&tables.balances, output.account)?;
-        balance.paid_sat = balance
-            .paid_sat
-            .checked_sub(output.amount_sat)
-            .ok_or_else(|| {
-                LedgerError::Corrupt("reverting a payout exceeds the paid balance".into())
-            })?;
+    apply_to_outputs(tables, &batch.outputs, |balance, amount| {
+        balance.paid_sat = balance.paid_sat.checked_sub(amount).ok_or_else(|| {
+            LedgerError::Corrupt("reverting a payout exceeds the paid balance".into())
+        })?;
         balance.reserved_sat = balance
             .reserved_sat
-            .checked_add(output.amount_sat)
+            .checked_add(amount)
             .ok_or(LedgerError::Overflow("reserved balance"))?;
-        store_balance(&tables.balances, output.account, &balance)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn release_reservation(tables: &Tables<'_>, batch: &PayoutBatch) -> Result<(), LedgerError> {
-    for output in &batch.outputs {
-        let mut balance = load_balance(&tables.balances, output.account)?;
-        balance.reserved_sat = balance
-            .reserved_sat
-            .checked_sub(output.amount_sat)
-            .ok_or_else(|| {
-                LedgerError::Corrupt("releasing a payout exceeds the reservation".into())
-            })?;
+    apply_to_outputs(tables, &batch.outputs, |balance, amount| {
+        balance.reserved_sat = balance.reserved_sat.checked_sub(amount).ok_or_else(|| {
+            LedgerError::Corrupt("releasing a payout exceeds the reservation".into())
+        })?;
         balance.available_sat = balance
             .available_sat
-            .checked_add(output.amount_sat)
+            .checked_add(amount)
             .ok_or(LedgerError::Overflow("available balance"))?;
-        store_balance(&tables.balances, output.account, &balance)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn next_rev(rev: u64) -> Result<u64, LedgerError> {

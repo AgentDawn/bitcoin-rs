@@ -38,14 +38,14 @@ use ruint::Uint;
 use thiserror::Error;
 
 /// Consensus limit on a coinbase scriptSig length (`bad-cb-length`).
-pub const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
+///
+/// Canonical value is [`CoinbaseBudget::MAX_SCRIPT_SIG_LEN`]; this alias keeps
+/// the existing `stratum::` path working.
+pub const MAX_COINBASE_SCRIPT_SIG_LEN: usize = CoinbaseBudget::MAX_SCRIPT_SIG_LEN;
 /// BIP320 general-purpose version-rolling bits.
 pub const BIP320_VERSION_MASK: u32 = 0x1fff_e000;
 /// Core's `MAX_FUTURE_BLOCK_TIME`: the largest forward `ntime` window a job may grant.
 pub const MAX_NTIME_FORWARD_SECS: u32 = 7_200;
-
-/// Smallest scriptSig the node builds (`bad-cb-length` lower bound).
-const MIN_COINBASE_SCRIPT_SIG_LEN: usize = 2;
 /// Offset of the scriptSig length byte in a one-input coinbase's txid serialization:
 /// version (4) + input count (1) + outpoint (36).
 const SCRIPT_SIG_LEN_OFFSET: usize = 41;
@@ -814,7 +814,7 @@ impl Job {
         let available = payout.value.to_sat();
         let base = input.script_sig.as_bytes();
         let total = config.extranonce.total_len();
-        let room = MAX_COINBASE_SCRIPT_SIG_LEN.saturating_sub(base.len());
+        let room = CoinbaseBudget::MAX_SCRIPT_SIG_LEN.saturating_sub(base.len());
         let needed = config.coinbase_tag.len().saturating_add(total);
         if needed > room {
             return Err(JobError::ExtranonceExceedsScriptSig { room, needed });
@@ -1231,7 +1231,9 @@ impl JobBookConfig {
             .coinbase_tag
             .len()
             .saturating_add(self.extranonce.total_len());
-        if needed.saturating_add(MIN_COINBASE_SCRIPT_SIG_LEN) > MAX_COINBASE_SCRIPT_SIG_LEN {
+        if needed.saturating_add(CoinbaseBudget::MIN_SCRIPT_SIG_LEN)
+            > CoinbaseBudget::MAX_SCRIPT_SIG_LEN
+        {
             return Err(JobError::InvalidConfig(
                 "coinbase tag and extranonce cannot fit under the scriptSig limit",
             ));

@@ -4,7 +4,8 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_script::push_int;
 use thiserror::Error;
 
-const MIN_COINBASE_SCRIPT_SIG_LEN: usize = 2;
+use crate::template::CoinbaseBudget;
+
 /// BIP141 `OP_RETURN` `PUSH36` `aa21a9ed` prefix. Core `MINIMUM_WITNESS_COMMITMENT` is 38 bytes.
 const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
@@ -140,7 +141,7 @@ fn coinbase_script_sig(height: u32) -> Vec<u8> {
     // Consensus rejects coinbase scriptSigs shorter than two bytes
     // (`bad-cb-length`). Heights whose BIP34 prefix is a single opcode need a
     // trailing OP_0, matching Bitcoin Core's `CreateNewBlock`.
-    if script.len() < MIN_COINBASE_SCRIPT_SIG_LEN {
+    if script.len() < CoinbaseBudget::MIN_SCRIPT_SIG_LEN {
         script.push(0x00);
     }
     script

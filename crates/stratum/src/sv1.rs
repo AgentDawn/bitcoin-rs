@@ -31,6 +31,7 @@ use std::fmt;
 use crate::{AcceptedShare, BlockReceipt, FoundBlock, Job, JobError, JobId, ShareTarget};
 use bitcoin_rs_mining::MiningControlError;
 use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::encode::hex_encode as primitives_hex_encode;
 use sonic_rs::{Array, JsonContainerTrait, JsonValueTrait, Value};
 
 pub use session::{
@@ -68,8 +69,6 @@ pub const MAX_DIFFICULTY_TEXT_LEN: usize = 20;
 // Hex and byte order
 // ---------------------------------------------------------------------------
 
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
 fn nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -81,19 +80,13 @@ fn nibble(byte: u8) -> Option<u8> {
 
 /// Appends the lowercase hex of `bytes` to `out`.
 pub fn push_hex(out: &mut String, bytes: &[u8]) {
-    out.reserve(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-        out.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-    }
+    out.push_str(&primitives_hex_encode(bytes));
 }
 
 /// Lowercase hex of `bytes`.
 #[must_use]
 pub fn encode_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    push_hex(&mut out, bytes);
-    out
+    primitives_hex_encode(bytes)
 }
 
 /// Decodes an even-length hex string of either case; `None` on any other byte.
