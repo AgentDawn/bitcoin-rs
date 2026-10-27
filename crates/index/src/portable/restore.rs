@@ -4,11 +4,16 @@
 //! computes its SHA-256, checks its header against the manifest, frames and
 //! orders every record, and (when the receiver's chain identity and a fresh
 //! `TxLookup` allow it) resolves every locator to a full transaction id
-//! through the receiver's own block bodies. Faults are reported in the
-//! plan's strict order regardless of where they were found: manifest fields,
-//! artifact length, SHA-256, header, record framing and order, chain
-//! identity, a fresh `TxLookup`, locator mismatch. A missing or pruned body
-//! is not corruption: the capability is withheld and ordinary backfill
+//! through the receiver's own block bodies. Every locator must equal a real
+//! top-level block transaction boundary: bytes that merely decode to a
+//! transaction elsewhere in the block (an embedded serialization inside a
+//! script or witness) never resolve a locator. The pass also compares all
+//! transactions in the covered range, so a bundle that omits a record cannot
+//! receive the complete watermark. Faults are reported in the plan's strict
+//! order regardless of where they were found: manifest fields, artifact
+//! length, SHA-256, header, record framing and order, chain identity, a fresh
+//! `TxLookup`, locator mismatch, omitted transactions. A missing or pruned
+//! body is not corruption: the capability is withheld and ordinary backfill
 //! proceeds. A bad bundle is refused before anything is written.
 //!
 //! Consistency: validation reads immutable bundle files and one captured
@@ -25,7 +30,7 @@ use super::artifact::{
     ARTIFACT_VERSION, ArtifactHeader, CANCEL_POLL_RECORDS, HEADER_LEN, ReadFault, RecordReader,
     RowAssembler, TxLookupRecord, into_digest, open_hashed,
 };
-use super::chain::{BaseCount, BodyReader, ChainBase, Located};
+use super::chain::{BaseCount, ChainBase, Located};
 use super::manifest::{
     BundleFamily, IndexBundleManifestV1, MANIFEST_FILE, MAX_MANIFEST_BYTES, ValidatedManifest,
 };
@@ -36,9 +41,13 @@ use super::{
 use crate::index::PortableImportRow;
 use crate::writer::TxIndexWriter;
 use crate::{
-    IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark, TxIndexFamily,
+    IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark, IndexWatermarks,
+    TxIndexFamily,
 };
-use bitcoin_rs_chain::{BlockTreeReader, TipSnapshot};
+use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipSnapshot};
+use bitcoin_rs_primitives::{BlockHash, Hash256, layout::ParsedBlock};
+use crate::types::TxPosition;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::ops::ControlFlow;
@@ -220,16 +229,27 @@ enum LocatorOutcome {
 
 /// Locator verification that rides the validating pass. The first terminal
 /// outcome sticks; later records are not looked up.
+///
+/// Every locator must equal a real top-level block transaction boundary.
+/// Bytes that merely decode to a transaction elsewhere in the block (an
+/// embedded serialization inside a script or witness) never resolve a
+/// locator, even when the decoded id matches. The check loads the receiver's
+/// whole body for the record height and requires the recorded offset and
+/// length to equal one parsed transaction span before comparing ids.
 struct LocatorCheck<'a> {
     chain: &'a ChainBase,
     tree: &'a BlockTreeReader,
-    bodies: BodyReader<'a>,
+    source: &'a dyn BlockBodySource,
+    cached: Option<(u32, Hash256, Vec<u8>)>,
+    /// Positions the bundle carries per height, for the completeness check.
+    counts: HashMap<u32, u64>,
     outcome: LocatorOutcome,
 }
 
 impl LocatorCheck<'_> {
-    /// Resolves every position of `record` and requires full transaction id
-    /// equality; a prefix match never resolves a locator.
+    /// Resolves every position of `record` against a top-level transaction
+    /// boundary and requires full transaction id equality; a prefix match
+    /// never resolves a locator.
     fn check(&mut self, record: &TxLookupRecord<'_>) -> Result<(), IndexBundleError> {
         if !matches!(self.outcome, LocatorOutcome::Verified) {
             return Ok(());
@@ -241,8 +261,10 @@ impl LocatorCheck<'_> {
             )
         })?;
         for &position in record.positions {
-            match self.bodies.transaction(height, hash, position)? {
-                Located::Found(tx) if tx.txid().0.to_le_bytes() == record.txid => {}
+            match self.resolve_strict(height, hash, position)? {
+                Located::Found(tx) if tx.txid().0.to_le_bytes() == record.txid => {
+                    *self.counts.entry(height).or_default() += 1;
+                }
                 Located::Found(_) | Located::Mismatch => {
                     self.outcome = LocatorOutcome::Mismatch { height };
                     return Ok(());
@@ -255,6 +277,168 @@ impl LocatorCheck<'_> {
         }
         Ok(())
     }
+
+    /// Resolves `position` to the top-level transaction at that exact span.
+    ///
+    /// A ranged read that merely decodes is not enough: the offset and length
+    /// must equal one parsed transaction span of the receiver's whole body.
+    /// An out-of-range position or bytes that decode away from any boundary
+    /// report `Mismatch`; an absent or pruned body reports `BodyMissing`.
+    fn resolve_strict(
+        &mut self,
+        height: u32,
+        hash: Hash256,
+        position: TxPosition,
+    ) -> Result<Located, IndexBundleError> {
+        let hit = self
+            .cached
+            .as_ref()
+            .is_some_and(|(held_height, held_hash, _)| {
+                *held_height == height && *held_hash == hash
+            });
+        if !hit {
+            match self.source.block_body(height, BlockHash::from(hash)) {
+                Ok(Some(body)) => self.cached = Some((height, hash, body)),
+                Ok(None) => return Ok(Located::BodyMissing),
+                Err(error) => {
+                    return Err(IndexBundleError::BodyRead {
+                        height,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        let body = self
+            .cached
+            .as_ref()
+            .map(|(_, _, body)| body.as_slice())
+            .unwrap_or(&[]);
+        let parsed = ParsedBlock::parse_exact(body).map_err(|error| {
+            IndexBundleError::BodyRead {
+                height,
+                reason: format!("block does not parse: {error}"),
+            }
+        })?;
+        for tx in parsed.transactions() {
+            let span = tx.span();
+            if is_top_level_span(position, span.start(), span.len()) {
+                return Ok(Located::Found(tx.materialize()));
+            }
+        }
+        Ok(Located::Mismatch)
+    }
+
+    /// Compares all transactions in the covered range.
+    ///
+    /// Every bundle position already proved to be a real boundary with a
+    /// matching id, and distinct bundle keys prove distinct locators, so the
+    /// bundle is complete exactly when its per-height position count equals
+    /// the receiver's per-height transaction count. A missing body withholds
+    /// instead of refusing; a count mismatch refuses before any write, so an
+    /// incomplete bundle never receives the complete watermark.
+    fn verify_completeness(
+        &mut self,
+        floor: u32,
+        base: u32,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), IndexBundleError> {
+        for height in floor..=base {
+            if u64::from(height) % CANCEL_POLL_RECORDS == 0 && cancelled() {
+                return Err(IndexBundleError::Cancelled);
+            }
+            let hash = self.chain.hash_at(self.tree, height).ok_or_else(|| {
+                IndexBundleError::Identity(
+                    "the receiver chain has no block at a covered height".to_owned(),
+                )
+            })?;
+            let expected = match self.block_tx_count(height, hash)? {
+                Some(count) => count,
+                None => {
+                    self.outcome =
+                        LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
+                    return Ok(());
+                }
+            };
+            if let Some(error) = incomplete_at(&self.counts, height, expected) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Transactions the receiver holds in `(height, hash)`, or `None` when the
+    /// body is absent or pruned. Metadata answers without I/O when the source
+    /// keeps it; otherwise the whole body is parsed for its count.
+    fn block_tx_count(
+        &mut self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<u64>, IndexBundleError> {
+        if let Some(metadata) = self
+            .source
+            .block_body_metadata(height, BlockHash::from(hash))
+        {
+            return u64::try_from(metadata.tx_count).map(Some).map_err(|_| {
+                IndexBundleError::BodyRead {
+                    height,
+                    reason: "the transaction count does not fit u64".to_owned(),
+                }
+            });
+        }
+        let hit = self
+            .cached
+            .as_ref()
+            .is_some_and(|(held_height, held_hash, _)| {
+                *held_height == height && *held_hash == hash
+            });
+        if !hit {
+            match self.source.block_body(height, BlockHash::from(hash)) {
+                Ok(Some(body)) => self.cached = Some((height, hash, body)),
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    return Err(IndexBundleError::BodyRead {
+                        height,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        let body = self
+            .cached
+            .as_ref()
+            .map(|(_, _, body)| body.as_slice())
+            .unwrap_or(&[]);
+        let parsed = ParsedBlock::parse_exact(body).map_err(|error| {
+            IndexBundleError::BodyRead {
+                height,
+                reason: format!("block does not parse: {error}"),
+            }
+        })?;
+        Ok(Some(u64::try_from(parsed.tx_count()).unwrap_or(u64::MAX)))
+    }
+}
+
+/// Reports whether `position` equals the top-level transaction span
+/// `[start, start + len)`. Offsets inside a transaction (an embedded
+/// serialization in a script or witness) and overlapping or truncated spans
+/// never match, even when the bytes there decode to a transaction.
+fn is_top_level_span(position: TxPosition, start: u32, len: u32) -> bool {
+    position.offset() == start && position.byte_len() == len
+}
+
+/// Reports the first height where the bundle's position count differs from
+/// the chain's transaction count, or `None` when the height is complete.
+fn incomplete_at(
+    counts: &HashMap<u32, u64>,
+    height: u32,
+    expected: u64,
+) -> Option<IndexBundleError> {
+    let actual = counts.get(&height).copied().unwrap_or(0);
+    (actual != expected).then_some(IndexBundleError::Incomplete {
+        height,
+        expected,
+        actual,
+    })
 }
 
 /// Streams the whole artifact once: SHA-256, header, record framing, and,
@@ -285,7 +469,9 @@ fn validate_artifact(
         (Some(chain), Some(source)) => Some(LocatorCheck {
             chain,
             tree: host.block_tree,
-            bodies: BodyReader::new(source),
+            source,
+            cached: None,
+            counts: HashMap::new(),
             outcome: LocatorOutcome::Verified,
         }),
         _ => None,
@@ -311,6 +497,15 @@ fn validate_artifact(
     }
     let header = header.map_err(|reason| IndexBundleError::ArtifactHeader { name, reason })?;
     framing?;
+    if let Some(check) = locators.as_mut() {
+        if matches!(check.outcome, LocatorOutcome::Verified) {
+            check.verify_completeness(
+                manifest.tx_lookup.floor,
+                manifest.identity.base_height,
+                host.cancelled,
+            )?;
+        }
+    }
     let outcome = match (chain, locators) {
         (Some(_), Some(check)) => check.outcome,
         (Some(_), None) => LocatorOutcome::Withheld(Withheld::NoBodySource),
@@ -393,9 +588,10 @@ impl ImportPlan<'_> {
     /// Imports the validated bundle through the writer's fenced stream and
     /// returns the number of rows written.
     ///
-    /// A failed attempt leaves only un-watermarked rows; they are cleared here
-    /// when the capability is still without a watermark, and otherwise by the
-    /// next start through the same capability reset.
+    /// A failed attempt clears its un-watermarked rows before returning. A
+    /// cleanup failure is an `Index` error: the store is uncertain, so the
+    /// worker must fail instead of reconciling over partial rows toward a
+    /// readiness the bundle never earned.
     fn import(&self) -> Result<usize, IndexBundleError> {
         let base = IndexWatermark {
             height: self.manifest.identity.base_height,
@@ -423,18 +619,17 @@ impl ImportPlan<'_> {
             Err(error) => error,
         };
         let error = failure.unwrap_or(IndexBundleError::Index(index_error));
-        if let Ok((_, watermarks)) = self.host.writer.fenced_watermarks() {
-            if watermarks.tx_lookup.is_none() {
-                if let Err(reset) = self
-                    .host
-                    .writer
-                    .reset_capabilities(IndexCapabilities::TX_LOOKUP)
-                {
-                    tracing::warn!(%reset, "partial index import left rows; the next start clears them");
-                }
-            }
-        }
-        Err(error)
+        let watermarks = self
+            .host
+            .writer
+            .fenced_watermarks()
+            .map(|(_, watermarks)| watermarks);
+        let reset = || {
+            self.host
+                .writer
+                .reset_capabilities(IndexCapabilities::TX_LOOKUP)
+        };
+        Err(discard_partial_rows(error, watermarks, reset))
     }
 
     /// Emits the receiver's block identities and then every bundle row,
@@ -481,5 +676,147 @@ impl ImportPlan<'_> {
             return Err(IndexBundleError::ArtifactHash { name });
         }
         Ok(())
+    }
+}
+
+/// Clears a failed import's un-watermarked rows before its error is reported.
+///
+/// A cleanup failure is an `Index` error even when the import itself failed
+/// with a bundle refusal: the store may hold partial rows, so the worker
+/// must fail instead of reconciling over them toward a readiness the bundle
+/// never earned. A watermarked capability needs no reset.
+fn discard_partial_rows(
+    error: IndexBundleError,
+    watermarks: Result<IndexWatermarks, IndexError>,
+    reset: impl FnOnce() -> Result<(), IndexError>,
+) -> IndexBundleError {
+    let watermarks = match watermarks {
+        Ok(watermarks) => watermarks,
+        Err(error) => return IndexBundleError::Index(error),
+    };
+    if watermarks.tx_lookup.is_none() {
+        if let Err(error) = reset() {
+            return IndexBundleError::Index(error);
+        }
+    }
+    error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A locator must equal its top-level span exactly. An offset shifted
+    /// into the transaction body (an embedded serialization), a truncated
+    /// length, or an overlapping span never matches, even when the bytes at
+    /// the shifted offset decode to a transaction elsewhere.
+    #[test]
+    fn top_level_spans_must_match_exactly() {
+        let position = TxPosition::new(100, 200);
+        assert!(is_top_level_span(position, 100, 200));
+        assert!(
+            !is_top_level_span(position, 101, 200),
+            "an embedded offset inside the transaction is not its boundary"
+        );
+        assert!(
+            !is_top_level_span(position, 100, 199),
+            "a truncated length is not the transaction boundary"
+        );
+        assert!(
+            !is_top_level_span(position, 90, 210),
+            "an overlapping span is not the transaction boundary"
+        );
+    }
+
+    /// Omitted records are refused at the first height whose bundle count
+    /// differs from the chain, so an incomplete bundle never receives the
+    /// complete watermark. A height with no bundle positions reports zero.
+    #[test]
+    fn omitted_positions_report_first_missing_height() {
+        let counts = HashMap::from([(0_u32, 2_u64), (1_u32, 1_u64)]);
+        assert!(incomplete_at(&counts, 0, 2).is_none());
+        assert!(
+            matches!(
+                incomplete_at(&counts, 1, 2),
+                Some(IndexBundleError::Incomplete {
+                    height: 1,
+                    expected: 2,
+                    actual: 1,
+                })
+            ),
+            "an omitted transaction must be refused at its height"
+        );
+        assert!(
+            matches!(
+                incomplete_at(&counts, 2, 1),
+                Some(IndexBundleError::Incomplete {
+                    height: 2,
+                    expected: 1,
+                    actual: 0,
+                })
+            ),
+            "a height with no bundle positions reports zero"
+        );
+    }
+
+    /// A failed import cleanup is an `Index` error even when the import
+    /// itself failed with a bundle refusal: the store may hold partial rows,
+    /// so the worker must fail instead of reconciling toward a readiness the
+    /// bundle never earned. Each branch below drives `discard_partial_rows`
+    /// — the exact tail `ImportPlan::import` returns through — with a failing
+    /// writer equivalent, not a variant check.
+    #[test]
+    fn cleanup_failure_preserves_index_error() {
+        // The reset fails after a bundle refusal: the `Index` error wins, so
+        // the worker fails instead of reconciling over partial rows.
+        let fatal = discard_partial_rows(
+            IndexBundleError::Locator { height: 9 },
+            Ok(IndexWatermarks::default()),
+            || Err(IndexError::InvalidWatermark),
+        );
+        assert!(
+            matches!(&fatal, IndexBundleError::Index(_)),
+            "a failing reset must stop the worker, not report the refusal: {fatal}"
+        );
+        // The reset succeeds after a bundle refusal: the refusal is reported
+        // and ordinary backfill proceeds.
+        let refusal = discard_partial_rows(
+            IndexBundleError::Locator { height: 9 },
+            Ok(IndexWatermarks::default()),
+            || Ok(()),
+        );
+        assert!(
+            matches!(&refusal, IndexBundleError::Locator { height: 9 }),
+            "a cleared import must report its refusal: {refusal}"
+        );
+        // The watermark read itself fails: the store is uncertain, so the
+        // worker fails without running the reset.
+        let uncertain = discard_partial_rows(
+            IndexBundleError::Locator { height: 9 },
+            Err(IndexError::InvalidWatermark),
+            || panic!("the reset must not run when the watermarks are uncertain"),
+        );
+        assert!(
+            matches!(&uncertain, IndexBundleError::Index(_)),
+            "an unreadable fence must stop the worker: {uncertain}"
+        );
+        // The capability is watermarked: no partial rows exist, the reset is
+        // skipped, and the original error is reported.
+        let watermarked = IndexWatermarks {
+            tx_lookup: Some(IndexWatermark {
+                height: 1,
+                hash: [0_u8; 32],
+            }),
+            ..IndexWatermarks::default()
+        };
+        let reported = discard_partial_rows(
+            IndexBundleError::Locator { height: 9 },
+            Ok(watermarked),
+            || panic!("the reset must not run when the capability is watermarked"),
+        );
+        assert!(
+            matches!(&reported, IndexBundleError::Locator { height: 9 }),
+            "a watermarked capability needs no cleanup: {reported}"
+        );
     }
 }

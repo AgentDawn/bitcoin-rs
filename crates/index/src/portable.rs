@@ -134,6 +134,19 @@ pub enum IndexBundleError {
         /// Height of the block holding the locator.
         height: u32,
     },
+    /// The bundle omits transactions in the covered range; stamping its base
+    /// would claim a completeness the rows do not have.
+    #[error(
+        "bundle omits transactions at height {height}: expected {expected}, found {actual}"
+    )]
+    Incomplete {
+        /// First height where the bundle's count differs from the chain.
+        height: u32,
+        /// Transactions the receiver's block holds.
+        expected: u64,
+        /// Positions the bundle carries for the height.
+        actual: u64,
+    },
     /// Reading a block body failed without establishing corruption.
     #[error("block body read failed at height {height}: {reason}")]
     BodyRead {
@@ -259,9 +272,65 @@ fn sync_dir(dir: &Path) -> Result<(), IndexBundleError> {
         .map_err(|error| io_error(dir, error))
 }
 
-/// Directory handles cannot be opened for sync through `std` off Unix; the
-/// file `sync_all` already made the contents durable.
-#[cfg(not(unix))]
+/// Flushes a directory entry to durable storage on Windows.
+///
+/// Windows flushes a directory handle only when it carries `GENERIC_WRITE`
+/// (`FlushFileBuffers` fails with `ERROR_ACCESS_DENIED` on a read-only
+/// handle), so the open requests write access. `FILE_FLAG_BACKUP_SEMANTICS`
+/// is what lets a directory be opened at all.
+#[cfg(windows)]
+fn sync_dir(dir: &Path) -> Result<(), IndexBundleError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|error| io_error(dir, error))
+}
+
+/// Directory handles cannot be opened for sync through `std` off Unix and
+/// Windows; the file `sync_all` already made the contents durable.
+#[cfg(not(any(unix, windows)))]
 fn sync_dir(_dir: &Path) -> Result<(), IndexBundleError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    /// An incomplete bundle names the first height whose count differs, so an
+    /// omitted record cannot silently receive the complete watermark.
+    #[test]
+    fn incomplete_reports_first_missing_height() {
+        let error = IndexBundleError::Incomplete {
+            height: 3,
+            expected: 5,
+            actual: 4,
+        };
+        let text = error.to_string();
+        assert!(text.contains("3"), "missing height in {text}");
+        assert!(text.contains('5'), "expected count in {text}");
+        assert!(text.contains('4'), "actual count in {text}");
+    }
+
+    /// The bundle directory entry itself is flushed, so a just-created file
+    /// survives a crash on either Unix or Windows.
+    #[test]
+    fn sync_dir_flushes_an_existing_bundle_directory() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        sync_dir(dir.path())?;
+        let missing = dir.path().join("missing");
+        assert!(
+            matches!(sync_dir(&missing), Err(IndexBundleError::Io { .. })),
+            "a missing directory entry must fail, not silently succeed"
+        );
+        Ok(())
+    }
 }
