@@ -5833,10 +5833,6 @@ mod block_forward_tests {
     /// applied chain or a body fetch this connection owns. Anything else is a
     /// header announcement only, and repeating an admitted hash never rescans.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep the complete compact reconstruction sequence together"
-    )]
     fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std::error::Error>>
     {
         // Genesis plus two blocks, all applied: the applied tip is block 2.
