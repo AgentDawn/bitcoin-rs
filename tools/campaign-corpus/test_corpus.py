@@ -19,14 +19,15 @@ import struct
 import tempfile
 import threading
 import unittest
+from collections.abc import Buffer, Callable, Mapping
 from contextlib import redirect_stdout
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Protocol
 
 import corpus
 from corpus import ContractError
-
 
 C150_HASH = "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
 CMODERN_HASH = "00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f"
@@ -49,6 +50,19 @@ FIX_MANIFEST_FILE_SHA256 = (
     "f9f5cd66a463490ab5361f43d17abbc6812fd89523aee6afe281d8e70689e739"
 )
 FIX_ARCHIVE_SIZE = 264
+
+
+class _Readable(Protocol):
+    """Narrow read surface the framing tests exercise."""
+
+    def read(self, size: int | None = -1) -> bytes: ...
+    def readinto(self, buffer: bytearray) -> int: ...
+
+
+class _Writable(Protocol):
+    """Narrow write surface the writer tests exercise."""
+
+    def write(self, data: bytes) -> int: ...
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +145,7 @@ def _golden_doc() -> dict[str, object]:
     }
 
 
-def _digest_over(doc: dict[str, object]) -> str:
+def _digest_over(doc: Mapping[str, object]) -> str:
     preimage = dict(doc)
     preimage["manifest_sha256"] = ZERO64
     return _sha256_hex(_canonical(preimage))
@@ -158,7 +172,13 @@ def _golden_manifest_bytes() -> bytes:
 
 
 def _expected_entries() -> list[dict[str, object]]:
-    return _golden_doc()["entries"]  # type: ignore[return-value]
+    entries = _golden_doc()["entries"]
+    assert isinstance(entries, list)
+    typed: list[dict[str, object]] = []
+    for item in entries:
+        assert isinstance(item, dict)
+        typed.append(item)
+    return typed
 
 
 def _branch_header(prev_digest: bytes, merkle_seed: str, nonce: int) -> bytes:
@@ -214,9 +234,13 @@ def _isolated_products():
         products = _write_products(root)
         original_loader = corpus.load_freeze
         corpus.PRODUCTS_PATH = products
-        corpus.load_freeze = lambda path=None: original_loader(
-            products if path is None else path
-        )
+
+        def _load_isolated(path: Path = products) -> corpus.Freeze:
+            return original_loader(path)
+
+        # Use the module dictionary so ty does not treat the replacement
+        # function as an incompatible attribute assignment.
+        vars(corpus)["load_freeze"] = _load_isolated
         try:
             yield root
         finally:
@@ -224,20 +248,17 @@ def _isolated_products():
             corpus.PRODUCTS_PATH = _ORIGINAL_PRODUCTS_PATH
 
 
-class _ShortReads(io.RawIOBase):
+class _ShortReads(io.BytesIO, _Readable):
     """Readable stream whose read() may return fewer bytes than requested."""
 
     def __init__(self, data: bytes, chunk: int) -> None:
-        self._buf = io.BytesIO(data)
+        super().__init__(data)
         self._chunk = chunk
 
-    def readable(self) -> bool:
-        return True
-
-    def read(self, size: int = -1) -> bytes:
+    def read(self, size: int | None = -1) -> bytes:
         if size is None or size < 0:
             size = self._chunk
-        return self._buf.read(min(size, self._chunk))
+        return super().read(min(size, self._chunk))
 
     def readinto(self, buffer) -> int:  # type: ignore[override]
         data = self.read(len(buffer))
@@ -245,52 +266,94 @@ class _ShortReads(io.RawIOBase):
         return len(data)
 
 
-class _RecordingReads:
+class _RecordingReads(io.BytesIO, _Readable):
     """Readable stream that records every requested read size."""
 
     def __init__(self, data: bytes) -> None:
-        self._buf = io.BytesIO(data)
+        super().__init__(data)
         self.requests: list[int] = []
 
-    def read(self, size: int = -1) -> bytes:
+    def read(self, size: int | None = -1) -> bytes:
+        if size is None:
+            size = -1
         self.requests.append(size)
-        return self._buf.read(size)
+        return super().read(size)
 
     def readinto(self, buffer) -> int:
         # A BufferedReader-wrapping implementation would otherwise read the
         # whole stream through this unrecorded path.
         self.requests.append(len(buffer))
-        return self._buf.readinto(buffer)
-
-    def __getattr__(self, name: str):
-        return getattr(self._buf, name)
+        return super().readinto(buffer)
 
 
-class _FlakyWrites:
-    """Writable stream wrapper that can inject a partial write then fail."""
+class _FlakyWrites(io.BytesIO, _Writable):
+    """Writable stream wrapper that can inject a partial write then fail.
+
+    Nominally a BinaryIO so the CorpusWriter seam accepts it; the inherited
+    buffer stays empty and every member below reaches the wrapped real file.
+    Lifecycle stays with the backing handles the tests own.
+    """
 
     def __init__(self, stream: io.BufferedIOBase) -> None:
+        super().__init__()
         self._stream = stream
         self.poisoned = False
 
-    def write(self, data) -> int:
+    def write(self, data: Buffer) -> int:
         if self.poisoned:
             self.poisoned = False
-            if len(data) > 1:
-                self._stream.write(data[: len(data) // 2])
+            view = memoryview(data)
+            if len(view) > 1:
+                self._stream.write(view[: len(view) // 2])
             raise OSError("injected partial write failure")
         return self._stream.write(data)
+
+    def read(self, size: int | None = -1) -> bytes:
+        return self._stream.read(-1 if size is None else size)
+
+    def readline(self, size: int | None = -1) -> bytes:
+        return self._stream.readline(-1 if size is None else size)
+
+    def readinto(self, buffer) -> int:
+        # Found on BytesIO otherwise; forward so reads through this wrapper
+        # reach the wrapped real file, as before.
+        return self._stream.readinto(buffer)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._stream.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._stream.tell()
+
+    def truncate(self, size: int | None = None) -> int:
+        return self._stream.truncate(size)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def close(self) -> None:
+        self._stream.close()
+
+    def readable(self) -> bool:
+        return self._stream.readable()
+
+    def writable(self) -> bool:
+        return self._stream.writable()
+
+    def seekable(self) -> bool:
+        return self._stream.seekable()
 
     def __getattr__(self, name: str):
         return getattr(self._stream, name)
 
 
 class _RestHandler(BaseHTTPRequestHandler):
-    def log_message(self, *args: object) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib API
+    def do_GET(self) -> None:
         server = self.server
+        assert isinstance(server, _RestServer)
         if self.path.startswith("/rest/blockhashbyheight/"):
             height = int(self.path.rsplit("/", 1)[1].split(".", 1)[0])
             self._respond(200, server.advertised(height).encode("ascii") + b"\n")
@@ -316,7 +379,13 @@ class _RestHandler(BaseHTTPRequestHandler):
 class _RestServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, blocks, advertised=None, fallback=None, on_block=None) -> None:
+    def __init__(
+        self,
+        blocks: dict[int, bytes],
+        advertised: dict[int, str] | None = None,
+        fallback: bytes | None = None,
+        on_block: Callable[[], None] | None = None,
+    ) -> None:
         self._blocks = blocks
         self._advertised = advertised or {}
         self._by_hash = {_display(block): block for block in blocks.values()}
@@ -327,14 +396,19 @@ class _RestServer(ThreadingHTTPServer):
     def advertised(self, height: int) -> str:
         return self._advertised.get(height, _display(self._blocks[height]))
 
-    def block_for(self, token: str):
+    def block_for(self, token: str) -> bytes | None:
         if token in self._by_hash:
             return self._by_hash[token]
         return self._fallback
 
 
 @contextlib.contextmanager
-def _rest_server(blocks, advertised=None, fallback=None, on_block=None):
+def _rest_server(
+    blocks: dict[int, bytes],
+    advertised: dict[int, str] | None = None,
+    fallback: bytes | None = None,
+    on_block: Callable[[], None] | None = None,
+):
     server = _RestServer(
         blocks, advertised=advertised, fallback=fallback, on_block=on_block
     )
@@ -520,9 +594,8 @@ class Framing(unittest.TestCase):
 
     def test_iter_frames_rejects_truncated_header(self) -> None:
         for cut in (1, 4, 7):
-            with self.subTest(cut=cut):
-                with self.assertRaises(ContractError):
-                    list(corpus.iter_frames(io.BytesIO(_GOLDEN_ARCHIVE[:cut])))
+            with self.subTest(cut=cut), self.assertRaises(ContractError):
+                list(corpus.iter_frames(io.BytesIO(_GOLDEN_ARCHIVE[:cut])))
 
     def test_iter_frames_rejects_truncated_payload(self) -> None:
         with self.assertRaises(ContractError):
@@ -564,9 +637,8 @@ class Framing(unittest.TestCase):
         payload = b"z" * 40
         blob = struct.pack("<I", len(payload)) + payload
         for cut in (1, 2, 3, len(blob) - 1):
-            with self.subTest(cut=cut):
-                with self.assertRaises(ContractError):
-                    list(corpus.iter_length_prefixed(io.BytesIO(blob[:cut])))
+            with self.subTest(cut=cut), self.assertRaises(ContractError):
+                list(corpus.iter_length_prefixed(io.BytesIO(blob[:cut])))
 
     def test_iter_length_prefixed_rejects_oversize_before_payload_read(self) -> None:
         stream = _RecordingReads(struct.pack("<I", 0xFFFFFFFF))
@@ -632,7 +704,7 @@ class WriterContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             freeze = _fixture_freeze(root)
-            with _writer_streams(root, "facts") as (archive, entries, _, entries_path):
+            with _writer_streams(root, "facts") as (archive, entries, _, _entries_path):
                 writer = corpus.CorpusWriter(freeze, FIX_CORPUS, archive, entries)
                 zero = writer.prefix_facts()
                 self.assertEqual(zero.count, 0)
@@ -754,9 +826,11 @@ class WriterContract(unittest.TestCase):
             freeze = _fixture_freeze(root)
             with self.assertRaises(ContractError):
                 corpus.product(freeze, "GHOST")
-            with _writer_streams(root, "ghost") as (archive, entries, _, _):
-                with self.assertRaises(ContractError):
-                    corpus.CorpusWriter(freeze, "GHOST", archive, entries)
+            with (
+                _writer_streams(root, "ghost") as (archive, entries, _, _),
+                self.assertRaises(ContractError),
+            ):
+                corpus.CorpusWriter(freeze, "GHOST", archive, entries)
 
 
 # ---------------------------------------------------------------------------
@@ -770,34 +844,21 @@ class ResumeContract(unittest.TestCase):
             root = Path(raw)
             freeze = _fixture_freeze(root)
             for boundary in range(4):
-                with self.subTest(boundary=boundary):
-                    with _writer_streams(root, f"resume{boundary}") as (
+                with (
+                    self.subTest(boundary=boundary),
+                    _writer_streams(root, f"resume{boundary}") as (
                         archive,
                         entries,
                         archive_path,
                         _,
-                    ):
-                        writer = corpus.CorpusWriter(
-                            freeze, FIX_CORPUS, archive, entries
-                        )
-                        zero = writer.prefix_facts()
-                        self.assertEqual(zero.count, 0)
-                        self.assertIsNone(zero.last_hash)
-                        for height, payload in enumerate(_LINKED):
-                            if height == boundary:
-                                archive.flush()
-                                entries.flush()
-                                writer = corpus.CorpusWriter.resume(
-                                    freeze,
-                                    FIX_CORPUS,
-                                    archive,
-                                    entries,
-                                    writer.prefix_facts(),
-                                )
-                            writer.append(
-                                payload, expected_hash=_EXPECTED_HASHES[height]
-                            )
-                        if boundary == 3:
+                    ),
+                ):
+                    writer = corpus.CorpusWriter(freeze, FIX_CORPUS, archive, entries)
+                    zero = writer.prefix_facts()
+                    self.assertEqual(zero.count, 0)
+                    self.assertIsNone(zero.last_hash)
+                    for height, payload in enumerate(_LINKED):
+                        if height == boundary:
                             archive.flush()
                             entries.flush()
                             writer = corpus.CorpusWriter.resume(
@@ -807,18 +868,29 @@ class ResumeContract(unittest.TestCase):
                                 entries,
                                 writer.prefix_facts(),
                             )
-                        summary, manifest_bytes = _finish_to(
-                            root, writer, f"resume{boundary}"
-                        )
+                        writer.append(payload, expected_hash=_EXPECTED_HASHES[height])
+                    if boundary == 3:
                         archive.flush()
-                        self.assertEqual(archive_path.read_bytes(), _GOLDEN_ARCHIVE)
-                        self.assertEqual(manifest_bytes, _GOLDEN_MANIFEST)
-                        self.assertEqual(summary.count, 3)
-                        self.assertEqual(summary.archive_sha256, FIX_ARCHIVE_SHA256)
-                        self.assertEqual(summary.manifest_sha256, FIX_MANIFEST_SHA256)
-                        self.assertEqual(
-                            summary.manifest_file_sha256, FIX_MANIFEST_FILE_SHA256
+                        entries.flush()
+                        writer = corpus.CorpusWriter.resume(
+                            freeze,
+                            FIX_CORPUS,
+                            archive,
+                            entries,
+                            writer.prefix_facts(),
                         )
+                    summary, manifest_bytes = _finish_to(
+                        root, writer, f"resume{boundary}"
+                    )
+                    archive.flush()
+                    self.assertEqual(archive_path.read_bytes(), _GOLDEN_ARCHIVE)
+                    self.assertEqual(manifest_bytes, _GOLDEN_MANIFEST)
+                    self.assertEqual(summary.count, 3)
+                    self.assertEqual(summary.archive_sha256, FIX_ARCHIVE_SHA256)
+                    self.assertEqual(summary.manifest_sha256, FIX_MANIFEST_SHA256)
+                    self.assertEqual(
+                        summary.manifest_file_sha256, FIX_MANIFEST_FILE_SHA256
+                    )
 
     def _full_prefix(self, root: Path, name: str):
         freeze = _fixture_freeze(root)
@@ -845,11 +917,11 @@ class ResumeContract(unittest.TestCase):
                 with (
                     archive_path.open("r+b") as archive,
                     entries_path.open("r+b") as entries,
+                    self.assertRaises(ContractError),
                 ):
-                    with self.assertRaises(ContractError):
-                        corpus.CorpusWriter.resume(
-                            freeze, FIX_CORPUS, archive, entries, facts
-                        )
+                    corpus.CorpusWriter.resume(
+                        freeze, FIX_CORPUS, archive, entries, facts
+                    )
             finally:
                 context.__exit__(None, None, None)
 
@@ -868,11 +940,11 @@ class ResumeContract(unittest.TestCase):
                 with (
                     archive_path.open("r+b") as archive,
                     entries_path.open("r+b") as entries,
+                    self.assertRaises(ContractError),
                 ):
-                    with self.assertRaises(ContractError):
-                        corpus.CorpusWriter.resume(
-                            freeze, FIX_CORPUS, archive, entries, facts
-                        )
+                    corpus.CorpusWriter.resume(
+                        freeze, FIX_CORPUS, archive, entries, facts
+                    )
             finally:
                 context.__exit__(None, None, None)
 
@@ -901,15 +973,15 @@ class ResumeContract(unittest.TestCase):
                     ),
                 }
                 for label, recorded in mutations.items():
-                    with self.subTest(recorded=label):
-                        with (
-                            archive_path.open("r+b") as archive,
-                            entries_path.open("r+b") as entries,
-                        ):
-                            with self.assertRaises(ContractError):
-                                corpus.CorpusWriter.resume(
-                                    freeze, FIX_CORPUS, archive, entries, recorded
-                                )
+                    with (
+                        self.subTest(recorded=label),
+                        archive_path.open("r+b") as archive,
+                        entries_path.open("r+b") as entries,
+                        self.assertRaises(ContractError),
+                    ):
+                        corpus.CorpusWriter.resume(
+                            freeze, FIX_CORPUS, archive, entries, recorded
+                        )
             finally:
                 context.__exit__(None, None, None)
 
@@ -1143,6 +1215,7 @@ class ManifestSchema(unittest.TestCase):
 
     def test_uppercase_hex_is_accepted_with_digest_over_decoded_originals(self) -> None:
         doc = self._with_uppercase_hex(json.loads(_GOLDEN_MANIFEST.decode("ascii")))
+        assert isinstance(doc, dict)
         doc["manifest_sha256"] = _digest_over(doc)
         product = _verify(
             self.freeze, self.root, json.dumps(doc, indent=1).encode("ascii")
@@ -1154,6 +1227,7 @@ class ManifestSchema(unittest.TestCase):
         # accepting it would mean the verifier hashed a normalized replacement
         # document instead of the accepted decoded values.
         doc = self._with_uppercase_hex(json.loads(_GOLDEN_MANIFEST.decode("ascii")))
+        assert isinstance(doc, dict)
         doc["manifest_sha256"] = FIX_MANIFEST_SHA256
         with self.assertRaises(ContractError):
             _verify(self.freeze, self.root, json.dumps(doc).encode("ascii"))
@@ -1311,7 +1385,9 @@ class ManifestSchema(unittest.TestCase):
 
     def test_wrong_entry_count_is_rejected(self) -> None:
         doc = _golden_doc()
-        doc["entries"] = doc["entries"][:2]
+        entries = doc["entries"]
+        assert isinstance(entries, list)
+        doc["entries"] = entries[:2]
         doc["manifest_sha256"] = _digest_over(doc)
         with self.assertRaises(ContractError):
             _verify(self.freeze, self.root, _canonical(doc) + b"\n")
@@ -1340,17 +1416,15 @@ class ManifestSchema(unittest.TestCase):
         freeze = corpus.load_freeze()
         doc = self._forged_c150_doc(freeze)
         # Digest-consistent but claiming one block for a 150,001-block corpus.
-        with tempfile.TemporaryDirectory() as raw:
-            with self.assertRaises(ContractError):
-                _verify(freeze, Path(raw), _canonical(doc) + b"\n", _frame(_GENESIS))
+        with tempfile.TemporaryDirectory() as raw, self.assertRaises(ContractError):
+            _verify(freeze, Path(raw), _canonical(doc) + b"\n", _frame(_GENESIS))
 
     def test_digest_tamper_is_rejected(self) -> None:
         freeze = corpus.load_freeze()
         doc = self._forged_c150_doc(freeze)
         doc["source_tip_hash"] = "ff" * 32
-        with tempfile.TemporaryDirectory() as raw:
-            with self.assertRaises(ContractError):
-                _verify(freeze, Path(raw), _canonical(doc) + b"\n", _frame(_GENESIS))
+        with tempfile.TemporaryDirectory() as raw, self.assertRaises(ContractError):
+            _verify(freeze, Path(raw), _canonical(doc) + b"\n", _frame(_GENESIS))
 
 
 # ---------------------------------------------------------------------------
@@ -1550,21 +1624,23 @@ class Publication(unittest.TestCase):
                 if not archive.exists():
                     archive.write_bytes(racer)
 
-            with _rest_server(blocks, on_block=appear_mid_export) as rest_url:
-                with self.assertRaises(ContractError):
-                    corpus.main(
-                        [
-                            "export",
-                            "--rest-url",
-                            rest_url,
-                            "--corpus-id",
-                            FIX_CORPUS,
-                            "--archive",
-                            str(archive),
-                            "--manifest",
-                            str(manifest),
-                        ]
-                    )
+            with (
+                _rest_server(blocks, on_block=appear_mid_export) as rest_url,
+                self.assertRaises(ContractError),
+            ):
+                corpus.main(
+                    [
+                        "export",
+                        "--rest-url",
+                        rest_url,
+                        "--corpus-id",
+                        FIX_CORPUS,
+                        "--archive",
+                        str(archive),
+                        "--manifest",
+                        str(manifest),
+                    ]
+                )
             self.assertEqual(archive.read_bytes(), racer)
             self.assertFalse(manifest.exists())
 
@@ -1603,9 +1679,8 @@ class RestSource(unittest.TestCase):
             )
 
     def test_rest_fetch_rejects_non_200_status(self) -> None:
-        with _rest_server({}) as rest_url:
-            with self.assertRaises(ContractError):
-                corpus.rest_fetch(rest_url, "/rest/block/missing.bin")
+        with _rest_server({}) as rest_url, self.assertRaises(ContractError):
+            corpus.rest_fetch(rest_url, "/rest/block/missing.bin")
 
     def test_rest_fetch_rejects_hostport_with_path(self) -> None:
         with self.assertRaises(ContractError):

@@ -120,10 +120,13 @@ class CorpusSummary:
 def load_freeze(path: Path = PRODUCTS_PATH) -> Freeze:
     raw = _load_json(path)
     if raw.get("schema") != "bitcoin-rs-campaign-corpora-v1":
-        raise ContractError("products.json schema is not bitcoin-rs-campaign-corpora-v1")
+        raise ContractError(
+            "products.json schema is not bitcoin-rs-campaign-corpora-v1"
+        )
     magic = bytes.fromhex(_text(raw["network_magic"], "network_magic"))
     specials = tuple(
-        _text(item, "census_specials[]") for item in _array(raw["census_specials"], "census_specials")
+        _text(item, "census_specials[]")
+        for item in _array(raw["census_specials"], "census_specials")
     )
     validation = _object(raw["validation"], "validation")
     products: dict[str, Product] = {}
@@ -141,7 +144,9 @@ def load_freeze(path: Path = PRODUCTS_PATH) -> Freeze:
         network=_text(raw["network"], "network"),
         network_magic=magic,
         genesis_hash=_hash(_text(raw["genesis_hash"], "genesis_hash")),
-        assume_valid_height=_u32(validation["assume_valid_height"], "assume_valid_height"),
+        assume_valid_height=_u32(
+            validation["assume_valid_height"], "assume_valid_height"
+        ),
         census_specials=specials,
         core_oracle=_object(raw["core_oracle"], "core_oracle"),
         products=products,
@@ -186,7 +191,9 @@ def _read_exact(source: BinaryIO, count: int, what: str) -> bytes:
     return b"".join(chunks)
 
 
-def iter_frames(source: BinaryIO, magic: bytes = MAINNET_MAGIC) -> Iterator[tuple[FrameMeta, bytes]]:
+def iter_frames(
+    source: BinaryIO, magic: bytes = MAINNET_MAGIC
+) -> Iterator[tuple[FrameMeta, bytes]]:
     """Stream Core-framed payloads. Clean EOF is legal only between frames."""
     offset = 0
     while True:
@@ -293,7 +300,9 @@ class CorpusWriter:
     directories, never deletes or truncates files, and never publishes paths.
     """
 
-    def __init__(self, freeze: Freeze, corpus_id: str, archive: BinaryIO, entries: BinaryIO) -> None:
+    def __init__(
+        self, freeze: Freeze, corpus_id: str, archive: BinaryIO, entries: BinaryIO
+    ) -> None:
         self._freeze = freeze
         self._chosen = product(freeze, corpus_id)
         self._archive = archive
@@ -317,7 +326,9 @@ class CorpusWriter:
     def _check_tail(self) -> None:
         if self._tail_pending:
             if not self._tail_cleared():
-                raise ContractError("unverified tail present: truncate owned files to the recorded prefix first")
+                raise ContractError(
+                    "unverified tail present: truncate owned files to the recorded prefix first"
+                )
             self._tail_pending = False
 
     def append(self, payload: bytes, *, expected_hash: str | None = None) -> FrameMeta:
@@ -345,11 +356,18 @@ class CorpusWriter:
             assert self._last_hash is not None
             if not _prev_field_matches(payload, self._last_hash):
                 raise ContractError("block header does not link to the previous block")
-            if height == self._chosen.stop_height and block_hash != self._chosen.stop_hash:
-                raise ContractError(f"{self._chosen.corpus_id} stop hash does not match the frozen tip")
+            if (
+                height == self._chosen.stop_height
+                and block_hash != self._chosen.stop_hash
+            ):
+                raise ContractError(
+                    f"{self._chosen.corpus_id} stop hash does not match the frozen tip"
+                )
         meta = FrameMeta(offset=self._offset, payload_length=len(payload))
         header = self._freeze.network_magic + struct.pack("<I", len(payload))
-        line = _entry_chunk(height, block_hash, meta.offset, meta.payload_length) + b"\n"
+        line = (
+            _entry_chunk(height, block_hash, meta.offset, meta.payload_length) + b"\n"
+        )
         self._tail_pending = True
         _write_all(self._archive, header)
         _write_all(self._archive, payload)
@@ -382,8 +400,12 @@ class CorpusWriter:
             )
         assert self._last_hash is not None
         if self._last_hash != self._chosen.stop_hash:
-            raise ContractError(f"{self._chosen.corpus_id} stop hash does not match the frozen tip")
-        metadata = _manifest_metadata(self._freeze, self._chosen, self._offset, self._archive_sha.hexdigest())
+            raise ContractError(
+                f"{self._chosen.corpus_id} stop hash does not match the frozen tip"
+            )
+        metadata = _manifest_metadata(
+            self._freeze, self._chosen, self._offset, self._archive_sha.hexdigest()
+        )
         preimage_sha = hashlib.sha256()
         for chunk in _manifest_chunks(metadata, self._replay_entries(), ZERO_SHA256):
             preimage_sha.update(chunk)
@@ -446,7 +468,9 @@ class CorpusWriter:
             try:
                 meta, payload = next(frames)
             except StopIteration:
-                raise ContractError("archive is shorter than the recorded prefix") from None
+                raise ContractError(
+                    "archive is shorter than the recorded prefix"
+                ) from None
             height = writer._count
             block_hash = header_block_hash(payload)
             if height == 0:
@@ -455,11 +479,20 @@ class CorpusWriter:
             else:
                 assert writer._last_hash is not None
                 if not _prev_field_matches(payload, writer._last_hash):
-                    raise ContractError("committed prefix fails previous-header linkage")
-                if height == writer._chosen.stop_height and block_hash != writer._chosen.stop_hash:
+                    raise ContractError(
+                        "committed prefix fails previous-header linkage"
+                    )
+                if (
+                    height == writer._chosen.stop_height
+                    and block_hash != writer._chosen.stop_hash
+                ):
                     raise ContractError("committed prefix carries a foreign stop block")
-            if line[:-1] != _entry_chunk(height, block_hash, meta.offset, meta.payload_length):
-                raise ContractError("entry spool record does not match the archive frame")
+            if line[:-1] != _entry_chunk(
+                height, block_hash, meta.offset, meta.payload_length
+            ):
+                raise ContractError(
+                    "entry spool record does not match the archive frame"
+                )
             header = freeze.network_magic + struct.pack("<I", len(payload))
             writer._archive_sha.update(header)
             writer._archive_sha.update(payload)
@@ -474,10 +507,14 @@ class CorpusWriter:
             or facts.archive_bytes != recorded_prefix.archive_bytes
             or facts.entries_bytes != recorded_prefix.entries_bytes
             or facts.last_hash != recorded_prefix.last_hash
-            or facts.archive_prefix_sha256 != _hash(recorded_prefix.archive_prefix_sha256)
-            or facts.entries_prefix_sha256 != _hash(recorded_prefix.entries_prefix_sha256)
+            or facts.archive_prefix_sha256
+            != _hash(recorded_prefix.archive_prefix_sha256)
+            or facts.entries_prefix_sha256
+            != _hash(recorded_prefix.entries_prefix_sha256)
         ):
-            raise ContractError("durable prefix does not match the recorded checkpoint identity")
+            raise ContractError(
+                "durable prefix does not match the recorded checkpoint identity"
+            )
         archive_end = archive.seek(0, os.SEEK_END)
         entries_end = entries.seek(0, os.SEEK_END)
         if archive_end < facts.archive_bytes or entries_end < facts.entries_bytes:
@@ -489,10 +526,18 @@ class CorpusWriter:
         return writer
 
 
-def _entry_chunk(height: int, block_hash: str, offset: int, payload_length: int) -> bytes:
+def _entry_chunk(
+    height: int, block_hash: str, offset: int, payload_length: int
+) -> bytes:
     return canonical_json(
-        {"hash": block_hash, "height": height, "offset": offset, "payload_length": payload_length}
+        {
+            "hash": block_hash,
+            "height": height,
+            "offset": offset,
+            "payload_length": payload_length,
+        }
     )
+
 
 def _entry_int(entry: Mapping[str, object], key: str) -> int:
     value = entry[key]
@@ -533,7 +578,9 @@ def _manifest_chunks(
     materializing the entries array. Key order is the sorted canonical order;
     scalar chunks reuse the retained canonical_json encoder."""
     archive = _object(metadata["archive"], "archive")
-    yield b'{"archive":' + canonical_json({"sha256": archive["sha256"], "size": archive["size"]})
+    yield b'{"archive":' + canonical_json(
+        {"sha256": archive["sha256"], "size": archive["size"]}
+    )
     yield b',"corpus_id":' + canonical_json(metadata["corpus_id"])
     yield b',"entries":['
     first = True
@@ -542,7 +589,7 @@ def _manifest_chunks(
             yield b","
         first = False
         yield chunk
-    yield b']'
+    yield b"]"
     yield b',"genesis_hash":' + canonical_json(metadata["genesis_hash"])
     yield b',"manifest_sha256":' + canonical_json(manifest_sha256)
     yield b',"network":' + canonical_json(metadata["network"])
@@ -678,7 +725,9 @@ class _ManifestReader:
                 raise ContractError("manifest object is malformed")
         missing = keys - result.keys()
         if missing:
-            raise ContractError(f"manifest object is missing members: {sorted(missing)}")
+            raise ContractError(
+                f"manifest object is missing members: {sorted(missing)}"
+            )
         return result
 
     def _read_string(self, label: str, max_chars: int) -> str:
@@ -693,7 +742,9 @@ class _ManifestReader:
             if char == ord('"') and not _ends_with_odd_escapes(raw[:-1]):
                 break
             if len(raw) > max_chars * 8 + 2:
-                raise ContractError(f"manifest {label} exceeds its schema-derived bound")
+                raise ContractError(
+                    f"manifest {label} exceeds its schema-derived bound"
+                )
         try:
             value = json.loads(b'"' + bytes(raw))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -713,7 +764,9 @@ class _ManifestReader:
     def _read_hex(self, label: str, digits: int) -> str:
         value = self._read_string(label, digits)
         if len(value) != digits or any(char not in _HEX for char in value):
-            raise ContractError(f"manifest {label} is not a {digits}-character hex value")
+            raise ContractError(
+                f"manifest {label} is not a {digits}-character hex value"
+            )
         return value
 
     def _read_int(self, label: str, max_digits: int) -> int:
@@ -726,7 +779,9 @@ class _ManifestReader:
             self._next()
             digits.append(char)
             if len(digits) > max_digits:
-                raise ContractError(f"manifest {label} exceeds its schema-derived bound")
+                raise ContractError(
+                    f"manifest {label} exceeds its schema-derived bound"
+                )
         if not digits:
             raise ContractError(f"manifest {label} is not a JSON integer")
         return int(digits.decode("ascii"))
@@ -821,13 +876,18 @@ def verify_archive(
     chosen = product(freeze, corpus_id)
     if metadata["network"] != freeze.network:
         raise ContractError("manifest network is not mainnet")
-    if bytes.fromhex(_text(metadata["network_magic"], "network_magic")) != freeze.network_magic:
+    if (
+        bytes.fromhex(_text(metadata["network_magic"], "network_magic"))
+        != freeze.network_magic
+    ):
         raise ContractError("manifest network magic is not mainnet")
     if _hash(_text(metadata["genesis_hash"], "genesis_hash")) != freeze.genesis_hash:
         raise ContractError("manifest genesis hash is not mainnet genesis")
     range_obj = _object(metadata["range"], "range")
     if range_obj["start_height"] != 0 or range_obj["stop_height"] != chosen.stop_height:
-        raise ContractError(f"{corpus_id} height range is not genesis through the frozen tip")
+        raise ContractError(
+            f"{corpus_id} height range is not genesis through the frozen tip"
+        )
     if _hash(_text(metadata["source_tip_hash"], "source_tip_hash")) != chosen.stop_hash:
         raise ContractError(f"{corpus_id} source tip is not the frozen stop hash")
     archive_info = _object(metadata["archive"], "archive")
@@ -842,7 +902,10 @@ def verify_archive(
         if not chunk:
             break
         archive_sha.update(chunk)
-    if _hash(_text(archive_info["sha256"], "archive.sha256")) != archive_sha.hexdigest():
+    if (
+        _hash(_text(archive_info["sha256"], "archive.sha256"))
+        != archive_sha.hexdigest()
+    ):
         raise ContractError("manifest archive sha256 does not match the file")
     archive.seek(0)
     height = 0
@@ -853,9 +916,15 @@ def verify_archive(
         try:
             meta, payload = next(frames)
         except StopIteration:
-            raise ContractError(f"{corpus_id} entry count is not the frozen block count") from None
+            raise ContractError(
+                f"{corpus_id} entry count is not the frozen block count"
+            ) from None
         block_hash = header_block_hash(payload)
-        if entry["height"] != height or entry["offset"] != meta.offset or entry["payload_length"] != meta.payload_length:
+        if (
+            entry["height"] != height
+            or entry["offset"] != meta.offset
+            or entry["payload_length"] != meta.payload_length
+        ):
             raise ContractError("manifest offsets do not match the archive frames")
         if _hash(_text(entry["hash"], f"entries[{height}].hash")) != block_hash:
             raise ContractError("manifest block hash does not match the framed header")
@@ -867,7 +936,9 @@ def verify_archive(
             if not _prev_field_matches(payload, last_hash):
                 raise ContractError("framed archive fails previous-header linkage")
             if height == chosen.stop_height and block_hash != chosen.stop_hash:
-                raise ContractError(f"{corpus_id} framed tip is not the frozen stop hash")
+                raise ContractError(
+                    f"{corpus_id} framed tip is not the frozen stop hash"
+                )
         last_hash = block_hash
         height += 1
     if archive.read(1):
@@ -877,9 +948,13 @@ def verify_archive(
     return chosen
 
 
-def classify_census(freeze: Freeze, corpus_id: str, counters: Mapping[str, object]) -> dict[str, object]:
+def classify_census(
+    freeze: Freeze, corpus_id: str, counters: Mapping[str, object]
+) -> dict[str, object]:
     chosen = product(freeze, corpus_id)
-    specials = {name: _u64(counters.get(name, 0), name) for name in freeze.census_specials}
+    specials = {
+        name: _u64(counters.get(name, 0), name) for name in freeze.census_specials
+    }
     missing = [name for name in freeze.census_specials if name not in counters]
     if missing:
         raise ContractError("census is missing required special context counters")
@@ -895,15 +970,25 @@ def classify_census(freeze: Freeze, corpus_id: str, counters: Mapping[str, objec
         passed = "c150_passed"
     elif corpus_id == "Cmodern":
         if any(count <= 0 for count in specials.values()):
-            raise ContractError("Cmodern census requires a positive count for every special context")
-        schnorr_entries = _u64(counters.get("checkschnorr_entries", 0), "checkschnorr_entries")
-        schnorr_calls = _u64(counters.get("schnorr_verify_calls", 0), "schnorr_verify_calls")
+            raise ContractError(
+                "Cmodern census requires a positive count for every special context"
+            )
+        schnorr_entries = _u64(
+            counters.get("checkschnorr_entries", 0), "checkschnorr_entries"
+        )
+        schnorr_calls = _u64(
+            counters.get("schnorr_verify_calls", 0), "schnorr_verify_calls"
+        )
         schnorr_ok = _u64(counters.get("schnorr_verify_ok", 0), "schnorr_verify_ok")
-        schnorr_fail = _u64(counters.get("schnorr_verify_fail", 0), "schnorr_verify_fail")
+        schnorr_fail = _u64(
+            counters.get("schnorr_verify_fail", 0), "schnorr_verify_fail"
+        )
         if schnorr_entries < schnorr_calls:
             raise ContractError("Cmodern Schnorr entries are below verify calls")
         if schnorr_calls != schnorr_ok + schnorr_fail:
-            raise ContractError("Cmodern Schnorr verify calls do not equal ok plus fail")
+            raise ContractError(
+                "Cmodern Schnorr verify calls do not equal ok plus fail"
+            )
         passed = "cmodern_passed"
     else:
         raise ContractError(f"unknown corpus_id {corpus_id!r}")
@@ -975,9 +1060,11 @@ def _run_writer(
     manifest_scratch = _unique_scratch(manifest_path)
     spool_scratch = _unique_scratch(archive_path)
     try:
-        with open(archive_scratch, "xb") as archive_fh, open(
-            spool_scratch, "x+b"
-        ) as spool_fh, open(manifest_scratch, "xb") as manifest_fh:
+        with (
+            open(archive_scratch, "xb") as archive_fh,
+            open(spool_scratch, "x+b") as spool_fh,
+            open(manifest_scratch, "xb") as manifest_fh,
+        ):
             writer = CorpusWriter(freeze, corpus_id, archive_fh, spool_fh)
             for hash_value, payload in items:
                 writer.append(payload, expected_hash=hash_value)
@@ -1005,7 +1092,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     export_cmd.add_argument("--archive", type=Path, required=True)
     export_cmd.add_argument("--manifest", type=Path, required=True)
 
-    convert_cmd = sub.add_parser("convert", help="convert a length-prefixed archive to Core frames")
+    convert_cmd = sub.add_parser(
+        "convert", help="convert a length-prefixed archive to Core frames"
+    )
     convert_cmd.add_argument("--length-prefixed", type=Path, required=True)
     convert_cmd.add_argument("--corpus-id", required=True, choices=("C150", "Cmodern"))
     convert_cmd.add_argument("--archive", type=Path, required=True)
@@ -1027,7 +1116,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.corpus_id,
             args.archive,
             args.manifest,
-            ((advertised, payload) for advertised, payload in iter_rest_blocks(freeze, args.corpus_id, args.rest_url)),
+            (
+                (advertised, payload)
+                for advertised, payload in iter_rest_blocks(
+                    freeze, args.corpus_id, args.rest_url
+                )
+            ),
         )
     elif args.command == "convert":
         with open(args.length_prefixed, "rb") as source:
@@ -1041,9 +1135,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "verify":
         scratch = _unique_scratch(args.archive)
         try:
-            with open(args.archive, "rb") as archive_fh, open(
-                args.manifest, "rb"
-            ) as manifest_fh, open(scratch, "w+b") as spool_fh:
+            with (
+                open(args.archive, "rb") as archive_fh,
+                open(args.manifest, "rb") as manifest_fh,
+                open(scratch, "w+b") as spool_fh,
+            ):
                 verify_archive(freeze, archive_fh, manifest_fh, entries=spool_fh)
         finally:
             scratch.unlink(missing_ok=True)
@@ -1056,11 +1152,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
 
 
 def _load_json(path: Path) -> dict[str, object]:
-    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicates)
+    return json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicates
+    )
 
 
 def _reject_duplicates(pairs: Iterable[tuple[str, object]]) -> dict[str, object]:
@@ -1112,7 +1212,12 @@ def _object(value: object, label: str) -> dict[str, object]:
 
 
 def _u32(value: object, label: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > 0xFFFFFFFF:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > 0xFFFFFFFF
+    ):
         raise ContractError(f"{label} must be a u32")
     return value
 
