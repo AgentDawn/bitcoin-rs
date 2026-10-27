@@ -712,8 +712,7 @@ pub(crate) fn decompressrawtransaction(
             .map_err(RpcError::from)?;
         Ok::<_, RpcError>((plan, resolver))
     })?;
-    let tx =
-        crate::compressed_tx::decompress_finalize(plan, &resolver).map_err(RpcError::from)?;
+    let tx = crate::compressed_tx::decompress_finalize(plan, &resolver).map_err(RpcError::from)?;
     ctx.chain.with_stable_chainstate(|| {
         if cancellation.is_triggered() || !resolver.view_matches_current() {
             return Err(RpcError::Misc(
@@ -3187,16 +3186,29 @@ mod finalizepsbt_tests {
         use super::{optional_max_feerate, parse_btc_amount, sats_from_btc};
 
         // 1e-8 = 1 sat accepted, 1e-9 rejected as Invalid amount
-        assert_eq!(sats_from_btc(&json!(1e-8), "Invalid amount").unwrap(), 1);
-        assert_eq!(sats_from_btc(&json!("1e-8"), "Invalid amount").unwrap(), 1);
-        assert_eq!(sats_from_btc(&json!("1E-8"), "Invalid amount").unwrap(), 1);
+        assert_eq!(
+            sats_from_btc(&json!(1e-8), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc 1e-8 must parse: {err}")),
+            1
+        );
+        assert_eq!(
+            sats_from_btc(&json!("1e-8"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc 1e-8 must parse: {err}")),
+            1
+        );
+        assert_eq!(
+            sats_from_btc(&json!("1E-8"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc 1E-8 must parse: {err}")),
+            1
+        );
         assert!(sats_from_btc(&json!(1e-9), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1e-9"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1E-9"), "Invalid amount").is_err());
 
         // Exact 8-decimal satoshi boundary
         assert_eq!(
-            sats_from_btc(&json!("0.00000001"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!("0.00000001"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc boundary must parse: {err}")),
             1
         );
         // More than 8 fractional decimals rejected when they carry value
@@ -3205,19 +3217,23 @@ mod finalizepsbt_tests {
         // Trailing zeros normalize away: these are whole satoshis, not
         // nine-decimal amounts.
         assert_eq!(
-            sats_from_btc(&json!("1.000000000"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!("1.000000000"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc trailing zeros must parse: {err}")),
             100_000_000
         );
         assert_eq!(
-            sats_from_btc(&json!("100e-10"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!("100e-10"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc 100e-10 must parse: {err}")),
             1
         );
         assert_eq!(
-            sats_from_btc(&json!("0e-100"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!("0e-100"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc 0e-100 must parse: {err}")),
             0
         );
         assert_eq!(
-            sats_from_btc(&json!("0.000000000"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!("0.000000000"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc zeros must parse: {err}")),
             0
         );
         // A decimal point needs a digit on each side (Core ParseFixedPoint).
@@ -3227,17 +3243,31 @@ mod finalizepsbt_tests {
         assert!(sats_from_btc(&json!("1.2.3"), "Invalid amount").is_err());
 
         // Zero handling
-        assert_eq!(sats_from_btc(&json!(0), "Invalid amount").unwrap(), 0);
-        assert_eq!(sats_from_btc(&json!("0"), "Invalid amount").unwrap(), 0);
-        assert_eq!(sats_from_btc(&json!("0.0"), "Invalid amount").unwrap(), 0);
         assert_eq!(
-            sats_from_btc(&json!("0e2147483647"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!(0), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc zero must parse: {err}")),
+            0
+        );
+        assert_eq!(
+            sats_from_btc(&json!("0"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc zero must parse: {err}")),
+            0
+        );
+        assert_eq!(
+            sats_from_btc(&json!("0.0"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc zero must parse: {err}")),
+            0
+        );
+        assert_eq!(
+            sats_from_btc(&json!("0e2147483647"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc zero exp must parse: {err}")),
             0
         );
 
         // Optional positive sign accepted, negative sign rejected
         assert_eq!(
-            sats_from_btc(&json!("+1.5"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!("+1.5"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc +1.5 must parse: {err}")),
             150_000_000
         );
         assert!(sats_from_btc(&json!("-1"), "Invalid amount").is_err());
@@ -3254,7 +3284,8 @@ mod finalizepsbt_tests {
 
         // Overflow safety
         assert_eq!(
-            sats_from_btc(&json!("184467440737.09551615"), "Invalid amount").unwrap(),
+            sats_from_btc(&json!("184467440737.09551615"), "Invalid amount")
+                .unwrap_or_else(|err| panic!("sats_from_btc max must parse: {err}")),
             u64::MAX
         );
         assert!(sats_from_btc(&json!("184467440737.09551616"), "Invalid amount").is_err());
@@ -3269,13 +3300,29 @@ mod finalizepsbt_tests {
         ));
 
         // parse_btc_amount routes through sats_from_btc
-        assert_eq!(parse_btc_amount(&json!("1e-8")).unwrap(), 1);
+        assert_eq!(
+            parse_btc_amount(&json!("1e-8"))
+                .unwrap_or_else(|err| panic!("parse_btc_amount 1e-8 must parse: {err}")),
+            1
+        );
         assert!(parse_btc_amount(&json!("1e-9")).is_err());
 
         // optional_max_feerate: 0 is no-cap, 1e-8 accepted, >= 1 BTC/kvB ceiling, negative rejected
-        assert_eq!(optional_max_feerate(&json!([0]), 0).unwrap(), None);
-        assert_eq!(optional_max_feerate(&json!(["0"]), 0).unwrap(), None);
-        assert_eq!(optional_max_feerate(&json!(["1e-8"]), 0).unwrap(), Some(1));
+        assert_eq!(
+            optional_max_feerate(&json!([0]), 0)
+                .unwrap_or_else(|err| panic!("optional_max_feerate zero must parse: {err}")),
+            None
+        );
+        assert_eq!(
+            optional_max_feerate(&json!(["0"]), 0)
+                .unwrap_or_else(|err| panic!("optional_max_feerate zero must parse: {err}")),
+            None
+        );
+        assert_eq!(
+            optional_max_feerate(&json!(["1e-8"]), 0)
+                .unwrap_or_else(|err| panic!("optional_max_feerate 1e-8 must parse: {err}")),
+            Some(1)
+        );
         assert!(optional_max_feerate(&json!([1.0]), 0).is_err());
         assert!(optional_max_feerate(&json!(["1.0"]), 0).is_err());
         assert!(optional_max_feerate(&json!([-0.1]), 0).is_err());

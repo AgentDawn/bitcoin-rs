@@ -2902,10 +2902,7 @@ mod admission_chain_tests {
         let burn = Tx {
             version: 2,
             inputs: vec![TxIn {
-                previous_output: OutPoint::new(
-                    Txid::from(Hash256::from_le_bytes(&[7; 32])),
-                    0,
-                ),
+                previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&[7; 32])), 0),
                 script_sig: Script::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -2921,7 +2918,7 @@ mod admission_chain_tests {
 
     #[test]
     #[expect(clippy::expect_used)]
-    fn sendrawtransaction_honors_maxburnamount_before_admission() -> anyhow::Result<()> {
+    fn sendrawtransaction_honors_maxburnamount_before_admission() {
         use sonic_rs::json;
 
         use crate::error::RpcError;
@@ -2956,7 +2953,6 @@ mod admission_chain_tests {
         )
         .expect_err("unknown prevout must still be refused");
         assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);
-        Ok(())
     }
 
     #[derive(Debug, Default)]
@@ -3050,7 +3046,6 @@ mod admission_chain_tests {
     }
 
     #[test]
-    #[expect(clippy::expect_used)]
     fn submitpackage_publishes_hashtx_only_for_newly_admitted() -> anyhow::Result<()> {
         use sonic_rs::json;
 
@@ -3116,17 +3111,13 @@ mod admission_chain_tests {
         // Re-submission finds residents: rows carry no aggregate rate, so
         // nothing publishes again.
         submitpackage(&rpc_ctx, &json!([[raws[0].clone(), raws[1].clone()]]))?;
-        assert_eq!(
-            published().len(),
-            2,
-            "resident members must not republish"
-        );
+        assert_eq!(published().len(), 2, "resident members must not republish");
         Ok(())
     }
 
     #[test]
     #[expect(clippy::expect_used)]
-    fn sendrawtransaction_rejects_unknown_extra_params() -> anyhow::Result<()> {
+    fn sendrawtransaction_rejects_unknown_extra_params() {
         use sonic_rs::json;
 
         use crate::handlers::tx;
@@ -3147,7 +3138,6 @@ mod admission_chain_tests {
             refused.to_string().contains("Unknown named parameter"),
             "unexpected refusal: {refused}"
         );
-        Ok(())
     }
 }
 

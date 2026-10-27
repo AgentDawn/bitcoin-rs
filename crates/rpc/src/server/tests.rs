@@ -631,7 +631,7 @@ fn unsupported_method_is_404_at_listener() -> std::io::Result<()> {
             false,
             core::time::Duration::from_secs(1),
             RpcSurface::Shared,
-            )
+        )
     });
 
     let mut client = TcpStream::connect(address)?;
@@ -1278,8 +1278,7 @@ fn unauthorized_json_rpc_is_answered_from_the_head_with_core_s_tuple() -> io::Re
 #[test]
 fn unauthorized_request_never_serves_pipelined_bytes() -> io::Result<()> {
     let mut request = json_rpc_head(None, 2);
-    request
-        .extend_from_slice(b"{}GET /rest/chaininfo.json HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    request.extend_from_slice(b"{}GET /rest/chaininfo.json HTTP/1.1\r\nHost: localhost\r\n\r\n");
     let seen = exchange(&request)?;
     assert_eq!(seen.response, CORE_UNAUTHORIZED);
     assert!(seen.eof);
@@ -1299,8 +1298,7 @@ fn unauthorized_request_with_buffered_body_returns_without_the_drain_hold() -> i
     let mut request = json_rpc_head(None, 1);
     request.extend_from_slice(b"X");
     client.write_all(&request)?;
-    let mut reader =
-        BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(30)));
+    let mut reader = BufReader::new(RequestDeadlineStream::new(server, Duration::from_secs(30)));
     let head = match read_request_head(&mut reader, REQUEST_HEAD_TIMEOUT) {
         Ok(Some(head)) => head,
         Ok(None) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing head")),
@@ -1317,8 +1315,7 @@ fn unauthorized_request_with_buffered_body_returns_without_the_drain_hold() -> i
         "declared byte must be prebuffered before the 401"
     );
     let started = Instant::now();
-    let handled =
-        authenticate_json_rpc_head(&Auth::basic("alice", "secret"), &mut reader, &head)?;
+    let handled = authenticate_json_rpc_head(&Auth::basic("alice", "secret"), &mut reader, &head)?;
     let elapsed = started.elapsed();
     assert!(handled, "unauthorized head must be handled");
     assert!(
@@ -1411,8 +1408,7 @@ fn head_framing_errors_keep_their_400_without_credentials() -> io::Result<()> {
     for (name, request) in [
         (
             "chunked",
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
-                .to_vec(),
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
         ),
         (
             "missing length",
@@ -1500,8 +1496,7 @@ fn accept_recovers_from_resource_and_connection_errors() -> io::Result<()> {
         ]);
         #[cfg(target_os = "linux")]
         {
-            let error =
-                io::Error::from_raw_os_error(rustix::io::Errno::OPNOTSUPP.raw_os_error());
+            let error = io::Error::from_raw_os_error(rustix::io::Errno::OPNOTSUPP.raw_os_error());
             assert_eq!(error.kind(), io::ErrorKind::Unsupported);
             errors.push(error);
         }

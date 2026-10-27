@@ -1260,11 +1260,8 @@ fn single_tx_maxfeerate_gates_on_base_fee_not_modified_fee() -> TestResult {
     let discounted = gateway();
     discounted.pool.write().limits.min_relay_fee_sat_per_kvb = 1;
     discounted.prioritise(tx.txid(), -1_900)?;
-    let preview = discounted.preview_transactions(
-        std::slice::from_ref(&tx),
-        Some(below_base),
-        &chain,
-    )?;
+    let preview =
+        discounted.preview_transactions(std::slice::from_ref(&tx), Some(below_base), &chain)?;
     assert_eq!(preview.results[0].allowed, Some(false));
     assert_eq!(
         preview.results[0].reject_reason,
@@ -1279,9 +1276,7 @@ fn single_tx_maxfeerate_gates_on_base_fee_not_modified_fee() -> TestResult {
             0,
             &chain,
         ),
-        Err(SubmitError::Policy(
-            AcceptanceRejectReason::MaxFeeExceeded
-        )),
+        Err(SubmitError::Policy(AcceptanceRejectReason::MaxFeeExceeded)),
         "a discount must not admit an over-cap base fee"
     );
     assert!(discounted.read().is_empty());
@@ -1290,11 +1285,8 @@ fn single_tx_maxfeerate_gates_on_base_fee_not_modified_fee() -> TestResult {
     let surcharged = gateway();
     surcharged.pool.write().limits.min_relay_fee_sat_per_kvb = 1;
     surcharged.prioritise(tx.txid(), 98_000)?;
-    let preview = surcharged.preview_transactions(
-        std::slice::from_ref(&tx),
-        Some(above_base),
-        &chain,
-    )?;
+    let preview =
+        surcharged.preview_transactions(std::slice::from_ref(&tx), Some(above_base), &chain)?;
     assert_eq!(preview.results[0].allowed, Some(true));
     assert_eq!(preview.results[0].reject_reason, None);
     surcharged.submit_local_transaction(

@@ -316,10 +316,7 @@ pub(crate) fn evaluate_one(
 
     let fee_rejection = match mempool_min_fee_sat_per_kvb {
         None => None,
-        Some(floor) => match (
-            modified_fee_res,
-            crate::rbf::required_fee(floor, vsize),
-        ) {
+        Some(floor) => match (modified_fee_res, crate::rbf::required_fee(floor, vsize)) {
             (Ok(fee), Ok(required)) => {
                 (fee < required).then_some(AcceptanceRejectReason::MinRelayFeeNotMet)
             }
@@ -356,7 +353,11 @@ pub(crate) fn evaluate_one(
     let effective_fee_rate = modified_fee.and_then(|fee| {
         let clamped = fee.max(0);
         (vsize != 0)
-            .then(|| clamped.checked_mul(1_000).map(|prod| prod / i128::from(vsize)))
+            .then(|| {
+                clamped
+                    .checked_mul(1_000)
+                    .map(|prod| prod / i128::from(vsize))
+            })
             .flatten()
             .and_then(|rate| u64::try_from(rate).ok())
     });
@@ -804,8 +805,8 @@ mod tests {
     }
 
     #[test]
-    fn signed_delta_clamp_prevents_maxfeerate_rejection_and_retains_effective_rate(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn signed_delta_clamp_prevents_maxfeerate_rejection_and_retains_effective_rate()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut pool = Mempool::new(crate::MempoolLimits::default());
         let tx = standard_tx(2);
         let txid = tx.txid();
@@ -833,7 +834,10 @@ mod tests {
 
         // Clamping negative modified fee to max(0) ensures:
         // 1. Never maps a negative delta to u64::MAX, so max feerate is not exceeded.
-        assert_ne!(fact.reject_reason, Some(AcceptanceRejectReason::MaxFeeExceeded));
+        assert_ne!(
+            fact.reject_reason,
+            Some(AcceptanceRejectReason::MaxFeeExceeded)
+        );
         // 2. Modified fee is tracked as signed -2000.
         assert_eq!(fact.modified_fee, Some(-2_000));
         // 3. Clamped effective fee rate produces Some(0), not None.
@@ -843,9 +847,9 @@ mod tests {
 
     #[test]
     fn three_vsize_meanings_on_sigop_heavy_tx() -> Result<(), Box<dyn std::error::Error>> {
-        use alloc::sync::Arc;
         use crate::accounting::prepared_context;
         use crate::entry::MempoolEntry;
+        use alloc::sync::Arc;
 
         let mut tx = standard_tx(2);
         // Add 50 OP_CHECKSIG opcodes in an output script (each counts as 4 sigop cost in consensus).

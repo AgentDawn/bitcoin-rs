@@ -168,9 +168,7 @@ pub(super) fn post(handler: &Handler, path: &str, body: &[u8]) -> Response {
                         mutation
                             .changes
                             .iter()
-                            .filter(|change| {
-                                change.outcome == MutationOutcome::Accepted
-                            })
+                            .filter(|change| change.outcome == MutationOutcome::Accepted)
                             .map(|change| Txid::from(change.txid)),
                     );
                     text_response("text/plain", txid.to_string().into_bytes())
