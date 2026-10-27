@@ -611,7 +611,9 @@ impl TorController {
         // re-registered after a restart. A reused persisted key
         // legitimately carries no blob.
         if key_blob.is_none() && private_key.is_none() {
-            return Err(invalid("tor ADD_ONION with NEW key returned no private key"));
+            return Err(invalid(
+                "tor ADD_ONION with NEW key returned no private key",
+            ));
         }
         if let Some(pk) = &private_key {
             if !valid_key_blob(pk) {
@@ -1020,9 +1022,12 @@ mod tests {
         };
         let target = TorControlTarget::Tcp(format!("127.0.0.1:{port}").parse()?);
         let start = Instant::now();
-        let Err(error) =
-            TorController::connect_with_budget(&target, None, Duration::from_millis(500), Duration::from_secs(5))
-        else {
+        let Err(error) = TorController::connect_with_budget(
+            &target,
+            None,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+        ) else {
             return Err("refused control port must fail".into());
         };
         assert!(

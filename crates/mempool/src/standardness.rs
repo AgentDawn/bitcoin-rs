@@ -786,5 +786,4 @@ mod tests {
             Err(StandardnessError::NonStandardOutput)
         );
     }
-
 }

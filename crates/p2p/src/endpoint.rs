@@ -751,10 +751,7 @@ mod tests {
             })
         );
         // Every other network with port 0 is still rejected.
-        for addr in [
-            AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
-            AddrV2::TorV3([3u8; 32]),
-        ] {
+        for addr in [AddrV2::Ipv4(Ipv4Addr::LOCALHOST), AddrV2::TorV3([3u8; 32])] {
             assert_eq!(
                 endpoint_from_addrv2(&AddrV2Message {
                     time: 1,

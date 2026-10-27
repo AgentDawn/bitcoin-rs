@@ -1681,10 +1681,6 @@ pub(super) fn confirmations(ctx: &Context, view: &AppliedView, hash: Hash256, he
     crate::render::confirmations(view.height(), height, on_active)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Keep the header/one/full verbosity envelopes together; splitting would scatter Core-parity fields"
-)]
 fn block_verbose_typed(
     ctx: &Context,
     record: &BlockRecord,
@@ -6193,5 +6189,4 @@ mod scantxoutset_tests {
             .unwrap_or_else(|err| panic!("scantxoutset abort failed: {err}"));
         assert_eq!(result.as_bool(), Some(false));
     }
-
 }

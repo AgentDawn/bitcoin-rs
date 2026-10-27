@@ -2990,7 +2990,9 @@ fn notfound_from_owner_replans_the_body_to_the_alternate_once_with_one_request_p
     );
     assert!(fixture.sync.owns_body_fetch(alternate_source, x1));
     assert!(
-        fixture.peers.is_connected(bitcoin_rs_primitives::PeerEndpoint::Ip(fixture.owner)),
+        fixture
+            .peers
+            .is_connected(bitcoin_rs_primitives::PeerEndpoint::Ip(fixture.owner)),
         "a peer that lacks a body is not punished"
     );
 
@@ -3189,7 +3191,9 @@ fn notfound_only_peer_is_retried_after_the_interval_and_not_starved_or_polled() 
         "no wake-up-paced getdata/notfound loop against the only peer"
     );
     assert!(
-        fixture.peers.is_connected(bitcoin_rs_primitives::PeerEndpoint::Ip(fixture.owner)),
+        fixture
+            .peers
+            .is_connected(bitcoin_rs_primitives::PeerEndpoint::Ip(fixture.owner)),
         "a peer that lacks a body is not disconnected"
     );
 

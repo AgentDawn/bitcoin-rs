@@ -2757,7 +2757,11 @@ mod tests {
         // the SESSION STATUS reply (which carries private material).
         assert_eq!(session.destination(), dest_b64());
         let mut stream = session
-            .connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
+            .connect(
+                destination_hash(&dest_bytes()),
+                8333,
+                Duration::from_secs(5),
+            )
             .map_err(crate::endpoint::DialFailure::into_io)?;
         stream.write_all(b"x")?;
         let mut byte = [0u8; 1];
@@ -3276,9 +3280,11 @@ mod tests {
             ];
             let mut fake = fake_sam(script)?;
             let session = SamSession::establish(fake.addr, &priv_b64(), Duration::from_secs(5))?;
-            let Err(error) =
-                session.connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
-            else {
+            let Err(error) = session.connect(
+                destination_hash(&dest_bytes()),
+                8333,
+                Duration::from_secs(5),
+            ) else {
                 panic!("peer unreachable must fail the dial");
             };
             assert!(
@@ -3448,9 +3454,11 @@ mod tests {
         ];
         let mut fake = fake_sam(script)?;
         let session = SamSession::establish(fake.addr, &priv_b64(), Duration::from_secs(5))?;
-        let Err(error) =
-            session.connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
-        else {
+        let Err(error) = session.connect(
+            destination_hash(&dest_bytes()),
+            8333,
+            Duration::from_secs(5),
+        ) else {
             panic!("connect must fail");
         };
         let error_str = error.to_string();
@@ -3683,7 +3691,11 @@ mod tests {
 
         // Calling connect or accept automatically recovers the root session
         let mut stream = session
-            .connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
+            .connect(
+                destination_hash(&dest_bytes()),
+                8333,
+                Duration::from_secs(5),
+            )
             .map_err(crate::endpoint::DialFailure::into_io)?;
         stream.write_all(b"x")?;
         assert_eq!(session.destination(), dest);
@@ -3711,7 +3723,11 @@ mod tests {
 
         for _ in 0..2 {
             let mut stream = session
-                .connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
+                .connect(
+                    destination_hash(&dest_bytes()),
+                    8333,
+                    Duration::from_secs(5),
+                )
                 .map_err(crate::endpoint::DialFailure::into_io)?;
             stream.write_all(b"x")?;
             let mut byte = [0u8; 1];
@@ -3752,9 +3768,11 @@ mod tests {
         let session = SamSession::establish(fake.addr, &priv_b64(), Duration::from_secs(5))?;
         session.close();
 
-        let Err(error) =
-            session.connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
-        else {
+        let Err(error) = session.connect(
+            destination_hash(&dest_bytes()),
+            8333,
+            Duration::from_secs(5),
+        ) else {
             panic!("a closed session must never dial");
         };
         assert!(matches!(&error, crate::endpoint::DialFailure::Transport(_)));
@@ -5283,9 +5301,11 @@ mod tests {
         )?;
         let session = SamSession::establish(fake.addr, &priv_b64(), Duration::from_millis(200))?;
         let started = Instant::now();
-        let Err(error) =
-            session.connect(destination_hash(&dest_bytes()), 8333, Duration::from_millis(200))
-        else {
+        let Err(error) = session.connect(
+            destination_hash(&dest_bytes()),
+            8333,
+            Duration::from_millis(200),
+        ) else {
             panic!("a stalled STREAM CONNECT must fail inside the deadline");
         };
         let elapsed = started.elapsed();
@@ -5329,7 +5349,11 @@ mod tests {
         let session = SamSession::establish(fake.addr, &priv_b64(), Duration::from_millis(200))?;
         let started = Instant::now();
         let stream = session
-            .connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
+            .connect(
+                destination_hash(&dest_bytes()),
+                8333,
+                Duration::from_secs(5),
+            )
             .map_err(|error| format!("caller budget must extend the dial: {error:?}"))?;
         let elapsed = started.elapsed();
         assert!(
@@ -5428,9 +5452,11 @@ mod tests {
             },
         )?;
         let session = SamSession::establish(fake.addr, &priv_b64(), Duration::from_secs(5))?;
-        let Err(error) =
-            session.connect(destination_hash(&dest_bytes()), 8333, Duration::from_secs(5))
-        else {
+        let Err(error) = session.connect(
+            destination_hash(&dest_bytes()),
+            8333,
+            Duration::from_secs(5),
+        ) else {
             panic!("an unterminated STREAM STATUS must fail the dial");
         };
         assert!(

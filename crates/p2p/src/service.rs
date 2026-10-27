@@ -4832,7 +4832,9 @@ mod tests {
                     // real key); without it the controller rejects the
                     // registration.
                     let blob = "A".repeat(86) + "==";
-                    format!("250-ServiceID={service_id}\r\n250-PrivateKey=ED25519-V3:{blob}\r\n250 OK\r\n")
+                    format!(
+                        "250-ServiceID={service_id}\r\n250-PrivateKey=ED25519-V3:{blob}\r\n250 OK\r\n"
+                    )
                 } else {
                     "250 OK\r\n".to_owned()
                 };
