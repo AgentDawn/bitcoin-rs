@@ -1218,3 +1218,92 @@ fn native_package_commit_survives_its_stale_resident_expiring() -> TestResult {
     );
     Ok(())
 }
+
+/// Single-transaction `maxfeerate` gates on the actual base fee, never the
+/// modified fee: a policy discount must not smuggle an over-cap fee in,
+/// and a surcharge must not refuse an under-cap fee.
+#[test]
+fn single_tx_maxfeerate_gates_on_base_fee_not_modified_fee() -> TestResult {
+    use crate::standardness::AcceptanceRejectReason;
+    // Gauge the fixture shape once: one anyone-can-spend input and output.
+    let gauge = gateway();
+    gauge.pool.write().limits.min_relay_fee_sat_per_kvb = 1;
+    let tx = spend(&[coin(840)], &[98_000], true);
+    // The spent output is a witness program so the native single path
+    // verifies the pushed witness instead of refusing a bare key.
+    let chain = Coins(vec![(coin(840), output(100_000))]);
+    gauge.submit_local_transaction(
+        Arc::new(tx.clone()),
+        crate::LocalOrigin::Rpc,
+        None,
+        0,
+        &chain,
+    )?;
+    let vsize = gauge
+        .read()
+        .entry_by_txid(&tx.txid())
+        .ok_or("fixture missing")?
+        .vsize;
+    let base_rate = 2_000_000 / u64::from(vsize);
+    // Wide margins around both rates so integer rounding cannot matter:
+    // the discount drops the modified fee to 100 sats, the surcharge lifts
+    // it to 100_000 sats, while the base fee stays 2_000 sats.
+    let below_base = base_rate / 2;
+    let above_base = base_rate * 2 + 1_000;
+    // Real margins, immune to integer-division equality: the discounted fee
+    // (100 sats) sits below the cap's required fee, the surcharge-implied
+    // fee (100_000 sats) sits above the higher cap's.
+    assert!(crate::rbf::required_fee(below_base, vsize).is_ok_and(|limit| limit > 100));
+    assert!(above_base < 100_000_000 / u64::from(vsize));
+
+    // Discount: modified rate is under the cap, base rate is over it.
+    let discounted = gateway();
+    discounted.pool.write().limits.min_relay_fee_sat_per_kvb = 1;
+    discounted.prioritise(tx.txid(), -1_900)?;
+    let preview = discounted.preview_transactions(
+        std::slice::from_ref(&tx),
+        Some(below_base),
+        &chain,
+    )?;
+    assert_eq!(preview.results[0].allowed, Some(false));
+    assert_eq!(
+        preview.results[0].reject_reason,
+        Some(AcceptanceRejectReason::MaxFeeExceeded),
+        "preview must agree with submit on the base-fee cap"
+    );
+    assert_eq!(
+        discounted.submit_local_transaction(
+            Arc::new(tx.clone()),
+            crate::LocalOrigin::Rpc,
+            Some(below_base),
+            0,
+            &chain,
+        ),
+        Err(SubmitError::Policy(
+            AcceptanceRejectReason::MaxFeeExceeded
+        )),
+        "a discount must not admit an over-cap base fee"
+    );
+    assert!(discounted.read().is_empty());
+
+    // Surcharge: modified rate is over the cap, base rate is under it.
+    let surcharged = gateway();
+    surcharged.pool.write().limits.min_relay_fee_sat_per_kvb = 1;
+    surcharged.prioritise(tx.txid(), 98_000)?;
+    let preview = surcharged.preview_transactions(
+        std::slice::from_ref(&tx),
+        Some(above_base),
+        &chain,
+    )?;
+    assert_eq!(preview.results[0].allowed, Some(true));
+    assert_eq!(preview.results[0].reject_reason, None);
+    surcharged.submit_local_transaction(
+        Arc::new(tx),
+        crate::LocalOrigin::Rpc,
+        Some(above_base),
+        0,
+        &chain,
+    )?;
+    assert_eq!(surcharged.read().len(), 1);
+    Ok(())
+}

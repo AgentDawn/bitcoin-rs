@@ -263,6 +263,22 @@ impl ZmqPublisher for NoOpZmqPublisher {
     fn publish_rawtx(&self, _bytes: &[u8]) {}
 }
 
+/// Publish one `hashtx` notification per newly admitted transaction id.
+///
+/// Callers pass only newly admitted transactions. Rejected submissions,
+/// already-known (duplicate) admissions, and removals must never reach
+/// this helper: single-transaction admission filters committed mutations
+/// to `Accepted` changes, and package admission publishes only `Accepted`
+/// rows that report an aggregate rate (residents carry none).
+pub fn publish_admitted_hashtx(
+    publisher: &dyn ZmqPublisher,
+    txids: impl IntoIterator<Item = Txid>,
+) {
+    for txid in txids {
+        publisher.publish_hashtx(txid);
+    }
+}
+
 #[cfg(feature = "zmq")]
 struct EndpointSocket {
     endpoint: String,

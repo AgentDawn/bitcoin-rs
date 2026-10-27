@@ -245,9 +245,10 @@ fn lookup_failure(error: LookupError, missing: CodecError) -> CodecError {
 // Integer primitives
 // ---------------------------------------------------------------------
 
-/// Encodes the carry-aware Core VARINT (chainstate form). At most five
-/// bytes: larger values are [`CodecError::Overflow`], never a longer
-/// spelling.
+/// Encodes the carry-aware Core VARINT (chainstate form). At most ten
+/// bytes, so every `u64` amount has a spelling; larger spellings are
+/// impossible on this domain. `u32`-range values keep their short (at most
+/// five-byte) spelling, which the capped readers below rely on.
 fn write_varint(value: u64, out: &mut Vec<u8>) -> Result<(), CodecError> {
     let mut tmp = [0_u8; 10];
     let mut len = 0_usize;
@@ -261,7 +262,7 @@ fn write_varint(value: u64, out: &mut Vec<u8>) -> Result<(), CodecError> {
         }
         current = (current >> 7) - 1;
     }
-    if len > 5 {
+    if len > 10 {
         return Err(CodecError::Overflow);
     }
     for index in (0..len).rev() {
@@ -352,13 +353,22 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    /// Reads the carry-aware Core VARINT. More than five bytes is
-    /// [`CodecError::Overflow`]; the encoding is a bijection, so the
-    /// re-encode comparison is the non-minimal-form rejection.
+    /// Reads the carry-aware Core VARINT, up to ten bytes so every `u64`
+    /// amount decodes. The encoding is a bijection, so the re-encode
+    /// comparison is the non-minimal-form rejection; overlong spellings of
+    /// small values stay [`CodecError::NonCanonical`].
     fn read_varint(&mut self) -> Result<u64, CodecError> {
+        self.read_varint_capped(10)
+    }
+
+    /// Reads the carry-aware Core VARINT with at most `max_bytes` bytes.
+    /// `u32`-capped fields (counts, heights, offsets, sequence deltas) use
+    /// five: their canonical spellings never exceed it, so anything longer
+    /// is [`CodecError::Overflow`] even before the range check.
+    fn read_varint_capped(&mut self, max_bytes: usize) -> Result<u64, CodecError> {
         let start = self.pos;
         let mut value = 0_u64;
-        for _ in 0..5 {
+        for _ in 0..max_bytes {
             let byte = self.read_u8()?;
             value = value
                 .checked_mul(128)
@@ -378,14 +388,16 @@ impl<'a> Reader<'a> {
     }
 
     fn read_vlp(&mut self) -> Result<&'a [u8], CodecError> {
-        let len = self.read_varint()?;
+        // Length prefixes stay five-byte capped: script and witness items
+        // are bounded by [`MAX_COMPRESSED_TX_BYTES`] well below it.
+        let len = self.read_varint_capped(5)?;
         let len = usize::try_from(len).map_err(|_| CodecError::Overflow)?;
         self.take(len)
     }
 }
 
 fn read_u32_varint(reader: &mut Reader<'_>) -> Result<u32, CodecError> {
-    u32::try_from(reader.read_varint()?).map_err(|_| CodecError::Overflow)
+    u32::try_from(reader.read_varint_capped(5)?).map_err(|_| CodecError::Overflow)
 }
 
 fn read_u32_compact_size(reader: &mut Reader<'_>) -> Result<u32, CodecError> {
@@ -739,10 +751,23 @@ fn compressed_signature(input: &TxIn, kind: &PrevoutKind) -> Option<CompressedSi
                 _ => None,
             }
         }
-        PrevoutKind::P2pkh(_) => {
+        PrevoutKind::P2pkh(expected) => {
             let (sig_item, pos) = read_push(input.script_sig.as_bytes(), 0)?;
-            let (_pubkey, end) = read_push(input.script_sig.as_bytes(), pos)?;
+            let (pubkey, end) = read_push(input.script_sig.as_bytes(), pos)?;
             if end != input.script_sig.len() {
+                return None;
+            }
+            // Decompression rebuilds the scriptSig from a recovered key, so
+            // only an exactly round-tripping pubkey may compress: the
+            // 33-byte compressed form or the 65-byte `0x04` uncompressed
+            // form hashing to the prevout commitment. Hybrid keys, misc
+            // pushes, and foreign keys fall back to the uncompressed
+            // envelope rather than changing the signer on rebuild.
+            let compressed = pubkey.len() == 33;
+            if !compressed && (pubkey.len() != 65 || pubkey.first() != Some(&0x04)) {
+                return None;
+            }
+            if hash160_20(pubkey) != *expected {
                 return None;
             }
             ecdsa_compressed(sig_item)
@@ -1188,20 +1213,31 @@ fn recover_pubkey(request: &Recovery<'_>) -> Result<Vec<u8>, CodecError> {
     Err(CodecError::SignatureUnrecoverable)
 }
 
-/// Decompresses one compressed transaction. Unavailable context is a
-/// refusal, never a fabricated prevout.
+/// The parsed, context-resolved skeleton of one compressed transaction:
+/// everything [`decompress_prepare`] reads while the stable chainstate
+/// excludes transitions. No public-key recovery has run yet, so holding a
+/// plan needs no lock; [`decompress_finalize`] finishes it lock-free.
+pub(crate) struct DecompressPlan {
+    tx: Tx,
+    inputs: Vec<InputParts>,
+}
+
+/// Parses one compressed transaction and resolves every input that needs
+/// context. Unavailable context is a refusal, never a fabricated prevout.
+/// Callers hold the stable chainstate across this call only; recovery runs
+/// in [`decompress_finalize`] without the lock.
 ///
 /// # Errors
 /// Returns [`CodecError`] for malformed encodings, unavailable context,
-/// unrecoverable signatures, budget exhaustion, and cancellation.
+/// budget exhaustion, and cancellation.
 #[allow(
     clippy::too_many_lines,
     reason = "one sequential decoding pass over the transaction fields"
 )]
-pub(crate) fn decompress_transaction(
+pub(crate) fn decompress_prepare(
     bytes: &[u8],
     resolver: &mut dyn PrevoutResolver,
-) -> Result<Tx, CodecError> {
+) -> Result<DecompressPlan, CodecError> {
     if bytes.len() > MAX_COMPRESSED_TX_BYTES {
         return Err(CodecError::Overflow);
     }
@@ -1311,7 +1347,8 @@ pub(crate) fn decompress_transaction(
             }
         } else {
             let script_sig = reader.read_vlp()?.to_vec();
-            let witness_count = reader.read_varint()?;
+            // Item counts stay five-byte capped like every other `u32` field.
+            let witness_count = reader.read_varint_capped(5)?;
             let witness_count = usize::try_from(witness_count).map_err(|_| CodecError::Overflow)?;
             if witness_count > reader.remaining() {
                 return Err(CodecError::Truncated);
@@ -1380,7 +1417,7 @@ pub(crate) fn decompress_transaction(
     // Assemble the skeleton first: sighashes commit to outpoints,
     // sequences, outputs, and locktime, but never to the scriptSig or
     // witness being reconstructed, so placeholders are safe.
-    let mut tx = Tx {
+    let tx = Tx {
         version,
         inputs: inputs
             .iter()
@@ -1394,10 +1431,29 @@ pub(crate) fn decompress_transaction(
         outputs,
         lock_time: LockTime::from_consensus(locktime),
     };
+    Ok(DecompressPlan { tx, inputs })
+}
+
+/// Reconstructs every compressed authorization against the plan's resolved
+/// prevouts. Runs without the stable chainstate: recovery only reads the
+/// immutable skeleton and resolved data, never the chain. Cancellation is
+/// polled per input like the parse pass; input count stays bounded by
+/// [`MAX_COMPRESSED_INPUTS`] on both passes.
+///
+/// # Errors
+/// Returns [`CodecError`] for unrecoverable signatures and cancellation.
+pub(crate) fn decompress_finalize(
+    plan: DecompressPlan,
+    resolver: &dyn PrevoutResolver,
+) -> Result<Tx, CodecError> {
+    let DecompressPlan { mut tx, inputs } = plan;
     // Reconstruction reads the immutable skeleton (sighash inputs), so
     // compute every authorization first and apply them afterwards.
     let mut fills: Vec<(Script, Witness)> = Vec::with_capacity(inputs.len());
     for (index, part) in inputs.iter().enumerate() {
+        if index % CANCELLATION_POLL_INPUTS == 0 && resolver.cancelled() {
+            return Err(CodecError::Cancelled);
+        }
         let fill = match &part.signature {
             SigParts::Uncompressed {
                 script_sig,
@@ -1490,6 +1546,25 @@ pub(crate) fn decompress_transaction(
         return Err(CodecError::Overflow);
     }
     Ok(tx)
+}
+
+/// Decompresses one compressed transaction. Unavailable context is a
+/// refusal, never a fabricated prevout.
+///
+/// Test-only convenience: parses, resolves, and recovers in one step.
+/// Handlers that must not block chain transitions split the work across
+/// [`decompress_prepare`] and [`decompress_finalize`] instead.
+///
+/// # Errors
+/// Returns [`CodecError`] for malformed encodings, unavailable context,
+/// unrecoverable signatures, budget exhaustion, and cancellation.
+#[cfg(test)]
+pub(crate) fn decompress_transaction(
+    bytes: &[u8],
+    resolver: &mut dyn PrevoutResolver,
+) -> Result<Tx, CodecError> {
+    let plan = decompress_prepare(bytes, resolver)?;
+    decompress_finalize(plan, resolver)
 }
 
 #[cfg(test)]

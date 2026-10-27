@@ -2895,6 +2895,260 @@ mod admission_chain_tests {
         );
         Ok(())
     }
+
+    fn burn_raw() -> String {
+        // Consensus-valid but unspendable: a 1_000-sat OP_RETURN output.
+        // Inputs never resolve; the burn guard runs before admission.
+        let burn = Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(
+                    Txid::from(Hash256::from_le_bytes(&[7; 32])),
+                    0,
+                ),
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: Script::from_bytes(vec![0x6a, 0x01, 0x51]),
+            }],
+            lock_time: LockTime::ZERO,
+        };
+        consensus_bytes(&burn).to_lower_hex_string()
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn sendrawtransaction_honors_maxburnamount_before_admission() -> anyhow::Result<()> {
+        use sonic_rs::json;
+
+        use crate::error::RpcError;
+        use crate::handlers::tx;
+
+        let rpc_ctx = Arc::new(Context::new());
+        let raw = &burn_raw();
+        // Default cap 0: the burn guard fires before admission is attempted,
+        // so even an unfunded burn is refused at the guard, not the pool.
+        let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw]))
+            .expect_err("burn above the default cap must be refused");
+        assert!(
+            refused.to_string().contains("maxburnamount"),
+            "unexpected refusal: {refused}"
+        );
+        // A cap covering the burn output passes the guard; admission then
+        // refuses the unknown prevout instead.
+        let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw, null, "0.00001"]))
+            .expect_err("unknown prevout must still be refused");
+        assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);
+        // An explicit cap below the burn still refuses at the guard.
+        let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw, null, "0.00000999"]))
+            .expect_err("burn above the explicit cap must be refused");
+        assert!(
+            refused.to_string().contains("maxburnamount"),
+            "unexpected refusal: {refused}"
+        );
+        // The named form carries the same cap.
+        let refused = tx::sendrawtransaction(
+            &rpc_ctx,
+            &json!({"hexstring": raw, "maxburnamount": "0.00001"}),
+        )
+        .expect_err("unknown prevout must still be refused");
+        assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingPublisher {
+        hashtx: std::sync::Mutex<Vec<Txid>>,
+    }
+
+    impl crate::zmq::ZmqPublisher for RecordingPublisher {
+        fn publish_hashblock(&self, _hash: Hash256) {}
+
+        fn publish_hashtx(&self, txid: Txid) {
+            if let Ok(mut seen) = self.hashtx.lock() {
+                seen.push(txid);
+            }
+        }
+
+        fn publish_rawblock(&self, _bytes: &[u8]) {}
+
+        fn publish_rawtx(&self, _bytes: &[u8]) {}
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn sendrawtransaction_publishes_hashtx_once_per_admission() -> anyhow::Result<()> {
+        use sonic_rs::json;
+
+        use crate::handlers::tx;
+
+        let outpoint = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[31; 32])), 0);
+        let spend = spending(outpoint);
+        let raw = &consensus_bytes(&spend).to_lower_hex_string();
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            outpoint,
+            TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: Script::from_bytes(spendable_script()),
+            },
+            false,
+            0,
+        ));
+
+        let recording = Arc::new(RecordingPublisher::default());
+        let publisher: Arc<dyn crate::zmq::ZmqPublisher> = recording.clone();
+        let mut fresh_ctx = Context::new();
+        fresh_ctx.zmq_publisher = publisher;
+        let rpc_ctx = Arc::new(fresh_ctx);
+        let published = || {
+            recording
+                .hashtx
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default()
+        };
+        bitcoin_rs_utxo::contract::commit_block_changes(
+            &rpc_ctx.chain.utxo.fixture_set(),
+            &changes,
+            &Hash256::default(),
+        )?;
+
+        // Accepted: one `hashtx` for the admitted txid.
+        tx::sendrawtransaction(&rpc_ctx, &json!([raw]))?;
+        assert_eq!(
+            published(),
+            vec![spend.txid()],
+            "admission must publish exactly one hashtx"
+        );
+
+        // Duplicate: already known, so the second call publishes nothing.
+        tx::sendrawtransaction(&rpc_ctx, &json!([raw]))?;
+        assert_eq!(
+            published().len(),
+            1,
+            "a duplicate admission must not republish"
+        );
+
+        // Rejected: an unknown prevout publishes nothing.
+        let orphan = spending(OutPoint::new(
+            Txid::from(Hash256::from_le_bytes(&[32; 32])),
+            0,
+        ));
+        let orphan_raw = consensus_bytes(&orphan).to_lower_hex_string();
+        tx::sendrawtransaction(&rpc_ctx, &json!([orphan_raw]))
+            .expect_err("an unknown prevout must be refused");
+        assert_eq!(
+            published().len(),
+            1,
+            "a rejected submission must not publish"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn submitpackage_publishes_hashtx_only_for_newly_admitted() -> anyhow::Result<()> {
+        use sonic_rs::json;
+
+        use crate::handlers::tx::submit_package::submitpackage;
+
+        let coin = OutPoint::new(Txid::from(Hash256::from_le_bytes(&[41; 32])), 0);
+        let parent = spending(coin);
+        let child = Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(parent.txid(), 0),
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_stack(vec![vec![0x51]]),
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(7_000),
+                script_pubkey: Script::from_bytes(spendable_script()),
+            }],
+            lock_time: LockTime::ZERO,
+        };
+        let raws = [
+            consensus_bytes(&parent).to_lower_hex_string(),
+            consensus_bytes(&child).to_lower_hex_string(),
+        ];
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            coin,
+            TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: Script::from_bytes(spendable_script()),
+            },
+            false,
+            0,
+        ));
+
+        let recording = Arc::new(RecordingPublisher::default());
+        let publisher: Arc<dyn crate::zmq::ZmqPublisher> = recording.clone();
+        let mut fresh_ctx = Context::new();
+        fresh_ctx.zmq_publisher = publisher;
+        let rpc_ctx = Arc::new(fresh_ctx);
+        let published = || {
+            recording
+                .hashtx
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default()
+        };
+        bitcoin_rs_utxo::contract::commit_block_changes(
+            &rpc_ctx.chain.utxo.fixture_set(),
+            &changes,
+            &Hash256::default(),
+        )?;
+
+        // Both members are newly admitted: one `hashtx` each, in order.
+        submitpackage(&rpc_ctx, &json!([[raws[0].clone(), raws[1].clone()]]))?;
+        assert_eq!(
+            published(),
+            vec![parent.txid(), child.txid()],
+            "each newly admitted member must publish hashtx"
+        );
+
+        // Re-submission finds residents: rows carry no aggregate rate, so
+        // nothing publishes again.
+        submitpackage(&rpc_ctx, &json!([[raws[0].clone(), raws[1].clone()]]))?;
+        assert_eq!(
+            published().len(),
+            2,
+            "resident members must not republish"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn sendrawtransaction_rejects_unknown_extra_params() -> anyhow::Result<()> {
+        use sonic_rs::json;
+
+        use crate::handlers::tx;
+
+        let rpc_ctx = Arc::new(Context::new());
+        let raw = &burn_raw();
+        // A fourth positional parameter is rejected before decoding.
+        let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw, null, null, "extra"]))
+            .expect_err("a fourth parameter must be refused");
+        assert!(
+            refused.to_string().contains("too many parameters"),
+            "unexpected refusal: {refused}"
+        );
+        // An unknown named parameter is rejected before decoding.
+        let refused = tx::sendrawtransaction(&rpc_ctx, &json!({"hexstring": raw, "bogus": 1}))
+            .expect_err("an unknown named parameter must be refused");
+        assert!(
+            refused.to_string().contains("Unknown named parameter"),
+            "unexpected refusal: {refused}"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

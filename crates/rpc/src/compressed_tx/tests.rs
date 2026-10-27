@@ -140,18 +140,45 @@ fn varint_uses_core_carry_form() {
     assert_eq!(encoded, [0xa6, 0x08]);
     let mut reader = super::Reader::new(&encoded);
     assert_eq!(super::Reader::read_varint(&mut reader).unwrap(), 5000);
-    for value in [0_u64, 1, 127, 128, 16_511, 4_294_967_293] {
+    for value in [
+        0_u64,
+        1,
+        127,
+        128,
+        16_511,
+        4_294_967_293,
+        1_u64 << 40,
+        2_100_000_000_000_000,
+        u64::MAX,
+    ] {
         let mut encoded = Vec::new();
         write_varint(value, &mut encoded).unwrap();
         let mut reader = super::Reader::new(&encoded);
         assert_eq!(reader.read_varint().unwrap(), value);
     }
-    // Six bytes is past the five-byte ceiling.
+    // Ten bytes carry every `u64`: the largest amount keeps a spelling.
     let mut encoded = Vec::new();
+    write_varint(u64::MAX, &mut encoded).unwrap();
+    assert_eq!(encoded.len(), 10);
+    let mut reader = super::Reader::new(&encoded);
+    assert_eq!(reader.read_varint().unwrap(), u64::MAX);
+    // Six bytes carry past `u32`: still a valid `u64` spelling.
+    let mut encoded = Vec::new();
+    write_varint(1_u64 << 40, &mut encoded).unwrap();
+    assert_eq!(encoded.len(), 6);
+    let mut reader = super::Reader::new(&encoded);
+    assert_eq!(reader.read_varint().unwrap(), 1_u64 << 40);
+    // `u32` fields keep their five-byte ceiling: a six-byte spelling is
+    // out of range even when the value would fit.
+    let mut reader = super::Reader::new(&encoded);
     assert_eq!(
-        write_varint(1_u64 << 40, &mut encoded),
+        super::read_u32_varint(&mut reader),
         Err(CodecError::Overflow)
     );
+    // Eleven continuation bytes never terminate within the ten-byte cap.
+    let unterminated = [0x80; 11];
+    let mut reader = super::Reader::new(&unterminated);
+    assert_eq!(reader.read_varint(), Err(CodecError::Overflow));
 }
 
 #[test]
@@ -325,6 +352,10 @@ impl Signer {
         self.public.serialize().to_vec()
     }
 
+    fn uncompressed_pubkey(&self) -> Vec<u8> {
+        self.public.serialize_uncompressed().to_vec()
+    }
+
     fn pubkey_hash(&self) -> [u8; 20] {
         super::hash160_20(&self.compressed_pubkey())
     }
@@ -433,6 +464,115 @@ fn roundtrip_legacy_p2pkh() {
     let mut resolver = MapResolver::default();
     resolver.register_tx(100, &prev_tx, 3);
     roundtrip(&tx, &mut resolver, true);
+}
+
+#[test]
+fn roundtrip_legacy_p2pkh_uncompressed_key() {
+    // The 65-byte `0x04` form round-trips through recovery exactly.
+    let signer = Signer::new(7);
+    let uncompressed = signer.uncompressed_pubkey();
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2pkh_script(super::hash160_20(&uncompressed)),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let mut tx = spend_of(&prev_tx, Script::new(), Witness::new());
+    let digest = SighashCache::new(&tx)
+        .legacy_signature_hash(0, prevout.script_pubkey.as_bytes(), 1)
+        .unwrap();
+    let sig_item = signer.ecdsa_item(digest, false);
+    let mut script_sig = super::push_data(&sig_item);
+    script_sig.extend_from_slice(&super::push_data(&uncompressed));
+    tx.inputs[0].script_sig = Script::from_bytes(script_sig);
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 3);
+    roundtrip(&tx, &mut resolver, true);
+}
+
+#[test]
+fn hybrid_p2pkh_key_falls_back_to_uncompressed_envelope() {
+    // A hybrid (non-round-tripping) pubkey must not compress: recovery
+    // could never reproduce it, so the input keeps its exact bytes.
+    let signer = Signer::new(7);
+    let mut hybrid = signer.uncompressed_pubkey();
+    hybrid[0] = 0x06;
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2pkh_script(super::hash160_20(&hybrid)),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let mut tx = spend_of(&prev_tx, Script::new(), Witness::new());
+    let digest = SighashCache::new(&tx)
+        .legacy_signature_hash(0, prevout.script_pubkey.as_bytes(), 1)
+        .unwrap();
+    let sig_item = signer.ecdsa_item(digest, false);
+    let mut script_sig = super::push_data(&sig_item);
+    script_sig.extend_from_slice(&super::push_data(&hybrid));
+    tx.inputs[0].script_sig = Script::from_bytes(script_sig);
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 3);
+    roundtrip(&tx, &mut resolver, true);
+}
+
+#[test]
+fn foreign_p2pkh_key_falls_back_instead_of_changing_signer() {
+    // A valid key that does not hash to the prevout commitment must not
+    // compress: rebuilding from recovery would silently swap the signer.
+    let signer = Signer::new(7);
+    let stranger = Signer::new(19);
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2pkh_script(signer.pubkey_hash()),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let mut tx = spend_of(&prev_tx, Script::new(), Witness::new());
+    let digest = SighashCache::new(&tx)
+        .legacy_signature_hash(0, prevout.script_pubkey.as_bytes(), 1)
+        .unwrap();
+    let sig_item = signer.ecdsa_item(digest, false);
+    let mut script_sig = super::push_data(&sig_item);
+    script_sig.extend_from_slice(&super::push_data(&stranger.compressed_pubkey()));
+    tx.inputs[0].script_sig = Script::from_bytes(script_sig);
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 3);
+    roundtrip(&tx, &mut resolver, true);
+}
+
+#[test]
+fn decompress_prepare_finalize_matches_single_pass() {
+    // The handler recovers outside the stable chainstate lock; the split
+    // entry points must agree with the single-pass wrapper exactly.
+    let signer = Signer::new(23);
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2pkh_script(signer.pubkey_hash()),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let mut tx = spend_of(&prev_tx, Script::new(), Witness::new());
+    let digest = SighashCache::new(&tx)
+        .legacy_signature_hash(0, prevout.script_pubkey.as_bytes(), 1)
+        .unwrap();
+    let sig_item = signer.ecdsa_item(digest, false);
+    let mut script_sig = super::push_data(&sig_item);
+    script_sig.extend_from_slice(&super::push_data(&signer.compressed_pubkey()));
+    tx.inputs[0].script_sig = Script::from_bytes(script_sig);
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 3);
+    let (compressed, _) = compress_transaction(
+        &tx,
+        &mut resolver,
+        CompressOptions {
+            compress_outpoints: true,
+        },
+    )
+    .unwrap();
+    let plan = super::decompress_prepare(&compressed, &mut resolver).unwrap();
+    let restored = super::decompress_finalize(plan, &resolver).unwrap();
+    assert_eq!(&restored, &tx);
+    assert_eq!(
+        &super::decompress_transaction(&compressed, &mut resolver).unwrap(),
+        &tx
+    );
 }
 
 #[test]

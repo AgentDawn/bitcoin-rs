@@ -7,7 +7,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_mempool::standardness::AcceptanceRejectReason;
-use bitcoin_rs_mempool::{LocalOrigin, SubmitError};
+use bitcoin_rs_mempool::{LocalOrigin, MutationOutcome, SubmitError};
 use bitcoin_rs_primitives::{
     Amount, Block as NativeBlock, Hash256, LockTime, OutPoint, Script, Sequence, Tx, TxIn, TxOut,
     Txid, Witness, consensus_bytes, deserialize as native_deserialize, unix_time_secs,
@@ -476,15 +476,44 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
 use crate::context::DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB;
 
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let bound = super::bind_named_params(params, &["hexstring", "maxfeerate", "maxburnamount"])?;
+    let params = bound.as_ref();
+    super::ensure_at_most_params(params, 3)?;
     let raw = required_str(params, 0, "raw transaction is required")?;
     let max_feerate = send_max_feerate(params, 1)?;
+    let max_burn = params_array(params)?
+        .get(2)
+        .filter(|value| !value.is_null())
+        .map(parse_btc_amount)
+        .transpose()?
+        .unwrap_or(0);
+    if max_burn > Amount::MAX_MONEY.to_sat() {
+        return Err(RpcError::InvalidParameter(
+            "maxburnamount is out of range".to_owned(),
+        ));
+    }
     let tx = decode_tx(
         raw,
         "TX decode failed. Make sure the tx has at least one input.".to_owned(),
     )?;
+    for output in &tx.outputs {
+        let script = output.script_pubkey.as_bytes();
+        // Core's burn guard is per output, not a sum. HasValidOps is
+        // already owned by the script crate, including malformed pushes.
+        if (script.len() > bitcoin_rs_script::MAX_SCRIPT_SIZE
+            || bitcoin_rs_script::is_op_return(script)
+            || !bitcoin_rs_script::has_valid_ops(script))
+            && output.value.to_sat() > max_burn
+        {
+            return Err(RpcError::TxVerifyError(
+                "Unspendable output exceeds maximum configured by user (maxburnamount)".to_owned(),
+            ));
+        }
+    }
     let txid = tx.txid();
 
-    ctx.mempool
+    let mutation = ctx
+        .mempool
         .gateway
         .submit_local_transaction(
             Arc::new(tx),
@@ -494,6 +523,16 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
             &ctx.chain.admission_chain(),
         )
         .map_err(submit_error_to_rpc_error)?;
+    // Already-known (duplicate) admissions commit nothing, so they publish
+    // nothing; only newly admitted changes notify.
+    crate::zmq::publish_admitted_hashtx(
+        ctx.zmq_publisher.as_ref(),
+        mutation
+            .changes
+            .iter()
+            .filter(|change| change.outcome == MutationOutcome::Accepted)
+            .map(|change| Txid::from(change.txid)),
+    );
     typed_to_sonic(&v31::SendRawTransaction(txid.to_string()))
 }
 
@@ -663,11 +702,19 @@ pub(crate) fn decompressrawtransaction(
         hex_decode(raw).map_err(|_| RpcError::Deserialization("TX decode failed".to_owned()))?;
     // Snapshot isolation, as in `compressrawtransaction`: every
     // resolution read runs under the same stable chainstate read that
-    // captured the applied view.
-    ctx.chain.with_stable_chainstate(|| {
+    // captured the applied view. Public-key recovery runs after the lock
+    // is released: it only reads the resolved plan, so a large request
+    // cannot block chain transitions while grinding recovery ids. A tip
+    // move during recovery is caught by the second view check below.
+    let (plan, resolver) = ctx.chain.with_stable_chainstate(|| {
         let mut resolver = crate::context::RpcPrevoutResolver::new(ctx, cancellation.clone())?;
-        let tx = crate::compressed_tx::decompress_transaction(&bytes, &mut resolver)
+        let plan = crate::compressed_tx::decompress_prepare(&bytes, &mut resolver)
             .map_err(RpcError::from)?;
+        Ok::<_, RpcError>((plan, resolver))
+    })?;
+    let tx =
+        crate::compressed_tx::decompress_finalize(plan, &resolver).map_err(RpcError::from)?;
+    ctx.chain.with_stable_chainstate(|| {
         if cancellation.is_triggered() || !resolver.view_matches_current() {
             return Err(RpcError::Misc(
                 "compressed transaction request cancelled or the applied tip moved; retry"
@@ -801,6 +848,10 @@ fn decode_tx(raw: &str, message: String) -> Result<Tx, RpcError> {
 /// decimal parsing, expanding e/E notation without floating point arithmetic and
 /// rejecting signs other than optional positive, non-digits, more than 8 fractional
 /// decimals, fractional satoshis, and overflow.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one amount parser keeps sign, exponent, mantissa, and scale checks in a single auditable sequence"
+)]
 fn sats_from_btc(value: &Value, message: &'static str) -> Result<u64, RpcError> {
     let text = if let Some(text) = value.as_str() {
         text.to_owned()
