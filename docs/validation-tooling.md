@@ -327,6 +327,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     # CLN live cell with pinned artifacts; see docs/lightning-interop-matrix.md §4 for the exact command
     timeout --signal=TERM --kill-after=30 900 bash scripts/verify-lightning-interop.sh --target cln \
       --bitcoin-rs-bin <path-to-built-bitcoin-rs> \
+      --bitcoind-bin <path-to-bitcoin-core-31.1> \
       --cln-bin <extract-dir>/usr/bin/lightningd \
       --cln-release-archive <dir>/clightning-v26.06.9-Ubuntu-26.04-amd64.tar.xz \
       --cln-library-path <dir>/libpq-probe/root/usr/lib/x86_64-linux-gnu
