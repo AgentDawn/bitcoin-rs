@@ -492,18 +492,6 @@ impl ConnectionShared {
         }
     }
 
-    fn send_sourceless_headers(&self, headers: Vec<bitcoin_rs_primitives::Header>) {
-        if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
-            headers,
-            source: None,
-            wire_response: false,
-        }) {
-            tracing::debug!(%error, "p2p sourceless inbound headers dropped");
-        } else {
-            wake_sync(self.wake_tx.as_ref());
-        }
-    }
-
     /// Enqueues a decoded block body into ingress, then forwards its carried
     /// header to header admission.
     ///
@@ -3008,7 +2996,17 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                             if let Some(sync) = &shared.block_sync {
                                 sync.stale_tips().note_heard(source, tip_hash);
                             }
-                            shared.send_sourceless_headers(headers);
+                            // Route through the identified peer — not sourceless —
+                            // so the same minimum-work/fault policy applies with
+                            // peer accountability: below the floor a valid page
+                            // defers instead of admitting past the hold, while a
+                            // broken page admits directly and carries the peer
+                            // fault (see `body_carried_header_needs_admission`).
+                            // The batch stays non-wire (`false`): it is not a
+                            // `getheaders` response, so it must neither consume
+                            // the pending request nor feed a live download-twice
+                            // cursor with a foreign side-branch page.
+                            shared.send_headers(source, headers, false);
                         }
                     }
                 }
@@ -7497,5 +7495,43 @@ mod onion_service_tests {
         };
         assert!(join_res.is_ok());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stale_tip_routing_tests {
+    //! Stale-tip batches keep the identified peer without wire-response
+    //! semantics: the drain credits the announcer and applies the
+    //! minimum-work/fault hold, but the batch never consumes the pending
+    //! `getheaders` request nor feeds a live download-twice cursor.
+
+    use super::*;
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn stale_tip_batch_keeps_identified_peer_without_wire_response() {
+        let peer_table = Arc::new(crate::PeerTable::new());
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (_blocks_tx, _blocks_rx) = crossbeam_channel::unbounded::<crate::InboundBlock>();
+        let shared = test_shared(Arc::clone(&peer_table), headers_tx, _blocks_tx);
+        let addr: SocketAddr = ([127, 0, 0, 1], 18444).into();
+        let endpoint = crate::PeerEndpoint::Ip(addr);
+        let source = crate::PeerSource::for_test(addr);
+        let header = bitcoin_rs_primitives::Network::Regtest
+            .genesis_block()
+            .header;
+        shared.send_headers(source, vec![header], false);
+        let received = headers_rx.try_recv().expect("the headers batch is queued");
+        assert_eq!(
+            received.source,
+            Some(source),
+            "stale-tip batches travel with the announcer, never sourceless"
+        );
+        assert!(
+            !received.wire_response,
+            "a stale-tip announcement is not a `getheaders` response"
+        );
+        assert_eq!(received.headers.len(), 1);
+        let _ = endpoint;
     }
 }

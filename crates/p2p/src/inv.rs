@@ -338,8 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_parents_resolve_unidentified_sessions()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn missing_parents_resolve_unidentified_sessions() -> Result<(), Box<dyn std::error::Error>> {
         let table = PeerTable::new();
         let (sender, receiver) = crate::test_support::message_channel_bounded(2);
         let lease = PeerLease::new(sender);
@@ -348,9 +347,9 @@ mod tests {
         assert!(source.endpoint.is_none());
 
         assert!(request_missing_parents(&table, source, &[parent(1)]));
-        let expected = Message::GetData(vec![Inventory::Transaction(bitcoin::Txid::from_byte_array(
-            *parent(1).as_bytes(),
-        ))]);
+        let expected = Message::GetData(vec![Inventory::Transaction(
+            bitcoin::Txid::from_byte_array(*parent(1).as_bytes()),
+        )]);
         assert!(matches!(receiver.try_recv(), Ok(message) if message == expected));
         assert!(!lease.is_cancelled());
 

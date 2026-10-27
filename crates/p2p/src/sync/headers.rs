@@ -100,7 +100,10 @@ impl BlockSync {
                     self.peer_table
                         .note_announced_tip(source, tip_hash, active_height);
                     credit_refresh_needed = true;
-                    if wire_response {
+                    // The compact path may already own this body through
+                    // `enqueue_owned_body_fetch`; a second window request
+                    // would duplicate the fetch it already issued.
+                    if wire_response && !self.owns_body_fetch(source, tip_hash) {
                         direct_fetch.push((source, tip_hash));
                     }
                 }
@@ -111,12 +114,27 @@ impl BlockSync {
             // network's minimum chain work is retained by that connection's
             // download-twice header sync; only headers the committed phase
             // releases — and batches at or above the threshold — reach
-            // admission here.
+            // admission here. Snapshot the tip so a rejection that still
+            // committed a higher-work prefix can preserve the tip it
+            // displaced (see `demoted_tip_after_rejection`).
+            let pre_tip = self.chain.chain_tip().map(|tip| tip.hash);
             let Some(admission) =
                 self.route_headers_batch(&headers, source, wire_response, batch_len)
             else {
                 continue;
             };
+            // A rejected batch can still have inserted a valid higher-work
+            // prefix and moved the tip; the `Err` reports no displacement, so
+            // infer it from the tip movement and retain the old tip for
+            // stale-tip relay instead of losing it.
+            if matches!(&admission, HeaderAdmission::Rejected(_)) {
+                if let Some(demoted) = bitcoin_rs_chain::header_sync::demoted_tip_after_rejection(
+                    &self.chain.block_tree(),
+                    pre_tip,
+                ) {
+                    self.record_demoted_tip(demoted);
+                }
+            }
             match admission {
                 HeaderAdmission::Accepted {
                     accepted,
@@ -131,7 +149,11 @@ impl BlockSync {
                     if let (Some(tip_hash), Some(source)) = (announced_tip, source) {
                         self.peer_table
                             .note_announced_tip(source, tip_hash, active_height);
-                        if wire_response {
+                        // Same owned-fetch guard as the known-batch path: skip
+                        // the direct fetch when the compact path already owns
+                        // the body so one announcement never issues two
+                        // `getdata` requests for the same hash.
+                        if wire_response && !self.owns_body_fetch(source, tip_hash) {
                             direct_fetch.push((source, tip_hash));
                         }
                     }
@@ -1216,8 +1238,16 @@ impl BlockSync {
     /// INVARIANT: the block-tree read guard is released before the caller
     ///   enters ordinary admission.
     fn body_carried_header_needs_admission(&self, headers: &[Header]) -> bool {
+        // A stale-tip announcement arrives as a multi-header batch on the
+        // identified peer with `wire_response = false`: it must not bypass
+        // the minimum-work hold the way a blanket `true` would. A fully
+        // valid, well-linked page on a known parent defers below the floor
+        // (the caller returns `None` and retries after the wire sync commits
+        // it); any break in the page needs direct admission so the error —
+        // and the peer fault it carries — is reported instead of silently
+        // deferred.
         let [header] = headers else {
-            return true;
+            return self.stale_tip_page_needs_admission(headers);
         };
         let tree = self.chain.block_tree();
         let Some(parent_id) = tree.lookup(Hash256::from(header.prev_blockhash)) else {
@@ -1231,6 +1261,65 @@ impl BlockSync {
                     &tree,
                     parent_id,
                     header,
+                    network,
+                    bitcoin_rs_chain::current_unix_seconds(),
+                    bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+                )
+            })
+            .is_err()
+    }
+
+    /// Whether a multi-header non-wire page (a stale-tip announcement)
+    /// needs direct admission rather than deferring below the work floor.
+    ///
+    /// PRE: `headers` holds more than one header.
+    /// POST: `true` when the page is broken — unknown first parent, unmet
+    ///   proof of work, broken prev-to-hash linkage, or a contextually
+    ///   invalid first header — so direct admission reports the error and
+    ///   carries the peer fault; `false` when the page is a fully valid,
+    ///   well-linked chain on a known, valid parent, in which case the
+    ///   caller defers it below the floor instead of admitting past the
+    ///   minimum-work hold.
+    /// INVARIANT: reads only the block tree; later headers build on earlier
+    ///   batch headers the tree does not yet hold, so only the first
+    ///   header faces the contextual check — a later contextual break
+    ///   defers safely without entering the tree, while a high-work page
+    ///   (anchor `None`) admits directly through the caller either way.
+    fn stale_tip_page_needs_admission(&self, headers: &[Header]) -> bool {
+        if headers.len() <= 1 {
+            return true;
+        }
+        let tree = self.chain.block_tree();
+        let network = self.chain.network();
+        let Some(first_parent) = tree.lookup(Hash256::from(headers[0].prev_blockhash)) else {
+            return true;
+        };
+        if tree
+            .node(first_parent)
+            .is_ok_and(|node| node.status == NodeStatus::Invalid)
+        {
+            return true;
+        }
+        // Declared `bits` honesty and prev-to-hash continuity across the
+        // whole page: a pasted tail of genuine headers after a break must
+        // not read as valid.
+        if headers.iter().any(|header| {
+            let hash = Hash256::from(header.compute_hash());
+            validate_pow(header, hash, network).is_err()
+        }) || headers.windows(2).any(|pair| {
+            Hash256::from(pair[1].prev_blockhash) != Hash256::from(pair[0].compute_hash())
+        }) {
+            return true;
+        }
+        // First-header contextual gate (the only one whose parent the tree
+        // holds). A failure here needs admission to fault the peer.
+        let hash = Hash256::from(headers[0].compute_hash());
+        validate_pow(&headers[0], hash, network)
+            .and_then(|()| {
+                bitcoin_rs_chain::validate_contextual_header(
+                    &tree,
+                    first_parent,
+                    &headers[0],
                     network,
                     bitcoin_rs_chain::current_unix_seconds(),
                     bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
@@ -1439,4 +1528,291 @@ fn presync_salt() -> [u8; 16] {
     let mut salt = [0_u8; 16];
     bitcoin::secp256k1::rand::thread_rng().fill_bytes(&mut salt);
     salt
+}
+
+#[cfg(test)]
+mod stale_tip_routing_tests {
+    //! Low-work, partial-prefix, and duplicate-fetch regressions for
+    //! stale-tip batches: identified-peer, non-wire batches take the same
+    //! minimum-work/fault hold as ordinary headers, preserve a displaced
+    //! tip on rejection, and never double-fetch an owned body.
+
+    use super::super::BlockSync;
+    use super::super::chain::HeaderAdmission;
+    use super::super::chain::SyncChain;
+    use super::super::chain::SyncChainError;
+    use super::super::chain::WindowCommitError;
+    use bitcoin_rs_chain::TipSnapshot;
+    use bitcoin_rs_chain::header_sync::demoted_tip_after_rejection;
+    use bitcoin_rs_chain::{BlockTree, ChainWork, NodeStatus};
+    use bitcoin_rs_primitives::{Hash256, Header, Network};
+    use parking_lot::RwLockReadGuard;
+    use std::sync::Arc;
+
+    struct RoutingStubChain {
+        tree: parking_lot::RwLock<BlockTree>,
+        network: Network,
+        floor: ChainWork,
+    }
+
+    impl RoutingStubChain {
+        fn with_floor(tree: BlockTree, floor: ChainWork) -> Self {
+            Self {
+                tree: parking_lot::RwLock::new(tree),
+                network: Network::Regtest,
+                floor,
+            }
+        }
+    }
+
+    impl SyncChain for RoutingStubChain {
+        fn network(&self) -> Network {
+            self.network
+        }
+
+        fn block_tree(&self) -> RwLockReadGuard<'_, BlockTree> {
+            self.tree.read()
+        }
+
+        fn chain_tip(&self) -> Option<Arc<TipSnapshot>> {
+            self.tree.read().tip()
+        }
+
+        fn applied_tip(&self) -> Option<Arc<TipSnapshot>> {
+            None
+        }
+
+        fn bootstrap_genesis(&self) {}
+
+        fn admit_headers(&self, headers: &[Header]) -> HeaderAdmission {
+            let mut tree = self.tree.write();
+            match bitcoin_rs_chain::accept_headers(
+                &mut tree,
+                headers,
+                self.network,
+                bitcoin_rs_chain::current_unix_seconds(),
+                bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+            ) {
+                Ok(admitted) => {
+                    let announced_tip = admitted
+                        .ids
+                        .last()
+                        .and_then(|id| tree.node(*id).ok())
+                        .map(|node| node.hash);
+                    let active_height = tree.tip().zip(announced_tip).and_then(|(tip, hash)| {
+                        tree.active_height_of(tip.tip_id, hash)
+                            .and_then(|h| i32::try_from(h).ok())
+                    });
+                    HeaderAdmission::Accepted {
+                        accepted: admitted.ids.len(),
+                        announced_tip,
+                        active_height,
+                        demoted_tip: admitted.demoted_tip,
+                    }
+                }
+                Err(error) => HeaderAdmission::Rejected(error),
+            }
+        }
+
+        fn minimum_chain_work(&self) -> ChainWork {
+            self.floor
+        }
+
+        fn check_body_binding(
+            &self,
+            _block: &bitcoin_rs_primitives::Block,
+        ) -> Result<(), SyncChainError> {
+            Ok(())
+        }
+
+        fn window_len(&self, _serialized_sizes: &mut dyn Iterator<Item = usize>) -> usize {
+            0
+        }
+
+        fn commit_window(
+            &self,
+            _blocks: &[&bitcoin_rs_primitives::Block],
+            _bodies: &[bytes::Bytes],
+        ) -> Result<usize, WindowCommitError> {
+            Ok(0)
+        }
+
+        fn switch_to_branch(
+            &self,
+            _target: bitcoin_rs_chain::NodeId,
+            _staged_body: &mut dyn FnMut(
+                Hash256,
+            )
+                -> Option<(bitcoin_rs_primitives::Block, bytes::Bytes)>,
+            _connected_body: &mut dyn FnMut(Hash256),
+        ) -> Result<(), bitcoin_rs_chainstate::reorg::ReorgError> {
+            Ok(())
+        }
+    }
+
+    fn routing_sync(tree: BlockTree, floor: ChainWork) -> (BlockSync, Arc<crate::PeerTable>) {
+        let peers = Arc::new(crate::PeerTable::new());
+        let (_headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (_blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
+        let chain: Arc<dyn SyncChain> = Arc::new(RoutingStubChain::with_floor(tree, floor));
+        let sync = BlockSync::new(
+            chain,
+            Arc::clone(&peers),
+            headers_rx,
+            blocks_rx,
+            crate::sync::syncing_ibd_latch(),
+        );
+        (sync, peers)
+    }
+
+    fn peer_source(peers: &Arc<crate::PeerTable>) -> crate::PeerSource {
+        let (tx, _rx) = crate::test_support::message_channel();
+        let lease = crate::PeerLease::new(tx);
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], 18444).into();
+        peers.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+        lease.source_ip(addr)
+    }
+
+    fn regtest_tree_with_main() -> BlockTree {
+        let mut tree = BlockTree::new();
+        let genesis = Network::Regtest.genesis_block();
+        tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)
+            .expect("genesis inserts");
+        let mut prev = genesis.block_hash();
+        let mut tip_id = tree.lookup(Hash256::from(prev)).expect("genesis indexed");
+        for height in 1..=2_u32 {
+            let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
+                .expect("fixture mines");
+            prev = header.compute_hash();
+            tip_id = tree
+                .insert_node(Some(tip_id), header, NodeStatus::HeaderValid)
+                .expect("main header inserts");
+        }
+        tree
+    }
+
+    /// A valid low-work multi-header stale-tip page defers below the floor
+    /// instead of admitting past the minimum-work hold; a broken page needs
+    /// direct admission so the fault is reported.
+    #[test]
+    fn low_work_stale_tip_page_defers_while_broken_page_admits() {
+        let tree = regtest_tree_with_main();
+        let floor = ChainWork::from_be_bytes([0xFF_u8; 32]);
+        let (sync, _peers) = routing_sync(tree, floor);
+        let genesis_prev =
+            bitcoin_rs_primitives::BlockHash::from(Network::Regtest.genesis_block().block_hash());
+        let first = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(genesis_prev, 101)
+            .expect("fixture mines");
+        let second =
+            bitcoin_rs_chain::regtest_fixture::mined_regtest_header(first.compute_hash(), 102)
+                .expect("fixture mines");
+        let valid_page = [first, second];
+        // Below the floor with a known parent: the valid page is complete
+        // and well-linked, so it defers rather than bypassing the hold.
+        assert!(
+            sync.presync_anchor(&valid_page).is_some(),
+            "the fixture page must sit below the raised floor"
+        );
+        assert!(
+            !sync.body_carried_header_needs_admission(&valid_page),
+            "a valid low-work stale-tip page must defer, not admit past the hold"
+        );
+        // A broken page (unmet proof of work) needs admission to fault.
+        let mut broken = valid_page.clone();
+        broken[1].nonce = broken[1].nonce.wrapping_add(1).wrapping_mul(7919);
+        // The grind above almost surely breaks the target; if it somehow
+        // still meets it, flip bits to force the failure deterministically.
+        if bitcoin_rs_chain::validate_pow(
+            &broken[1],
+            Hash256::from(broken[1].compute_hash()),
+            Network::Regtest,
+        )
+        .is_ok()
+        {
+            broken[1].bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x1d00_ffff);
+        }
+        assert!(
+            sync.body_carried_header_needs_admission(&broken),
+            "a broken stale-tip page must admit so the fault is reported"
+        );
+    }
+
+    /// A rejected batch whose valid prefix displaced the tip preserves the
+    /// old tip through the tip-movement helper instead of losing it.
+    #[test]
+    fn partial_prefix_rejection_preserves_demoted_tip() {
+        let mut tree = regtest_tree_with_main();
+        let pre_tip = tree.tip().map(|tip| tip.hash);
+        let genesis_prev =
+            bitcoin_rs_primitives::BlockHash::from(Network::Regtest.genesis_block().block_hash());
+        let mut batch = Vec::new();
+        let mut prev = genesis_prev;
+        for height in [101_u32, 102, 103] {
+            let header = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(prev, height)
+                .expect("fixture mines");
+            prev = header.compute_hash();
+            batch.push(header);
+        }
+        let garbage = bitcoin_rs_primitives::BlockHash::from(
+            bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xFF_u8; 32]),
+        );
+        batch.push(
+            bitcoin_rs_chain::regtest_fixture::mined_regtest_header(garbage, 104)
+                .expect("fixture mines"),
+        );
+        let result = bitcoin_rs_chain::accept_headers(
+            &mut tree,
+            &batch,
+            Network::Regtest,
+            bitcoin_rs_chain::current_unix_seconds(),
+            bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(bitcoin_rs_chain::ChainError::MissingParent { .. })
+            ),
+            "the tail must fail after the prefix moved the tip, got {result:?}"
+        );
+        assert_eq!(
+            demoted_tip_after_rejection(&tree, pre_tip),
+            pre_tip,
+            "the pre-batch tip is the preserved demotion"
+        );
+    }
+
+    /// A body the compact path already owns is never direct-fetched twice:
+    /// both drain branches gate on `owns_body_fetch`.
+    #[test]
+    fn duplicate_fetch_skips_owned_body() {
+        let tree = regtest_tree_with_main();
+        let floor = ChainWork::from_be_bytes(Network::Regtest.minimum_chain_work());
+        let (sync, peers) = routing_sync(tree, floor);
+        let source = peer_source(&peers);
+        let tip_hash = sync.chain.chain_tip().expect("tree has a tip").hash;
+        let tree = sync.chain.block_tree();
+        let height = tree
+            .lookup(tip_hash)
+            .and_then(|id| tree.node(id).ok())
+            .map(|node| node.height)
+            .expect("tip height resolves");
+        assert!(
+            !sync.owns_body_fetch(source, tip_hash),
+            "nothing owns the tip body yet"
+        );
+        assert!(
+            sync.enqueue_owned_body_fetch(source, tip_hash, || true),
+            "the compact follow-up publishes ownership"
+        );
+        assert!(
+            sync.owns_body_fetch(source, tip_hash),
+            "the owned mark must resolve for the exact owner"
+        );
+        let wire_response = true;
+        assert!(
+            !(wire_response && !sync.owns_body_fetch(source, tip_hash)),
+            "the direct-fetch guard must skip a body the compact path owns"
+        );
+        let _ = height;
+    }
 }

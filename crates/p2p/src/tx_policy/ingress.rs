@@ -934,9 +934,11 @@ impl PeerTable {
         // claim, or an already-`Enqueued` body must keep its owner and retry
         // path; a forged oversized body must not release them.
         let awaiting = policy.requests.get(&key).is_some_and(|request| {
-            request.package.as_ref().is_some_and(|claim| {
-                claim.state == super::PackagePhase::Awaiting
-            }) && request.owner.is_some_and(|(owner, _)| owner == source)
+            request
+                .package
+                .as_ref()
+                .is_some_and(|claim| claim.state == super::PackagePhase::Awaiting)
+                && request.owner.is_some_and(|(owner, _)| owner == source)
         });
         if awaiting {
             policy.failed(key, source, now);
@@ -1409,11 +1411,7 @@ mod tests {
         let child = sample_tx(1, 2, 40_000);
         let subject = child.wtxid();
         assert!(table.request_package_info(owner, subject));
-        assert!(table.request_package_transactions(
-            owner,
-            subject,
-            vec![parent.wtxid(), subject]
-        ));
+        assert!(table.request_package_transactions(owner, subject, vec![parent.wtxid(), subject]));
 
         // 26 members ending at the solicited subject: oversized for admission.
         let mut oversized: Vec<Tx> = (0..25u32).map(|i| sample_tx(3, i, 1_000)).collect();
@@ -1437,11 +1435,7 @@ mod tests {
         // A forged oversized body from a stranger must not release an ordinary
         // owner: solicit again, then send oversized from the stranger.
         assert!(table.request_package_info(owner, subject));
-        assert!(table.request_package_transactions(
-            owner,
-            subject,
-            vec![parent.wtxid(), subject]
-        ));
+        assert!(table.request_package_transactions(owner, subject, vec![parent.wtxid(), subject]));
         assert_eq!(
             table
                 .admit_package(&capacity, &inventory, stranger, oversized_payload)
@@ -1450,12 +1444,7 @@ mod tests {
         );
         // The owner's claim survives the stranger's forgery.
         let admitted = table
-            .admit_package(
-                &capacity,
-                &inventory,
-                owner,
-                make_payload(&[parent, child]),
-            )
+            .admit_package(&capacity, &inventory, owner, make_payload(&[parent, child]))
             .expect("owner claim survives a stranger oversized body");
         table.package_response_rejected(admitted.into_token(), &inventory);
     }

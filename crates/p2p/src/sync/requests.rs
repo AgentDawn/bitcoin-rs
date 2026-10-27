@@ -574,8 +574,8 @@ impl BlockSync {
 }
 #[cfg(test)]
 mod tests {
-    use super::release_unavailable_body;
     use super::UnavailableBodies;
+    use super::release_unavailable_body;
     use crate::connection::PeerSource;
     use crate::download_window::DownloadWindow;
     use std::net::SocketAddr;
@@ -639,17 +639,7 @@ mod tests {
             hash: bitcoin_rs_primitives::Hash256::from(tip_header.compute_hash()),
         };
         let request = window
-            .next_peer_request(
-                &mut stager,
-                owner,
-                false,
-                &chain_tip,
-                1,
-                10,
-                0,
-                &tree,
-                now,
-            )
+            .next_peer_request(&mut stager, owner, false, &chain_tip, 1, 10, 0, &tree, now)
             .unwrap_or_else(|| panic!("window must plan the test prefix"));
         let (_, hash) = request
             .entries()
@@ -683,7 +673,12 @@ mod tests {
 
         let unknown = bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xab; 32]);
         assert!(!scheduler.window.contains_pending(&unknown));
-        assert!(!release_unavailable_body(&mut scheduler, racer, unknown, now));
+        assert!(!release_unavailable_body(
+            &mut scheduler,
+            racer,
+            unknown,
+            now
+        ));
         assert!(!scheduler.body_unavailable.refuses(racer, unknown, now));
 
         assert!(release_unavailable_body(&mut scheduler, owner, hash, now));

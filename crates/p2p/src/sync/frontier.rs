@@ -321,8 +321,7 @@ impl SyncFrontier {
         self.usable_peers
             .iter()
             .filter(|peer| {
-                eligible(peer)
-                    && pending_id.is_none_or(|id| peer.source.connection_id().get() > id)
+                eligible(peer) && pending_id.is_none_or(|id| peer.source.connection_id().get() > id)
             })
             .min_by_key(|peer| peer.source.connection_id().get())
             .map(|peer| peer.source)

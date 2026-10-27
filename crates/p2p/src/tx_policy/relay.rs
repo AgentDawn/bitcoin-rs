@@ -289,9 +289,9 @@ impl PeerTable {
         let TxPolicy {
             relay, inbound_inv, ..
         } = &mut *policy;
-        let peer = relay
-            .entry(source)
-            .or_insert_with(|| RelayPeer::new(Instant::now(), is_inbound, inbound, inbound_inv, &mut rng));
+        let peer = relay.entry(source).or_insert_with(|| {
+            RelayPeer::new(Instant::now(), is_inbound, inbound, inbound_inv, &mut rng)
+        });
         for identity in identities {
             peer.note_known(identity);
         }
@@ -338,7 +338,9 @@ impl PeerTable {
         } = &mut *policy;
         relay
             .entry(source)
-            .or_insert_with(|| RelayPeer::new(Instant::now(), is_inbound, inbound, inbound_inv, &mut rng))
+            .or_insert_with(|| {
+                RelayPeer::new(Instant::now(), is_inbound, inbound, inbound_inv, &mut rng)
+            })
             .fee_filter = rate;
     }
 

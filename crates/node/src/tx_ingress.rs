@@ -262,11 +262,7 @@ impl TxIngressConsumer {
                 {
                     bitcoin_rs_p2p::inv::request_package_info(&self.peer_table, source, wtxid);
                 }
-                bitcoin_rs_p2p::request_missing_parents(
-                    &self.peer_table,
-                    source,
-                    &missing_parents,
-                );
+                bitcoin_rs_p2p::request_missing_parents(&self.peer_table, source, &missing_parents);
                 false
             }
             Ok(SubmitOutcome::AlreadyConfirmed) => {

@@ -717,11 +717,11 @@ mod tests {
     use crate::connection::PeerSource;
     use crate::download_window::FanoutCandidate;
     use crate::download_window::SyncPeer;
-    use std::net::SocketAddr;
     use bitcoin_rs_chain::{
         BlockTree, ChainError, NodeId, NodeStatus, accept_headers, compact_is_met_by,
     };
     use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Header, Network};
+    use std::net::SocketAddr;
     fn body_candidate_impl(port: u16, height: i32, soft_blocked: bool) -> FanoutCandidate {
         FanoutCandidate {
             peer: SyncPeer {
@@ -758,10 +758,8 @@ mod tests {
             )))),
         );
 
-        let all_soft = body_request_peers(&[
-            soft_body_candidate(9001, 10),
-            soft_body_candidate(9002, 20),
-        ]);
+        let all_soft =
+            body_request_peers(&[soft_body_candidate(9001, 10), soft_body_candidate(9002, 20)]);
         assert_eq!(all_soft.len(), 2);
     }
 

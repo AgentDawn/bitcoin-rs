@@ -64,7 +64,8 @@ pub struct AcceptHeaders {
     /// A contiguous batch displaces at most one tip, because once the tip lies
     /// on the batch's own chain every later header extends it. A batch the
     /// validation rejects after a prefix moved the tip returns `Err`, so that
-    /// displacement is not reported; the old tip stays a stale leaf.
+    /// displacement is not reported here; the old tip stays a stale leaf and
+    /// the caller recovers it with [`demoted_tip_after_rejection`].
     pub demoted_tip: Option<Hash256>,
 }
 
@@ -73,6 +74,38 @@ impl AcceptHeaders {
         self.ids.push(inserted.id);
         self.demoted_tip = self.demoted_tip.or(inserted.demoted_tip);
     }
+}
+
+/// Demoted tip when a batch [`accept_headers`] rejected still displaced the tip.
+///
+/// [`accept_headers`] inserts each valid prefix header before validating the
+/// next, so a batch whose prefix carries more work than the active tip moves
+/// the tip and marks the old tip `Stale` even when a later header fails and
+/// the call returns `Err`. The `Err` itself reports no displacement (see
+/// [`AcceptHeaders::demoted_tip`); the old tip stays a stale leaf and must
+/// still enter stale-tip relay.
+///
+/// Call after an `Err` return with `pre_tip` captured before the call and the
+/// same `tree`. Returns `pre_tip` when the tip moved onto a branch that does
+/// not contain it, else `None` (no movement, linear extension, or unknown
+/// tips). The tree stays the authority; this only reads it.
+///
+/// Single ownership: header admission owns tip mutation; this helper and the
+/// stale-tip retainer only read the displacement it left behind.
+#[must_use]
+pub fn demoted_tip_after_rejection(tree: &BlockTree, pre_tip: Option<Hash256>) -> Option<Hash256> {
+    let pre_hash = pre_tip?;
+    let pre_id = tree.lookup(pre_hash)?;
+    let current = tree.tip()?;
+    if current.hash == pre_hash {
+        return None;
+    }
+    // A linear extension keeps the old tip as an ancestor: nothing was
+    // displaced onto another branch.
+    if tree.find_common_ancestor(pre_id, current.tip_id) == Some(pre_id) {
+        return None;
+    }
+    Some(pre_hash)
 }
 
 /// Accepts a contiguous batch of headers after proof-of-work validation.
@@ -595,8 +628,8 @@ mod fixture {
 #[cfg(test)]
 mod contextual_header_tests {
     use super::{
-        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, accept_headers, fixture::mine_regtest,
-        next_work_required, validate_contextual_header,
+        HeaderValidationMode, MAX_FUTURE_TIME_SECONDS, accept_headers, demoted_tip_after_rejection,
+        fixture::mine_regtest, next_work_required, validate_contextual_header,
     };
     use crate::{
         ChainError,
@@ -914,6 +947,88 @@ mod contextual_header_tests {
             }
         }
 
+        Ok(())
+    }
+
+    /// A rejected batch whose valid higher-work prefix displaced the tip
+    /// still reports the old tip through [`demoted_tip_after_rejection`].
+    ///
+    /// The `Err` itself carries no displacement; the tree retains the prefix
+    /// and the helper recovers the stale leaf for relay instead of losing it.
+    /// A linear extension that fails the same way reports no demotion.
+    #[test]
+    fn partial_prefix_failure_preserves_demoted_tip_via_helper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::Regtest;
+        let genesis = network.genesis_block();
+        let base_time = genesis.header.time;
+        let mut tree = BlockTree::new();
+        accept_headers(
+            &mut tree,
+            &[genesis.header],
+            network,
+            base_time,
+            HeaderValidationMode::LiveAdmission,
+        )?;
+        let mut prev = genesis.block_hash();
+        for height in 1..=2_u32 {
+            extend_regtest(&mut tree, &mut prev, height, 4, base_time);
+        }
+        let pre_tip = tree.tip().map(|tip| tip.hash);
+
+        // Side branch from genesis with more headers than the main chain, so
+        // its prefix carries strictly higher work and displaces the tip.
+        let mut side_prev = genesis.block_hash();
+        let mut batch = Vec::new();
+        for height in [101_u32, 102, 103] {
+            let header = mine_regtest(side_prev, height, base_time + height * 600, 4);
+            side_prev = header.compute_hash();
+            batch.push(header);
+        }
+        // Invalid tail on the displaced tip: mined for its garbage parent so
+        // proof of work passes, then rejected with `MissingParent` after the
+        // prefix has already moved the tip.
+        let garbage = BlockHash::from(Hash256::from_le_bytes(&[0xFF_u8; 32]));
+        let tail = mine_regtest(garbage, 104, base_time + 104 * 600, 4);
+        batch.push(tail);
+
+        let now = base_time + 200 * 600;
+        let result = accept_headers(
+            &mut tree,
+            &batch,
+            network,
+            now,
+            HeaderValidationMode::LiveAdmission,
+        );
+        assert!(
+            matches!(result, Err(ChainError::MissingParent { .. })),
+            "the tail must fail after the prefix moved the tip, got {result:?}"
+        );
+        assert_eq!(
+            demoted_tip_after_rejection(&tree, pre_tip),
+            pre_tip,
+            "the tip active before the batch is the preserved demotion"
+        );
+
+        // A linear extension that fails the same way displaces nothing.
+        let tip_now = tree.tip().map(|tip| tip.hash);
+        let bad_child = mine_regtest(garbage, 999, now, 4);
+        let linear = accept_headers(
+            &mut tree,
+            &[bad_child],
+            network,
+            now,
+            HeaderValidationMode::LiveAdmission,
+        );
+        assert!(
+            matches!(linear, Err(ChainError::MissingParent { .. })),
+            "linear failure must also reject, got {linear:?}"
+        );
+        assert_eq!(
+            demoted_tip_after_rejection(&tree, tip_now),
+            None,
+            "no movement means no demotion to preserve"
+        );
         Ok(())
     }
 }
