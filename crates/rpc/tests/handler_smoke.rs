@@ -14,7 +14,7 @@ use bitcoin_rs_chain::{BlockBodySource, ChainWork, NodeId, NodeStatus, TipSnapsh
 use bitcoin_rs_index::block_log::BlockRecord;
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_mining::FakeMiningControl;
-use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerTable};
+use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerTable, wire::PROTOCOL_VERSION};
 use bitcoin_rs_primitives::{
     Amount, Block, BlockHash, CompactTarget, Hash256, Header, LockTime, Network, OutPoint, Script,
     Sequence, Tx, TxIn, TxOut, Txid, Witness, consensus_bytes,
@@ -263,7 +263,7 @@ fn network_and_wallet_expectations(
         (
             "getnetworkinfo",
             json!([]),
-            json!({"protocolversion": 70016, "connections": 0, "networkactive": true}),
+            json!({"protocolversion": PROTOCOL_VERSION, "connections": 0, "networkactive": true}),
         ),
         ("getpeerinfo", json!([]), json!([])),
         ("getconnectioncount", json!([]), json!(0)),
