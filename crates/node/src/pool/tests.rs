@@ -388,3 +388,210 @@ macro_rules! backend_tests {
 backend_tests!(redb, bitcoin_rs_storage::RedbStore);
 #[cfg(feature = "fjall")]
 backend_tests!(fjall, bitcoin_rs_storage::FjallStore);
+
+#[test]
+fn composed_core_bounds_pin_the_contract_literals() -> TestResult {
+    let composed = super::composed_core_config(128)?;
+    assert_eq!(
+        composed.book.max_jobs, 64,
+        "retained job bound must stay 64"
+    );
+    assert_eq!(
+        composed.book.max_sessions, 256,
+        "session bound must stay twice the connection cap"
+    );
+    assert_eq!(
+        composed.book.max_shares_per_job, 65_536,
+        "per-job duplicate-tracking bound must stay 65,536"
+    );
+    assert_eq!(
+        composed.outbox_items, 1024,
+        "deferred share-ledger outbox must stay 1024 records"
+    );
+    assert_eq!(
+        composed.outbox_bytes,
+        8 * 1024 * 1024,
+        "deferred share-ledger outbox must stay 8 MiB"
+    );
+    Ok(())
+}
+
+#[test]
+fn pool_directory_lock_is_exclusive_while_prepare_resources_live() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let datadir = directory.path().join("pool");
+    std::fs::create_dir_all(&datadir)?;
+    let guard = crate::state::lock_pool_directory(&datadir)?;
+    assert!(
+        crate::state::lock_pool_directory(&datadir).is_err(),
+        "a second pool prepare must not acquire the dedicated directory lock"
+    );
+    drop(guard);
+    let _released = crate::state::lock_pool_directory(&datadir)?;
+    Ok(())
+}
+
+fn ledger_create_open_and_epoch_under_guard(
+    backend: bitcoin_rs_storage::StorageBackend,
+) -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let datadir = directory.path().join("pool");
+    std::fs::create_dir_all(&datadir)?;
+    let guard = crate::state::lock_pool_directory(&datadir)?;
+    let ledger_path = datadir.join("ledger");
+    let policy = || pool_ledger::PoolConfig::new(1_000, vec![0x51]);
+    let (_ledger, first): (pool_ledger::Ledger, u32) = crate::storage_backend::open_generic(
+        "pool",
+        backend,
+        &ledger_path,
+        None,
+        &guard,
+        super::LedgerComposer { config: policy() },
+    )?;
+    drop(_ledger);
+    let (_ledger, second): (pool_ledger::Ledger, u32) = crate::storage_backend::open_generic(
+        "pool",
+        backend,
+        &ledger_path,
+        None,
+        &guard,
+        super::LedgerComposer { config: policy() },
+    )?;
+    assert!(
+        second > first,
+        "run-epoch allocation must advance across restarts while the directory lock is held"
+    );
+    drop(_ledger);
+    let mismatch = pool_ledger::PoolConfig::new(2_000, vec![0x51]);
+    let outcome = crate::storage_backend::open_generic(
+        "pool",
+        backend,
+        &ledger_path,
+        None,
+        &guard,
+        super::LedgerComposer { config: mismatch },
+    )
+    .map(|_: (pool_ledger::Ledger, u32)| ());
+    let error = outcome.unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<pool_ledger::LedgerError>(),
+            Some(pool_ledger::LedgerError::ConfigMismatch)
+        ),
+        "a changed policy must fail rather than reinterpret history: {error:?}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "redb")]
+#[test]
+fn pool_prepare_create_open_and_epoch_run_under_the_directory_lock_redb() -> TestResult {
+    ledger_create_open_and_epoch_under_guard(bitcoin_rs_storage::StorageBackend::Redb)
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn pool_prepare_create_open_and_epoch_run_under_the_directory_lock_fjall() -> TestResult {
+    ledger_create_open_and_epoch_under_guard(bitcoin_rs_storage::StorageBackend::Fjall)
+}
+
+#[test]
+fn node_chain_view_reports_missing_index_observer_errors() -> TestResult {
+    use pool_ledger::ChainView as _;
+
+    let directory = tempfile::tempdir()?;
+    let mut config = crate::config::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = directory.path().to_owned();
+    config.rpc.bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    config.rpc.auth = crate::Auth::basic("user", "password");
+    config.indexes.txindex = false;
+    config.indexes.script_index = crate::config::ScriptIndexMode::Disabled;
+    config.p2p.listen.clear();
+    config.observability.metrics_bind = None;
+    let state = crate::state::NodeState::open(config, None)?;
+    assert!(state.derived_index_query().is_none());
+    assert!(state.script_index_query().is_none());
+    let view = super::ledger::NodeChainView::new(
+        state.chainstate(),
+        state.stable_read(),
+        state.mempool_reader(),
+        state.derived_index_query(),
+        state.script_index_query(),
+    )?;
+    let txid = [0x07; 32];
+    match pool_ledger::ChainView::tx_status(&view, &txid) {
+        Err(error) => assert!(
+            error.0.contains("txindex"),
+            "missing txindex must be reported, not treated as evidence: {error}"
+        ),
+        Ok(_) => panic!("unknown payout must not resolve without a txindex"),
+    }
+    let outpoint = pool_ledger::OutPoint {
+        txid: [0x09; 32],
+        vout: 0,
+    };
+    match pool_ledger::ChainView::confirmed_spender(&view, &outpoint) {
+        Err(error) => assert!(
+            error.0.contains("script index"),
+            "missing script index must be reported, not treated as evidence: {error}"
+        ),
+        Ok(_) => panic!("no spend can be observed without a script index"),
+    }
+    Ok(())
+}
+
+#[test]
+fn pool_prepare_holds_directory_lock_for_service_lifetime() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let pool_datadir = directory.path().join("pool");
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = probe.local_addr()?.port();
+    drop(probe);
+    let mut config = crate::config::NodeConfig::default_for_network(crate::Network::Regtest);
+    config.data_dir = directory.path().join("node");
+    config.rpc.bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    config.rpc.auth = crate::Auth::basic("user", "password");
+    config.indexes.txindex = false;
+    config.indexes.script_index = crate::config::ScriptIndexMode::Disabled;
+    config.p2p.listen.clear();
+    config.observability.metrics_bind = None;
+    #[cfg(feature = "redb")]
+    {
+        config.storage.backend = bitcoin_rs_storage::StorageBackend::Redb;
+    }
+    #[cfg(all(not(feature = "redb"), feature = "fjall"))]
+    {
+        config.storage.backend = bitcoin_rs_storage::StorageBackend::Fjall;
+    }
+    config.mining.payout_script = vec![0x51];
+    config.pool = Some(crate::config::PoolConfig {
+        datadir: pool_datadir.clone(),
+        v1_bind: Some(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+        sv2_bind: None,
+        sv2_authority_key: None,
+        allow_non_loopback: false,
+        max_connections: 128,
+        max_connections_per_ip: 8,
+        share_difficulty: "1".to_owned(),
+        share_target: bitcoin_rs_stratum::ShareTarget::from_pool_difficulty_decimal("1")?,
+        window_work: 1_000,
+        fee_bps: 0,
+        reward_script: vec![0x51],
+        maturity: 100,
+        payout_confirmations: 6,
+        reorg_watch_depth: 1_000,
+        min_payout_sat: 1_000,
+        max_payout_outputs: 10,
+    });
+    let state = crate::state::NodeState::open(config, None)?;
+    let control = Arc::new(bitcoin_rs_mining::FakeMiningControl::default());
+    let service =
+        super::PoolService::prepare(&state, control)?.expect("enabled pool must prepare a service");
+    assert!(
+        crate::state::lock_pool_directory(&pool_datadir).is_err(),
+        "pool datadir must stay locked while the prepared service lives"
+    );
+    drop(service);
+    let _released = crate::state::lock_pool_directory(&pool_datadir)?;
+    Ok(())
+}

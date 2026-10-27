@@ -615,6 +615,173 @@ fn transactional_outbox_buffers_shares_when_ledger_fails() {
 }
 
 #[test]
+fn second_submit_while_accounting_pending_is_shed_before_validation() {
+    let prev = Hash256::from_le_bytes(&[0x44; 32]);
+    let candidate = Arc::new(sample_candidate(
+        prev,
+        CompactTarget::from_consensus(0x207f_ffff),
+        4,
+    ));
+    let fake_control = Arc::new(FakeMiningControl::default());
+    // A permanently failing ledger is a deterministic barrier: the first
+    // share can never complete inline, so the session holds exactly one
+    // pending accounting response until the test disarms the ledger.
+    let ledger = Arc::new(TestLedger::armed_with_failures(usize::MAX));
+    let pool = build_pool(fake_control, ledger.clone());
+    let installed = pool
+        .install(candidate, Vec::new())
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    let job_id = installed.job.id();
+
+    let accounts = Arc::new(
+        StaticAccountResolver::new()
+            .with_account("alice", "secret123")
+            .unwrap_or_else(|error| panic!("test operation failed: {error:?}")),
+    );
+    let diff_policy = DifficultyPolicy::new("0.0000000001", "0.00000000001", "1000")
+        .unwrap_or_else(|error| panic!("test operation failed: {error:?}"));
+    let config = ServerConfig::new(diff_policy);
+    let server = Server::bind(
+        "127.0.0.1:0",
+        config,
+        ServerDeps {
+            pool: pool.clone(),
+            accounts,
+            observer: None,
+        },
+    )
+    .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    let addr = server.local_addr();
+
+    let mut client = TestClient::connect(addr);
+    client.send("{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n");
+    let _ = client.read_line();
+    client.send(
+        "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"alice.w1\",\"secret123\"]}\n",
+    );
+    let _ = client.read_line();
+    let _ = client.read_line(); // diff
+    let _ = client.read_line(); // notify
+
+    let first = format!(
+        "{{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"alice.w1\",\"{job_id:08x}\",\"00000001\",\"{ntime:08x}\",\"00000000\"]}}\n",
+        job_id = job_id.get(),
+        ntime = installed.job.ntime(),
+    );
+    client.send(&first);
+    // The first share is buffered in the outbox; no success may precede the
+    // durable record.
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    let mut early = String::new();
+    assert!(
+        !TestClient::read_available(&mut client.reader, &mut early),
+        "no success may precede the durable record"
+    );
+    assert!(early.is_empty(), "unexpected early frame: {early:?}");
+
+    // A second submit with a fresh valid nonce arrives while the first
+    // accounting is still pending. It must be shed before validation with the
+    // retryable accounting error: the hash is never burned and the miner may
+    // retry it.
+    let second = format!(
+        "{{\"id\":4,\"method\":\"mining.submit\",\"params\":[\"alice.w1\",\"{job_id:08x}\",\"00000001\",\"{ntime:08x}\",\"00000001\"]}}\n",
+        job_id = job_id.get(),
+        ntime = installed.job.ntime(),
+    );
+    client.send(&second);
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    let shed = client.read_line();
+    assert!(
+        shed.contains("\"error\":[20,") && shed.contains("Share accounting unavailable"),
+        "second submit while pending must be shed retryably: {shed}"
+    );
+    assert_eq!(
+        ledger.recorded_shares().len(),
+        0,
+        "a shed submit must not reach the ledger"
+    );
+
+    // Disarm the barrier, then drain: the session's next poll delivers the
+    // deferred first success, and the connection is still alive.
+    ledger.disarm();
+    pool.drain_outbox();
+    let resp = client.read_line();
+    assert_eq!(resp, "{\"id\":3,\"result\":true,\"error\":null}\n");
+    assert_eq!(ledger.recorded_shares().len(), 1);
+
+    // The shed share was never burned: resubmitting it now credits a second
+    // share instead of answering duplicate.
+    let retry = second.replace("\"id\":4", "\"id\":5");
+    client.send(&retry);
+    let retried = client.read_line();
+    assert_eq!(retried, "{\"id\":5,\"result\":true,\"error\":null}\n");
+    assert_eq!(ledger.recorded_shares().len(), 2);
+
+    server.shutdown();
+}
+
+#[test]
+fn composed_pool_defaults_enforce_total_and_per_ip_caps() -> TestResult {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let limiter = Arc::new(ConnectionLimiter::new(128, 8)?);
+    let mut held = Vec::new();
+    for host in 1..=16u8 {
+        let peer = IpAddr::V4(Ipv4Addr::new(127, 0, 0, host));
+        for _ in 0..8 {
+            held.push(limiter.try_admit(peer).map_err(|reason| {
+                std::io::Error::other(format!(
+                    "composed default admission refused early: {reason:?}"
+                ))
+            })?);
+        }
+        assert!(
+            limiter.try_admit(peer).is_err(),
+            "the 9th connection from one IP must be refused under the composed 8-per-IP cap"
+        );
+    }
+    assert_eq!(held.len(), 128);
+    assert!(
+        limiter
+            .try_admit(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 17)))
+            .is_err(),
+        "the 129th total connection must be refused under the composed 128-total cap"
+    );
+    drop(held);
+    limiter
+        .try_admit(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .map_err(|reason| {
+            std::io::Error::other(format!("released slot not re-admittable: {reason:?}"))
+        })?;
+    Ok(())
+}
+
+#[test]
+fn job_install_with_new_parent_issues_no_ledger_write() {
+    let ledger = Arc::new(TestLedger::default());
+    let pool = build_pool(Arc::new(FakeMiningControl::default()), ledger.clone());
+    for (parent, height) in [([0x51; 32], 10), ([0x52; 32], 11)] {
+        let candidate = Arc::new(sample_candidate(
+            Hash256::from_le_bytes(&parent),
+            CompactTarget::from_consensus(0x207f_ffff),
+            height,
+        ));
+        pool.install(candidate, Vec::new())
+            .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    }
+    assert!(
+        ledger.recorded_shares().is_empty(),
+        "installing jobs with new parents must not write share accounting"
+    );
+}
+
+#[test]
 fn protocol_negative_scenarios_rejected_deterministically() {
     let prev = Hash256::from_le_bytes(&[0x33; 32]);
     let candidate = Arc::new(sample_candidate(

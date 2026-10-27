@@ -70,6 +70,24 @@ fn pool_requires_explicit_policy_and_listener() {
 
 #[cfg(feature = "pool")]
 #[test]
+fn pool_composed_connection_defaults_are_pinned() {
+    let config = resolved(&[&pool_layer()]);
+    let pool = config
+        .pool
+        .as_ref()
+        .unwrap_or_else(|| panic!("pool layer must enable the pool"));
+    assert_eq!(
+        pool.max_connections, 128,
+        "shared total connection default must stay 128"
+    );
+    assert_eq!(
+        pool.max_connections_per_ip, 8,
+        "shared per-IP connection default must stay 8"
+    );
+}
+
+#[cfg(feature = "pool")]
+#[test]
 fn pool_layers_preserve_explicit_fields_and_override_policy() -> anyhow::Result<()> {
     let base = pool_layer();
     let later = UserConfig {

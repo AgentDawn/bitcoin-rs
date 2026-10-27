@@ -437,24 +437,16 @@ fn pool_management_requires_authentication_and_management_surface()
         authorized.starts_with("HTTP/1.1 200 OK"),
         "authorized management request must reach the pool handler: {authorized}"
     );
-    let payload = authorized
-        .split_once("\r\n\r\n")
-        .ok_or("missing body")?
-        .1;
+    let payload = authorized.split_once("\r\n\r\n").ok_or("missing body")?.1;
     let value: sonic_rs::Value = sonic_rs::from_str(payload)?;
-    assert_eq!(
-        value.get("jsonrpc").and_then(|v| v.as_str()),
-        Some("2.0")
-    );
+    assert_eq!(value.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
     let error = value
         .get("error")
         .ok_or("pool refusal without a ledger must be an error")?;
     #[cfg(feature = "pool")]
     {
         assert_eq!(
-            error
-                .get("code")
-                .and_then(sonic_rs::JsonValueTrait::as_i64),
+            error.get("code").and_then(sonic_rs::JsonValueTrait::as_i64),
             Some(-32_603),
             "disabled pool must answer MethodDisabled: {payload}"
         );
@@ -469,9 +461,7 @@ fn pool_management_requires_authentication_and_management_surface()
     #[cfg(not(feature = "pool"))]
     {
         assert_eq!(
-            error
-                .get("code")
-                .and_then(sonic_rs::JsonValueTrait::as_i64),
+            error.get("code").and_then(sonic_rs::JsonValueTrait::as_i64),
             Some(-32_601),
             "unshipped pool method must answer MethodNotFound: {payload}"
         );

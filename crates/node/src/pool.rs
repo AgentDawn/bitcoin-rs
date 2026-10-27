@@ -58,6 +58,43 @@ impl crate::storage_backend::StoreConsumer for LedgerComposer {
     }
 }
 
+/// Composition-time bounds for the single shared pool core.
+///
+/// Every protocol listener shares one [`PoolCore`]: at most 64 retained jobs,
+/// one session slot per configured connection plus a spare set for reconnects
+/// (twice the connection cap), 65,536 duplicate-tracked shares per job, and a
+/// deferred share-ledger outbox of 1024 records / 8 MiB. Owner sessions are
+/// not live TCP connections; the aggregate TCP caps live in the shared
+/// [`ConnectionLimiter`](bitcoin_rs_stratum::ConnectionLimiter).
+struct ComposedCore {
+    book: JobBookConfig,
+    outbox_items: usize,
+    outbox_bytes: usize,
+}
+
+fn composed_core_config(max_connections: u32) -> Result<ComposedCore> {
+    let sessions = usize::try_from(max_connections)?
+        .checked_mul(2)
+        .context("pool session bound overflow")?;
+    Ok(ComposedCore {
+        book: JobBookConfig {
+            budget: CoinbaseBudget {
+                additional_size: 0,
+                additional_sigops: 0,
+            },
+            extranonce: ExtranonceLayout::new(4, 4),
+            coinbase_tag: b"/btcrs/".to_vec(),
+            version_mask: bitcoin_rs_stratum::BIP320_VERSION_MASK,
+            ntime_forward_secs: bitcoin_rs_stratum::MAX_NTIME_FORWARD_SECS,
+            max_jobs: 64,
+            max_sessions: sessions,
+            max_shares_per_job: 65_536,
+        },
+        outbox_items: 1024,
+        outbox_bytes: 8 * 1024 * 1024,
+    })
+}
+
 impl PoolService {
     pub(crate) fn prepare(
         state: &crate::state::NodeState,
@@ -85,29 +122,11 @@ impl PoolService {
                 max_outputs: usize::try_from(config.max_payout_outputs)?,
             },
         ));
-        let sessions = usize::try_from(config.max_connections)?
-            .checked_mul(2)
-            .context("pool session bound overflow")?;
+        let composed = composed_core_config(config.max_connections)?;
         let core = Arc::new(
-            PoolCore::new(
-                JobBookConfig {
-                    budget: CoinbaseBudget {
-                        additional_size: 0,
-                        additional_sigops: 0,
-                    },
-                    extranonce: ExtranonceLayout::new(4, 4),
-                    coinbase_tag: b"/btcrs/".to_vec(),
-                    version_mask: bitcoin_rs_stratum::BIP320_VERSION_MASK,
-                    ntime_forward_secs: bitcoin_rs_stratum::MAX_NTIME_FORWARD_SECS,
-                    max_jobs: 64,
-                    max_sessions: sessions,
-                    max_shares_per_job: 65_536,
-                },
-                Arc::clone(&control),
-                host.clone(),
-            )?
-            .with_ledger_retry(1, Duration::ZERO)
-            .with_outbox(1024, 8 * 1024 * 1024),
+            PoolCore::new(composed.book, Arc::clone(&control), host.clone())?
+                .with_ledger_retry(1, Duration::ZERO)
+                .with_outbox(composed.outbox_items, composed.outbox_bytes),
         );
         let chain = Arc::new(ledger::NodeChainView::new(
             state.chainstate(),
