@@ -46,15 +46,18 @@ scanning and wallet interoperability remain unverified.
 
 
 - Parameter type and coercion rules, named and positional forms, the
-  declared JSON-RPC 1 and 2 envelopes, batches, notifications,
+  declared JSON-RPC 1 and 2 envelopes, notifications,
   authentication, and error ordering follow the pinned Core 31.1
-  contract.
+  contract. Batches follow it except for the two deviations noted
+  below (empty-array rejection, 204 for notification-only batches).
 - The HTTP endpoint accepts JSON-RPC batch arrays as implemented by
   `handle_decoded_json` in `crates/rpc/src/server.rs`: a top-level JSON
   array dispatches each entry independently via `handle_single_json`,
   preserving each entry's own 1.1/2.0 framing
   (`JsonRpcVersion::from_request`). An empty array is rejected
-  (`InvalidRequest`, "batch must not be empty"). Replies assemble into a
+  (`InvalidRequest`, "batch must not be empty") with HTTP 500 and a
+  legacy-envelope error body (not an array) — Core 31.1 instead
+  answers `[]` with HTTP 200. Replies assemble into a
   JSON array in request order; 2.0 notifications (requests without `id`)
   contribute no entry. A notification-only batch answers HTTP 204 with no
   body; otherwise the status is the maximum per-entry status. There is no
