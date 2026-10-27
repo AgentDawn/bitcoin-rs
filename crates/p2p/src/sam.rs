@@ -1512,8 +1512,20 @@ impl SamSession {
         let _accept_wake = AcceptWakeGuard {
             slot: &self.accept_wake,
         };
-        conn.hello(deadline)?;
-        let reply = conn.command(&format!("STREAM ACCEPT ID={}", self.id), deadline)?;
+        // Every entry point fails closed: a wake-induced failure in any
+        // setup step reports the close, not the socket error, via the same
+        // release/acquire pairing as the announcement read below.
+        let close_mapped = |error: io::Error| {
+            if self.closed.load(Ordering::Acquire) {
+                session_closed()
+            } else {
+                error
+            }
+        };
+        conn.hello(deadline).map_err(close_mapped)?;
+        let reply = conn
+            .command(&format!("STREAM ACCEPT ID={}", self.id), deadline)
+            .map_err(close_mapped)?;
         let fields = parse_fields(&reply, "STREAM STATUS")?;
         if field(&fields, "RESULT") == Some("INVALID_ID") {
             let _ = self.retire_root(root, deadline);
