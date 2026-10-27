@@ -35,10 +35,13 @@ Honest scope labeling:
   Unavailable with an explicit reason, never zero.
 
 Read-only bound: this module only reads the mount table, the one chosen
-device's counter files, and local topology/queue attribute files listed in
-``mechanisms_checked``. It spawns no subprocess, writes nothing, and follows
-exactly one counter per scope (a partition's own counter, never the parent
-disk added to it, never slaves added together).
+device's sysfs counter file, and local topology/queue attribute files listed
+in ``mechanisms_checked``. The ``/proc/diskstats`` sectors-written value and
+the ``shared_mounts`` list are recorded diagnostics alongside the sysfs
+counter, never cross-validated against it and never gating availability. It
+spawns no subprocess, writes nothing, and follows exactly one counter per
+scope (a partition's own counter, never the parent disk added to it, never
+slaves added together).
 
 Sector unit: the kernel block-layer counter unit is always 512 bytes,
 independent of the filesystem logical block size or the device physical
@@ -165,7 +168,11 @@ def read_mountinfo(path: str | Path = MOUNTINFO_DEFAULT) -> list[MountInfo]:
     if text is None:
         return []
     mounts: list[MountInfo] = []
-    for line in text.splitlines():
+    # Split records only on "\n": the kernel octal-escapes space/tab/newline/
+    # backslash, so remaining raw vertical-tab, form-feed, and carriage-return
+    # bytes in mountpoints must survive as record content. str.splitlines()
+    # would split on those bytes and corrupt such records.
+    for line in text.split("\n"):
         if " - " not in line:
             continue
         left, right = line.split(" - ", 1)
@@ -272,6 +279,8 @@ class CounterHandle:
             or sample["in_flight"] < 0
         ):
             raise ValueError("counter file holds a negative value")
+        # Recorded diagnostic only: the diskstats value is stored alongside the
+        # sysfs counter and is never cross-validated against it.
         text = _read_text(self.diskstats_path)
         if text is not None:
             for line in text.splitlines():
@@ -485,6 +494,8 @@ def identify_scope(
             ),
         )
         return None, info
+    # Recorded diagnostic only: other mounts on this device are listed for
+    # context and never cross-validated against the counter.
     shared = [
         str(entry["mountpoint"])
         for entry in mounts
