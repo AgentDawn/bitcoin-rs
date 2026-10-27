@@ -264,6 +264,20 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     and mempool restoration (process-test mapping in [`e2e/REORG-COVERAGE.md`](../e2e/REORG-COVERAGE.md)).
 - **Feature requirement**: The AssumeUTXO recovery unit module is gated by
   `fjall`; without it, that filter selects no tests.
+- **Host prerequisite (AssumeUTXO non-UTF-8 snapshot test)**:
+  `e2e/tests/assumeutxo.rs::invalid_core_snapshots_fail_without_activating`
+  requires `/tmp` to accept arbitrary non-NUL byte filenames for its Unix
+  fixture. The test owns a temporary directory under `/tmp` containing
+  `core-\xff.dat`; the UTF-8 `core200.dat` symlink stays in the node datadir,
+  and the RPC receives `{"path":"core200.dat"}`. It copies the snapshot to the
+  target, removes the original, and creates the symlink rather than renaming
+  across potentially different filesystems. The owned target directory is
+  removed at test end or on an early error. This leaves the node datadir and
+  global `TMPDIR` on their configured disk-backed filesystem, even if that
+  filesystem rejects non-UTF-8 entry names. The former rename-in-datadir
+  fixture could fail with `EILSEQ` (92) before RPC; that failure was not JSON
+  serialization. A byte-capable `/tmp` remains a host prerequisite; record an
+  incapable lane as `BLOCKED` rather than skipping or weakening the scenario.
 - **Reproduce**:
   ```sh
   cargo test --locked -p bitcoin-rs-chainstate --lib recovery_marker_order_tests
