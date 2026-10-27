@@ -1599,39 +1599,10 @@ impl SessionState {
             );
             return Verdict::Ignored;
         }
-        // Normalize the wire version bits to the canonical header version
-        // before the common submit owner: rolled-bits interpretation lives in
-        // this SV1 edge (read through the single authoritative `JobBook`,
-        // which stays the sole owner of the share predicate), so
-        // `PoolCore::submit` and settlement below see only canonical
-        // submissions and hold no wire branching.
-        let version = match self.shared.pool.with_job_book(|book| {
-            let job_ref = book.job(job)?;
-            Some(match submit.version_bits {
-                Some(bits) => job_ref.version_from_rolled_bits(bits),
-                None => Ok(job_ref.version()),
-            })
-        }) {
-            Some(Ok(version)) => version,
-            Some(Err(error)) => {
-                let wire = share_error_wire(&error);
-                if matches!(error, ShareError::ExtranonceLength { .. }) {
-                    emit_reply(request, out, &encode_error(&request.id, &wire));
-                    return Verdict::Violation;
-                }
-                emit_reply(request, out, &encode_reject(&request.id, &wire));
-                return Verdict::Rejected;
-            }
-            // The book rejects an unknown job before it reads the version;
-            // answer here with the same verdict the owner would produce.
-            None => {
-                emit_reply(
-                    request,
-                    out,
-                    &encode_reject(&request.id, &errors::JOB_NOT_FOUND_ERROR),
-                );
-                return Verdict::Rejected;
-            }
+        // Normalize the wire version bits before the common submit owner.
+        let version = match self.normalized_version(job, submit) {
+            Ok(version) => version,
+            Err(failure) => return Self::submit_failure_verdict(request, &failure, out),
         };
         let target = self.effective_target(Instant::now());
         let share_request = ShareRequest {
@@ -1644,25 +1615,56 @@ impl SessionState {
         };
         let session = share_request.session;
         match self.shared.pool.submit(&identity, &share_request, &target) {
-            Ok(credited) => {
-                if credited.completion.is_complete() {
-                    let reply = request.has_id.then_some(&request.id);
-                    self.emit_credited(reply, session, &credited, out);
-                } else {
-                    self.deferred.push(DeferredResponse {
-                        id: request.id.clone(),
-                        has_id: request.has_id,
-                        hash: credited.hash,
-                        class: credited.class,
-                        block: credited.block,
-                        completion: credited.completion,
-                    });
-                    self.poll_hint = true;
-                }
-                Verdict::Accepted
-            }
+            Ok(credited) => self.admit_credited(request, session, credited, out),
             Err(failure) => Self::submit_failure_verdict(request, &failure, out),
         }
+    }
+
+    /// Normalizes the wire version bits to the canonical header version:
+    /// rolled-bits interpretation lives in this SV1 edge (read through the
+    /// single authoritative `JobBook`, which stays the sole owner of the
+    /// share predicate), so `PoolCore::submit` and settlement below see only
+    /// canonical submissions and hold no wire branching. An unknown job
+    /// answers with the same verdict the owner would produce.
+    fn normalized_version(&self, job: JobId, submit: &Submit) -> Result<u32, SubmitFailure> {
+        match self.shared.pool.with_job_book(|book| {
+            let job_ref = book.job(job)?;
+            Some(match submit.version_bits {
+                Some(bits) => job_ref.version_from_rolled_bits(bits),
+                None => Ok(job_ref.version()),
+            })
+        }) {
+            Some(result) => result.map_err(SubmitFailure::Share),
+            None => Err(SubmitFailure::Share(ShareError::UnknownJob(job))),
+        }
+    }
+
+    /// Records an accepted share: answers immediately when its accounting is
+    /// complete, otherwise withholds the reply on the session's single
+    /// outstanding completion. Always `Accepted`: the verdict counts the
+    /// submission, not its durability.
+    fn admit_credited(
+        &mut self,
+        request: &Request,
+        session: SessionId,
+        credited: Credited,
+        out: &mut Vec<u8>,
+    ) -> Verdict {
+        if credited.completion.is_complete() {
+            let reply = request.has_id.then_some(&request.id);
+            self.emit_credited(reply, session, &credited, out);
+        } else {
+            self.deferred.push(DeferredResponse {
+                id: request.id.clone(),
+                has_id: request.has_id,
+                hash: credited.hash,
+                class: credited.class,
+                block: credited.block,
+                completion: credited.completion,
+            });
+            self.poll_hint = true;
+        }
+        Verdict::Accepted
     }
 
     /// Maps a common-owner submit refusal onto the wire reply and verdict.
