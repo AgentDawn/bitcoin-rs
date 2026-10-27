@@ -51,6 +51,19 @@ pub const MAX_HIGH_BANDWIDTH_PEERS: usize = 3;
 /// Drain poll interval when the block announce queue is empty.
 const ANNOUNCE_POLL: Duration = Duration::from_millis(100);
 
+/// Shared initial-block-download predicate behind the proactive P2P paths:
+/// true while the node's latch reports active for its network.
+pub(crate) fn ibd_active(
+    ibd: Option<&(
+        Arc<bitcoin_rs_chain::InitialBlockDownload>,
+        bitcoin_rs_primitives::Network,
+    )>,
+) -> bool {
+    ibd.is_some_and(|(latch, network)| {
+        latch.is_active(bitcoin_rs_primitives::unix_time_secs(), *network)
+    })
+}
+
 /// Configuration for block announcements.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlockAnnounceConfig {
@@ -209,9 +222,7 @@ impl BlockAnnouncer {
     /// Whether the node is currently in initial block download.
     #[must_use]
     pub fn in_ibd(&self) -> bool {
-        self.ibd.as_ref().is_some_and(|(latch, network)| {
-            latch.is_active(bitcoin_rs_primitives::unix_time_secs(), *network)
-        })
+        ibd_active(self.ibd.as_ref())
     }
 
     /// Returns the current list of peers we requested high-bandwidth compact blocks from.

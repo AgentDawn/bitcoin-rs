@@ -274,9 +274,7 @@ impl PeerRelaySink {
 impl RelaySink for PeerRelaySink {
     fn poll(&self, gateway: &MempoolGateway) {
         use bitcoin::secp256k1::rand::SeedableRng as _;
-        let ibd = self.ibd.as_ref().is_some_and(|(latch, network)| {
-            latch.is_active(bitcoin_rs_primitives::unix_time_secs(), *network)
-        });
+        let ibd = crate::block_announce::ibd_active(self.ibd.as_ref());
         if !ibd {
             self.peers.poll_transaction_requests(gateway);
         }

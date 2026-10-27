@@ -211,11 +211,12 @@ pub fn recover_disconnect_marker(handles: &Chainstate) -> Result<(), ApplyError>
         return reconcile_at_boot(handles);
     };
     let fail_closed = |head_tip: Hash256, head_height: u32, reason: &'static str| {
+        let restored = handles.applied_tip.load_full();
         ApplyError::DurableHeadGapUnrecoverable {
             head_tip,
             head_height,
-            restored_tip: handles.applied_tip.load_full().map(|tip| tip.hash),
-            restored_height: handles.applied_tip.load_full().map(|tip| tip.height),
+            restored_tip: restored.as_ref().map(|tip| tip.hash),
+            restored_height: restored.as_ref().map(|tip| tip.height),
             reason,
         }
     };

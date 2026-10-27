@@ -159,8 +159,7 @@ pub(super) fn invalidate_and_republish(
         .invalidate_subtree(root)
         .map_err(InvalidationError::Plan)?;
     let tip = tree.tip().ok_or(InvalidationError::NoValidTip)?;
-    handles.chain_tip.store(Some(tip));
-    handles.reevaluate_assume_valid_with(&tree);
+    handles.publish_chain_tip(Some(tip), &tree);
     Ok(invalidated)
 }
 
@@ -960,8 +959,7 @@ where
                         // surface both failures.
                         let handles = transition.chainstate();
                         let tree = handles.block_tree.read();
-                        handles.chain_tip.store(tree.tip());
-                        handles.reevaluate_assume_valid_with(&tree);
+                        handles.publish_chain_tip(tree.tip(), &tree);
                         drop(tree);
                         return Err(ReorgError::Invalidation {
                             source: Box::new(ReorgError::from(invalidation)),

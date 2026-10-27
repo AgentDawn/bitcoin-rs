@@ -220,7 +220,14 @@ impl PeerTable {
 
     /// Register an unidentified (anonymous) inbound session. Anonymous
     /// sessions coexist, are capacity-only, and never replace a known peer.
-    #[allow(dead_code, reason = "slice B inbound Tor registers through this path")]
+    ///
+    /// Test-only: no production caller registers through this path (inbound
+    /// Tor reserves via `try_register_inbound_unidentified`).
+    ///
+    /// Cross-crate integration tests reach it via `p2p/test-seam`; enabling
+    /// that seam in `crates/rpc` dev-dependencies is a follow-up outside this
+    /// change's scope.
+    #[cfg(any(test, feature = "test-seam"))]
     pub fn register_unidentified(&self, lease: PeerLease) -> bool {
         let key = SessionKey::Unidentified(lease.connection_id());
         let entry = Entry {
@@ -358,7 +365,6 @@ impl PeerTable {
 
     /// Reserve an unidentified inbound session: capacity-only, coexists
     /// with known peers, never replaces by endpoint.
-    #[allow(dead_code, reason = "slice B inbound Tor registers through this path")]
     #[must_use]
     pub(crate) fn try_register_inbound_unidentified(
         &self,

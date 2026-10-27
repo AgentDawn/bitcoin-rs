@@ -1183,6 +1183,14 @@ impl Chainstate {
         self.assume_valid_gate.evaluate(tree);
     }
 
+    /// Publishes `tip` as the chain tip and re-evaluates the assume-valid
+    /// anchor against the already locked `tree`, keeping the two tree-derived
+    /// facts in step.
+    pub(crate) fn publish_chain_tip(&self, tip: Option<Arc<TipSnapshot>>, tree: &BlockTree) {
+        self.chain_tip.store(tip);
+        self.reevaluate_assume_valid_with(tree);
+    }
+
     /// `Fast` trusts a block only when it is the node at `height` on the
     /// best header tip's own chain, so a block on a competing branch never
     /// borrows that trust. The tip is read from the tree under the same read
