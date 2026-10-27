@@ -32,16 +32,21 @@ pub fn request_missing_parents(
 ) -> bool {
     use bitcoin::hashes::Hash as _;
 
-    let Some(endpoint) = source.endpoint else {
+    // Unidentified-aware resolution: an anonymous inbound session has no
+    // endpoint, so it is found by connection id among live sessions rather
+    // than by the endpoint-keyed lookup. The token comparison still rejects
+    // stale tokens.
+    let Some(session) = peers.sessions().into_iter().find(|session| {
+        session.endpoint == source.endpoint
+            && session.lease.connection_id().get() == source.connection_id
+    }) else {
         return false;
     };
-    let Some(lease) = peers.lease(endpoint) else {
-        return false;
-    };
-    let connection = lease.source(source.endpoint);
+    let lease = session.lease;
+    let connection = lease.source(session.endpoint);
     if PeerToken::from(connection) != source {
         return false;
-    }
+    };
     let mut witness = false;
     peers.for_each_ready_lease(|addr, current, info| {
         if addr == source.endpoint && current.same_connection(&lease) {
@@ -328,6 +333,32 @@ mod tests {
         lease.cancel();
 
         assert!(!request_missing_parents(&table, source, &[parent(1)]));
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_parents_resolve_unidentified_sessions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = PeerTable::new();
+        let (sender, receiver) = crate::test_support::message_channel_bounded(2);
+        let lease = PeerLease::new(sender);
+        table.register_unidentified(lease.clone());
+        let source = PeerToken::from(lease.source(None));
+        assert!(source.endpoint.is_none());
+
+        assert!(request_missing_parents(&table, source, &[parent(1)]));
+        let expected = Message::GetData(vec![Inventory::Transaction(bitcoin::Txid::from_byte_array(
+            *parent(1).as_bytes(),
+        ))]);
+        assert!(matches!(receiver.try_recv(), Ok(message) if message == expected));
+        assert!(!lease.is_cancelled());
+
+        let stale = PeerToken {
+            endpoint: None,
+            connection_id: source.connection_id.wrapping_add(1),
+        };
+        assert!(!request_missing_parents(&table, stale, &[parent(1)]));
         assert!(receiver.try_recv().is_err());
         Ok(())
     }

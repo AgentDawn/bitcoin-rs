@@ -137,10 +137,15 @@ fn not_found_block_hash(item: &Inventory) -> Option<Hash256> {
 ///   through the owner-only delivery rejection, which also ends a timeout
 ///   observation or cold-front episode naming it and lowers the request
 ///   cursor) or a deferred owned-fetch mark for it (dropped); `false` and no
-///   change otherwise.
+///   release otherwise. A `notfound` from a connection that owns nothing for
+///   a tracked (pending) hash — a prefix-probe racer or cold-front hedge
+///   alternate answering for the owner's prefix — is still remembered, so
+///   the probe and request paths stop offering it that hash, but the
+///   owner's request is left untouched.
 /// INVARIANT: only the exact owning connection releases. A different
-///   connection's `notfound`, or one for a hash nobody asked this connection
-///   for, changes nothing. Nothing here blames or disconnects the owner.
+///   connection's `notfound` never releases the owner; one for a hash
+///   nobody tracks changes nothing at all. Nothing here blames or
+///   disconnects the owner.
 fn release_unavailable_body(
     scheduler: &mut SchedulerState,
     source: PeerSource,
@@ -158,6 +163,9 @@ fn release_unavailable_body(
         .iter()
         .position(|(owner, owned)| *owner == source && *owned == hash);
     if !owns_window_request && deferred.is_none() {
+        if window.contains_pending(&hash) {
+            body_unavailable.note(source, hash, now);
+        }
         return false;
     }
     if owns_window_request {
@@ -562,5 +570,122 @@ impl BlockSync {
             }
         }
         None
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::release_unavailable_body;
+    use super::UnavailableBodies;
+    use crate::connection::PeerSource;
+    use crate::download_window::DownloadWindow;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    fn test_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A minimal header chain: genesis plus linked successors, so window
+    /// planning resolves contiguous heights without proof-of-work mining.
+    fn test_chain() -> (
+        bitcoin_rs_chain::BlockTree,
+        Vec<(bitcoin_rs_chain::NodeId, bitcoin_rs_primitives::Header)>,
+    ) {
+        use bitcoin_rs_primitives::Header;
+        let genesis = bitcoin_rs_primitives::Network::Regtest
+            .genesis_block()
+            .header;
+        let headers: Vec<Header> = std::iter::successors(Some(genesis), |prev| {
+            let height = prev.time.saturating_sub(genesis.time).saturating_add(1);
+            let mut merkle = [0_u8; 32];
+            merkle[..4].copy_from_slice(&height.to_le_bytes());
+            Some(Header {
+                prev_blockhash: prev.compute_hash(),
+                merkle_root: bitcoin_rs_primitives::Hash256::from_le_bytes(&merkle),
+                time: prev.time.saturating_add(1),
+                ..*prev
+            })
+        })
+        .take(32)
+        .collect();
+        let mut tree = bitcoin_rs_chain::BlockTree::new();
+        let mut parent = None;
+        let mut nodes = Vec::with_capacity(headers.len());
+        for header in headers {
+            let inserted = tree
+                .insert_node(parent, header, bitcoin_rs_chain::NodeStatus::HeaderValid)
+                .unwrap_or_else(|error| panic!("test header: {error}"));
+            parent = Some(inserted);
+            nodes.push((inserted, header));
+        }
+        (tree, nodes)
+    }
+
+    fn scheduler_with_owner_pending(
+        owner: PeerSource,
+    ) -> (super::super::SchedulerState, bitcoin_rs_primitives::Hash256) {
+        use bitcoin_rs_chain::{ChainTxCount, ChainWork, TipSnapshot};
+        let budget = crate::sync::default_sync_budget(bitcoin_rs_primitives::Network::Regtest);
+        let mut window = DownloadWindow::new(budget);
+        let mut stager = crate::BlockStager::new(budget);
+        let (tree, nodes) = test_chain();
+        let (tip_id, tip_header) = nodes[10];
+        let now = Instant::now();
+        let chain_tip = TipSnapshot {
+            tip_id,
+            chain_tx_count: ChainTxCount::UNKNOWN,
+            height: 10,
+            chainwork: ChainWork::from(11_u64),
+            hash: bitcoin_rs_primitives::Hash256::from(tip_header.compute_hash()),
+        };
+        let request = window
+            .next_peer_request(
+                &mut stager,
+                owner,
+                false,
+                &chain_tip,
+                1,
+                10,
+                0,
+                &tree,
+                now,
+            )
+            .unwrap_or_else(|| panic!("window must plan the test prefix"));
+        let (_, hash) = request
+            .entries()
+            .next()
+            .unwrap_or_else(|| panic!("plan must name a body"));
+        assert!(window.mark_requested(&stager, &request, owner, now));
+        let scheduler = super::super::SchedulerState {
+            window,
+            stager,
+            header_request_owner: None,
+            owned_body_fetches: Vec::new(),
+            body_unavailable: UnavailableBodies::new(8),
+            chain_sync: hashbrown::HashMap::new(),
+            headers_sync: hashbrown::HashMap::new(),
+            stale_tip: Default::default(),
+            expected_apply_cache: None,
+        };
+        (scheduler, hash)
+    }
+
+    #[test]
+    fn racer_notfound_is_remembered_without_releasing_the_owner() {
+        let owner = PeerSource::for_test(test_addr(9001));
+        let racer = PeerSource::for_test(test_addr(9002));
+        let (mut scheduler, hash) = scheduler_with_owner_pending(owner);
+        let now = Instant::now();
+
+        assert!(!release_unavailable_body(&mut scheduler, racer, hash, now));
+        assert!(scheduler.body_unavailable.refuses(racer, hash, now));
+        assert_eq!(scheduler.window.pending_owner(&hash), Some(owner));
+
+        let unknown = bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xab; 32]);
+        assert!(!scheduler.window.contains_pending(&unknown));
+        assert!(!release_unavailable_body(&mut scheduler, racer, unknown, now));
+        assert!(!scheduler.body_unavailable.refuses(racer, unknown, now));
+
+        assert!(release_unavailable_body(&mut scheduler, owner, hash, now));
     }
 }
