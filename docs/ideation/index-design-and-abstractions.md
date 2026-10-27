@@ -1,6 +1,6 @@
-# Better tasting and efficient index design and abstractions
+# Index design and abstractions
 
-Status: ideation complete; intent selection pending.
+Status: historical brainstorm; not a plan.
 
 The useful direction is less duplicated resolution policy and less repeated query work. A new index framework is not justified by this review.
 
@@ -134,8 +134,8 @@ The reviewer's introductory rejection count was a counting error. The complete I
 
 Some early resource follow-up citations came from the stale root checkout. The corrected grounding uses the integrated worktree. No measured gain is inferred from these source facts. Public-caller discovery and resource acceptance remain future obligations.
 
-## Next step: clarify intent
+## Historical note
 
-My preference is to deepen the existing query module, not add an index framework. The single-owner direction offers the clearest reduction in duplicated policy. Row-scoped identity offers the clearest removal of repeated work. Typed refusal causes need a real caller requirement. Query-local memoization needs evidence that its memory tradeoff earns its place.
+The review favored deepening the existing query module, not adding an index framework. The single-owner direction offers the clearest reduction in duplicated policy. Row-scoped identity offers the clearest removal of repeated work. Typed refusal causes need a real caller requirement. Query-local memoization needs evidence that its memory tradeoff earns its place.
 
-Which of the four survivors should shape the next design discussion? Choose any combination. Keep the public-removal gate explicit, and decide whether memoization should wait for a representative workload. `askme` can help resolve those tradeoffs. This document does not begin planning or implementation.
+The four survivors were left as historical options. Keep the public-removal gate explicit, and leave memoization until a representative workload appears. This record does not begin planning or implementation.

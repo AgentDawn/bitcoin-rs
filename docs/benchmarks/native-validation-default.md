@@ -1,6 +1,6 @@
 # Native validation default: promotion record
 
-This document is the promotion record for the native strict-Rust validation default. The owner of the default is [`docs/contracts/validation-default.md`](../contracts/validation-default.md), proven by feature-matrix builds, Core vectors, and measured promotion evidence. The end-state decision is recorded here after T16 and T17 run; until then the recorded verdict stays `KeepKernel` and this page states the contract only.
+This document is the promotion record for the native strict-Rust validation default. The owner of the default is [`docs/contracts/validation-default.md`](../contracts/validation-default.md), proven by feature-matrix builds, Core vectors, and measured promotion evidence. This page records the measured end-state gates for the documented production default engine. The `KeepKernel` verdict in the prior-evidence section is superseded history and does not describe today's defaults.
 
 > **Policy superseded (issue #1117).** The manifest policy this page's recorded
 > verdict (`KeepKernel`) answered — "`kernel` is a library default" — no longer
@@ -13,17 +13,13 @@ This document is the promotion record for the native strict-Rust validation defa
 
 ## Decision it owns
 
-Whether `bitcoin-rs-consensus`, `bitcoin-rs-chainstate`, `bitcoin-rs-node`,
-`bin/bitcoin-rs` and the container image ship strict-Rust validation as their
-default. The decision is one coordinated cut across binary, library and image
-with matching manifests and packaging. `bitcoinkernel` remains an explicit
+Whether the documented production default engine is strict-Rust validation.
+Every crate manifest is already kernel-free and `validation.engine` already
+defaults to `native`; the shipped image selects `kernel` through
+`/etc/bitcoin-rs/default.toml`. Promotion below means changing that documented
+production selection, not manifest defaults. `bitcoinkernel` remains an explicit
 opt-in oracle only. It is never a silent fallback and it is never the default
 after promotion.
-
-The promotion target moved with #1263: every crate manifest is kernel-free and
-`validation.engine` defaults to `native`, while the shipped image selects
-`kernel` through `/etc/bitcoin-rs/default.toml`. Promotion below means changing
-that documented production selection, not manifest defaults.
 
 ## Ordering
 
@@ -50,7 +46,7 @@ Reference identity for the comparison arm: Bitcoin Core release `v31.1`, commit 
 
 ## Refusal conditions
 
-Promotion is refused when any cell above is `BLOCKED`, when signed-spend evidence is not measured on the final strict artifacts, when either arm exceeds the 5% stability rule, or when a feature-unified workspace build supplied the closure claim. On refusal the last-green `secp256k1` product is retained and the verdict stays `KeepKernel`.
+Promotion is refused when any cell above is `BLOCKED`, when signed-spend evidence is not measured on the final strict artifacts, when either arm exceeds the 5% stability rule, or when a feature-unified workspace build supplied the closure claim. On refusal the last-green `secp256k1` product is retained and the documented production selection is unchanged.
 
 ## Required identities per sample
 
@@ -85,7 +81,7 @@ A **measured observation** copies a field from a cited artifact or an
 in-tree test pin. An **inference** interprets those observations. Promotion
 requires every gate in the issue, not a subset.
 
-### Decision
+### Historical decision (superseded)
 
 Keep `kernel` as the `bitcoin-rs-consensus` and `bitcoin-rs-node` default,
 and in the Compose image. Leave `bin/bitcoin-rs` kernel-free. The native
@@ -114,7 +110,7 @@ that freeze does not run the comparator. A missing replay does not weaken
 the signed-spend or vector gates. A failed signed-spend measurement does
 not flip the default.
 
-### Current ownership of the default
+### Historical ownership of the default (superseded)
 
 | Surface | Script engine |
 |---|---|
@@ -122,10 +118,7 @@ not flip the default.
 | `bitcoin-rs-consensus` / `bitcoin-rs-node` crate defaults | `kernel` (`libbitcoinkernel`) |
 | Compose image (`Dockerfile --features fjall,kernel`) | `kernel` |
 
-Until the gates pass, the library crates and the image keep `kernel`. The
-binary already builds native so a default `cargo build -p bitcoin-rs` needs
-no C++ toolchain. Promoting native is one coordinated change: drop
-`kernel` from the two library defaults in the same commit.
+> Historical 2026-09-04 plan (superseded): coordinated manifest cut described here; current promotion changes the shipped image selection, not manifest defaults.
 
 ### Measured observations
 
