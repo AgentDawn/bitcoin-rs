@@ -248,6 +248,7 @@ impl<'a, K, V> TableDefinition<'a, K, V> {
             "pplns_batch_idem_v1" => 16,
             "pplns_batch_txids_v1" => 17,
             "pplns_audit_v1" => 18,
+            "pplns_retired_hashes_v1" => 19,
             _ => {
                 return Err(LedgerError::Invariant(
                     "unknown logical ledger table".into(),
@@ -325,43 +326,19 @@ impl<K: Value, V: Value> Table<'_, K, V> {
             })
         };
         let mut rows = BTreeMap::new();
-        let mut seek = self.prefix.clone();
-        if let Some((key, _)) = &start {
-            seek.extend_from_slice(key);
-        }
-        loop {
-            let page = self.snapshot.scan_prefix_from_bounded(
-                CF,
-                &self.prefix,
-                &seek,
-                bitcoin_rs_storage::PrefixScanLimit {
-                    max_rows: 256,
-                    max_bytes: 1024 * 1024,
-                },
-            )?;
-            let mut beyond_end = false;
-            let mut next = None;
-            for (key, value) in page.rows {
-                let logical = &key[self.prefix.len()..];
-                if end.as_ref().is_some_and(|(b, inclusive)| {
-                    logical > b.as_slice() || (!inclusive && logical == b.as_slice())
-                }) {
-                    beyond_end = true;
-                    break;
-                }
-                let mut cursor = key.clone();
-                cursor.push(0);
-                next = Some(cursor);
-                if within(logical) {
-                    rows.insert(key, value);
-                }
-            }
-            if page.complete || beyond_end {
+        // The snapshot iterator is lazy and ascending, so this single pass can stop at the
+        // end bound without reading the tail that follows it.
+        for item in self.snapshot.iter_prefix(CF, &self.prefix)? {
+            let (key, value) = item?;
+            let logical = &key[self.prefix.len()..];
+            if end.as_ref().is_some_and(|(b, inclusive)| {
+                logical > b.as_slice() || (!inclusive && logical == b.as_slice())
+            }) {
                 break;
             }
-            seek = next.ok_or_else(|| {
-                LedgerError::Invariant("incomplete storage scan made no progress".into())
-            })?;
+            if within(logical) {
+                rows.insert(key, value);
+            }
         }
         let mut overlay_start = self.prefix.clone();
         if let Some((key, _)) = &start {
@@ -394,8 +371,43 @@ impl<K: Value, V: Value> Table<'_, K, V> {
         }
         Ok(result.into_iter())
     }
+    /// Greatest row in key order without materializing the table. The snapshot iterator is
+    /// lazy, so the single pass below retains one row no matter how large the table is;
+    /// the uncommitted overlay is already in memory and merges by direct key comparison.
+    /// Callers that only need the tail (for example the newest share) never materialize
+    /// the rows before it. Reaching the tail still walks the table because the storage
+    /// backend exposes forward iteration only; a sublinear reverse seek would need a
+    /// backend reverse cursor, which is outside this crate's table layer.
     pub(crate) fn last(&self) -> Result<Option<GuardPair<K, V>>, LedgerError> {
-        self.rows_iter()?.next_back().transpose()
+        let changes = self.changes.borrow();
+        let deleted = |key: &[u8]| changes.get(key).is_some_and(|value| value.is_none());
+        let mut last: Option<(Vec<u8>, Vec<u8>)> = None;
+        for item in self.snapshot.iter_prefix(CF, &self.prefix)? {
+            let (key, value) = item?;
+            if deleted(&key) {
+                continue;
+            }
+            last = Some((key, value));
+        }
+        // Overlay puts sort after (or replace) the snapshot tail; overlay deletes were
+        // already skipped in the pass above, so only the highest put can win.
+        for (key, value) in changes.iter().rev() {
+            if !key.starts_with(&self.prefix) {
+                continue;
+            }
+            if let Some(put) = value {
+                if last.as_ref().is_none_or(|(tail, _)| tail.as_slice() <= key.as_slice()) {
+                    last = Some((key.clone(), put.clone()));
+                }
+                break;
+            }
+        }
+        drop(changes);
+        last.map(|(key, value)| {
+            let logical = key[self.prefix.len()..].to_vec();
+            Ok((Guard(K::decode(logical)?), Guard(V::decode(value)?)))
+        })
+        .transpose()
     }
     pub(crate) fn len(&self) -> Result<u64, LedgerError> {
         let mut count = 0u64;

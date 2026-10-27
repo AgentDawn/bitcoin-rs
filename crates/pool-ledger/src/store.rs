@@ -49,6 +49,7 @@ const META_BYTES: TableDefinition<'static, &'static str, &'static [u8]> =
     TableDefinition::new("pplns_meta_bytes_v1");
 const SHARES: U64Bytes = TableDefinition::new("pplns_shares_v1");
 const SHARE_HASHES: BytesBytes = TableDefinition::new("pplns_share_hashes_v1");
+const RETIRED_HASHES: BytesBytes = TableDefinition::new("pplns_retired_hashes_v1");
 const SHARE_TUPLES: BytesBytes = TableDefinition::new("pplns_share_tuples_v1");
 const RETIRED_JOBS: U64Unit = TableDefinition::new("pplns_retired_jobs_v1");
 const ROUNDS: U64Bytes = TableDefinition::new("pplns_rounds_v1");
@@ -193,6 +194,7 @@ struct Tables<'t> {
     meta_bytes: Table<'t, &'static str, &'static [u8]>,
     shares: Table<'t, u64, &'static [u8]>,
     share_hashes: Table<'t, &'static [u8], &'static [u8]>,
+    retired_hashes: Table<'t, &'static [u8], &'static [u8]>,
     share_tuples: Table<'t, &'static [u8], &'static [u8]>,
     retired_jobs: Table<'t, u64, ()>,
     rounds: Table<'t, u64, &'static [u8]>,
@@ -216,6 +218,7 @@ impl<'t> Tables<'t> {
             meta_bytes: txn.open_table(META_BYTES)?,
             shares: txn.open_table(SHARES)?,
             share_hashes: txn.open_table(SHARE_HASHES)?,
+            retired_hashes: txn.open_table(RETIRED_HASHES)?,
             share_tuples: txn.open_table(SHARE_TUPLES)?,
             retired_jobs: txn.open_table(RETIRED_JOBS)?,
             rounds: txn.open_table(ROUNDS)?,
@@ -399,9 +402,11 @@ impl Ledger {
         Ok(receipt)
     }
 
-    /// Retire a job: later shares for it are refused and its identity index rows are deleted so
-    /// the index stays bounded. Call only after the job's found block (if any) is recorded.
-    /// Returns the number of index rows removed.
+    /// Retire a job: later shares for it are refused, its secondary-identity rows are deleted
+    /// so the per-job index stays bounded, and its header hashes move to a durable tombstone
+    /// table so the same header hash can never be credited again under another job. Call only
+    /// after the job's found block (if any) is recorded. Returns the number of index rows
+    /// retired.
     ///
     /// # Errors
     /// Returns a storage error.
@@ -429,7 +434,16 @@ impl Ledger {
             }
             for (key, hash) in &rows {
                 tables.share_tuples.remove(key.as_slice())?;
-                tables.share_hashes.remove(hash.as_slice())?;
+                // Tombstone the header hash instead of deleting it: the hash stays reserved
+                // forever, so replaying it under a different job fails as a share conflict
+                // rather than crediting the same work a second time. The entry keeps its
+                // original encoding so conflict reports still name the first credit.
+                if let Some(entry) = tables.share_hashes.get(hash.as_slice())? {
+                    tables
+                        .retired_hashes
+                        .insert(hash.as_slice(), entry.value())?;
+                    tables.share_hashes.remove(hash.as_slice())?;
+                }
             }
             tables.retired_jobs.insert(job, ())?;
             rows.len()
@@ -528,7 +542,13 @@ impl Ledger {
         let hashes = read.open_table(SHARE_HASHES)?;
         let entry = match hashes.get(header_hash.as_slice())? {
             Some(guard) => Some(decode_hash_entry(guard.value())?),
-            None => None,
+            None => {
+                let retired = read.open_table(RETIRED_HASHES)?;
+                retired
+                    .get(header_hash.as_slice())?
+                    .map(|guard| decode_hash_entry(guard.value()))
+                    .transpose()?
+            }
         };
         Ok(entry.map(|(seq, work, _)| (seq, work)))
     }
@@ -1563,6 +1583,12 @@ fn credit_share(tables: &Tables<'_>, share: &ShareCredit) -> Result<ShareReceipt
             return Err(LedgerError::ShareConflict { seq });
         }
         return Ok(ShareReceipt::Duplicate { seq });
+    }
+    // A tombstoned hash belongs to a retired job: the same header hash can never be
+    // credited again, under any job. Report the original credit as the conflict.
+    if let Some(guard) = tables.retired_hashes.get(share.header_hash.as_slice())? {
+        let (seq, _, _) = decode_hash_entry(guard.value())?;
+        return Err(LedgerError::ShareConflict { seq });
     }
     let owner = match tables.share_tuples.get(tuple.as_slice())? {
         Some(guard) => Some(hash_from(guard.value())?),

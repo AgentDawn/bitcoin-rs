@@ -432,6 +432,8 @@ mod tests {
                 account: MinerId(7),
                 extranonce: vec![1],
                 nonce: 1,
+                version: 1,
+                ntime: 1_700_000_000,
                 work: 100,
             },
             height: 100,

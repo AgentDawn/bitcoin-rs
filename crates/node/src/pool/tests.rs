@@ -77,6 +77,8 @@ fn expected_credit(share: &AcceptedShare, epoch: u32) -> ShareCredit {
         account: MinerId(42),
         extranonce: share.extranonce.clone(),
         nonce: share.header.nonce,
+        version: share.header.version,
+        ntime: share.header.time,
         work: 1,
     }
 }

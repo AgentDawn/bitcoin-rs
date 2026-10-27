@@ -104,6 +104,10 @@ pub struct ShareCredit {
     pub extranonce: Vec<u8>,
     /// Header nonce.
     pub nonce: u32,
+    /// Complete header version as hashed (version-rolling bits applied).
+    pub version: i32,
+    /// Header time in Unix epoch seconds.
+    pub ntime: u32,
     /// Exact work of the assigned share target, at least 1.
     pub work: u128,
 }
@@ -123,14 +127,19 @@ impl ShareCredit {
         Ok(())
     }
 
-    /// Canonical secondary identity: `job || account || nonce || extranonce` (big-endian).
-    /// Fixed-width fields come first, so the encoding is injective and prefix-scannable by job.
+    /// Canonical secondary identity: `job || account || nonce || version || ntime || extranonce`
+    /// (big-endian). Fixed-width fields come first, so the encoding is injective and
+    /// prefix-scannable by job. Version and ntime are part of the identity because miners may
+    /// legitimately roll either one while reusing a nonce and extranonce; two shares that differ
+    /// only in version or ntime are distinct shares, never a conflicting reuse.
     #[must_use]
     pub fn tuple_key(&self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(20 + self.extranonce.len());
+        let mut key = Vec::with_capacity(28 + self.extranonce.len());
         key.extend_from_slice(&self.job.to_be_bytes());
         key.extend_from_slice(&self.account.0.to_be_bytes());
         key.extend_from_slice(&self.nonce.to_be_bytes());
+        key.extend_from_slice(&self.version.to_be_bytes());
+        key.extend_from_slice(&self.ntime.to_be_bytes());
         key.extend_from_slice(&self.extranonce);
         key
     }
@@ -278,11 +287,15 @@ impl PoolConfig {
         Ok(())
     }
 
-    /// Canonical encoding stored in the ledger and compared at open.
+    /// Canonical encoding stored in the ledger and compared at open. Validates first so an
+    /// over-count or invalid change script can never be persisted or compared as bytes.
     ///
     /// # Errors
-    /// Returns [`LedgerError::Codec`] if a length does not fit the wire format.
+    /// Returns [`LedgerError::InvalidConfig`] for any bound violation (including the change
+    /// script count and contents) and [`LedgerError::Codec`] if a length does not fit the
+    /// wire format.
     pub fn encode(&self) -> Result<Vec<u8>, LedgerError> {
+        self.validate()?;
         let mut enc = codec::Enc::new();
         enc.u8(WIRE_VERSION);
         enc.u128(self.window_work);
@@ -1595,7 +1608,8 @@ pub enum LedgerError {
         /// Sequence number of the original credit.
         seq: u64,
     },
-    /// Different header hash reusing a `(job, account, extranonce, nonce)` identity.
+    /// Different header hash reusing a `(job, account, nonce, version, ntime, extranonce)`
+    /// identity.
     ShareIdentityConflict {
         /// Sequence number of the original credit.
         seq: u64,
@@ -1698,6 +1712,25 @@ impl From<ReceiptError> for LedgerError {
 impl From<bitcoin_rs_storage::StorageError> for LedgerError {
     fn from(error: bitcoin_rs_storage::StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl LedgerError {
+    /// True for share-crediting failures no retry can cure: the job is retired, the header hash
+    /// or secondary identity is already taken, or the block is already recorded with a
+    /// different claim. Protocol adapters must report these as rejected shares, never as a
+    /// temporarily unavailable ledger: retrying would either spin forever or, worse, credit
+    /// the same work twice. Every other error (revision conflict, storage, chain view,
+    /// signer) is potentially transient and keeps the existing retry behavior.
+    #[must_use]
+    pub fn is_permanent_share_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::JobRetired(_)
+                | Self::ShareConflict { .. }
+                | Self::ShareIdentityConflict { .. }
+                | Self::BlockConflict
+        )
     }
 }
 

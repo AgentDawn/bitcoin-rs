@@ -66,10 +66,16 @@ fn config(window: u128, fee_bps: u16) -> PoolConfig {
 }
 
 fn share(job: u64, account: u64, nonce: u32, work: u128) -> ShareCredit {
+    share_vnt(job, account, nonce, 1, 1_700_000_000, work)
+}
+
+fn share_vnt(job: u64, account: u64, nonce: u32, version: i32, ntime: u32, work: u128) -> ShareCredit {
     let mut seed = Vec::new();
     seed.extend_from_slice(&job.to_be_bytes());
     seed.extend_from_slice(&account.to_be_bytes());
     seed.extend_from_slice(&nonce.to_be_bytes());
+    seed.extend_from_slice(&version.to_be_bytes());
+    seed.extend_from_slice(&ntime.to_be_bytes());
     seed.extend_from_slice(&work.to_be_bytes());
     ShareCredit {
         header_hash: sha256(&seed),
@@ -77,6 +83,8 @@ fn share(job: u64, account: u64, nonce: u32, work: u128) -> ShareCredit {
         account: MinerId(account),
         extranonce: vec![u8::try_from(account).fixture("small account"), 1, 2, 3],
         nonce,
+        version,
+        ntime,
         work,
     }
 }
@@ -1103,7 +1111,8 @@ fn retiring_a_job_bounds_the_index_and_refuses_late_shares() {
     assert_eq!(ledger.retire_job(7).fixture("again"), 0);
     assert_eq!(
         ledger.share_by_hash(&old.header_hash).fixture("lookup"),
-        None
+        Some((0, 10)),
+        "retired header hashes stay reserved as tombstones"
     );
     assert!(matches!(
         ledger.record_share(&old).err(),
@@ -1117,6 +1126,95 @@ fn retiring_a_job_bounds_the_index_and_refuses_late_shares() {
     ledger
         .record_share(&share(8, 3, 1, 10))
         .fixture("live job still credits");
+}
+
+#[test]
+fn version_and_ntime_rolls_are_distinct_shares_not_conflicts() {
+    let (_dir, ledger) = plain_ledger(100);
+    let base = share_vnt(1, 1, 7, 0x20000000, 1_700_000_000, 10);
+    assert_eq!(
+        ledger.record_share(&base).fixture("base"),
+        ShareReceipt::Credited { seq: 0 }
+    );
+    // A version roll (BIP320-style) with the same nonce and extranonce is a new share.
+    let rolled_version = share_vnt(1, 1, 7, 0x20000001, 1_700_000_000, 10);
+    assert_ne!(rolled_version.header_hash, base.header_hash);
+    assert_eq!(
+        ledger.record_share(&rolled_version).fixture("version roll"),
+        ShareReceipt::Credited { seq: 1 }
+    );
+    // A time roll with the same nonce and extranonce is a new share too.
+    let rolled_time = share_vnt(1, 1, 7, 0x20000000, 1_700_000_001, 10);
+    assert_ne!(rolled_time.header_hash, base.header_hash);
+    assert_eq!(
+        ledger.record_share(&rolled_time).fixture("ntime roll"),
+        ShareReceipt::Credited { seq: 2 }
+    );
+    // The old identity (without version/ntime) would have rejected both as conflicts.
+    assert_eq!(ledger.share_count().fixture("count"), 3);
+    ledger.check_invariants().fixture("invariants");
+}
+
+#[test]
+fn a_retired_header_hash_is_never_credited_again() {
+    let (_dir, ledger) = plain_ledger(100);
+    let old = share(7, 1, 1, 10);
+    assert_eq!(
+        ledger.record_share(&old).fixture("credit"),
+        ShareReceipt::Credited { seq: 0 }
+    );
+    assert_eq!(ledger.retire_job(7).fixture("retire"), 1);
+    // Same job replay is refused as retired.
+    assert!(matches!(
+        ledger.record_share(&old).err(),
+        Some(LedgerError::JobRetired(7))
+    ));
+    // Same header hash under a live job is a permanent conflict, never a new credit.
+    let mut cross_job = old.clone();
+    cross_job.job = 8;
+    assert!(matches!(
+        ledger.record_share(&cross_job).err(),
+        Some(LedgerError::ShareConflict { seq: 0 })
+    ));
+    assert_eq!(ledger.share_count().fixture("count"), 1);
+    ledger.check_invariants().fixture("invariants");
+}
+
+#[test]
+fn permanent_share_conflicts_are_classified_for_rejection() {
+    assert!(LedgerError::JobRetired(7).is_permanent_share_conflict());
+    assert!(LedgerError::ShareConflict { seq: 0 }.is_permanent_share_conflict());
+    assert!(
+        LedgerError::ShareIdentityConflict { seq: 0 }.is_permanent_share_conflict()
+    );
+    assert!(LedgerError::BlockConflict.is_permanent_share_conflict());
+    assert!(!LedgerError::Conflict.is_permanent_share_conflict());
+    assert!(!LedgerError::WindowPruned.is_permanent_share_conflict());
+    assert!(!LedgerError::InvalidInput("x").is_permanent_share_conflict());
+}
+
+#[test]
+fn config_encode_validates_change_scripts_before_encoding() {
+    let ok = config(100, 0);
+    assert!(ok.encode().is_ok());
+    let mut too_many = ok.clone();
+    too_many.change_scripts = vec![change_script(); MAX_CHANGE_SCRIPTS + 1];
+    assert!(matches!(
+        too_many.encode().err(),
+        Some(LedgerError::InvalidConfig(_))
+    ));
+    let mut empty = ok.clone();
+    empty.change_scripts = vec![Vec::new()];
+    assert!(matches!(
+        empty.encode().err(),
+        Some(LedgerError::InvalidConfig(_))
+    ));
+    let mut unspendable = ok.clone();
+    unspendable.change_scripts = vec![vec![0x6a, 0x01]];
+    assert!(matches!(
+        unspendable.encode().err(),
+        Some(LedgerError::InvalidConfig(_))
+    ));
 }
 
 // ---------------------------------------------------------------------------------------------
