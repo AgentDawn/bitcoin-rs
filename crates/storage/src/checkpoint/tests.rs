@@ -652,9 +652,10 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
         ".hidden/../escape",
     ];
     for hostile in hostile_destinations {
-        let error = root
-            .rename_noreplace("victim", hostile)
-            .expect_err(&format!("destination {hostile:?} was accepted"));
+        let error = match root.rename_noreplace("victim", hostile) {
+            Ok(()) => panic!("destination {hostile:?} was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(
             error.kind(),
             std::io::ErrorKind::InvalidInput,
@@ -669,9 +670,10 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
     // Crafted sources are confined symmetrically: an outside path must not be
     // importable into the root.
     for hostile in ["../victim", "/tmp/victim", "a/b", "", ".", "..", "link/"] {
-        let error = root
-            .rename_noreplace(hostile, "fresh-dest")
-            .expect_err(&format!("source {hostile:?} was accepted"));
+        let error = match root.rename_noreplace(hostile, "fresh-dest") {
+            Ok(()) => panic!("source {hostile:?} was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(
             error.kind(),
             std::io::ErrorKind::InvalidInput,
@@ -689,13 +691,15 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
         fs::create_dir(&outside)?;
         let root_path = dir.path().join(CHECKPOINT_ROOT);
         symlink(&outside, root_path.join("link"))?;
-        let error = root
-            .rename_noreplace("victim", "link/escape")
-            .expect_err("symlink-intermediate destination was accepted");
+        let error = match root.rename_noreplace("victim", "link/escape") {
+            Ok(()) => panic!("symlink-intermediate destination was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        let error = root
-            .rename_noreplace("link/escape", "fresh-dest")
-            .expect_err("symlink-intermediate source was accepted");
+        let error = match root.rename_noreplace("link/escape", "fresh-dest") {
+            Ok(()) => panic!("symlink-intermediate source was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
             !outside.join("escape").exists(),
@@ -710,9 +714,10 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
 
     // An existing destination is preserved by NOREPLACE: the collision fails
     // without consuming the source or clobbering operator data.
-    let collision = root
-        .rename_noreplace("victim", "operator-notes")
-        .expect_err("rename onto operator data was accepted");
+    let collision = match root.rename_noreplace("victim", "operator-notes") {
+        Ok(()) => panic!("rename onto operator data was accepted"),
+        Err(collision) => collision,
+    };
     assert_eq!(collision.kind(), std::io::ErrorKind::AlreadyExists);
     assert!(root.entry_exists("victim")?);
     assert!(root.entry_exists("operator-notes")?);
@@ -798,9 +803,7 @@ fn open_file_refuses_fifo_without_blocking() -> Result<(), Box<dyn std::error::E
         // Unblock a regressed reader before reporting failure. O_RDWR
         // plus NONBLOCK prevents this rescue from introducing another
         // FIFO wait.
-        use cap_fs_ext::{
-            DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _,
-        };
+        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
         let mut options = cap_std::fs::OpenOptions::new();
         options
             .read(true)
