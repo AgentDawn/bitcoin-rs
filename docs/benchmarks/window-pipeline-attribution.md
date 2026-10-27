@@ -1,7 +1,5 @@
 # Window pipeline and group commit attribution (ENG-91, #1607)
 
-Anchors: John Carmack, Richard Feynman
-
 This page owns the measurement protocol, the evidence schema and the promotion
 gates for the windowed block apply and its durable group commit (ENG-91, issue
 #1607). It records no measured value: every number lives in the files a run
