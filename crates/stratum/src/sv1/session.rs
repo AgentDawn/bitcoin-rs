@@ -1661,8 +1661,23 @@ impl SessionState {
                 }
                 Verdict::Accepted
             }
-            Err(SubmitFailure::Share(error)) => {
-                let wire = share_error_wire(&error);
+            Err(failure) => Self::submit_failure_verdict(request, &failure, out),
+        }
+    }
+
+    /// Maps a common-owner submit refusal onto the wire reply and verdict.
+    /// Reply suppression, verdicts, and deferred completion behavior are
+    /// unchanged: `OutboxFull` stays silent-side `Ignored` (the miner may
+    /// retry: nothing burned); every `Share` refusal and `Duplicate` answers
+    /// and counts.
+    fn submit_failure_verdict(
+        request: &Request,
+        failure: &SubmitFailure,
+        out: &mut Vec<u8>,
+    ) -> Verdict {
+        match failure {
+            SubmitFailure::Share(error) => {
+                let wire = share_error_wire(error);
                 if matches!(error, ShareError::ExtranonceLength { .. }) {
                     emit_reply(request, out, &encode_error(&request.id, &wire));
                     Verdict::Violation
@@ -1671,7 +1686,7 @@ impl SessionState {
                     Verdict::Rejected
                 }
             }
-            Err(SubmitFailure::Duplicate) => {
+            SubmitFailure::Duplicate => {
                 emit_reply(
                     request,
                     out,
@@ -1679,7 +1694,7 @@ impl SessionState {
                 );
                 Verdict::Rejected
             }
-            Err(SubmitFailure::OutboxFull) => {
+            SubmitFailure::OutboxFull => {
                 // The share was rejected BEFORE validation; the hash was NOT burned.
                 // The miner may retry.
                 emit_reply(
