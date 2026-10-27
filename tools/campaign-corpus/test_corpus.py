@@ -1949,6 +1949,76 @@ class IndexedParity(unittest.TestCase):
             with self.assertRaises(ContractError):
                 corpus.verify_index(freeze, tampered, source_dir)
 
+    def test_rejects_embedded_offset_inside_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = root / "blks"
+            source_dir.mkdir()
+            b2 = _IDX_LINKED[2]
+            embedded_frame = _frame(b2)
+            decoy_header = _branch_header(_dsha(_GENESIS), "44" * 32, 7)
+            decoy_payload = decoy_header + embedded_frame + b"\x00" * 16
+            frame_g = _frame(_IDX_LINKED[0])
+            frame_b1 = _frame(_IDX_LINKED[1])
+            frame_decoy = _frame(decoy_payload)
+            frame_b2 = _frame(b2)
+            (source_dir / "blk00000.dat").write_bytes(frame_g + frame_b1 + frame_decoy)
+            (source_dir / "blk00001.dat").write_bytes(frame_b2)
+            decoy_offset = len(frame_g) + len(frame_b1)
+            embedded_offset = decoy_offset + 8 + 80
+            with open(source_dir / "blk00000.dat", "rb") as handle:
+                handle.seek(embedded_offset)
+                header = handle.read(8)
+                self.assertEqual(header[:4], MAGIC)
+                self.assertEqual(struct.unpack_from("<I", header, 4)[0], len(b2))
+                self.assertEqual(handle.read(len(b2)), b2)
+            honest_path = root / "honest.index"
+            corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, honest_path)
+            self.assertEqual(
+                corpus.verify_index(freeze, honest_path, source_dir).corpus_id,
+                FIX_CORPUS,
+            )
+            data0 = (source_dir / "blk00000.dat").read_bytes()
+            data1 = (source_dir / "blk00001.dat").read_bytes()
+            writer = corpus.IndexWriter(freeze, FIX_CORPUS)
+            writer.add_source(
+                corpus.IndexSource(
+                    name="blk00000.dat",
+                    size=len(data0),
+                    sha256=hashlib.sha256(data0).hexdigest(),
+                )
+            )
+            writer.add_source(
+                corpus.IndexSource(
+                    name="blk00001.dat",
+                    size=len(data1),
+                    sha256=hashlib.sha256(data1).hexdigest(),
+                )
+            )
+            writer.append(
+                _IDX_LINKED[0],
+                corpus.SourceOffset(source=0, offset=0),
+                expected_hash=GENESIS_HASH,
+            )
+            writer.append(
+                _IDX_LINKED[1],
+                corpus.SourceOffset(source=0, offset=len(frame_g)),
+                expected_hash=FIX_B1_HASH,
+            )
+            writer.append(
+                b2,
+                corpus.SourceOffset(source=0, offset=embedded_offset),
+                expected_hash=FIX_STOP_HASH,
+            )
+            evil_path = root / "embedded.index"
+            with open(evil_path, "wb") as handle:
+                writer.finish(handle)
+            with self.assertRaisesRegex(ContractError, "top-level frame"):
+                corpus.verify_index(freeze, evil_path, source_dir)
+            with self.assertRaisesRegex(ContractError, "top-level frame"):
+                list(corpus.iter_indexed_payloads(freeze, evil_path, source_dir))
+
     def test_finish_rejects_overlapping_ranges(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

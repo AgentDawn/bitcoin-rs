@@ -1776,6 +1776,31 @@ def build_index_from_scan(
     return summary
 
 
+def _actual_frame_spans(
+    source_dir: Path, sources: Sequence[IndexSource], magic: bytes
+) -> list[set[tuple[int, int]]]:
+    """Pre-parse every source with the `iter_frames` owner.
+
+    Returns per-source sets of exact top-level ``(offset, length)`` spans.
+    Only frame metadata is retained; payload bytes are discarded at once, so
+    no second packed copy is held. `ContractError` from `iter_frames` (magic
+    mismatch, truncation, over-limit length) propagates unchanged; `OSError`
+    becomes `ContractError` to preserve indexed-path refusal behavior.
+    """
+    spans: list[set[tuple[int, int]]] = []
+    for source in sources:
+        path = _source_path(source_dir, source.name)
+        actual: set[tuple[int, int]] = set()
+        try:
+            with open(path, "rb") as handle:
+                for meta, _payload in iter_frames(handle, magic):
+                    actual.add((meta.offset, meta.payload_length))
+        except OSError as err:
+            raise ContractError(f"cannot scan source {source.name}: {err}") from err
+        spans.append(actual)
+    return spans
+
+
 def verify_index(freeze: Freeze, index_path: Path, source_dir: Path) -> Product:
     """Fully verify an index against its sources. Pre-hashes every source before accepting frames."""
     doc = _load_index(index_path)
@@ -1792,6 +1817,7 @@ def verify_index(freeze: Freeze, index_path: Path, source_dir: Path) -> Product:
         _, digest = _hash_file(path)
         if digest != source.sha256:
             raise ContractError(f"source {source.name} digest does not match the index")
+    actual_spans = _actual_frame_spans(source_dir, doc.sources, freeze.network_magic)
     logical_sha = hashlib.sha256()
     logical_size = 0
     last_hash: str | None = None
@@ -1801,6 +1827,11 @@ def verify_index(freeze: Freeze, index_path: Path, source_dir: Path) -> Product:
         for height, entry in enumerate(doc.entries):
             if entry.height != height:
                 raise ContractError("index entries are not in height order")
+            if (entry.offset, entry.length) not in actual_spans[entry.source]:
+                raise ContractError(
+                    f"entries[{height}] is not a top-level frame in source "
+                    f"{doc.sources[entry.source].name!r}"
+                )
             payload = reader.read(entry)
             last_hash = _verify_entry_hash(
                 freeze, chosen, entry, height, payload, last_hash
@@ -1839,8 +1870,11 @@ def iter_indexed_payloads(
     """Yield verified (height, hash, payload) triples in height order.
 
     Every source is fully hashed (streaming) before the first payload is
-    yielded, so same-length replacement is rejected up front. Each payload is
-    hash- and linkage-checked before it is yielded. The caller must exhaust the
+    yielded, so same-length replacement is rejected up front. Actual top-level
+    frames are pre-parsed with `iter_frames` before the first payload is
+    yielded, so embedded or misaligned spans are rejected even when their
+    magic and length decode. Each payload is hash- and linkage-checked before
+    it is yielded. The caller must exhaust the
     iterator: the trailing logical-digest check binds stream identity for the
     comparator, and an abandoned prefix must not be accepted. Retrying is
     idempotent.
@@ -1859,6 +1893,7 @@ def iter_indexed_payloads(
         _, digest = _hash_file(path)
         if digest != source.sha256:
             raise ContractError(f"source {source.name} digest does not match the index")
+    actual_spans = _actual_frame_spans(source_dir, doc.sources, freeze.network_magic)
     logical_sha = hashlib.sha256()
     logical_size = 0
     last_hash: str | None = None
@@ -1868,6 +1903,11 @@ def iter_indexed_payloads(
         for height, entry in enumerate(doc.entries):
             if entry.height != height:
                 raise ContractError("index entries are not in height order")
+            if (entry.offset, entry.length) not in actual_spans[entry.source]:
+                raise ContractError(
+                    f"entries[{height}] is not a top-level frame in source "
+                    f"{doc.sources[entry.source].name!r}"
+                )
             payload = reader.read(entry)
             block_hash = _verify_entry_hash(
                 freeze, chosen, entry, height, payload, last_hash

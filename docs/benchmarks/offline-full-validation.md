@@ -169,8 +169,11 @@ Tests use a two-block Core-framed archive and deterministic fixture nodes
 that read the archive and write the certified state file. Indexed harness
 tests add a dual packed/indexed case over the same two linked bytes with a
 synthetic harness freeze (not C150/Cmodern): an indexed golden plus source,
-truncation, index-tamper, and post-load pin refusals. They prove the
-harness, not live node performance. A live seven-pair campaign still needs
+truncation, index-tamper, post-load and child-time pin refusals, and a
+no-second-packed-copy proof (no `custody/indexed-archive` exists,
+`custody/archive` is the only custody file carrying the packed bytes, every
+arm executes those bytes, and every custody pin stays `0o400`). They prove
+the harness, not live node performance. A live seven-pair campaign still needs
 hash-pinned `bitcoind` and bitcoin-rs binaries plus an exported archive of
 a corpus frozen by issue #42
 ([`docs/contracts/campaign-corpora.md`](../contracts/campaign-corpora.md));

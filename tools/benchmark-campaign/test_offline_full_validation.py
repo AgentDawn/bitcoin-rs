@@ -756,6 +756,48 @@ class IndexedParityHarnessTests(unittest.TestCase):
             self.assertEqual(record["exit_code"], 0)
             self.assertEqual(record["final_state"], state_json(expected))
 
+    def test_indexed_campaign_materializes_no_second_packed_copy(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="offline-indexed-nodup-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        config_path, _ = _build_dual_workspace(root)
+        arms_root = root / "arms"
+        result = run_campaign(load_config(config_path), arms_root)
+        self.assertEqual(result["arm_count"], 14)
+        custody = arms_root / "custody"
+        # No indexed-derived second packed file is materialized.
+        self.assertFalse((custody / "indexed-archive").exists())
+        archive_bytes = (root / "blocks.dat").read_bytes()
+        archive_digest = hashlib.sha256(archive_bytes).hexdigest()
+        matches: list[str] = []
+        for path in sorted(custody.rglob("*")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            if path.stat().st_size != len(archive_bytes):
+                continue
+            if hashlib.sha256(path.read_bytes()).hexdigest() == archive_digest:
+                matches.append(path.name)
+        self.assertEqual(matches, ["archive"])
+        # Every arm executed those exact packed bytes through custody/archive.
+        arm_dirs = sorted(
+            child
+            for child in arms_root.iterdir()
+            if child.is_dir() and child.name != "custody"
+        )
+        self.assertEqual(len(arm_dirs), 14)
+        for arm_dir in arm_dirs:
+            imported = arm_dir / "data" / "imported"
+            self.assertTrue(imported.is_file())
+            self.assertEqual(
+                hashlib.sha256(imported.read_bytes()).hexdigest(), archive_digest
+            )
+        # Indexed inputs stay distinct, custody-pinned, and read-only.
+        sources = sorted((custody / "sources").iterdir())
+        self.assertEqual(
+            [path.name for path in sources], ["blk00000.dat", "blk00001.dat"]
+        )
+        for path in [custody / "archive", custody / "index", *sources]:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+
     def test_indexed_source_mutation_is_refused(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="offline-indexed-mut-"))
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
@@ -807,6 +849,29 @@ class IndexedParityHarnessTests(unittest.TestCase):
         victim.write_bytes(bytes(raw))
         with self.assertRaises(ContractError):
             run_campaign(config, root / "arms")
+
+    def test_child_custody_source_mutation_is_refused(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="offline-indexed-srcmut-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        config_path, expected = _build_dual_workspace(root)
+        mutator = _write_executable(
+            root / "mutate_src.py",
+            _node_source(expected).replace(
+                "raise SystemExit(0)\n",
+                "target = __import__('pathlib').Path(args.corpus).parent / 'sources' / 'blk00000.dat'\n"
+                "__import__('os').chmod(target, 0o600)\n"
+                "target.write_bytes(target.read_bytes()[::-1])\n"
+                "raise SystemExit(0)\n",
+            ),
+        )
+        config = json.loads(config_path.read_text())
+        config["candidate"]["binary"] = str(mutator)
+        config["candidate"]["binary_sha256"] = _sha256_file(mutator)
+        config_path.write_bytes(canonical_bytes(config) + b"\n")
+        output = root / OUTPUT_NAME
+        with self.assertRaises(ContractError):
+            main(["--config", str(config_path), "--output", str(output)])
+        self.assertFalse(output.exists())
 
 
 class ProducerManifestTests(unittest.TestCase):
