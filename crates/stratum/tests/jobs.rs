@@ -1201,11 +1201,12 @@ fn found_blocks_reach_the_authoritative_submit_path_and_receipts_map_verdicts() 
     assert_eq!(receipt.coinbase_value, fx.candidate.coinbase_value);
     assert_eq!(receipt.session, fx.session.id());
     assert_eq!(receipt.job, fx.job.id());
-    let submitted = lock(&control.submitted);
-    assert_eq!(submitted.len(), 1);
-    assert_eq!(submitted[0].block(), &found.block);
-    assert_eq!(submitted[0].bytes().as_ref(), found.raw.as_slice());
-    drop(submitted);
+    {
+        let submitted = lock(&control.submitted);
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].block(), &found.block);
+        assert_eq!(submitted[0].bytes().as_ref(), found.raw.as_slice());
+    }
 
     let cases = [
         (BlockValidationResult::Duplicate, BlockStatus::Applied),

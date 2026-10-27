@@ -629,8 +629,15 @@ impl FoundBlock {
     /// or an [`BlockStatus::Undetermined`] receipt means the chain outcome is
     /// unknown: the caller must not infer acceptance or rejection.
     pub fn submit(&self, control: &dyn MiningControl) -> Result<BlockReceipt, MiningControlError> {
+        // The job retains the exact wire bytes built at share time: decode
+        // them once through the shared payload path instead of re-encoding
+        // the block, so the node receives one exact payload with no second
+        // owner and no second decode. A decode failure means our own encoder
+        // just produced bytes the decoder rejects, so it surfaces as an
+        // operational submit failure, never as a share verdict: validation
+        // outcomes are unchanged, and `&self` keeps the block retryable.
         let payload = BlockPayload::from_raw(self.raw.clone().into())
-            .map_err(|error| MiningControlError::Failed(CompactString::from(error.to_string())))?;
+            .map_err(|err| MiningControlError::Failed(CompactString::from(err.to_string())))?;
         let result = control.submit_block(payload)?;
         Ok(BlockReceipt {
             hash: self.share.hash,
