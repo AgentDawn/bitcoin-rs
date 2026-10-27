@@ -540,15 +540,14 @@ impl Ledger {
     pub fn share_by_hash(&self, header_hash: &Hash32) -> Result<Option<(u64, u128)>, LedgerError> {
         let read = self.db.begin_read()?;
         let hashes = read.open_table(SHARE_HASHES)?;
-        let entry = match hashes.get(header_hash.as_slice())? {
-            Some(guard) => Some(decode_hash_entry(guard.value())?),
-            None => {
-                let retired = read.open_table(RETIRED_HASHES)?;
-                retired
-                    .get(header_hash.as_slice())?
-                    .map(|guard| decode_hash_entry(guard.value()))
-                    .transpose()?
-            }
+        let entry = if let Some(guard) = hashes.get(header_hash.as_slice())? {
+            Some(decode_hash_entry(guard.value())?)
+        } else {
+            let retired = read.open_table(RETIRED_HASHES)?;
+            retired
+                .get(header_hash.as_slice())?
+                .map(|guard| decode_hash_entry(guard.value()))
+                .transpose()?
         };
         Ok(entry.map(|(seq, work, _)| (seq, work)))
     }

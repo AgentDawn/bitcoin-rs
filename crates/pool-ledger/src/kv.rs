@@ -380,7 +380,7 @@ impl<K: Value, V: Value> Table<'_, K, V> {
     /// backend reverse cursor, which is outside this crate's table layer.
     pub(crate) fn last(&self) -> Result<Option<GuardPair<K, V>>, LedgerError> {
         let changes = self.changes.borrow();
-        let deleted = |key: &[u8]| changes.get(key).is_some_and(|value| value.is_none());
+        let deleted = |key: &[u8]| changes.get(key).is_some_and(Option::is_none);
         let mut last: Option<(Vec<u8>, Vec<u8>)> = None;
         for item in self.snapshot.iter_prefix(CF, &self.prefix)? {
             let (key, value) = item?;
