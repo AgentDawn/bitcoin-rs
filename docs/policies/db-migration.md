@@ -87,8 +87,13 @@ Current readers still validate magic values, versions, filenames, lengths, hashe
 ## Approved checkpoint header compatibility
 
 Checkpoint header artifacts have one explicit compatibility exception.
-The current writer MUST emit version 2. The current reader MAY read version 1
-or version 2 within the current datadir epoch. Version 1 contains active
+The current writer MUST emit version 2. Checkpoints written as version 1
+MUST remain readable by current code: the current reader MUST read version 1
+and version 2 within the current datadir epoch. The forward-compat read path
+is `read_headers` gated by `is_readable_version` in
+`crates/chainstate/src/checkpoint/headers.rs`
+(`ACTIVE_ONLY_HEADER_VERSION = 1`, `HEADER_VERSION = 2`).
+Version 1 contains active
 ancestry only. Version 2 also contains replayable side-branch headers.
 Both versions MUST pass the manifest, digest, ancestry, commitment, and
 historical-header validation checks. Side-header replay MUST NOT change the

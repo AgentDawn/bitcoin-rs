@@ -457,6 +457,10 @@ class Framing(unittest.TestCase):
         self.assertEqual([meta.offset for meta, _ in frames], [0, 88, 176])
         self.assertEqual([meta.payload_length for meta, _ in frames], [80, 80, 80])
         self.assertEqual([payload for _, payload in frames], list(_LINKED))
+        for meta, payload in frames:
+            self.assertEqual(_GOLDEN_ARCHIVE[meta.offset:meta.offset + 4], MAGIC)
+            self.assertEqual(struct.unpack_from("<I", _GOLDEN_ARCHIVE, meta.offset + 4)[0], meta.payload_length)
+            self.assertEqual(_GOLDEN_ARCHIVE[meta.offset + 8:meta.offset + 8 + meta.payload_length], payload)
 
     def test_iter_frames_survives_short_reads(self) -> None:
         for chunk in (1, 3, 7):
