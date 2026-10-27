@@ -271,7 +271,7 @@ impl SnapshotControl {
         cancellation: &LatchReader,
     ) -> Result<SnapshotExport, SnapshotExportError> {
         let shutdown = self.chainstate.shutdown_reader();
-        self.export_until(&output, &|| {
+        self.export_until(output, &|| {
             cancellation.is_triggered() || shutdown.is_triggered()
         })
     }

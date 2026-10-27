@@ -242,7 +242,7 @@ pub fn create_file(dir: &Dir, name: &str) -> io::Result<File> {
 /// Open nonblocking without following symlinks, then require the opened
 /// inode to be a regular file. `O_NONBLOCK` is a no-op for regular files,
 /// so `NotFound` and other I/O error kinds propagate unchanged.
-pub(crate) fn open_file(dir: &Dir, name: &str) -> io::Result<File> {
+pub fn open_file(dir: &Dir, name: &str) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No).nonblock(true);
     let file = dir.open_with(name, &options)?;
