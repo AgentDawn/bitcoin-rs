@@ -31,11 +31,23 @@ contract.
   `--all-features` resolve and the maximum lane's default-feature
   resolve — for `bitcoin`, `bitcoin_hashes`, `secp256k1`, and
   `secp256k1-sys`.
-- Each of those crates resolves to exactly one version per graph:
-  `deny.toml` `multiple-versions = "deny"` fails any second version of
-  any crate, and those four names must not gain a `[bans].skip` entry,
-  including `crate@version`. Package-id cardinality beyond one version
-  per name is not mechanically checked; lockfile review pins it.
+- Each of those crates resolves to exactly one version per graph, with one
+  approved pool-only exception: the pinned SRI release family
+  (`noise_sv2 2.0.0`, reachable only through the `pool-sv2` feature) carries
+  its own audited `secp256k1 0.28.2` / `secp256k1-sys 0.9.2` authority-key line
+  and `bitcoin_hashes 0.13.1` transport line. Those exact versions are pinned
+  in `deny.toml` `[bans].skip` with the `noise_sv2 2.0.0` reason;
+  `multiple-versions = "deny"` still fails any other second version, and no
+  further skip for these four names is approved. Package-id cardinality beyond
+  one version per name is not mechanically checked; lockfile review pins it.
+- Pool-only SRI crates (the Noise-family dependencies in
+  `crates/node/Cargo.toml`) are optional normal dependencies enabled by the
+  existing `pool-sv2` feature — Cargo forbids `optional` dev-dependencies and
+  does not honor `cfg(feature)` in target dev tables — so the
+  default-feature (maximum-lane) graph never resolves the exception chain;
+  only the `--all-features` (minimal-lane) graph does, where the exact-version
+  skips above apply. Only the `pool-sv2`-gated `pool/sv2.rs` test module uses
+  them.
 - Range-endpoint graphs are in scope: `cargo deny check bans` runs after
   each DEP-01 resolve. Missing cargo-deny is a failed prerequisite, not a skip.
 
@@ -50,6 +62,12 @@ contract.
   `syn 3.0.x` patch in the root or `fuzz` lock moves, update the exception
   to that exact version in the same change. The entry describes this pin
   only; it does not approve other splits.
+- The `secp256k1@0.28.2`, `secp256k1-sys@0.9.2`, and `bitcoin_hashes@0.13.1`
+  exceptions (with their RustCrypto transport companions) in `deny.toml`
+  `[bans]` are exact-version pins for the `noise_sv2 2.0.0` SV2 chain, like
+  the `syn` pin above. When the pinned SRI release family moves, update those
+  exceptions to the exact resolved versions in the same change. The entries
+  approve no other split.
 
 ## Proven by
 
