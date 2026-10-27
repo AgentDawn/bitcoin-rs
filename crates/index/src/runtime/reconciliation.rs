@@ -357,6 +357,13 @@ impl Worker {
                         .writer
                         .fenced_watermarks()
                         .map_err(DerivedIndexWorkerError::Index)?;
+                    // The reset erased the watermark: the outage that
+                    // triggered it is stale, so clear it here and let the
+                    // reset family replay from genesis. Terminal
+                    // no-watermark failures (watermark already None on entry)
+                    // stay excluded via `effective_enabled` to avoid a history
+                    // spin; they retry only on a fresh token.
+                    self.runtime.clear_script_live();
                     match self.seed_dispatch(pending.as_ref())? {
                         SeedFlow::Return(action) => return Ok(action),
                         SeedFlow::Seeded => return Ok(ReconcileAction::Progressed),

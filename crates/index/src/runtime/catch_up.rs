@@ -114,11 +114,13 @@ impl Worker {
             || watermark.map_or(0, |w| w.height.saturating_add(1)),
             |endpoint| endpoint.height.saturating_add(1),
         );
-        // The leg consumed the seed pin iff the seed covered this start and
-        // the grant took it (leaving the slot empty).
-        let seed_covering = seed_lease
-            .as_ref()
-            .is_some_and(|lease| lease.floor().is_some_and(|floor| floor <= start_height));
+        // Seed handoff ownership, tracked separately from coverage: the
+        // bundle lent its pin for first-leg use whether it covers this start
+        // (consumed directly) or sits above it (subsumed by the lower fresh
+        // grant). A stalled lower leg parks the fresh pin instead of dropping
+        // both, so one lease stays owned across stalls with no second live
+        // pin and no reacquisition.
+        let seed_handoff = seed_lease.is_some();
         let pass_history = match self.grant_leg_history(
             start_height,
             capabilities,
@@ -130,7 +132,7 @@ impl Worker {
             ControlFlow::Continue(lease) => lease,
             ControlFlow::Break(leg) => return Ok(leg),
         };
-        let from_seed = seed_covering && seed_lease.is_none();
+        let from_seed = seed_handoff && seed_lease.is_none();
         if start_height > target.height {
             return Ok(ForwardLeg::Settled(
                 if self.commit_forward(state, &pass_history)?.is_some() {
@@ -264,12 +266,12 @@ impl Worker {
     ) -> Result<ControlFlow<ForwardLeg, HistoryLease>, DerivedIndexWorkerError> {
         // Single-holder rule: a live seed pin covering this start is consumed
         // directly with no second `request_history`. Any other seed pin is
-        // dropped before the fresh request — a dead pin is superseded, and a
-        // live higher pin is subsumed by the lower grant (which pins a
-        // superset while the committed seed watermark already covers that
-        // height) — so no observer ever sees two live leases. A refusal
-        // restores the live pin, so a transient `Reserved`, `Missing`,
-        // `Shutdown`, or `Pruned` never loses the seed.
+        // held aside during the fresh request — a dead pin is superseded, and
+        // a live higher pin is subsumed once the lower grant lands (which pins
+        // a superset while the committed seed watermark already covers that
+        // height) — so only the fresh pin stays live after success. A refusal
+        // restores the held pin, so a transient `Reserved`, `Missing`,
+        // `Shutdown`, or `Pruned` never loses the seed and never re-requests.
         let mut parked = None;
         if let Some(lease) = seed_lease.take() {
             if lease.floor().is_some_and(|floor| floor <= start_height) {
@@ -280,7 +282,15 @@ impl Worker {
             }
         }
         let action = match self.history.request_history(start_height) {
-            Ok(lease) => return Ok(ControlFlow::Continue(lease)),
+            Ok(lease) => {
+                // The lower fresh grant lands first, so the parked higher
+                // seed pin is subsumed (it pins a subset while the committed
+                // seed watermark already covers that height). Drop it here so
+                // only the fresh pin stays live; a refusal below restores it
+                // instead of re-requesting.
+                drop(parked);
+                return Ok(ControlFlow::Continue(lease));
+            }
             Err(HistoryUnavailable::Pruned { below }) => {
                 *seed_lease = parked;
                 tracing::warn!(
