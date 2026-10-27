@@ -993,13 +993,15 @@ impl PoolCore {
                 // idempotent ledger consumer, which is keyed on `share.hash`.
                 match self.deliver_inline(&item) {
                     Ok(RecordOutcome::Recorded) => completion.record(),
-                    Ok(RecordOutcome::AlreadyRecorded) => return Err(SubmitFailure::Duplicate),
-                    // Permanently refused: answer the duplicate identity at
-                    // once with no retry and no buffering. The book already
-                    // burned the hash, so a miner retry converges to the same
-                    // duplicate verdict instead of spinning on an uncurable
-                    // ledger refusal.
-                    Ok(RecordOutcome::Rejected) => return Err(SubmitFailure::Duplicate),
+                    // Already durable (crash restore or post-eviction replay)
+                    // or permanently refused (the ledger judged this work
+                    // first): answer the duplicate identity at once with no
+                    // retry and no buffering. The book already burned the
+                    // hash, so a miner retry converges to the same duplicate
+                    // verdict instead of spinning on an uncurable refusal.
+                    Ok(RecordOutcome::AlreadyRecorded | RecordOutcome::Rejected) => {
+                        return Err(SubmitFailure::Duplicate);
+                    }
                     Err(LedgerUnavailable) => reservation.commit_reserved(item),
                 }
                 Ok(Credited {
@@ -1046,7 +1048,7 @@ impl PoolCore {
                 let mut share_settled = false;
                 match self.deliver_inline(&share_item) {
                     Ok(RecordOutcome::Recorded) => completion.record(),
-                    Ok(RecordOutcome::AlreadyRecorded) | Ok(RecordOutcome::Rejected) => {
+                    Ok(RecordOutcome::AlreadyRecorded | RecordOutcome::Rejected) => {
                         completion.record();
                         share_settled = true;
                     }
