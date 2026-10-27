@@ -721,6 +721,10 @@ impl P2pService {
     /// socket, this loop acquire-loads them between accepts, and the thread
     /// join in `join_core_workers` is the linearizable teardown handoff. The
     /// worker is never detached: it always ends before the join returns.
+    /// Error backoff polls `shutdown` only, which suffices: every path that
+    /// sets `session_cancel` also sets `shutdown`, the pause is bounded
+    /// (one growing step, polled every 50 ms), and the loop re-checks both
+    /// flags before the next accept.
     fn spawn_i2p_accept_worker(
         session: Arc<crate::sam::SamSession>,
         shared: crate::listener::ConnectionShared,

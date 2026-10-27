@@ -1469,6 +1469,11 @@ impl SamSession {
     /// `TO_PORT` the peer dialed). An absent `TO_PORT`, or I2CP port `0`
     /// (any or unspecified service), yields the application `fallback_port`;
     /// a nonzero port is returned as reported.
+    ///
+    /// Single concurrent caller: the wake slot holds one socket, so an
+    /// overlapping `accept` is rejected instead of stranding the first
+    /// registration. The service upholds this with one accept worker per
+    /// start.
     pub fn accept(
         &self,
         wait: Duration,
@@ -1498,6 +1503,9 @@ impl SamSession {
             let mut slot = self.accept_wake.lock();
             if self.closed.load(Ordering::Acquire) {
                 return Err(session_closed());
+            }
+            if slot.is_some() {
+                return Err(io::Error::other("sam accept already in progress"));
             }
             *slot = Some(conn.reader.try_clone()?);
         }
