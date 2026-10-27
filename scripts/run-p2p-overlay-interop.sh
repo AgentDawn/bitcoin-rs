@@ -14,11 +14,12 @@
 # network prerequisite fails the run (the caller reports BLOCKED).
 #
 # usage: run-p2p-overlay-interop.sh --tor-command <command>
-#            --tor-gencert-command <command> --i2pd-command <path>
+#            --tor-gencert-command <command> --tor-gencert-sha256 <hex> --i2pd-command <path>
 #            [--bitcoin-rs-command <command>] [--workdir <dir>]
 #            [--evidence <path>] [--timeout-seconds <n>] [--keep]
 #
-# Pinned externals: Tor 0.4.9.14 release (tor and tor-gencert matched); official i2pd 3.0.0 release.
+# Pinned externals: Tor 0.4.9.14 release (tor binary); tor-gencert by operator-supplied
+# SHA-256 digest (--tor-gencert-sha256; tor-gencert has no --version flag); official i2pd 3.0.0 release.
 # Any prerequisite mismatch or missing metadata
 # fails closed (non-zero exit).
 #
@@ -39,11 +40,12 @@ umask 077
 
 usage() {
   printf '%s\n' \
-    "usage: run-p2p-overlay-interop.sh --tor-command <command> --tor-gencert-command <command> --i2pd-command <path> [--bitcoin-rs-command <command>] [--workdir <dir>] [--evidence <path>] [--timeout-seconds <n>] [--keep]" \
+    "usage: run-p2p-overlay-interop.sh --tor-command <command> --tor-gencert-command <command> --tor-gencert-sha256 <hex> --i2pd-command <path> [--bitcoin-rs-command <command>] [--workdir <dir>] [--evidence <path>] [--timeout-seconds <n>] [--keep]" \
     "" \
     "Required:" \
     "  --tor-command <cmd>       Tor binary (pinned to release 0.4.9.14)" \
-    "  --tor-gencert-command <cmd> tor-gencert binary (same 0.4.9.14 release as --tor-command)" \
+    "  --tor-gencert-command <cmd> tor-gencert binary (must match --tor-gencert-sha256; tor-gencert has no --version flag)" \
+    "  --tor-gencert-sha256 <hex> Expected SHA-256 of the tor-gencert binary (64 hex chars; fail-closed on mismatch)" \
     "  --i2pd-command <path>      Path to i2pd binary (pinned to official release 3.0.0; supply the binary path, additional arguments are not parsed)" \
     "" \
     "Optional:" \
@@ -58,6 +60,7 @@ usage() {
 TOR_COMMAND=""
 I2PD_COMMAND=""
 TOR_GENCERT_COMMAND=""
+TOR_GENCERT_SHA256=""
 BITCOIN_RS_COMMAND="target/debug/bitcoin-rs"
 WORKDIR=""
 AUTO_WORKDIR=0
@@ -75,6 +78,11 @@ while (($# > 0)); do
     --tor-gencert-command)
       [[ $# -ge 2 ]] || { echo "error: --tor-gencert-command requires an argument" >&2; usage >&2; exit 2; }
       TOR_GENCERT_COMMAND=$2
+      shift 2
+      ;;
+    --tor-gencert-sha256)
+      [[ $# -ge 2 ]] || { echo "error: --tor-gencert-sha256 requires an argument" >&2; usage >&2; exit 2; }
+      TOR_GENCERT_SHA256=$2
       shift 2
       ;;
     --i2pd-command)
@@ -118,8 +126,13 @@ while (($# > 0)); do
   esac
 done
 
-if [[ -z "${TOR_COMMAND}" || -z "${TOR_GENCERT_COMMAND}" || -z "${I2PD_COMMAND}" ]]; then
-  echo "error: --tor-command, --tor-gencert-command, and --i2pd-command are required" >&2
+if [[ -z "${TOR_COMMAND}" || -z "${TOR_GENCERT_COMMAND}" || -z "${TOR_GENCERT_SHA256}" || -z "${I2PD_COMMAND}" ]]; then
+  echo "error: --tor-command, --tor-gencert-command, --tor-gencert-sha256, and --i2pd-command are required" >&2
+  usage >&2
+  exit 2
+fi
+if [[ ! "${TOR_GENCERT_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "error: --tor-gencert-sha256 must be 64 hex characters" >&2
   usage >&2
   exit 2
 fi
@@ -490,20 +503,11 @@ if [[ ! -x "${TOR_GENCERT_BIN}" ]]; then
   echo "error: tor-gencert binary not found or not executable: ${TOR_GENCERT_BIN}" >&2
   exit 1
 fi
-read -r -a TOR_GENCERT_CMD <<<"${TOR_GENCERT_COMMAND}"
-TOR_GENCERT_VER_RAW=$("${TOR_GENCERT_CMD[@]}" --version 2>/dev/null || true)
-TOR_GENCERT_FIRST_LINE=$(printf '%s\n' "${TOR_GENCERT_VER_RAW}" | head -n1 | tr -d '\r')
-TOR_GENCERT_RELEASE_OK=$(python3 -c '
-import sys, re
-line = sys.argv[1].strip()
-pattern = r"^Tor version 0\.4\.9\.14(?:\s+\(git-[0-9a-fA-F]+\))?\.?$"
-sys.exit(0 if re.match(pattern, line) else 1)
-' "${TOR_GENCERT_FIRST_LINE}" && echo 1 || echo 0)
-if [[ "${TOR_GENCERT_RELEASE_OK}" -ne 1 ]]; then
-  echo "error: tor-gencert pin mismatch: expected release 0.4.9.14 (without dev/alpha/rc suffixes), got: '${TOR_GENCERT_FIRST_LINE}'" >&2
+TOR_GENCERT_SHA=$(sha256sum "${TOR_GENCERT_BIN}" | awk '{print $1}')
+if [[ "${TOR_GENCERT_SHA,,}" != "${TOR_GENCERT_SHA256,,}" ]]; then
+  echo "error: tor-gencert pin mismatch: binary sha256 ${TOR_GENCERT_SHA} != pinned ${TOR_GENCERT_SHA256}" >&2
   exit 1
 fi
-TOR_GENCERT_SHA=$(sha256sum "${TOR_GENCERT_BIN}" | awk '{print $1}')
 
 # 3. bitcoin-rs binary check
 RS_BIN="${BITCOIN_RS_COMMAND%% *}"
@@ -1629,6 +1633,7 @@ evidence = {
         "version_raw": "${TOR_FIRST_LINE}",
         "release_verified": ("${TOR_OBSERVED_VERSION}" == "0.4.9.14"),
         "gencert_sha256": "${TOR_GENCERT_SHA}",
+        "gencert_sha256_pinned": True,
         "private_fixture": {"authorities": 3, "relays": 3, "testing_network": True},
         "public_bootstrap": False,
         "socks_atyp": socks_entry["atyp"],
