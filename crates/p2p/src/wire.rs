@@ -212,10 +212,7 @@ impl Message {
             Self::GetBlocks(message) => NetworkMessage::GetBlocks(message.clone()),
             Self::GetHeaders(message) => NetworkMessage::GetHeaders(message.clone()),
             Self::MemPool => NetworkMessage::MemPool,
-            Self::Tx(_)
-            | Self::Block(_)
-            | Self::BlockPayload(_)
-            | Self::Headers(_) => {
+            Self::Tx(_) | Self::Block(_) | Self::BlockPayload(_) | Self::Headers(_) => {
                 unreachable!("native payloads are encoded directly")
             }
             Self::SendHeaders => NetworkMessage::SendHeaders,
