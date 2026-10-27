@@ -186,6 +186,21 @@ class EscapeTests(unittest.TestCase):
         self.assertEqual(len(mounts), 1)
         self.assertEqual(mounts[0]["mountpoint"], "/mnt/my dir")
 
+    def test_mountinfo_splits_only_on_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / "mountinfo"
+            table.write_text(
+                "1 0 8:1 / /data\x0braw rw,relatime - ext4 /dev/sda1 rw\n"
+                "2 0 8:2 / /other\x0craw rw,relatime - ext4 /dev/sda2 rw\n"
+                "3 0 8:3 / /car\riageraw rw,relatime - ext4 /dev/sda3 rw\n",
+                encoding="utf-8",
+            )
+            mounts = read_mountinfo(table)
+        self.assertEqual(
+            [mount["mountpoint"] for mount in mounts],
+            ["/data\x0braw", "/other\x0craw", "/car\riageraw"],
+        )
+
     def test_mountinfo_malformed_lines_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             table = Path(tmp) / "mountinfo"

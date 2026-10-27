@@ -149,9 +149,18 @@ def unescape_mountinfo(field: str) -> str:
     return raw.decode("utf-8", errors="surrogateescape")
 
 
-def _read_text(path: Path | str, errors: str = "replace") -> str | None:
+def _read_text(
+    path: Path | str, errors: str = "replace", newline: str | None = None
+) -> str | None:
     try:
-        return Path(path).read_text(encoding="utf-8", errors=errors)
+        if newline is None:
+            return Path(path).read_text(encoding="utf-8", errors=errors)
+        try:
+            return Path(path).read_text(
+                encoding="utf-8", errors=errors, newline=newline
+            )
+        except TypeError:
+            return Path(path).read_text(encoding="utf-8", errors=errors)
     except OSError:
         return None
 
@@ -163,15 +172,15 @@ def read_mountinfo(path: str | Path = MOUNTINFO_DEFAULT) -> list[MountInfo]:
     survive decoding, consistent with the os.fsdecode-derived scratch path
     they are matched against. Replacement decoding would map distinct byte
     sequences onto one placeholder and misroute child mounts to ancestors.
+    Records are read with newline translation disabled and split only on
+    "\n": the kernel escapes just space, tab, newline, and backslash, so
+    str.splitlines() would wrongly split records holding raw vertical-tab,
+    form-feed, or carriage-return bytes in mountpoints.
     """
-    text = _read_text(path, errors="surrogateescape")
+    text = _read_text(path, errors="surrogateescape", newline="")
     if text is None:
         return []
     mounts: list[MountInfo] = []
-    # Split records only on "\n": the kernel octal-escapes space/tab/newline/
-    # backslash, so remaining raw vertical-tab, form-feed, and carriage-return
-    # bytes in mountpoints must survive as record content. str.splitlines()
-    # would split on those bytes and corrupt such records.
     for line in text.split("\n"):
         if " - " not in line:
             continue
@@ -369,7 +378,7 @@ def identify_scope(
         "mount": None,
         "mechanisms_checked": mechanisms,
     }
-    if _read_text(mountinfo_path, errors="surrogateescape") is None:
+    if _read_text(mountinfo_path, errors="surrogateescape", newline="") is None:
         info.update(
             status="unavailable",
             scope_kind="unavailable",
