@@ -570,6 +570,7 @@ macro_rules! option_rows {
                         cli[#[arg(long = "dns-seeds-enabled")]]
                         env["BITCOIN_RS_DNS_SEEDS_ENABLED", parse_bool]
                         toml native("dns_seeds_enabled")
+                        conf["dnsseed"]
                     }
                     /// Optional Bitcoin Core `ASMap` file for network diversity.
                     asmap as asmap: Option<PathBuf> {
