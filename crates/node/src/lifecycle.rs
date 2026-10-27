@@ -735,7 +735,7 @@ pub(crate) fn start_node(
         Arc::clone(&chainstate),
         state.stable_read(),
         state.chain_followers(),
-        pool_reward_script(state.config()),
+        final_payout_script(state.config()),
     ));
     let sequence_wake: Arc<dyn bitcoin_rs_mining::MempoolSequenceWake> = coordinator.clone();
     let mining_control: Arc<dyn bitcoin_rs_mining::MiningControl> = coordinator;
@@ -883,7 +883,19 @@ pub(crate) fn start_node(
     Ok(guard.finish(context))
 }
 
-fn pool_reward_script(config: &NodeConfig) -> Vec<u8> {
+/// The one final payout-script owner for pool jobs and ordinary
+/// `getblocktemplate`.
+///
+/// Both paths share the coordinator's `coinbase_script`: pool templates fetch
+/// through `MiningControl::get_block_template` with a coinbase budget, and
+/// ordinary GBT uses the same candidate without a budget. Neither path may
+/// pick a script on its own.
+///
+/// Precedence is explicit so differing configuration cannot split the two
+/// paths: the pool reward wins whenever a pool is configured, otherwise the
+/// ordinary mining payout wins. Validation still requires a mining payout
+/// alongside a pool, but the mining value is ignored while a pool is present.
+fn final_payout_script(config: &NodeConfig) -> Vec<u8> {
     #[cfg(feature = "pool")]
     if let Some(pool) = config.pool.as_ref() {
         return pool.reward_script.clone();

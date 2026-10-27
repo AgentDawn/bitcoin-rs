@@ -462,6 +462,10 @@ struct Credited {
 
 struct DeferredResponse {
     id: RequestId,
+    /// Whether the originating frame carried an `"id"` member. `false` is a
+    /// notification: the later completion still emits `ServerEvent`s but never
+    /// a wire reply.
+    has_id: bool,
     hash: BlockHash,
     class: ShareClass,
     block: Option<BlockOutcome>,
@@ -477,8 +481,15 @@ struct Outbox {
     reserved_bytes: usize,
 }
 
-/// Atomically holds outbox space for one in-flight submit (up to 2 items and
-/// 8 MiB for worst-case block entries).
+/// Buffered cost of one accepted share record.
+const SHARE_RECORD_BYTES: usize = 256;
+/// Buffered cost of one block record without its block body.
+const BLOCK_RECORD_FRAMING_BYTES: usize = 512;
+
+/// Atomically holds outbox space for one in-flight submit: two item slots and
+/// the share plus block-record framing bytes. A block body is admitted over
+/// the byte bound rather than shedding a found block, so one in-flight submit
+/// never spends the whole pool byte budget.
 struct OutboxReservation<'a> {
     pool: &'a PoolCore,
     items: usize,
@@ -496,7 +507,7 @@ impl Drop for DrainGuard<'_> {
 impl OutboxReservation<'_> {
     /// Commits an item into the outbox by consuming part of this reservation.
     /// Capacity is guaranteed because it was pre-allocated.
-    fn commit(&mut self, item: Pending) {
+    fn commit_reserved(&mut self, item: Pending) {
         let cost = item.bytes_cost();
         let mut outbox = locked(&self.pool.outbox);
         outbox.reserved_items = outbox.reserved_items.saturating_sub(1);
@@ -977,7 +988,7 @@ impl PoolCore {
                 match self.deliver_inline(&item) {
                     Ok(RecordOutcome::Recorded) => completion.record(),
                     Ok(RecordOutcome::AlreadyRecorded) => return Err(SubmitFailure::Duplicate),
-                    Err(LedgerUnavailable) => reservation.commit(item),
+                    Err(LedgerUnavailable) => reservation.commit_reserved(item),
                 }
                 Ok(Credited {
                     hash,
@@ -1016,12 +1027,12 @@ impl PoolCore {
                 match self.deliver_inline(&share_item) {
                     Ok(RecordOutcome::Recorded) => completion.record(),
                     Ok(RecordOutcome::AlreadyRecorded) => return Err(SubmitFailure::Duplicate),
-                    Err(LedgerUnavailable) => reservation.commit(share_item),
+                    Err(LedgerUnavailable) => reservation.commit_reserved(share_item),
                 }
 
                 // Deliver or buffer block record.
                 if self.deliver_inline(&block_item).is_err() {
-                    reservation.commit(block_item);
+                    reservation.commit_reserved(block_item);
                 } else {
                     completion.record();
                 }
@@ -1202,6 +1213,14 @@ fn emit_line(out: &mut Vec<u8>, line: &str) {
     out.extend_from_slice(line.as_bytes());
 }
 
+/// Emits `line` unless `request` is a notification without an `"id"` member.
+/// State changes still apply; only the wire reply is suppressed.
+fn emit_reply(request: &Request, out: &mut Vec<u8>, line: &str) {
+    if request.has_id {
+        emit_line(out, line);
+    }
+}
+
 impl SessionState {
     fn new(shared: Arc<Shared>, ordinal: u64, peer: SocketAddr) -> Self {
         let difficulty = shared.config.difficulty.initial().clone();
@@ -1236,7 +1255,11 @@ impl SessionState {
     fn handle_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Flow {
         let verdict = match decode_line(frame) {
             Err(failure) => {
-                emit_line(out, &encode_error(&failure.id, &failure.error));
+                // JSON-RPC notifications carry no `"id"`: no reply, not even
+                // for decode failures. The violation still counts.
+                if failure.has_id {
+                    emit_line(out, &encode_error(&failure.id, &failure.error));
+                }
                 Verdict::Violation
             }
             Ok(Incoming::Response) => Verdict::Ignored,
@@ -1282,29 +1305,34 @@ impl SessionState {
         let parsed = match ClientRequest::parse(request) {
             Ok(parsed) => parsed,
             Err(error) => {
-                emit_line(out, &encode_error(&request.id, &error));
+                emit_reply(request, out, &encode_error(&request.id, &error));
                 return Verdict::Violation;
             }
         };
         match parsed {
-            ClientRequest::Configure(configure) => self.on_configure(&request.id, &configure, out),
-            ClientRequest::Subscribe(subscribe) => self.on_subscribe(&request.id, subscribe, out),
-            ClientRequest::Authorize(authorize) => self.on_authorize(&request.id, authorize, out),
-            ClientRequest::Submit(submit) => self.on_submit(&request.id, &submit, out),
+            ClientRequest::Configure(configure) => self.on_configure(request, &configure, out),
+            ClientRequest::Subscribe(subscribe) => self.on_subscribe(request, subscribe, out),
+            ClientRequest::Authorize(authorize) => self.on_authorize(request, authorize, out),
+            ClientRequest::Submit(submit) => self.on_submit(request, &submit, out),
             ClientRequest::ExtranonceSubscribe => {
                 // The common owner fixes each session's extranonce prefix; it is
                 // never rotated, so there is nothing to subscribe to.
-                emit_line(
+                emit_reply(
+                    request,
                     out,
                     &encode_reject(&request.id, &errors::EXTRANONCE_SUBSCRIPTION_UNSUPPORTED),
                 );
                 Verdict::Ignored
             }
             ClientRequest::SuggestDifficulty(difficulty) => {
-                self.on_suggest(&request.id, difficulty, out)
+                self.on_suggest(request, difficulty, out)
             }
             ClientRequest::Unknown => {
-                emit_line(out, &encode_error(&request.id, &errors::METHOD_NOT_FOUND));
+                emit_reply(
+                    request,
+                    out,
+                    &encode_error(&request.id, &errors::METHOD_NOT_FOUND),
+                );
                 Verdict::Violation
             }
         }
@@ -1312,12 +1340,16 @@ impl SessionState {
 
     fn on_configure(
         &mut self,
-        id: &RequestId,
+        request: &Request,
         configure: &Configure,
         out: &mut Vec<u8>,
     ) -> Verdict {
         if self.work_started {
-            emit_line(out, &encode_error(id, &errors::CONFIGURE_TOO_LATE));
+            emit_reply(
+                request,
+                out,
+                &encode_error(&request.id, &errors::CONFIGURE_TOO_LATE),
+            );
             return Verdict::Violation;
         }
         let mut members: Vec<String> = Vec::new();
@@ -1344,20 +1376,34 @@ impl SessionState {
                 members.push(format!("{}:false", json_string(name)));
             }
         }
-        emit_line(
+        emit_reply(
+            request,
             out,
-            &encode_result(id, &format!("{{{}}}", members.join(","))),
+            &encode_result(&request.id, &format!("{{{}}}", members.join(","))),
         );
         Verdict::Good
     }
 
-    fn on_subscribe(&mut self, id: &RequestId, subscribe: Subscribe, out: &mut Vec<u8>) -> Verdict {
+    fn on_subscribe(
+        &mut self,
+        request: &Request,
+        subscribe: Subscribe,
+        out: &mut Vec<u8>,
+    ) -> Verdict {
         if self.lease.is_some() {
-            emit_line(out, &encode_error(id, &errors::ALREADY_SUBSCRIBED));
+            emit_reply(
+                request,
+                out,
+                &encode_error(&request.id, &errors::ALREADY_SUBSCRIBED),
+            );
             return Verdict::Violation;
         }
         let Some(lease) = self.shared.pool.open_lease().ok() else {
-            emit_line(out, &encode_error(id, &errors::POOL_AT_CAPACITY));
+            emit_reply(
+                request,
+                out,
+                &encode_error(&request.id, &errors::POOL_AT_CAPACITY),
+            );
             return Verdict::Fatal(SessionEnd::PoolRefused);
         };
         let extranonce1 = encode_hex(lease.session.extranonce_prefix());
@@ -1366,7 +1412,7 @@ impl SessionState {
         let result = format!(
             "[[[\"mining.set_difficulty\",\"d{tag}\"],[\"mining.notify\",\"n{tag}\"]],\"{extranonce1}\",{extranonce2_size}]"
         );
-        emit_line(out, &encode_result(id, &result));
+        emit_reply(request, out, &encode_result(&request.id, &result));
         self.shared.emit(&ServerEvent::Subscribed {
             peer: self.peer,
             session: lease.session.id(),
@@ -1379,14 +1425,23 @@ impl SessionState {
         Verdict::Good
     }
 
-    fn on_authorize(&mut self, id: &RequestId, authorize: Authorize, out: &mut Vec<u8>) -> Verdict {
+    fn on_authorize(
+        &mut self,
+        request: &Request,
+        authorize: Authorize,
+        out: &mut Vec<u8>,
+    ) -> Verdict {
         let Ok(identity) = self
             .shared
             .accounts
             .resolve(&authorize.login, &authorize.password)
         else {
             self.auth_failures = self.auth_failures.saturating_add(1);
-            emit_line(out, &encode_reject(id, &errors::UNAUTHORIZED_WORKER_ERROR));
+            emit_reply(
+                request,
+                out,
+                &encode_reject(&request.id, &errors::UNAUTHORIZED_WORKER_ERROR),
+            );
             return if self.auth_failures >= self.shared.config.max_auth_failures {
                 Verdict::Fatal(SessionEnd::TooManyAuthFailures)
             } else {
@@ -1400,21 +1455,34 @@ impl SessionState {
             .any(|(login, _)| *login == authorize.login)
         {
             if self.workers.len() >= self.shared.config.max_workers_per_session {
-                emit_line(out, &encode_error(id, &errors::TOO_MANY_WORKERS));
+                emit_reply(
+                    request,
+                    out,
+                    &encode_error(&request.id, &errors::TOO_MANY_WORKERS),
+                );
                 return Verdict::Violation;
             }
             self.workers.push((authorize.login, identity));
         }
-        emit_line(out, &encode_result(id, "true"));
+        emit_reply(request, out, &encode_result(&request.id, "true"));
         if self.is_ready() {
             self.poll_hint = true;
         }
         Verdict::Good
     }
 
-    fn on_suggest(&mut self, id: &RequestId, difficulty: Difficulty, out: &mut Vec<u8>) -> Verdict {
+    fn on_suggest(
+        &mut self,
+        request: &Request,
+        difficulty: Difficulty,
+        out: &mut Vec<u8>,
+    ) -> Verdict {
         if !self.shared.config.difficulty.contains(&difficulty) {
-            emit_line(out, &encode_reject(id, &errors::DIFFICULTY_OUT_OF_RANGE));
+            emit_reply(
+                request,
+                out,
+                &encode_reject(&request.id, &errors::DIFFICULTY_OUT_OF_RANGE),
+            );
             return Verdict::Ignored;
         }
         if difficulty != self.difficulty {
@@ -1423,7 +1491,7 @@ impl SessionState {
             self.difficulty = difficulty;
             self.difficulty_pending = true;
         }
-        emit_line(out, &encode_result(id, "true"));
+        emit_reply(request, out, &encode_result(&request.id, "true"));
         if self.is_ready() {
             self.poll_hint = true;
         }
@@ -1439,9 +1507,13 @@ impl SessionState {
         }
     }
 
-    fn on_submit(&mut self, id: &RequestId, submit: &Submit, out: &mut Vec<u8>) -> Verdict {
+    fn on_submit(&mut self, request: &Request, submit: &Submit, out: &mut Vec<u8>) -> Verdict {
         let Some(lease) = self.lease.as_ref() else {
-            emit_line(out, &encode_error(id, &errors::NOT_SUBSCRIBED_ERROR));
+            emit_reply(
+                request,
+                out,
+                &encode_error(&request.id, &errors::NOT_SUBSCRIBED_ERROR),
+            );
             return Verdict::Violation;
         };
         let Some(identity) = self
@@ -1450,33 +1522,53 @@ impl SessionState {
             .find(|(login, _)| *login == submit.login)
             .map(|(_, identity)| identity.clone())
         else {
-            emit_line(out, &encode_error(id, &errors::UNAUTHORIZED_WORKER_ERROR));
+            emit_reply(
+                request,
+                out,
+                &encode_error(&request.id, &errors::UNAUTHORIZED_WORKER_ERROR),
+            );
             return Verdict::Violation;
         };
         if let Some(bits) = submit.version_bits {
             let Some(mask) = self.version_rolling else {
-                emit_line(out, &encode_error(id, &errors::UNEXPECTED_VERSION_BITS));
+                emit_reply(
+                    request,
+                    out,
+                    &encode_error(&request.id, &errors::UNEXPECTED_VERSION_BITS),
+                );
                 return Verdict::Violation;
             };
             if bits & !mask != 0 {
-                emit_line(out, &encode_reject(id, &errors::VERSION_BITS_OUTSIDE_MASK));
+                emit_reply(
+                    request,
+                    out,
+                    &encode_reject(&request.id, &errors::VERSION_BITS_OUTSIDE_MASK),
+                );
                 return Verdict::Rejected;
             }
         }
         // Job text this adapter never issued cannot name a job.
         let Some(job) = parse_wire_job_id(&submit.job_id) else {
-            emit_line(out, &encode_reject(id, &errors::JOB_NOT_FOUND_ERROR));
+            emit_reply(
+                request,
+                out,
+                &encode_reject(&request.id, &errors::JOB_NOT_FOUND_ERROR),
+            );
             return Verdict::Rejected;
         };
         // Shed before validation: an accepted share burns its duplicate
         // identity, so a second submit while a completion is outstanding
         // must not enter the book or the outbox.
         if !self.deferred.is_empty() {
-            emit_line(out, &encode_reject(id, &errors::ACCOUNTING_UNAVAILABLE));
+            emit_reply(
+                request,
+                out,
+                &encode_reject(&request.id, &errors::ACCOUNTING_UNAVAILABLE),
+            );
             return Verdict::Ignored;
         }
         let target = self.effective_target(Instant::now());
-        let request = ShareRequest {
+        let share_request = ShareRequest {
             session: lease.session.id(),
             job,
             rolled: &submit.extranonce2,
@@ -1484,14 +1576,16 @@ impl SessionState {
             nonce: submit.nonce,
             version_bits: submit.version_bits,
         };
-        let session = request.session;
-        match self.shared.pool.submit(&identity, &request, &target) {
+        let session = share_request.session;
+        match self.shared.pool.submit(&identity, &share_request, &target) {
             Ok(credited) => {
                 if credited.completion.is_complete() {
-                    self.emit_credited(id, session, &credited, out);
+                    let reply = request.has_id.then_some(&request.id);
+                    self.emit_credited(reply, session, &credited, out);
                 } else {
                     self.deferred.push(DeferredResponse {
-                        id: id.clone(),
+                        id: request.id.clone(),
+                        has_id: request.has_id,
                         hash: credited.hash,
                         class: credited.class,
                         block: credited.block,
@@ -1504,29 +1598,40 @@ impl SessionState {
             Err(SubmitFailure::Share(error)) => {
                 let wire = share_error_wire(&error);
                 if matches!(error, ShareError::ExtranonceLength { .. }) {
-                    emit_line(out, &encode_error(id, &wire));
+                    emit_reply(request, out, &encode_error(&request.id, &wire));
                     Verdict::Violation
                 } else {
-                    emit_line(out, &encode_reject(id, &wire));
+                    emit_reply(request, out, &encode_reject(&request.id, &wire));
                     Verdict::Rejected
                 }
             }
             Err(SubmitFailure::Duplicate) => {
-                emit_line(out, &encode_reject(id, &errors::DUPLICATE_SHARE_ERROR));
+                emit_reply(
+                    request,
+                    out,
+                    &encode_reject(&request.id, &errors::DUPLICATE_SHARE_ERROR),
+                );
                 Verdict::Rejected
             }
             Err(SubmitFailure::OutboxFull) => {
                 // The share was rejected BEFORE validation; the hash was NOT burned.
                 // The miner may retry.
-                emit_line(out, &encode_reject(id, &errors::ACCOUNTING_UNAVAILABLE));
+                emit_reply(
+                    request,
+                    out,
+                    &encode_reject(&request.id, &errors::ACCOUNTING_UNAVAILABLE),
+                );
                 Verdict::Ignored
             }
         }
     }
 
+    /// Records the credited share and, when `id` is present, answers it.
+    /// `None` is a notification completion: the `ShareAccepted`/`BlockSubmitted`
+    /// events still emit, but no wire reply does.
     fn emit_credited(
         &self,
-        id: &RequestId,
+        id: Option<&RequestId>,
         session: SessionId,
         credited: &Credited,
         out: &mut Vec<u8>,
@@ -1543,7 +1648,9 @@ impl SessionState {
                 outcome,
             });
         }
-        emit_line(out, &encode_result(id, "true"));
+        if let Some(id) = id {
+            emit_line(out, &encode_result(id, "true"));
+        }
     }
 
     /// Sends pending difficulty and the newest job this session has not seen.
@@ -1562,7 +1669,8 @@ impl SessionState {
                         completion: response.completion,
                         block: response.block,
                     };
-                    self.emit_credited(&response.id, session, &credited, out);
+                    let reply = response.has_id.then_some(&response.id);
+                    self.emit_credited(reply, session, &credited, out);
                 }
             } else {
                 pending.push(response);

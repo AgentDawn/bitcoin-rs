@@ -396,7 +396,10 @@ impl<K: Value, V: Value> Table<'_, K, V> {
                 continue;
             }
             if let Some(put) = value {
-                if last.as_ref().is_none_or(|(tail, _)| tail.as_slice() <= key.as_slice()) {
+                if last
+                    .as_ref()
+                    .is_none_or(|(tail, _)| tail.as_slice() <= key.as_slice())
+                {
                     last = Some((key.clone(), put.clone()));
                 }
                 break;

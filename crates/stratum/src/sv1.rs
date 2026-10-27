@@ -455,6 +455,10 @@ fn request_id(value: Option<&Value>) -> Option<RequestId> {
 pub struct Request {
     /// Id to echo in the response.
     pub id: RequestId,
+    /// Whether the frame carried an `"id"` member. `false` is a JSON-RPC
+    /// notification: the server must process it without emitting any reply,
+    /// including errors and deferred share outcomes.
+    pub has_id: bool,
     /// Method name, at most [`MAX_METHOD_LEN`] bytes.
     pub method: String,
     document: Value,
@@ -486,7 +490,8 @@ impl fmt::Debug for Request {
 /// A decoded frame.
 #[derive(Debug)]
 pub enum Incoming {
-    /// A request or notification from the miner.
+    /// A request or notification from the miner. When [`Request::has_id`] is
+    /// `false` the frame is a notification and the session must emit nothing.
     Request(Request),
     /// A response to a server request. This adapter sends none, so it is dropped.
     Response,
@@ -499,11 +504,28 @@ pub struct DecodeFailure {
     pub id: RequestId,
     /// Error to send.
     pub error: WireError,
+    /// Whether a reply may be emitted. `false` is a notification without an
+    /// `"id"` member: the session must emit nothing, not even this error.
+    pub has_id: bool,
 }
 
 impl DecodeFailure {
+    /// A failure that may be answered under `id`.
     fn new(id: RequestId, error: WireError) -> Self {
-        Self { id, error }
+        Self {
+            id,
+            error,
+            has_id: true,
+        }
+    }
+
+    /// A failure for a notification without an `"id"` member: never emitted.
+    fn notification(id: RequestId, error: WireError) -> Self {
+        Self {
+            id,
+            error,
+            has_id: false,
+        }
     }
 }
 
@@ -544,14 +566,16 @@ pub fn decode_line(line: &[u8]) -> Result<Incoming, DecodeFailure> {
     }
     let document: Value = sonic_rs::from_slice(line)
         .map_err(|_| DecodeFailure::new(RequestId::null(), errors::PARSE_ERROR))?;
-    let (id, method, shape) = {
+    let (id, has_id, method, shape) = {
         let Some(object) = document.as_object() else {
             return Err(DecodeFailure::new(
                 RequestId::null(),
                 errors::INVALID_REQUEST,
             ));
         };
+        let has_id = object.get(&"id").is_some();
         let Some(id) = request_id(object.get(&"id")) else {
+            // An `"id"` member is present but unusable: answer under `null`.
             return Err(DecodeFailure::new(
                 RequestId::null(),
                 errors::INVALID_REQUEST,
@@ -563,7 +587,10 @@ pub fn decode_line(line: &[u8]) -> Result<Incoming, DecodeFailure> {
                     .as_str()
                     .filter(|name| !name.is_empty() && name.len() <= MAX_METHOD_LEN);
                 let Some(name) = name else {
-                    return Err(DecodeFailure::new(id, errors::INVALID_REQUEST));
+                    if has_id {
+                        return Err(DecodeFailure::new(id, errors::INVALID_REQUEST));
+                    }
+                    return Err(DecodeFailure::notification(id, errors::INVALID_REQUEST));
                 };
                 let params_ok = match object.get(&"params") {
                     None => true,
@@ -573,15 +600,20 @@ pub fn decode_line(line: &[u8]) -> Result<Incoming, DecodeFailure> {
                         .is_some_and(|array| array.len() <= MAX_PARAMS),
                 };
                 if !params_ok {
-                    return Err(DecodeFailure::new(id, errors::INVALID_PARAMS));
+                    if has_id {
+                        return Err(DecodeFailure::new(id, errors::INVALID_PARAMS));
+                    }
+                    return Err(DecodeFailure::notification(id, errors::INVALID_PARAMS));
                 }
-                (id, name.to_owned(), true)
+                (id, has_id, name.to_owned(), true)
             }
             None => {
                 if object.get(&"result").is_some() || object.get(&"error").is_some() {
-                    (id, String::new(), false)
-                } else {
+                    (id, has_id, String::new(), false)
+                } else if has_id {
                     return Err(DecodeFailure::new(id, errors::INVALID_REQUEST));
+                } else {
+                    return Err(DecodeFailure::notification(id, errors::INVALID_REQUEST));
                 }
             }
         }
@@ -589,6 +621,7 @@ pub fn decode_line(line: &[u8]) -> Result<Incoming, DecodeFailure> {
     if shape {
         Ok(Incoming::Request(Request {
             id,
+            has_id,
             method,
             document,
         }))
@@ -1194,4 +1227,67 @@ pub fn encode_notify(job: &Job, clean_jobs: bool) -> String {
     line.push_str(if clean_jobs { "true" } else { "false" });
     line.push_str("]}\n");
     line
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::{DecodeFailure, Incoming, decode_line, errors};
+
+    fn has_id_of(line: &[u8]) -> Option<bool> {
+        match decode_line(line) {
+            Ok(Incoming::Request(request)) => Some(request.has_id),
+            Ok(Incoming::Response) => None,
+            Err(DecodeFailure { has_id, .. }) => Some(has_id),
+        }
+    }
+
+    #[test]
+    fn calls_carry_has_id_and_notifications_do_not() {
+        let call = br#"{"id":7,"method":"mining.subscribe","params":[]}"#;
+        let decoded = decode_line(call).expect("a call with an id decodes");
+        match decoded {
+            Incoming::Request(request) => {
+                assert!(request.has_id);
+                assert_eq!(request.id.as_json(), "7");
+            }
+            Incoming::Response => panic!("a method frame is not a response"),
+        }
+
+        let notification = br#"{"method":"mining.subscribe","params":[]}"#;
+        let decoded = decode_line(notification).expect("a notification decodes");
+        match decoded {
+            Incoming::Request(request) => {
+                assert!(!request.has_id);
+                assert_eq!(request.id.as_json(), "null");
+            }
+            Incoming::Response => panic!("a method frame is not a response"),
+        }
+    }
+
+    #[test]
+    fn explicit_null_id_is_a_call_not_a_notification() {
+        let line = br#"{"id":null,"method":"mining.subscribe","params":[]}"#;
+        assert_eq!(has_id_of(line), Some(true));
+    }
+
+    #[test]
+    fn only_notifications_suppress_their_failure_reply() {
+        let bad_call = br#"{"id":3,"method":"","params":[]}"#;
+        match decode_line(bad_call) {
+            Err(failure) => {
+                assert!(failure.has_id);
+                assert_eq!(failure.error, errors::INVALID_REQUEST);
+            }
+            Ok(_) => panic!("an empty method is invalid"),
+        }
+
+        let bad_notification = br#"{"method":"","params":[]}"#;
+        match decode_line(bad_notification) {
+            Err(failure) => {
+                assert!(!failure.has_id);
+                assert_eq!(failure.error, errors::INVALID_REQUEST);
+            }
+            Ok(_) => panic!("an empty method is invalid"),
+        }
+    }
 }
