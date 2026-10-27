@@ -503,6 +503,12 @@ pub fn connect_peer_stream(
                     "overlay transport unavailable: no I2P SAM session is configured",
                 )));
             };
+            // Dial owner: the stored endpoint port is passed verbatim as SAM
+            // `TO_PORT`. Port `0` is SAM unspecified service; the responder
+            // maps it to its P2P fallback via the accept adapter, so a stored
+            // I2P `:0` still dials the peer P2P service rather than an
+            // arbitrary service. No configured-port substitution here: the
+            // local fallback port owns inbound accept only.
             session.connect(hash, port, timeout)
         }
     }

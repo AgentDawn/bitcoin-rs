@@ -1026,6 +1026,26 @@ impl PeerTable {
             .map(|entry| entry.lease.clone())
     }
 
+    /// Clones the lease for the exact connection named by `token`, whether
+    /// endpoint-identified or anonymous.
+    ///
+    /// Read-only: never registers and never affects capacity. Returns `None`
+    /// when the named connection is not live, is cancelled, or is not the
+    /// exact connection the token names.
+    #[must_use]
+    pub(crate) fn lease_for_token(
+        &self,
+        token: bitcoin_rs_mempool::PeerToken,
+    ) -> Option<PeerLease> {
+        self.entries.read().iter().find_map(|(key, entry)| {
+            if entry.lease.is_cancelled() {
+                return None;
+            }
+            let current = entry.lease.source(key.endpoint());
+            (bitcoin_rs_mempool::PeerToken::from(current) == token).then(|| entry.lease.clone())
+        })
+    }
+
     /// Number of live connections, including those still handshaking.
     #[must_use]
     pub fn len(&self) -> usize {

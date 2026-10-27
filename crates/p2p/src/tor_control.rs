@@ -575,7 +575,8 @@ impl TorController {
         target: SocketAddr,
     ) -> io::Result<OnionService> {
         if let Some(blob) = key_blob {
-            if !valid_key_blob(blob) {
+            let bare = blob.strip_prefix("ED25519-V3:").unwrap_or(blob);
+            if !valid_key_blob(bare) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "provided key blob is not a valid ED25519-V3 key blob",
@@ -583,7 +584,12 @@ impl TorController {
             }
         }
         let key = match key_blob {
-            Some(blob) => format!("ED25519-V3:{blob}"),
+            Some(blob) => {
+                format!(
+                    "ED25519-V3:{}",
+                    blob.strip_prefix("ED25519-V3:").unwrap_or(blob)
+                )
+            }
             None => "NEW:ED25519-V3".to_owned(),
         };
         let lines = self.command(&format!(
@@ -895,6 +901,43 @@ mod tests {
             commands
                 .iter()
                 .any(|c| c.starts_with("ADD_ONION ED25519-V3:") && c.contains("Port=8333"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefixed_key_blob_reuse_sends_single_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        let (addr, rx, _dir) = fake_tor()?;
+        let mut controller = TorController::connect(&TorControlTarget::Tcp(addr), Some("pw"))?;
+        let bare = "A".repeat(86) + "==";
+        let prefixed = format!("ED25519-V3:{bare}");
+        // Core-form reuse is accepted and normalized to one wire prefix.
+        let service = controller.add_onion(Some(&prefixed), 8333, "127.0.0.1:19000".parse()?)?;
+        assert_eq!(
+            service.service_id,
+            "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead"
+        );
+        drop(controller);
+        let commands: Vec<String> = rx.try_iter().collect();
+        let expected = format!("ADD_ONION ED25519-V3:{bare} Port=8333,127.0.0.1:19000");
+        assert!(
+            commands.iter().any(|c| c == &expected),
+            "prefixed reuse must send exactly one prefix: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("ED25519-V3:ED25519-V3:")),
+            "doubled prefix must never reach the wire: {commands:?}"
+        );
+        // A doubled prefix stays corrupt and never reaches the wire.
+        let (addr, _rx, _dir) = fake_tor()?;
+        let mut controller = TorController::connect(&TorControlTarget::Tcp(addr), Some("pw"))?;
+        let doubled = format!("ED25519-V3:{prefixed}");
+        let result = controller.add_onion(Some(&doubled), 8333, "127.0.0.1:19000".parse()?);
+        assert!(
+            matches!(&result, Err(err) if err.kind() == io::ErrorKind::InvalidInput),
+            "doubled prefix must be rejected"
         );
         Ok(())
     }

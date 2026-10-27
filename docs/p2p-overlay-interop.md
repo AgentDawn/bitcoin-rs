@@ -234,6 +234,7 @@ Every launched child (Tor net, i2pd mesh, the recorders, and each node) starts u
 ./scripts/run-p2p-overlay-interop.sh \
   --tor-command <path-or-cmd> \
   --tor-gencert-command <path-or-cmd> \
+  --tor-gencert-sha256 <64-hex> \
   --i2pd-command <path> \
   [--bitcoin-rs-command <path>] \
   [--workdir <dir>] \
@@ -246,6 +247,7 @@ Every launched child (Tor net, i2pd mesh, the recorders, and each node) starts u
 |---|---|---|---|
 | `--tor-command` | Yes | none | Command or path to Tor binary (pinned to release 0.4.9.14). |
 | `--tor-gencert-command` | Yes | none | tor-gencert binary from the same 0.4.9.14 release. |
+| `--tor-gencert-sha256` | Yes | none | Expected SHA-256 of the tor-gencert binary (64 hex chars; fail-closed on mismatch). |
 | `--i2pd-command` | Yes | none | Path to i2pd binary (pinned to official release 3.0.0; supply the binary path, additional arguments are not parsed). |
 | `--bitcoin-rs-command` | No | `target/debug/bitcoin-rs` | Path to `bitcoin-rs` executable. |
 | `--workdir` | No | fresh temporary directory | Explicit directory for daemon datadirs and logs. Must not exist, or must be an empty directory owned by the caller; it is created or tightened to `0700` and never cleared (exit `2` otherwise). |
@@ -266,6 +268,7 @@ The `--i2pd-command` value is used verbatim as the executable path (quoted, no s
 ./scripts/run-p2p-overlay-interop.sh \
   --tor-command /opt/overlay/tor \
   --tor-gencert-command /opt/overlay/tor-gencert \
+  --tor-gencert-sha256 <64-hex> \
   --i2pd-command /opt/overlay/i2pd \
   --bitcoin-rs-command ./target/debug/bitcoin-rs \
   --evidence ./evidence.json \

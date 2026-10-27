@@ -1486,6 +1486,41 @@ fn mapped_alias_exact_connection_filter_does_not_block_distinct_endpoints() {
         "linked IPv4 grouping never rewrites a real IPv6 endpoint identity"
     );
 }
+
+#[test]
+fn i2p_port_zero_is_routable_and_gossiped_while_ip_tor_zero_are_not() {
+    use std::time::Instant;
+    let book = book();
+    let i2p_zero = PeerEndpoint::I2p {
+        hash: [9u8; 32],
+        port: 0,
+    };
+    let tor_zero = PeerEndpoint::TorV3 {
+        key: [3u8; 32],
+        port: 0,
+    };
+    let ip_zero: PeerEndpoint = SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 0).into();
+    book.learn_dns("seed", &[i2p_zero, tor_zero, ip_zero], 10_000);
+    assert!(
+        book.state.lock().by_addr.contains_key(&i2p_zero),
+        "Core-form I2P :0 must be admitted"
+    );
+    assert!(
+        !book.state.lock().by_addr.contains_key(&tor_zero),
+        "TorV3 :0 must stay unroutable"
+    );
+    assert!(
+        !book.state.lock().by_addr.contains_key(&ip_zero),
+        "IP :0 must stay unroutable"
+    );
+    book.set_addrv2_gossip(false, true);
+    let tick = Instant::now();
+    let rows = book.gossip_addrv2_at(10_000, tick);
+    assert!(
+        rows.iter().any(|row| matches!(&row.addr, bitcoin::p2p::address::AddrV2::I2p(hash) if *hash == [9u8; 32]) && row.port == 0),
+        "admitted I2P :0 must be gossiped with its explicit zero port"
+    );
+}
 mod asmap_tests;
 
 mod probe_tests;
