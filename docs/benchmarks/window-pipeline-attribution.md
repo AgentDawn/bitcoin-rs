@@ -23,7 +23,7 @@ that a measurement campaign ran. Rules shared by all cells are in
 
 | Item | State |
 |---|---|
-| Baseline pipeline | `apply_window_admitted` in `crates/chainstate/src/window.rs`: `prove_window` proves the whole window, then the sequential per-block loop stages blocks into a `WindowGroup` and flushes at 64 blocks or 8 MiB, all under one chain transition. |
+| Baseline pipeline | `ChainTransition::connect_window` in `crates/chainstate/src/lib.rs` (delegating to `apply_window_admitted` in `crates/chainstate/src/window.rs`): `prove_window` proves the whole window, then the sequential per-block loop stages blocks into a `WindowGroup` and flushes at 64 blocks or 8 MiB, all under the one transition the caller holds. |
 | Candidate S-A | Not implemented. The tree has no `prove_chunk` and no scoped worker thread. Nothing here adopts it. |
 | Diagnostic spans | Implemented in #1701, absent from #1703. See section 2 for the protocol. |
 | Existing series | `node.sync.apply_idle_seconds` and `node.sync.download_blocked_by_apply_seconds` exist in `crates/p2p/src/download_window.rs`. |
@@ -37,7 +37,9 @@ reorg and script-cache takes.
 ## 2. Diagnostic spans (implemented in #1701)
 
 In #1701, both spans use `quanta::Instant` and `tracing::debug!`. They create no metric
-family, change no lock scope and never feed a decision.
+family, change no lock scope and never feed a production decision. They do gate
+the #1701 harness's validity: that replay panics when a unit lacks a
+`transition_held_us` event, so a missing span fails the run instead of recording it.
 
 | Span | Acquire or start | Release or end | Emitted |
 |---|---|---|---|
