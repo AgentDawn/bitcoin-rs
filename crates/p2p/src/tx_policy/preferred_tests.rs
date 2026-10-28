@@ -347,6 +347,15 @@ impl TxInventory for EvictDuringRead<'_> {
     fn get_tx_by_wtxid(&self, _: Wtxid) -> Option<bitcoin_rs_primitives::Tx> {
         None
     }
+    fn resident_ancestor_package(&self, _: Wtxid) -> Option<Vec<Wtxid>> {
+        None
+    }
+    fn resident_package(
+        &self,
+        _: &[Wtxid],
+    ) -> Option<Vec<std::sync::Arc<bitcoin_rs_primitives::Tx>>> {
+        None
+    }
 }
 
 #[test]
@@ -472,7 +481,7 @@ fn registered_inbound(
             Arc::new(crate::PeerCounters::default()),
         ),
     );
-    (lease.source(addr), receiver)
+    (lease.source(Some(addr)), receiver)
 }
 
 #[test]

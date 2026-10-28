@@ -109,7 +109,6 @@ impl UnavailableBodies {
             })
             .collect()
     }
-
     /// Forgets `source`'s answer for `hash`: it delivered the body, so the
     /// earlier `notfound` no longer describes it.
     pub(super) fn clear(&mut self, source: PeerSource, hash: Hash256) {
@@ -145,10 +144,15 @@ fn not_found_block_hash(item: &Inventory) -> Option<Hash256> {
 ///   through the owner-only delivery rejection, which also ends a timeout
 ///   observation or cold-front episode naming it and lowers the request
 ///   cursor) or a deferred owned-fetch mark for it (dropped); `false` and no
-///   change otherwise.
+///   release otherwise. A `notfound` from a connection that owns nothing for
+///   a tracked (pending) hash — a prefix-probe racer or cold-front hedge
+///   alternate answering for the owner's prefix — is still remembered, so
+///   the probe and request paths stop offering it that hash, but the
+///   owner's request is left untouched.
 /// INVARIANT: only the exact owning connection releases. A different
-///   connection's `notfound`, or one for a hash nobody asked this connection
-///   for, changes nothing. Nothing here blames or disconnects the owner.
+///   connection's `notfound` never releases the owner; one for a hash
+///   nobody tracks changes nothing at all. Nothing here blames or
+///   disconnects the owner.
 fn release_unavailable_body(
     scheduler: &mut SchedulerState,
     source: PeerSource,
@@ -166,6 +170,9 @@ fn release_unavailable_body(
         .iter()
         .position(|(owner, owned)| *owner == source && *owned == hash);
     if !owns_window_request && deferred.is_none() {
+        if window.contains_pending(&hash) {
+            body_unavailable.note(source, hash, now);
+        }
         return false;
     }
     if owns_window_request {
@@ -190,7 +197,11 @@ impl BlockSync {
     ///   offers it to `source` until [`BODY_UNAVAILABLE_RETRY`] passes — the
     ///   one record in `SchedulerState::body_unavailable` serves all three
     ///   paths. Returns whether anything was released, so the caller can
-    ///   wake the sync loop.
+    ///   wake the sync loop. A vector for a hash `source` was never asked
+    ///   for — not its request, and neither a probe nor a hedge offer — is
+    ///   ignored entirely: it neither releases nor is remembered, so a
+    ///   racing alternate or a replacement cannot poison the owner's or its
+    ///   own retry record.
     /// INVARIANT: the peer table's `with_current` authority is held across
     ///   the scheduler mutation, so a stale connection or a same-address
     ///   replacement can neither release its predecessor's request nor be
@@ -216,6 +227,16 @@ impl BlockSync {
                 released += 1;
             }
             for hash in items.iter().filter_map(not_found_block_hash) {
+                let asked = scheduler.window.pending_owner(&hash) == Some(source)
+                    || scheduler
+                        .owned_body_fetches
+                        .iter()
+                        .any(|(owner, owned)| *owner == source && *owned == hash)
+                    || scheduler.window.probe_offered(source, &hash)
+                    || scheduler.window.hedge_offered(source, &hash);
+                if !asked {
+                    continue;
+                }
                 if release_unavailable_body(&mut scheduler, source, hash, now) {
                     released += 1;
                 }
@@ -225,7 +246,7 @@ impl BlockSync {
             metrics::counter!("node.sync.body_not_found_releases")
                 .increment(u64::try_from(released).unwrap_or(u64::MAX));
             tracing::debug!(
-                peer_addr = ?source.addr,
+                peer_addr = ?source.endpoint,
                 released,
                 "block sync: peer answered notfound for requested blocks; released for replan"
             );
@@ -320,7 +341,7 @@ impl BlockSync {
             .window
             .confirm_prefix_probe(owner, hashes, &successful, now);
         tracing::info!(
-            owner = %owner.addr,
+            owner = ?owner.endpoint,
             alternates = successful.len(),
             blocks = block_count,
             "block sync: started common-prefix peer probe"
@@ -359,7 +380,7 @@ impl BlockSync {
             return false;
         };
         chain_tip.height.saturating_sub(first_height) < COMPACT_RELAY_NEAR_TIP_BLOCKS
-            && self.peer_table.compact_relay_of(request.owner().addr)
+            && self.peer_table.compact_relay_of_source(request.owner())
     }
 
     /// Requests the next window batch from `source`, a usable peer from the
@@ -385,7 +406,7 @@ impl BlockSync {
         // too: header-drain fetches and stripe retries reach this function
         // without passing the selector, so the gate is enforced at the one
         // path every body request takes (net_processing.cpp:6521-6525).
-        let Some(info) = self.peer_table.info_of(source.addr) else {
+        let Some(info) = self.peer_table.info_of_source(source) else {
             return GetdataRequestOutcome::default();
         };
         let policy = BlockDownloadPolicy {
@@ -453,12 +474,12 @@ impl BlockSync {
             // plans the request again from the window's then-current state.
             if refusal.is_saturated() {
                 tracing::debug!(
-                    peer_addr = %source.addr,
+                    peer_addr = ?source.endpoint,
                     "block sync: getdata deferred; node outbound budget is full"
                 );
             } else {
                 tracing::warn!(
-                    peer_addr = %source.addr,
+                    peer_addr = ?source.endpoint,
                     "block sync: outbound channel disconnected (getdata)"
                 );
             }
@@ -467,13 +488,13 @@ impl BlockSync {
         metrics::histogram!("node.sync.getdata_batch_size").record(metric_count(count));
         if compact_fetch {
             tracing::info!(
-                peer_addr = %source.addr,
+                peer_addr = ?source.endpoint,
                 count,
                 "block sync: requested compact blocks near tip"
             );
         }
         tracing::debug!(
-            peer_addr = %source.addr,
+            peer_addr = ?source.endpoint,
             count,
             compact = compact_fetch,
             applied_height = applied_tip.height,
@@ -512,7 +533,7 @@ impl BlockSync {
             let Some(peer) = session.info else {
                 continue;
             };
-            let source = session.lease.source(session.addr);
+            let source = session.lease.source(session.endpoint);
             // One capability rule for every path that asks for a body: the
             // same `body_capability` the frontier's usable-peer view
             // precomputes, so the hedge and the scheduler can never disagree
@@ -540,7 +561,7 @@ impl BlockSync {
                 .into_iter()
                 .filter(|source| {
                     !window.peer_has_expired_pending(*source, now)
-                        && !window.peer_in_staller_cooldown(source.addr, now)
+                        && !window.peer_in_staller_cooldown(*source, now)
                         && !scheduler.body_unavailable.refuses(*source, front_hash, now)
                 })
                 .collect()
@@ -552,8 +573,8 @@ impl BlockSync {
             match self.peer_table.send(source, message) {
                 Ok(()) => {
                     tracing::info!(
-                        owner = %owner.addr,
-                        hedge_peer = %source.addr,
+                        owner = ?owner.endpoint,
+                        hedge_peer = ?source.endpoint,
                         %front_hash,
                         front_height,
                         "block sync: hedged cold-start stalled front"
@@ -573,13 +594,123 @@ mod tests {
     use super::BODY_UNAVAILABLE_RETRY;
     use super::MAX_UNAVAILABLE_BODY_RECORDS;
     use super::UnavailableBodies;
+    use super::release_unavailable_body;
     use crate::connection::PeerSource;
+    use crate::download_window::DownloadWindow;
+    use crate::download_window::RefusalFilter;
     use bitcoin_rs_primitives::Hash256;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
     use std::time::Duration;
     use std::time::Instant;
+
+    fn test_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A minimal header chain: genesis plus linked successors, so window
+    /// planning resolves contiguous heights without proof-of-work mining.
+    fn test_chain() -> (
+        bitcoin_rs_chain::BlockTree,
+        Vec<(bitcoin_rs_chain::NodeId, bitcoin_rs_primitives::Header)>,
+    ) {
+        use bitcoin_rs_primitives::Header;
+        let genesis = bitcoin_rs_primitives::Network::Regtest
+            .genesis_block()
+            .header;
+        let headers: Vec<Header> = std::iter::successors(Some(genesis), |prev| {
+            let height = prev.time.saturating_sub(genesis.time).saturating_add(1);
+            let mut merkle = [0_u8; 32];
+            merkle[..4].copy_from_slice(&height.to_le_bytes());
+            Some(Header {
+                prev_blockhash: prev.compute_hash(),
+                merkle_root: bitcoin_rs_primitives::Hash256::from_le_bytes(&merkle),
+                time: prev.time.saturating_add(1),
+                ..*prev
+            })
+        })
+        .take(32)
+        .collect();
+        let mut tree = bitcoin_rs_chain::BlockTree::new();
+        let mut parent = None;
+        let mut nodes = Vec::with_capacity(headers.len());
+        for header in headers {
+            let inserted = tree
+                .insert_node(parent, header, bitcoin_rs_chain::NodeStatus::HeaderValid)
+                .unwrap_or_else(|error| panic!("test header: {error}"));
+            parent = Some(inserted);
+            nodes.push((inserted, header));
+        }
+        (tree, nodes)
+    }
+
+    fn scheduler_with_owner_pending(
+        owner: PeerSource,
+    ) -> (super::super::SchedulerState, bitcoin_rs_primitives::Hash256) {
+        use bitcoin_rs_chain::{ChainTxCount, ChainWork, TipSnapshot};
+        let budget = crate::sync::default_sync_budget(bitcoin_rs_primitives::Network::Regtest);
+        let mut window = DownloadWindow::new(budget);
+        let mut stager = crate::BlockStager::new(budget);
+        let (tree, nodes) = test_chain();
+        let (tip_id, tip_header) = nodes[10];
+        let now = Instant::now();
+        let chain_tip = TipSnapshot {
+            tip_id,
+            chain_tx_count: ChainTxCount::UNKNOWN,
+            height: 10,
+            chainwork: ChainWork::from(11_u64),
+            hash: bitcoin_rs_primitives::Hash256::from(tip_header.compute_hash()),
+        };
+        let never_refused = |_: bitcoin_rs_primitives::Hash256| false;
+        let mut refusals = RefusalFilter::new(&never_refused);
+        let request = window
+            .next_peer_request(
+                &mut stager, owner, false, &chain_tip, 1, 10, 0, &tree, now, &mut refusals,
+            )
+            .unwrap_or_else(|| panic!("window must plan the test prefix"));
+        let (_, hash) = request
+            .entries()
+            .next()
+            .unwrap_or_else(|| panic!("plan must name a body"));
+        assert!(window.mark_requested(&stager, &request, owner, now));
+        let scheduler = super::super::SchedulerState {
+            window,
+            stager,
+            header_request_owner: None,
+            owned_body_fetches: Vec::new(),
+            body_unavailable: UnavailableBodies::new(),
+            chain_sync: hashbrown::HashMap::new(),
+            headers_sync: hashbrown::HashMap::new(),
+            stale_tip: super::super::StaleTipState::default(),
+            expected_apply_cache: None,
+        };
+        (scheduler, hash)
+    }
+
+    #[test]
+    fn racer_notfound_is_remembered_without_releasing_the_owner() {
+        let owner = PeerSource::for_test(test_addr(9001));
+        let racer = PeerSource::for_test(test_addr(9002));
+        let (mut scheduler, hash) = scheduler_with_owner_pending(owner);
+        let now = Instant::now();
+
+        assert!(!release_unavailable_body(&mut scheduler, racer, hash, now));
+        assert!(scheduler.body_unavailable.refuses(racer, hash, now));
+        assert_eq!(scheduler.window.pending_owner(&hash), Some(owner));
+
+        let unknown = bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xab; 32]);
+        assert!(!scheduler.window.contains_pending(&unknown));
+        assert!(!release_unavailable_body(
+            &mut scheduler,
+            racer,
+            unknown,
+            now
+        ));
+        assert!(!scheduler.body_unavailable.refuses(racer, unknown, now));
+
+        assert!(release_unavailable_body(&mut scheduler, owner, hash, now));
+    }
 
     fn test_source(port: u16) -> PeerSource {
         PeerSource::for_test(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))

@@ -755,7 +755,8 @@ pub enum SeedProvenance {
 ///
 /// `Integrity` covers every byte-binding failure (parse, length, digest,
 /// truncation, trailing bytes); `Io` covers transport failures that a retry
-/// may heal; `Emit` forwards the caller's own abort.
+/// may heal; `Emit` forwards the caller's own abort; `Cancelled` reports a
+/// shutdown poll so the caller can keep its bundle for retry.
 #[derive(Debug, Error)]
 pub enum RawSeedError<E> {
     /// The artifact bytes are not exactly the witnessed accepted state.
@@ -767,6 +768,9 @@ pub enum RawSeedError<E> {
     /// The caller's `emit` closure failed.
     #[error("seed emit failed: {0}")]
     Emit(E),
+    /// Shutdown was requested; the bundle is intact and the caller retries.
+    #[error("seed traversal cancelled")]
+    Cancelled,
 }
 
 /// One immutable native-v4 artifact whose bytes the authoritative chainstate
@@ -822,9 +826,14 @@ impl VerifiedSnapshotArtifact {
     /// (19-byte header plus a script of at most 65,535 bytes). Reads are
     /// capped at the witnessed length plus one probe byte, so a file that
     /// grows concurrently cannot extend the traversal.
+    ///
+    /// `cancelled` is polled at entry and every 4,096 emitted coins; a trip
+    /// returns [`RawSeedError::Cancelled`] with the bundle intact so the
+    /// caller can retry with the same artifact.
     pub fn for_each_coin_raw<E, F: FnMut(&OutPoint, &[u8]) -> Result<(), E> + ?Sized>(
         &mut self,
         emit: &mut F,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<(), RawSeedError<E>> {
         self.file.rewind().map_err(RawSeedError::Io)?;
         let limit = self
@@ -832,13 +841,15 @@ impl VerifiedSnapshotArtifact {
             .byte_len()
             .checked_add(1)
             .ok_or(RawSeedError::Integrity)?;
-        // Buffer the small header/output/script reads in memory. The buffer
-        // sits below the tee, so the digest still covers exactly the bytes
-        // the decoder consumes; prefetch never reaches the hash.
+        // Seeding issues one tiny read per output header and script, so the
+        // capped file reader is buffered in memory. The buffer sits below
+        // the tee on the consumed-byte side, so the witnessed length and
+        // digest still cover exactly what the parser reads while the file
+        // sees bulk reads; prefetch never reaches the hash.
         let capped = Read::by_ref(&mut self.file).take(limit);
         let mut buffered = BufReader::new(capped);
         let mut tee = TeeReader::new(&mut buffered);
-        let stream = read_raw_snapshot_stream(&mut tee, emit)?;
+        let stream = read_raw_snapshot_stream(&mut tee, emit, cancelled)?;
         let (digest, len) = tee.finish();
         let bound = len == self.witness.len
             && digest == self.witness.sha256
@@ -969,10 +980,18 @@ struct RawStreamCounts {
 /// accepted path also refuses (via its record-count agreement). Duplicate
 /// transaction ids cannot pair with a witness (the mint requires strict
 /// acceptance), so any duplication fails the terminal length/digest binding.
+///
+/// `cancelled` is polled at entry and every 4,096 emitted coins; a trip
+/// returns [`RawSeedError::Cancelled`] with no integrity verdict.
 fn read_raw_snapshot_stream<E, F: FnMut(&OutPoint, &[u8]) -> Result<(), E> + ?Sized>(
     reader: &mut impl Read,
     emit: &mut F,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<RawStreamCounts, RawSeedError<E>> {
+    const SEED_CANCEL_POLL_COINS: u64 = 4_096;
+    if cancelled() {
+        return Err(RawSeedError::Cancelled);
+    }
     let NativeSnapshotMetadata {
         tip_hash,
         height,
@@ -997,7 +1016,13 @@ fn read_raw_snapshot_stream<E, F: FnMut(&OutPoint, &[u8]) -> Result<(), E> + ?Si
             let outpoint = OutPoint::new(Txid::from(txid), output.vout);
             emit(&outpoint, &output.script_pubkey).map_err(RawSeedError::Emit)?;
             outputs = outputs.checked_add(1).ok_or(RawSeedError::Integrity)?;
+            if outputs.is_multiple_of(SEED_CANCEL_POLL_COINS) && cancelled() {
+                return Err(RawSeedError::Cancelled);
+            }
         }
+    }
+    if cancelled() {
+        return Err(RawSeedError::Cancelled);
     }
 
     let mut trailer = [0_u8; MUHASH_TRAILER_LEN];

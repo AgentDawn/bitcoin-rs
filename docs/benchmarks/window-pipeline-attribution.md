@@ -6,16 +6,7 @@ gates for the windowed block apply and its durable group commit (ENG-91, issue
 generates, never here (`HPA-08`, `HPA-12`).
 
 Status: `planned_not_executed`. No arm has run under this protocol, so no
-cell, ratio or percentile is on this page. Implementation status is scoped to
-the branch: the diagnostic spans (section 2) and replay harness (section 3)
-are implemented in [PR #1701](https://github.com/gosuda/bitcoin-rs/pull/1701)
-(`994e82acf425ff420921238514545c99c75ea4f4`), but are absent from the
-documentation-cleanup branch (#1703). On #1701, `crates/chainstate/src/lib.rs`
-emits `transition_held_us`, `window.rs` emits `flush_wait_us`, and
-`crates/node/benches/sync_pipeline.rs::main` dispatches `--window-attribution`.
-Use that implementation branch for the control arm; the invocation described
-in section 3 cannot run on #1703 until those changes are integrated. Implementation does not prove
-that a measurement campaign ran. Rules shared by all cells are in
+cell, ratio or percentile is on this page. Rules shared by all cells are in
 [README.md](README.md); the attribution method is
 [`docs/contracts/hot-path-attribution.md`](../contracts/hot-path-attribution.md).
 
@@ -23,23 +14,21 @@ that a measurement campaign ran. Rules shared by all cells are in
 
 | Item | State |
 |---|---|
-| Baseline pipeline | `ChainTransition::connect_window` in `crates/chainstate/src/lib.rs` (delegating to `apply_window_admitted` in `crates/chainstate/src/window.rs`): `prove_window` proves the whole window, then the sequential per-block loop stages blocks into a `WindowGroup` and flushes at 64 blocks or 8 MiB, all under the one transition the caller holds. |
+| Baseline pipeline | `apply_window_admitted` in `crates/chainstate/src/window.rs`: `prove_window` proves the whole window, then the sequential per-block loop stages blocks into a `WindowGroup` and flushes at 64 blocks or 8 MiB, all under one chain transition. |
 | Candidate S-A | Not implemented. The tree has no `prove_chunk` and no scoped worker thread. Nothing here adopts it. |
-| Diagnostic spans | Implemented in #1701, absent from #1703. See section 2 for the protocol. |
+| Diagnostic spans | `transition_held_us` and `flush_wait_us` exist (section 2). |
 | Existing series | `node.sync.apply_idle_seconds` and `node.sync.download_blocked_by_apply_seconds` exist in `crates/p2p/src/download_window.rs`. |
-| Replay harness | Implemented in #1701 as `sync_pipeline --window-attribution`; absent from #1703. See section 3. |
-| Candidate arm | Defined so it can run once S-A exists. The control implementation is available in #1701; #1703 requires integration of that implementation before running it. No control-against-candidate comparison may be written without S-A and measured evidence. |
+| Replay harness | `crates/node/benches/sync_pipeline.rs`, `--window-attribution` (section 3). |
+| Candidate arm | Defined so it can run once S-A exists. Until then only the control arm is measurable, and no control-against-candidate comparison may be written. |
 
 Out-of-transition pipelines (S-B) and verify-only lock release (S-C) stay
 rejected: tip identity alone cannot fence `replace_from`, header-gate changes,
 reorg and script-cache takes.
 
-## 2. Diagnostic spans (implemented in #1701)
+## 2. Diagnostic spans
 
-In #1701, both spans use `quanta::Instant` and `tracing::debug!`. They create no metric
-family, change no lock scope and never feed a production decision. They do gate
-the #1701 harness's validity: that replay panics when a unit lacks a
-`transition_held_us` event, so a missing span fails the run instead of recording it.
+Both spans use `quanta::Instant` and `tracing::debug!`. They create no metric
+family, change no lock scope and never feed a decision.
 
 | Span | Acquire or start | Release or end | Emitted |
 |---|---|---|---|
@@ -51,23 +40,24 @@ flush` is a development diagnostic beside `durable_head: group commit`, whose
 `sync_us` and `commit_us` are sub-intervals of the same wait. The spans are
 reported side by side and never added (`HPA-12`).
 
-## 3. Replay harness (implemented in #1701)
+## 3. Replay harness
 
-This section describes the mode implemented in #1701 as a protocol reference
-only. That implementation is unavailable on the #1703 branch alone, so nothing
-in this section is executable here; run it on a #1701 checkout.
+### 3.1 Invocation
 
-### 3.1 Invocation (reference only; runs on a #1701 checkout, not on #1703)
+Run from the repository root so `rust-toolchain.toml` selects the toolchain
+that built the binary. `TMPDIR` must name a directory on a disk-backed
+filesystem, because the harness refuses `tmpfs` and `ramfs`: a group flush
+there is not a durable write.
 
-The #1701 replay is invoked as `sync_pipeline --window-attribution
-<control|candidate> <single_group|multi_group>`: one arm and one scenario per
-process in a single process run (a Cargo-appended `--bench` is ignored by the
-parser), launched from the repository root of a #1701 checkout so
-`rust-toolchain.toml` selects the toolchain that built the binary, with cores
-pinned via `taskset -c <set>` and `TMPDIR` on a disk-backed filesystem (the
-harness refuses `tmpfs` and `ramfs`: a group flush there is not a durable
-write). The exact shape above is recorded so a future integration can replay it
-verbatim; it is not an executable step for this branch.
+```bash
+cargo bench -p bitcoin-rs-node --bench sync_pipeline -- \
+  --window-attribution <control|candidate> <single_group|multi_group>
+```
+
+The flag takes exactly one arm and one scenario. Cargo appends `--bench`, which
+the parser ignores. Pin the cores with `taskset -c <set>` before `cargo bench`.
+One invocation is one run: it executes every unit of one arm and one scenario in
+one process.
 
 ### 3.2 Scenarios and units
 
@@ -149,9 +139,7 @@ names custody only; the artifact digest proves the programs differ.
 Run each scenario alternately, control then candidate, three times
 (`A-B-A-B-A-B`). With no candidate in the tree, run the control arm three times
 per scenario: the runs set the stability and the host noise floor, and no
-comparison is produced. The control arm can use the implementation in #1701;
-running it on #1703 requires integrating the spans and harness first. The
-candidate arm still requires S-A.
+comparison is produced.
 
 ## 5. Gates for the replay (`HPA-13`)
 

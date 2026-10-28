@@ -327,6 +327,9 @@ fn flush_group(
     committed: &mut Vec<ConnectOutcome>,
     payloads: &[&BlockPayload],
 ) -> core::result::Result<(), WindowApplyError> {
+    if group.pending.is_empty() {
+        return Ok(());
+    }
     // The staged prefix is a contiguous suffix starting at `committed.len()`,
     // so the newest staged block is borrowed straight from the caller's apply
     // batch — no clone in chainstate. Empty group: nothing staged, no hook.
@@ -376,7 +379,10 @@ fn invalidate_permanent_failure(
     hash: Hash256,
 ) -> (Box<[Hash256]>, WindowApplyDisposition) {
     match crate::reorg::invalidate_and_republish(handles, hash) {
-        Ok(invalidated) => (invalidated, WindowApplyDisposition::Permanent),
+        Ok(outcome) => (
+            outcome.invalid.into_boxed_slice(),
+            WindowApplyDisposition::Permanent,
+        ),
         Err(crate::reorg::InvalidationError::UnknownBlock(_)) => {
             (Box::default(), WindowApplyDisposition::Permanent)
         }

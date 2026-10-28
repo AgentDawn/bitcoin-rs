@@ -673,8 +673,8 @@ struct RecordingGatewayObserver {
     changes: parking_lot::Mutex<Vec<(u64, Hash256, MutationOutcome)>>,
 }
 
-impl MempoolObserver for RecordingGatewayObserver {
-    fn on_mutation(&self, envelope: &MutationEnvelope) {
+    impl MempoolObserver for RecordingGatewayObserver {
+        fn on_mutation(&self, envelope: &MutationEnvelope) {
         let result = &envelope.result;
         let mut changes = self.changes.lock();
         for (offset, change) in result.changes.iter().enumerate() {
@@ -1710,6 +1710,7 @@ fn invalidation_handler(state: &NodeState) -> Handler {
             derived_index_status: None,
         },
         network: NetworkHandles {
+            overlay: bitcoin_rs_p2p::OverlayConfig::default(),
             peer_table: state.peer_table(),
             p2p: state.p2p(),
             local_services: state.p2p().local_services().to_u64(),

@@ -121,11 +121,15 @@ fn cold_start_stall_hedges_front_without_reassigning_owner() -> TestResult {
     let mut alternate_info = peers
         .infos()
         .into_iter()
-        .find(|info| info.addr == alternate)
+        .find(|info| info.endpoint == alternate.endpoint())
         .ok_or_else(|| std::io::Error::other("alternate peer info missing"))?;
     alternate_info.start_height = 0;
     alternate_info.best_known_height = 0;
-    assert!(peers.publish_info(alternate, &alternate_lease, alternate_info));
+    assert!(peers.publish_info(
+        alternate,
+        &alternate_lease,
+        alternate_info
+    ));
     assert!(peers.note_announced_tip(
         current_source(&peers, alternate),
         Hash256::from_le_bytes(expected[0].as_bytes()),
@@ -377,7 +381,7 @@ fn apply_side_backpressure_never_blamed_on_front_peer() -> TestResult {
             .window
             .stalling_peer()
             .map(|(addr, _)| addr),
-        Some(staller)
+        Some(staller.endpoint())
     );
     assert!(peers.is_connected(staller));
     sync.reconcile_window_recovery(
@@ -503,7 +507,7 @@ fn staged_frontier_stuck_past_bound_escalates_without_blame() -> TestResult {
             .window
             .stalling_peer()
             .map(|(addr, _)| addr),
-        Some(staller)
+        Some(staller.endpoint())
     );
     sync.reconcile_window_recovery(
         &sync.observe_chain_frontier(),

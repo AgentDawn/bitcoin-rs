@@ -196,7 +196,7 @@ pub trait KvStore: Send + Sync + 'static {
         prefix: &[u8],
         limit: PrefixScanLimit,
     ) -> Result<PrefixScan, StorageError> {
-        collect_bounded(self.iter_prefix(cf, prefix)?, limit)
+        collect_bounded_prefix(self.iter_prefix(cf, prefix)?, &[], limit)
     }
 
     /// Collects matching rows from the inclusive full-key seek point `start`.
@@ -363,7 +363,7 @@ pub trait KvSnapshot: Send + Sync {
         prefix: &[u8],
         limit: PrefixScanLimit,
     ) -> Result<PrefixScan, StorageError> {
-        collect_bounded(self.iter_prefix(cf, prefix)?, limit)
+        collect_bounded_prefix(self.iter_prefix(cf, prefix)?, &[], limit)
     }
 
     /// Collects matching snapshot rows from the inclusive full-key seek point
@@ -396,10 +396,6 @@ pub(crate) fn push_bounded_row(
     rows.push((key.to_vec(), value.to_vec()));
     *bytes = next_bytes;
     true
-}
-
-fn collect_bounded(iter: KvIter<'_>, limit: PrefixScanLimit) -> Result<PrefixScan, StorageError> {
-    collect_bounded_prefix(iter, &[], limit)
 }
 
 /// Collects ordered pairs under `limit`, ending at the first key outside

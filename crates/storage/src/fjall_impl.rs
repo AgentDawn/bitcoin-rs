@@ -100,8 +100,11 @@ impl FjallStore {
         };
         metrics::counter!("storage.writes_total", "backend" => "fjall", "durability" => durability_label)
             .increment(1);
-        metrics::histogram!("storage.write_bytes", "backend" => "fjall")
-            .record(crate::metric_f64_from_usize(batch.encoded_bytes));
+        metrics::histogram!("storage.write_bytes", "backend" => "fjall").record(
+            bitcoin_rs_primitives::u64_to_f64(
+                u64::try_from(batch.encoded_bytes).unwrap_or(u64::MAX),
+            ),
+        );
 
         #[cfg(any(test, feature = "test-seam"))]
         {

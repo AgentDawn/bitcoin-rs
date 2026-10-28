@@ -5,6 +5,7 @@ use anyhow::Result;
 use bitcoin_rs_chainstate::{ChainstateJournalConfig, ValidationMode};
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_index::IndexCapabilities;
+use bitcoin_rs_p2p::endpoint::{ClassifiedEndpoint, classify_endpoint};
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_storage::StorageBackend;
 #[cfg(feature = "pool")]
@@ -397,6 +398,11 @@ pub struct P2pConfig {
     /// `NODE_P2P_V2` is advertised. On by default, as Core's `-v2transport` is;
     /// off keeps every connection on v1.
     pub v2_transport: bool,
+    /// The opt-in relay capabilities offered to peers. Every switch is off by
+    /// default and peers relay packages or stale tips only after both sides
+    /// negotiate them. BIP332 stale-tip relay is off by default on every
+    /// network; setting it on a test network is the explicit test override.
+    pub relay_offers: bitcoin_rs_p2p::RelayOffers,
 }
 
 /// Resolved RPC configuration.
@@ -412,6 +418,8 @@ pub struct RpcConfig {
     pub rest: bool,
     /// Optional experimental keyless BIP352 read service, off by default.
     pub silent_payments: bool,
+    /// Optional BIP337 compressed-transaction RPCs, off by default.
+    pub compressed_transactions: bool,
     pub auth: Auth,
 }
 
@@ -520,15 +528,16 @@ impl NodeConfig {
         let mempool_snapshot_restore_timeout_secs = settings
             .mempool_snapshot_restore_timeout_secs
             .unwrap_or_else(|| std::cmp::max(60, mempool_snapshot_max_bytes / (1024 * 1024)));
+        let data_dir = settings
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".bitcoin-rs"));
         Self {
             network: selection.consensus_network(),
             persist_mempool: settings.persist_mempool.unwrap_or(true),
             mempool_snapshot_max_bytes,
             mempool_snapshot_restore_timeout_secs,
-            data_dir: settings
-                .data_dir
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(".bitcoin-rs")),
+            data_dir,
             storage: StorageConfig {
                 backend: settings.storage.backend.unwrap_or(DEFAULT_STORAGE_BACKEND),
                 dbcache_mb: settings.storage.dbcache_mb.unwrap_or(DEFAULT_DBCACHE_MB),
@@ -561,6 +570,14 @@ impl NodeConfig {
                 connect: settings.p2p.connect.clone().unwrap_or(profile.connect),
                 fast_sync: settings.p2p.fast_sync.unwrap_or(false),
                 v2_transport: settings.p2p.v2_transport.unwrap_or(true),
+                relay_offers: bitcoin_rs_p2p::RelayOffers {
+                    package_relay: settings.p2p.package_relay.unwrap_or(false),
+                    stale_tip_relay: settings.p2p.stale_tip_relay.unwrap_or(false),
+                    stale_tip_prefers_blocks: settings
+                        .p2p
+                        .stale_tip_prefers_blocks
+                        .unwrap_or(false),
+                },
             },
             rpc: RpcConfig {
                 bind: settings.rpc.bind.unwrap_or(profile.rpc_bind),
@@ -569,6 +586,7 @@ impl NodeConfig {
                 public_max_connections: settings.rpc.public_max_connections.unwrap_or(128),
                 rest: settings.rpc.rest.unwrap_or(false),
                 silent_payments: settings.rpc.silent_payments.unwrap_or(false),
+                compressed_transactions: settings.rpc.compressed_transactions.unwrap_or(false),
                 auth: rpc_auth(settings),
             },
             indexes: IndexConfig {
@@ -690,6 +708,12 @@ impl NodeConfig {
              support is not compiled in (enable the `kernel` feature)",
             self.validation.engine
         );
+        self.validate_overlay()?;
+        anyhow::ensure!(
+            !self.p2p.relay_offers.stale_tip_prefers_blocks
+                || self.p2p.relay_offers.stale_tip_relay,
+            "--p2p-stale-tip-prefers-blocks requires --p2p-stale-tip-relay"
+        );
         self.validate_index_bundle()?;
         self.p2p.overlay.validate()?;
         if self.p2p.magic != self.network.magic() {
@@ -742,6 +766,76 @@ impl NodeConfig {
             journal.max_lag_seconds > 0,
             "chainstate_journal.max_lag_seconds must be positive"
         );
+        Ok(())
+    }
+
+    /// Validates cross-field overlay transport constraints.
+    ///
+    /// Overlay targets require their routes: an onion target without
+    /// an onion/general proxy, an I2P target without a SAM bridge, or
+    /// an onlynet naming an overlay without its route is refused
+    /// before any worker starts.
+    ///
+    /// A configured privacy route (general/onion proxy or I2P SAM bridge)
+    /// additionally forbids local DNS: DNS seeds resolve through the system
+    /// resolver and ordinary hostname `--connect` peers resolve via
+    /// `resolve()` on the dial path, so both would bypass the overlay.
+    /// They fail fast here instead of leaking or silently downgrading
+    /// privacy; typed IP, Tor, and I2P endpoints stay supported.
+    fn validate_overlay(&self) -> Result<()> {
+        let overlay = &self.p2p.overlay;
+        let onion_route = overlay.onion_proxy.is_some() || overlay.proxy.is_some();
+        let privacy_route = onion_route || overlay.i2p_sam.is_some();
+        anyhow::ensure!(
+            !privacy_route || !self.p2p.dns_seeds_enabled,
+            "proxy/overlay routing requires --dns-seeds-enabled=false; DNS seeds resolve via local DNS and would bypass the privacy route"
+        );
+        anyhow::ensure!(
+            !overlay
+                .onlynet
+                .contains(&bitcoin_rs_p2p::PeerNetwork::Onion)
+                || onion_route,
+            "--onlynet=onion requires an onion route (--onion or --proxy)"
+        );
+        anyhow::ensure!(
+            !overlay
+                .onlynet
+                .contains(&bitcoin_rs_p2p::PeerNetwork::I2p)
+                || overlay.i2p_sam.is_some(),
+            "--onlynet=i2p requires an I2P SAM bridge (--i2psam)"
+        );
+        anyhow::ensure!(
+            !overlay.i2p_accept || overlay.i2p_sam.is_some(),
+            "--i2pacceptincoming requires an I2P SAM bridge (--i2psam)"
+        );
+        for target in &self.p2p.connect {
+            match classify_endpoint(target) {
+                ClassifiedEndpoint::InvalidOverlay => {
+                    anyhow::bail!("--connect target `{target}` is an invalid overlay endpoint");
+                }
+                ClassifiedEndpoint::Valid(bitcoin_rs_primitives::PeerEndpoint::TorV3 {
+                    ..
+                }) => {
+                    anyhow::ensure!(
+                        onion_route,
+                        "--connect onion target requires an onion route (--onion or --proxy)"
+                    );
+                }
+                ClassifiedEndpoint::Valid(bitcoin_rs_primitives::PeerEndpoint::I2p { .. }) => {
+                    anyhow::ensure!(
+                        overlay.i2p_sam.is_some(),
+                        "--connect I2P target requires an I2P SAM bridge (--i2psam)"
+                    );
+                }
+                ClassifiedEndpoint::Valid(bitcoin_rs_primitives::PeerEndpoint::Ip(..)) => {}
+                ClassifiedEndpoint::NonOverlay => {
+                    anyhow::ensure!(
+                        !privacy_route,
+                        "--connect target `{target}` is a hostname that would resolve via local DNS; with a proxy/overlay route configured, use a literal IP or overlay endpoint"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

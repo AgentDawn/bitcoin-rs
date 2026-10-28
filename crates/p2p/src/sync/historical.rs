@@ -105,14 +105,15 @@ impl BlockSync {
         };
         // PeerTable -> historical is the ingress lock order. Snapshot all
         // peer data before holding download state, and stamp via send_then.
+        // Source-keyed live-session snapshot: anonymous (`endpoint: None`)
+        // sessions participate identically to addressed ones.
         let live = self
             .peer_table
-            .infos()
+            .usable_peers()
             .into_iter()
-            .filter_map(|info| {
-                self.peer_table
-                    .ready_source(info.addr)
-                    .map(|source| (source, info))
+            .filter_map(|session| {
+                let info = session.info?;
+                Some((session.lease.source(session.endpoint), info))
             })
             .collect::<Vec<_>>();
         let mut peers = live
@@ -157,7 +158,7 @@ impl BlockSync {
                 let mut historical = self.historical.lock();
                 let HistoricalDownload { window, stager, .. } = &mut *historical;
                 // Back off corrupt deliveries even if this is our only peer.
-                if window.peer_in_staller_cooldown(source.addr, now) {
+                if window.peer_in_staller_cooldown(*source, now) {
                     continue;
                 }
                 // Bodies `source` already answered `notfound` for are
@@ -185,6 +186,7 @@ impl BlockSync {
             let Some(request) = request else {
                 continue;
             };
+
             let inventory = request
                 .entries()
                 .map(|(_, hash)| {
@@ -219,7 +221,7 @@ impl BlockSync {
             tracing::warn!(%error, "historical body rejected");
             let mut historical = self.historical.lock();
             historical.window.reject_delivery(hash, Some(source), now);
-            historical.window.mark_peer_unresponsive(source.addr, now);
+            historical.window.mark_peer_unresponsive(source, now);
             return None;
         }
         {

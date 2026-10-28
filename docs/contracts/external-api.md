@@ -48,21 +48,31 @@ scanning and wallet interoperability remain unverified.
 - Parameter type and coercion rules, named and positional forms, the
   declared JSON-RPC 1 and 2 envelopes, notifications,
   authentication, and error ordering follow the pinned Core 31.1
-  contract. Batches follow it except for the two deviations noted
-  below (empty-array rejection, 204 for notification-only batches).
-- The HTTP endpoint accepts JSON-RPC batch arrays as implemented by
-  `handle_decoded_json` in `crates/rpc/src/server.rs`: a top-level JSON
-  array dispatches each entry independently via `handle_single_json`,
-  preserving each entry's own 1.1/2.0 framing
-  (`JsonRpcVersion::from_request`). An empty array is rejected
-  (`InvalidRequest`, "batch must not be empty") with HTTP 500 and a
-  legacy-envelope error body (not an array) — Core 31.1 instead
-  answers `[]` with HTTP 200. Replies assemble into a
-  JSON array in request order; 2.0 notifications (requests without `id`)
-  contribute no entry. A notification-only batch answers HTTP 204 with no
-  body; otherwise the status is the maximum per-entry status. There is no
-  per-entry count limit; the bound is the HTTP body
-  `Content-Length <= MAX_BODY_BYTES` (16 MiB).
+  contract.
+- The envelope is validated before any method dispatch
+  (`crates/rpc/src/server.rs::handle_single_json`), mirroring Core's
+  `JSONRPCRequest::parse` (`src/rpc/request.cpp:206-260`): a **non-null**
+  `jsonrpc` field must be a string and must be `"1.0"` (accepted as legacy
+  for compatibility) or `"2.0"`; a present `params` field must be an array,
+  an object, or `null`; and `method` must be present and a string. Core
+  checks `isNull()` before `isStr()`, so an explicit `null` method is
+  "Missing method", not "Method must be a string". An absent or
+  explicit-null `jsonrpc` is the legacy dialect, as in Core. A violation
+  is `-32600` carrying Core's exact message, and the method never runs.
+  A top-level JSON value that is neither an object nor an array is
+  `-32700` "Top-level object parse error" (`src/httprpc.cpp`, the final
+  `else` of `HTTPReq_JSONRPC`).
+- HTTP status follows Core's mapping (`src/httprpc.cpp:41-56`). An
+  envelope refusal — an error raised while `parse()` runs — is `-32600`
+  at HTTP 400 whatever dialect the request claimed. Only the reply's
+  envelope depends on how far parsing got: a rejected `jsonrpc` field
+  falls back to the legacy envelope, while a `method`/`params` refusal
+  after a clean `"2.0"` keeps the v2 envelope. Dispatch errors then
+  follow the dialect: a legacy request answers with an HTTP error status
+  (`-32600` → 400, `-32601` → 404, every other code → 500), and a v2
+  request stays inside HTTP 200. A batch that produces replies answers HTTP 200
+  with per-member errors carried in its array; an empty batch answers HTTP 200
+  `[]`; an all-notification batch answers 204 with no body.
 - Failures map through `RpcError` (`crates/rpc/src/error.rs`): standard
   JSON-RPC codes (`-32700`, `-32600`..=`-32603`) and Core codes `-1`
   (miscellaneous runtime failure), `-3` (invalid type), `-5` (not found), `-8` (invalid parameter), `-9`
@@ -371,6 +381,29 @@ scanning and wallet interoperability remain unverified.
   counts retain the local JSON-RPC parameter-shape error instead of Core's
   method-help message.
 
+Proof: `crates/rpc/src/server.rs` tests
+`non_string_jsonrpc_version_is_an_invalid_request`,
+`unsupported_jsonrpc_version_is_an_invalid_request`,
+`json_rpc_1_0_remains_accepted_as_legacy`,
+`non_array_or_object_params_are_an_invalid_request`,
+`legacy_invalid_request_maps_to_http_400`,
+`legacy_method_not_found_maps_to_http_404`,
+`legacy_other_errors_keep_http_500`,
+`json_rpc_2_dispatch_errors_still_answer_http_200`,
+`json_rpc_2_envelope_error_uses_the_legacy_status`,
+`json_rpc_2_method_and_params_envelope_errors_answer_400`,
+`a_top_level_scalar_is_a_parse_error`,
+`batch_members_keep_per_member_envelope_dialect`,
+`notification_with_a_malformed_envelope_is_not_executed`, and
+`a_rejected_envelope_never_dispatches_the_method`, and
+`an_empty_batch_answers_an_empty_ok_batch`, and
+`an_all_notification_batch_answers_204` pin the envelope rules, the Core
+status mapping, execution prevention, and the batch reply shape; `crates/rpc/tests/auth.rs`
+`legacy_error_has_core_envelope_and_http_error` pins them through a real
+listener. The pinned Core 31.1 sources are `src/rpc/request.cpp:206-260` and
+`src/httprpc.cpp:41-56` (no Core binary was run; the rules are read from the
+pinned source).
+
 ### `API-03`: REST dialect
 
 
@@ -554,11 +587,14 @@ scanning and wallet interoperability remain unverified.
 ### `API-10`: Broadcast and preview through the admission gateway
 
 
-- `sendrawtransaction`, `testmempoolaccept`, Esplora `POST /tx`, and P2P
+- `sendrawtransaction`, `submitpackage`, `testmempoolaccept`, Esplora `POST /tx`, and P2P
   ingress reach the single `MempoolGateway` (`mempool-policy.md` `POL-02`).
   Each committing producer carries an explicit `AdmissionOrigin` and its
-  own request fee limits. Aggregate package submission remains unsupported
-  (`POL-05`); its future producer must use this same admission owner.
+  own request fee limits. Scoped `submitpackage` admits singletons and 1p1c
+  through the existing atomic package owner, with Core's individual-first
+  partial results (`POL-05`). Wider shapes and replacement are explicitly
+  refused. Named or positional `package`, `maxfeerate`, and `maxburnamount`
+  parameters feed the same owner; burn guards run before any mutation.
 - Esplora `POST /tx` is implemented on both `/api` and `/esplora` with
   `AdmissionOrigin::Esplora` and an explicit, fixed 10,000,000 sat/kvB
   request ceiling. Its hex body provides no fee override. RPC keeps its

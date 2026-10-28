@@ -273,9 +273,7 @@ impl PeerRelaySink {
 impl RelaySink for PeerRelaySink {
     fn poll(&self, gateway: &MempoolGateway) {
         use bitcoin::secp256k1::rand::SeedableRng as _;
-        let ibd = self.ibd.as_ref().is_some_and(|(latch, network)| {
-            latch.is_active(bitcoin_rs_primitives::unix_time_secs(), *network)
-        });
+        let ibd = crate::block_announce::ibd_active(self.ibd.as_ref());
         if !ibd {
             self.peers.poll_transaction_requests(gateway);
         }
@@ -972,6 +970,7 @@ mod tests {
             (
                 3,
                 AdmissionOrigin::Peer(PeerToken {
+                    endpoint: Some(crate::PeerEndpoint::from(([127, 0, 0, 1], 8333))),
                     addr: Some(crate::PeerEndpoint::from(([127, 0, 0, 1], 8333))),
                     connection_id: 7,
                 }),
@@ -1097,6 +1096,7 @@ mod tests {
     }
     fn relay_identity_peer() -> AdmissionOrigin {
         AdmissionOrigin::Peer(bitcoin_rs_mempool::PeerToken {
+            endpoint: Some(crate::PeerEndpoint::from(([127, 0, 0, 1], 8333))),
             addr: Some(crate::PeerEndpoint::from(([127, 0, 0, 1], 8333))),
             connection_id: 7,
         })
