@@ -175,6 +175,40 @@ fn unmarked_nonempty_datadir_is_refused_without_modification() -> anyhow::Result
 }
 
 #[test]
+fn overlay_identity_dir_is_rooted_in_data_dir() -> anyhow::Result<()> {
+    // The P2P overlay keeps its onion/I2P keys under the node data dir, so an
+    // upgraded node reuses its existing identities and two data dirs never
+    // share one. The configured value stays a relative leaf; only the
+    // service config handed to P2P is rooted.
+    let dir = tempfile::tempdir()?;
+
+    let mut config_a = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config_a.data_dir = dir.path().join("node-a");
+    config_a.p2p.listen.clear();
+    let relative = config_a.p2p.overlay.identity_dir.clone();
+    assert!(
+        relative.is_relative(),
+        "overlay identity leaf must stay relative, got {}",
+        relative.display()
+    );
+    let state_a = NodeState::open(config_a, None)?;
+    let rooted_a = state_a.p2p().overlay_config().identity_dir.clone();
+    assert_eq!(rooted_a, dir.path().join("node-a").join(&relative));
+
+    let mut config_b = crate::NodeConfig::default_for_network(crate::Network::Regtest);
+    config_b.data_dir = dir.path().join("node-b");
+    config_b.p2p.listen.clear();
+    let state_b = NodeState::open(config_b, None)?;
+    let rooted_b = state_b.p2p().overlay_config().identity_dir.clone();
+    assert_eq!(rooted_b, dir.path().join("node-b").join(&relative));
+    assert_ne!(
+        rooted_a, rooted_b,
+        "separate data dirs must not share overlay identities"
+    );
+    Ok(())
+}
+
+#[test]
 fn mismatched_datadir_schema_is_refused_before_storage_opens() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
