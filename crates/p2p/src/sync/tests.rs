@@ -3072,6 +3072,94 @@ fn notfound_owner_with_request_headroom_is_skipped_and_the_alternate_serves_the_
 }
 
 #[test]
+fn two_refusing_peers_do_not_starve_a_lower_ranked_holder() -> TestResult {
+    let fixture = NotFoundFixture::two_peers(one_request_peer_budget())?;
+    // A lower-ranked third peer holds the body both higher-ranked peers
+    // lack. A budget-bounded ledger would let the second refusal evict the
+    // first, so the scheduler would alternate between the refusers and never
+    // reach this holder; retention-bounded records demote both refusers.
+    let holder = test_addr(9_810, 2)?;
+    let holder_rx = connect_peer(&fixture.peers, synthetic_peer(holder, 90));
+    let owner_source = current_source(&fixture.peers, fixture.owner);
+    let alternate_source = current_source(&fixture.peers, fixture.alternate);
+    let holder_source = current_source(&fixture.peers, holder);
+    let x0 = fixture.hash(0);
+
+    // The highest-ranked peer is asked first and answers `notfound`.
+    fixture.sync.tick();
+    assert_eq!(fixture.owner_getdata(), vec![fixture.inventory(0, true)]);
+    assert_eq!(fixture.alternate_getdata(), Vec::<Inventory>::new());
+    assert_eq!(drain_getdata_items(&holder_rx), Vec::<Inventory>::new());
+    assert!(
+        fixture
+            .sync
+            .block_not_found(owner_source, &[fixture.inventory(0, true)])
+    );
+
+    // The second-ranked peer is asked next — not the demoted owner — and it
+    // answers `notfound` too.
+    fixture.sync.tick();
+    assert_eq!(
+        fixture.owner_getdata(),
+        Vec::<Inventory>::new(),
+        "a peer that answered notfound is not re-asked while its record lives"
+    );
+    assert_eq!(
+        fixture.alternate_getdata(),
+        vec![fixture.inventory(0, false)]
+    );
+    assert_eq!(drain_getdata_items(&holder_rx), Vec::<Inventory>::new());
+    assert!(
+        fixture
+            .sync
+            .block_not_found(alternate_source, &[fixture.inventory(0, true)])
+    );
+
+    // Both refusals are retained, so the scan reaches the lower-ranked
+    // holder instead of alternating between the refusers.
+    let now = Instant::now();
+    assert!(
+        fixture.sync.scheduler.lock().body_unavailable.refuses(owner_source, x0, now),
+        "the first refusal survives the second under retention bounding"
+    );
+    assert!(
+        fixture
+            .sync
+            .scheduler
+            .lock()
+            .body_unavailable
+            .refuses(alternate_source, x0, now),
+        "the second refusal is recorded"
+    );
+    for _ in 0..4 {
+        fixture.sync.tick();
+    }
+    assert_eq!(
+        fixture.owner_getdata(),
+        Vec::<Inventory>::new(),
+        "neither refuser is re-asked before the retry interval"
+    );
+    assert_eq!(
+        fixture.alternate_getdata(),
+        Vec::<Inventory>::new(),
+        "neither refuser is re-asked before the retry interval"
+    );
+    assert_eq!(
+        drain_getdata_items(&holder_rx),
+        vec![fixture.inventory(0, false)],
+        "the lower-ranked holder is asked exactly once"
+    );
+    assert!(fixture.sync.owns_body_fetch(holder_source, x0));
+    for peer in [fixture.owner, fixture.alternate, holder] {
+        assert!(
+            fixture.peers.is_connected(peer),
+            "a peer that lacks a body is not punished"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn notfound_only_releases_for_the_exact_current_owner_session() -> TestResult {
     let fixture = NotFoundFixture::two_peers(one_request_peer_budget())?;
     let owner_source = current_source(&fixture.peers, fixture.owner);
@@ -3488,15 +3576,17 @@ fn unavailable_body_ledger_is_bounded_exact_source_and_expires() {
     let second = PeerSource::for_test(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_821));
     let hash = |byte: u8| Hash256::from_le_bytes(&[byte; 32]);
     let base = Instant::now();
-    let mut ledger = UnavailableBodies::new(2);
+    let mut ledger = UnavailableBodies::new();
 
+    // Retention-bounded, not budget-bounded: every live record is kept, so a
+    // small pending budget can no longer evict another peer's live answer.
     ledger.note(first, hash(1), base);
     ledger.note(first, hash(2), base + Duration::from_secs(1));
     ledger.note(second, hash(3), base + Duration::from_secs(2));
     let now = base + Duration::from_secs(2);
     assert!(
-        !ledger.refuses(first, hash(1), now),
-        "the oldest record leaves when the bound is reached"
+        ledger.refuses(first, hash(1), now),
+        "live records are retained regardless of pending-budget pressure"
     );
     assert!(ledger.refuses(first, hash(2), now));
     assert!(ledger.refuses(second, hash(3), now));
@@ -3524,4 +3614,53 @@ fn unavailable_body_ledger_is_bounded_exact_source_and_expires() {
         !ledger.refuses(first, hash(4), now + BODY_UNAVAILABLE_RETRY),
         "a record older than the interval refuses nothing"
     );
+}
+
+#[test]
+fn small_pending_budget_keeps_live_records_for_other_peers() -> TestResult {
+    // The window only ever holds one pending block, but the availability
+    // ledger is retention-bounded: two refusers alternating must not evict
+    // each other's live records and starve the replanned body.
+    let fixture = NotFoundFixture::two_peers(one_request_peer_budget())?;
+    let owner_source = current_source(&fixture.peers, fixture.owner);
+    let alternate_source = current_source(&fixture.peers, fixture.alternate);
+    let x1 = fixture.hash(0);
+    let now = Instant::now();
+
+    fixture.sync.tick();
+    assert_eq!(fixture.owner_getdata(), vec![fixture.inventory(0, true)]);
+    assert!(
+        fixture
+            .sync
+            .block_not_found(owner_source, &[fixture.inventory(0, true)])
+    );
+
+    // The released body is replanned to the alternate, which refuses it too.
+    for _ in 0..4 {
+        fixture.sync.tick();
+    }
+    assert_eq!(
+        fixture.alternate_getdata(),
+        vec![fixture.inventory(0, false)]
+    );
+    assert!(
+        fixture
+            .sync
+            .block_not_found(alternate_source, &[fixture.inventory(0, false)])
+    );
+
+    // Both live refusal records survive despite the one-block budget, so a
+    // lower-ranked holder would still be asked instead of a refuser.
+    let scheduler = fixture.sync.scheduler.lock();
+    assert!(
+        scheduler.body_unavailable.refuses(owner_source, x1, now),
+        "the first refuser's live record survives the second refusal"
+    );
+    assert!(
+        scheduler
+            .body_unavailable
+            .refuses(alternate_source, x1, now),
+        "the second refuser's live record is kept"
+    );
+    Ok(())
 }

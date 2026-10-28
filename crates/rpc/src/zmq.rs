@@ -534,10 +534,6 @@ impl MempoolSequenceObserver {
 }
 
 impl bitcoin_rs_mempool::MempoolObserver for MempoolSequenceObserver {
-    fn wants_accepted_transactions(&self) -> bool {
-        self.publisher.wants_rawtx()
-    }
-
     fn on_mutation(&self, envelope: &bitcoin_rs_mempool::MutationEnvelope) {
         use bitcoin_rs_primitives::encode::ConsensusEncode;
         let result = &envelope.result;
@@ -1041,14 +1037,16 @@ mod manifest_tests {
         bitcoin_rs_mempool::MempoolGateway,
         std::sync::Arc<RecordingPublisher>,
     ) {
-        use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits, MempoolObserver};
+        use bitcoin_rs_mempool::{
+            BodyInterest, Mempool, MempoolGateway, MempoolLimits, MempoolObserver,
+        };
         use parking_lot::RwLock;
         let publisher = std::sync::Arc::new(RecordingPublisher::default());
         let observer: std::sync::Arc<dyn MempoolObserver> =
             std::sync::Arc::new(MempoolSequenceObserver::new(publisher.clone()));
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Some(observer),
+            Some((observer, BodyInterest::Bodies)),
             bitcoin_rs_consensus::ValidationEngine::Native,
             None,
         );
@@ -1103,7 +1101,7 @@ mod manifest_tests {
             Arc::new(parking_lot::RwLock::new(Mempool::new(
                 MempoolLimits::default(),
             ))),
-            Some(observer),
+            Some((observer, bitcoin_rs_mempool::BodyInterest::Bodies)),
             bitcoin_rs_consensus::ValidationEngine::Native,
             None,
         );
@@ -1145,25 +1143,32 @@ mod manifest_tests {
         #[derive(Default)]
         struct CaptureCheck(parking_lot::Mutex<Vec<bitcoin_rs_mempool::MutationEnvelope>>);
         impl MempoolObserver for CaptureCheck {
-            fn wants_accepted_transactions(&self) -> bool {
-                false
-            }
             fn on_mutation(&self, envelope: &bitcoin_rs_mempool::MutationEnvelope) {
                 self.0.lock().push(envelope.clone());
             }
         }
         let publisher = std::sync::Arc::new(RecordingPublisher::default());
         let observer = std::sync::Arc::new(MempoolSequenceObserver::new(publisher));
-        assert!(!observer.wants_accepted_transactions());
         let capture = std::sync::Arc::new(CaptureCheck::default());
         let composite = bitcoin_rs_mempool::CompositeObserver::new();
-        composite.add_leg("zmq", observer);
-        composite.add_leg("capture", capture.clone());
+        // Rawtx disabled: neither leg registers body interest, so the commit
+        // retains nothing even though the sequence leg would publish rawtx
+        // had a subscriber been present at delivery.
+        composite.add_leg("zmq", observer, bitcoin_rs_mempool::BodyInterest::Metadata);
+        composite.add_leg(
+            "capture",
+            capture.clone(),
+            bitcoin_rs_mempool::BodyInterest::Metadata,
+        );
+        assert!(!composite.wants_bodies(), "no leg registered body interest");
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(parking_lot::RwLock::new(Mempool::new(
                 MempoolLimits::default(),
             ))),
-            Some(std::sync::Arc::new(composite)),
+            Some((
+                std::sync::Arc::new(composite),
+                bitcoin_rs_mempool::BodyInterest::Metadata,
+            )),
             bitcoin_rs_consensus::ValidationEngine::Native,
             None,
         );
@@ -1313,7 +1318,7 @@ mod manifest_tests {
                 max_total_bytes: 150,
                 ..MempoolLimits::default()
             }))),
-            Some(observer),
+            Some((observer, bitcoin_rs_mempool::BodyInterest::Bodies)),
             bitcoin_rs_consensus::ValidationEngine::Native,
             None,
         );
@@ -1342,8 +1347,8 @@ mod manifest_tests {
     // would scatter the arrange-act-assert across helpers with no reuse.
     fn composite_observer_fans_out_to_sequence_then_mining_wake() {
         use bitcoin_rs_mempool::{
-            AdmissionOrigin, CompositeObserver, Mempool, MempoolGateway, MempoolLimits,
-            MempoolObserver,
+            AdmissionOrigin, BodyInterest, CompositeObserver, Mempool, MempoolGateway,
+            MempoolLimits, MempoolObserver,
         };
         use bitcoin_rs_mining::FakeMiningControl;
         use bitcoin_rs_mining::MempoolSequenceWake;
@@ -1363,11 +1368,15 @@ mod manifest_tests {
         composite.add_leg(
             "sequence",
             std::sync::Arc::new(MempoolSequenceObserver::new(publisher.clone())),
+            BodyInterest::Bodies,
         );
-        composite.add_leg("mining", signal);
+        composite.add_leg("mining", signal, BodyInterest::Metadata);
         let gateway = MempoolGateway::new(
             std::sync::Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Some(std::sync::Arc::new(composite) as std::sync::Arc<dyn MempoolObserver>),
+            Some((
+                std::sync::Arc::new(composite) as std::sync::Arc<dyn MempoolObserver>,
+                BodyInterest::Bodies,
+            )),
             bitcoin_rs_consensus::ValidationEngine::Native,
             None,
         );
