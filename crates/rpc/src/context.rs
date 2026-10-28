@@ -2388,7 +2388,7 @@ mod admission_chain_tests {
         let result = ctx.mempool.gateway.submit_transaction(
             Arc::new(tx),
             AdmissionOrigin::Peer(PeerToken {
-                addr: std::net::SocketAddr::from(([127, 0, 0, 1], 18444)),
+                addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 18444)).into()),
                 connection_id: 1,
             }),
             None,

@@ -1,7 +1,9 @@
 //! Fee-aware queued inventory, contained in the transaction policy owner.
+#[cfg(test)]
+use bitcoin_rs_primitives::PeerEndpoint;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use bitcoin::hashes::Hash as _;
@@ -24,6 +26,8 @@ const INVENTORY_TARGET: usize = 70;
 /// Core v31.1 net.cpp builds `m_network_key` from remote `GetNetClass` plus
 /// bound address bytes and port. Socket scope/flow and the remote address/port
 /// are not part of this identity.
+/// Accepted I2P SAM streams use their ephemeral local bind endpoint, so their
+/// clocks are per stream; they do not share a destination-wide inbound clock.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct InboundClockKey {
     network: NetworkClass,
@@ -32,9 +36,11 @@ pub(super) struct InboundClockKey {
 }
 
 impl InboundClockKey {
-    fn new(remote: IpAddr, bind: SocketAddr) -> Self {
+    fn new(remote: crate::PeerRemote, bind: std::net::SocketAddr) -> Self {
         Self {
-            network: network_class(remote),
+            network: remote.endpoint().map_or(NetworkClass::Onion, |endpoint| {
+                network_class(endpoint.address())
+            }),
             bind_ip: canonical_ip(bind.ip()),
             bind_port: bind.port(),
         }
@@ -201,7 +207,7 @@ impl PeerTable {
             let inbound = session
                 .lease
                 .is_inbound()
-                .then(|| InboundClockKey::new(session.addr.ip(), info.addr_bind));
+                .then(|| InboundClockKey::new(session.addr, info.addr_bind));
             let TxPolicy {
                 relay, inbound_inv, ..
             } = &mut *policy;
@@ -258,7 +264,7 @@ impl PeerTable {
         let inbound = session
             .lease
             .is_inbound()
-            .then(|| InboundClockKey::new(session.addr.ip(), info.addr_bind));
+            .then(|| InboundClockKey::new(session.addr, info.addr_bind));
         {
             let mut policy = self.tx_policy.lock();
             if let Some(peer) = policy.relay.get_mut(&source) {
@@ -303,7 +309,7 @@ impl PeerTable {
         let inbound = session
             .lease
             .is_inbound()
-            .then(|| InboundClockKey::new(session.addr.ip(), info.addr_bind));
+            .then(|| InboundClockKey::new(session.addr, info.addr_bind));
         {
             let mut policy = self.tx_policy.lock();
             if let Some(peer) = policy.relay.get_mut(&source) {
@@ -362,7 +368,7 @@ impl PeerTable {
             let inbound = session
                 .lease
                 .is_inbound()
-                .then(|| InboundClockKey::new(session.addr.ip(), info.addr_bind));
+                .then(|| InboundClockKey::new(session.addr, info.addr_bind));
             let requests = {
                 let mut policy = self.tx_policy.lock();
                 let TxPolicy {
@@ -648,14 +654,14 @@ mod tests {
         role: crate::PeerRole,
         ready: bool,
     ) -> (PeerSource, MessageReceiver) {
-        let addr = ([127, 0, 0, 1], port).into();
+        let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
         connect_at(table, addr, addr, inbound, wtxid, role, ready)
     }
 
     fn connect_at(
         table: &PeerTable,
-        addr: SocketAddr,
-        bind: SocketAddr,
+        addr: PeerEndpoint,
+        bind: PeerEndpoint,
         inbound: bool,
         wtxid: bool,
         role: crate::PeerRole,
@@ -680,7 +686,8 @@ mod tests {
             );
             let mut info = crate::PeerInfo::outbound_from_version(
                 addr,
-                bind,
+                bind.socket_addr()
+                    .unwrap_or_else(|| panic!("expected IP fixture")),
                 &version,
                 0,
                 0,
@@ -800,9 +807,10 @@ mod tests {
         // GetPort. IPv4 mapped bind bytes are identical; scope/flow are absent.
         let key = |remote: &str, bind: &str| {
             InboundClockKey::new(
-                remote
-                    .parse()
-                    .unwrap_or_else(|error| panic!("remote: {error}")),
+                remote.parse::<crate::PeerAddress>().map_or_else(
+                    |error| panic!("remote: {error}"),
+                    |address| crate::PeerEndpoint::new(address, 0).into(),
+                ),
                 bind.parse().unwrap_or_else(|error| panic!("bind: {error}")),
             )
         };
@@ -817,10 +825,10 @@ mod tests {
         let plain: std::net::Ipv6Addr = "fe80::1"
             .parse()
             .unwrap_or_else(|error| panic!("IPv6: {error}"));
-        let bind = SocketAddr::V6(std::net::SocketAddrV6::new(plain, 8333, 123, 456));
+        let bind = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(plain, 8333, 123, 456));
         assert_eq!(
             key("8.8.8.8", "[fe80::1]:8333"),
-            InboundClockKey::new(([8, 8, 8, 8]).into(), bind),
+            InboundClockKey::new(crate::PeerRemote::from(([8, 8, 8, 8], 0)), bind),
         );
     }
 
@@ -1044,7 +1052,7 @@ mod tests {
         port: u16,
         aggregate: &Arc<crate::connection::SharedOutboundBudget>,
     ) -> (PeerSource, MessageReceiver) {
-        let addr = ([127, 0, 0, 1], port).into();
+        let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
         let (sender, receiver) = message_channel_bounded(1024);
         let lease = crate::PeerLease::new(sender).with_shared_budget(aggregate);
         let source = lease.source(addr);
@@ -1057,7 +1065,8 @@ mod tests {
         );
         let mut info = crate::PeerInfo::outbound_from_version(
             addr,
-            addr,
+            addr.socket_addr()
+                .unwrap_or_else(|| panic!("expected IP fixture")),
             &version,
             0,
             0,
