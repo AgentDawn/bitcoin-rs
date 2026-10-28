@@ -201,7 +201,7 @@ fn same_address_registration_after_window_eviction_keeps_replacement() -> TestRe
         synthetic_peer(addr, 100),
     );
     sync.tick();
-    assert!(peers.is_current(new.source(addr)));
+    assert!(peers.is_current(new.source(addr.endpoint())));
     assert!(old.is_cancelled());
     assert!(peers.is_connected(addr));
     assert!(new_rx.try_recv().is_ok());

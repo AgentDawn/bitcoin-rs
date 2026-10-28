@@ -246,7 +246,7 @@ fn on_peer_ready_sweep_releases_dead_owned_requests_only() -> TestResult {
         });
         scheduler.header_request_owner = Some(replacement);
     }
-    sync.on_peer_ready(stale.source(peer_addr));
+    sync.on_peer_ready(stale.source(peer_addr.endpoint()));
     sync.on_peer_ready(replacement);
     assert!(
         sync.scheduler

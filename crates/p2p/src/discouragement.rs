@@ -135,13 +135,14 @@ pub(crate) fn is_local(address: impl Into<PeerAddress>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin_rs_primitives::PeerEndpoint;
 
     #[test]
     fn avoidance_is_bounded_expires_and_does_not_refresh_on_repetition()
     -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let mut entries = DiscouragedPeers::default();
-        let first = EndpointHost::Ip(IpAddr::from([8, 8, 8, 8]));
+        let first = PeerAddress::Ip(IpAddr::from([8, 8, 8, 8]));
         entries.insert(first, now);
         entries.insert(first, now + Duration::from_secs(20));
         assert!(entries.contains(
@@ -151,11 +152,11 @@ mod tests {
         assert!(!entries.contains(first, now + DISCOURAGEMENT_LIFETIME));
         for n in 0..=MAX_DISCOURAGED_IPS {
             let bytes = u32::try_from(n)?.to_be_bytes();
-            entries.insert(EndpointHost::Ip(IpAddr::from(bytes)), now);
+            entries.insert(PeerAddress::Ip(IpAddr::from(bytes)), now);
         }
         assert_eq!(entries.deadlines.len(), MAX_DISCOURAGED_IPS);
         assert_eq!(entries.oldest.len(), MAX_DISCOURAGED_IPS);
-        assert!(!entries.contains(EndpointHost::Ip(IpAddr::from([0, 0, 0, 0])), now));
+        assert!(!entries.contains(PeerAddress::Ip(IpAddr::from([0, 0, 0, 0])), now));
         assert!(entries.snapshot(now + DISCOURAGEMENT_LIFETIME).is_empty());
         Ok(())
     }
@@ -168,16 +169,16 @@ mod tests {
             key: [3u8; 32],
             port: 8333,
         };
-        entries.insert(tor.host(), now);
+        entries.insert(tor.address(), now);
         // Same key at any port shares the discouragement (port zeroed).
-        assert!(entries.contains(tor.with_port(9999).host(), now));
+        assert!(entries.contains(tor.with_port(9999).address(), now));
         assert!(
             entries.contains(
                 PeerEndpoint::TorV3 {
                     key: [3u8; 32],
                     port: 1
                 }
-                .host(),
+                .address(),
                 now
             )
         );
@@ -187,11 +188,11 @@ mod tests {
                     key: [4u8; 32],
                     port: 8333
                 }
-                .host(),
+                .address(),
                 now
             )
         );
-        assert!(!is_local_endpoint(tor));
+        assert!(!is_local(tor.address()));
         // Snapshot keys carry no port and no socket.
         assert!(
             entries

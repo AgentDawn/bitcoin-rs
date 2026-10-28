@@ -24,6 +24,7 @@ mod historical;
 mod peers;
 mod receive;
 mod requests;
+mod stale_tips;
 mod telemetry;
 
 #[cfg(test)]
@@ -62,6 +63,7 @@ use crate::download_window::RECEIVED_BLOCK_TIMEOUT;
 use commit::restore_split;
 
 pub use chain::SyncChain;
+pub use stale_tips::StaleTipRetainer;
 
 pub use headers_presync::{
     HeaderAnchor, HeaderSyncError, HeaderSyncResult, HeadersSyncPhase, HeadersSyncState,
@@ -209,6 +211,10 @@ pub struct BlockSync {
     /// Only recreating the sync object (restart path) clears it; there is no
     /// in-place recovery that reopens admission.
     apply_halted: std::sync::atomic::AtomicBool,
+    /// Recent stale tips for BIP332 relay, kept across [`BlockSync::install_budget`]
+    /// so a budget swap cannot erase them. Shared with the announcer and the
+    /// chain query; see [`StaleTipRetainer`].
+    stale_tips: Arc<StaleTipRetainer>,
 }
 
 /// Cap on deferred owned-fetch marks waiting on unattached tip headers:
@@ -415,6 +421,7 @@ impl BlockSync {
         ibd: Arc<bitcoin_rs_chain::InitialBlockDownload>,
     ) -> Self {
         let budget = default_sync_budget(chain.network());
+        let stale_tips = Arc::new(StaleTipRetainer::seed(&chain.block_tree()));
         Self {
             historical: Mutex::new(historical::HistoricalDownload::new(budget)),
             historical_work: Mutex::new(()),
@@ -437,6 +444,7 @@ impl BlockSync {
             refused_rerequest_at: Mutex::new(None),
             block_announcements: Mutex::new(hashbrown::HashMap::new()),
             apply_halted: std::sync::atomic::AtomicBool::new(false),
+            stale_tips,
         }
     }
 
@@ -861,7 +869,7 @@ impl BlockSync {
                     })
                 };
                 usable_peers.push(UsablePeer {
-                    source: session.lease.source(session.addr),
+                    source: session.lease.source(session.endpoint),
                     info,
                     demonstrated_tips,
                     active_height,

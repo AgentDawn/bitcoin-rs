@@ -153,6 +153,11 @@ pub struct P2pConfig {
     /// `NODE_P2P_V2` is advertised. On by default, as Core's `-v2transport` is;
     /// off keeps every connection on v1.
     pub v2_transport: bool,
+    /// The opt-in relay capabilities offered to peers. Every switch is off by
+    /// default and peers relay packages or stale tips only after both sides
+    /// negotiate them. BIP332 stale-tip relay is off by default on every
+    /// network; setting it on a test network is the explicit test override.
+    pub relay_offers: bitcoin_rs_p2p::RelayOffers,
 }
 
 /// Resolved RPC configuration.
@@ -318,6 +323,14 @@ impl NodeConfig {
                 connect: settings.p2p.connect.clone().unwrap_or(profile.connect),
                 fast_sync: settings.p2p.fast_sync.unwrap_or(false),
                 v2_transport: settings.p2p.v2_transport.unwrap_or(true),
+                relay_offers: bitcoin_rs_p2p::RelayOffers {
+                    package_relay: settings.p2p.package_relay.unwrap_or(false),
+                    stale_tip_relay: settings.p2p.stale_tip_relay.unwrap_or(false),
+                    stale_tip_prefers_blocks: settings
+                        .p2p
+                        .stale_tip_prefers_blocks
+                        .unwrap_or(false),
+                },
             },
             rpc: RpcConfig {
                 bind: settings.rpc.bind.unwrap_or(profile.rpc_bind),
@@ -439,6 +452,11 @@ impl NodeConfig {
             "validation engine `{}` is not supported by this build: bitcoinkernel \
              support is not compiled in (enable the `kernel` feature)",
             self.validation.engine
+        );
+        anyhow::ensure!(
+            !self.p2p.relay_offers.stale_tip_prefers_blocks
+                || self.p2p.relay_offers.stale_tip_relay,
+            "--p2p-stale-tip-prefers-blocks requires --p2p-stale-tip-relay"
         );
         self.validate_index_bundle()?;
         self.validate_p2p_network()?;

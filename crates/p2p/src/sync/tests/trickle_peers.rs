@@ -36,7 +36,7 @@ fn slow_trickle_front_peer_observable_but_never_disconnected() -> TestResult {
                     .window
                     .stalling_peer()
                     .map(|(addr, _)| addr),
-                Some(trickler),
+                Some(trickler.endpoint()),
                 "the stall episode must be observable while the front trickles"
             );
             std::thread::sleep(Duration::from_millis(100));

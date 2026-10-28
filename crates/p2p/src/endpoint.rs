@@ -1,15 +1,21 @@
-//! P2P-owned endpoint parsing, formatting, and BIP155 conversion.
+//! P2P-owned endpoint parsing, formatting, BIP155 conversion, and dialing.
 //!
-//! Every caller treats [`PeerEndpoint`] as opaque identity; the single
-//! transport dial lives on [`crate::overlay::OverlayTransport`].
+//! Only [`connect_peer_stream`] matches on transport variants. Every other
+//! caller treats [`PeerEndpoint`] as opaque identity.
 
-use std::net::SocketAddr;
+use std::io;
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
-use bitcoin_rs_primitives::endpoint::{base32_decode, tor_v3_key_from_payload};
-use bitcoin_rs_primitives::{EndpointHost, PeerEndpoint};
+use bitcoin_rs_primitives::endpoint::{base32_decode, tor_v3_key_from_payload, tor_v3_payload};
+use bitcoin_rs_primitives::{EndpointHost, NetworkLabel, PeerEndpoint};
 use sha2::{Digest, Sha256};
+
+use crate::sam::SamSession;
+use crate::socks::{SocksTarget, socks_connect};
 
 /// Socket that actually carried a connection. This is socket accounting
 /// (`addrbind`, local/remote socket) only; it is never peer identity and
@@ -42,6 +48,12 @@ impl std::fmt::Display for TransportRemote {
 #[must_use]
 pub fn accepted_ip_identity(remote: SocketAddr) -> PeerEndpoint {
     PeerEndpoint::Ip(remote)
+}
+
+/// Identity assigned to a dialed IP endpoint.
+#[must_use]
+pub fn dialed_ip_identity(addr: SocketAddr) -> PeerEndpoint {
+    PeerEndpoint::Ip(addr)
 }
 
 /// Result of classifying a textual peer target for dialing and DNS policy.
@@ -249,6 +261,231 @@ pub fn overlay_netgroup(host: EndpointHost) -> Option<Vec<u8>> {
 pub fn anonymous_netgroup(connection_id: crate::ConnectionId) -> Vec<u8> {
     let digest = Sha256::digest(connection_id.get().to_le_bytes());
     vec![3, digest[0], digest[1]]
+}
+
+/// Routing configuration for dials: which SOCKS proxy carries IP and
+/// onion traffic and which SAM session carries I2P traffic.
+#[derive(Clone, Debug, Default)]
+pub struct DialRoutes {
+    /// General SOCKS5 proxy for IP dials (and onion when `onion` unset).
+    pub proxy: Option<SocketAddr>,
+    /// SOCKS5 proxy for onion dials.
+    pub onion: Option<SocketAddr>,
+    /// Per-dial credential randomization on the general proxy.
+    pub proxy_randomize_credentials: bool,
+    /// Established persistent SAM session for I2P dials.
+    pub sam_session: Option<Arc<SamSession>>,
+    /// Dial restriction; empty allows every network.
+    pub onlynet: Vec<NetworkLabel>,
+}
+
+impl DialRoutes {
+    /// Whether Tor dials can be routed.
+    #[must_use]
+    pub fn tor_enabled(&self) -> bool {
+        self.onion.is_some() || self.proxy.is_some()
+    }
+
+    /// Whether I2P dials can be routed.
+    #[must_use]
+    pub fn i2p_enabled(&self) -> bool {
+        self.sam_session.is_some()
+    }
+}
+
+/// Why this node cannot route a dial to an endpoint. Pure configuration
+/// fact: no I/O, derivable before any socket is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteDenial {
+    /// The endpoint's network is outside the configured `onlynet` set.
+    NotInOnlynet,
+    /// A Tor endpoint with no onion proxy route configured.
+    NoOnionRoute,
+    /// An I2P endpoint with no SAM session established.
+    NoI2pRoute,
+}
+
+/// Static reachability predicate over one node's local routes.
+///
+/// Selection applies [`RouteTable::denial`] before any worker, thread, or
+/// address-book claim is spent; the dial-time gate in [`connect_peer_stream`]
+/// stays as defense in depth for fixed peers and races.
+#[derive(Clone, Debug, Default)]
+pub struct RouteTable {
+    /// Dial restriction; empty allows every network.
+    pub onlynet: Vec<NetworkLabel>,
+    /// SOCKS5 proxy for onion dials (or the general proxy as fallback).
+    pub proxy: Option<SocketAddr>,
+    /// SOCKS5 proxy dedicated to onion dials.
+    pub onion: Option<SocketAddr>,
+    /// Established persistent SAM session for I2P dials.
+    pub sam_session: Option<Arc<SamSession>>,
+}
+
+impl RouteTable {
+    /// Build the predicate from the live dial routes. The snapshot is taken
+    /// after overlay startup, so an established SAM session is included.
+    #[must_use]
+    pub fn from_routes(routes: &DialRoutes) -> Self {
+        Self {
+            onlynet: routes.onlynet.clone(),
+            proxy: routes.proxy,
+            onion: routes.onion,
+            sam_session: routes.sam_session.clone(),
+        }
+    }
+
+    /// Pure reachability check. `None` means dialable by this node.
+    #[must_use]
+    pub fn denial(&self, endpoint: &PeerEndpoint) -> Option<RouteDenial> {
+        if !self.onlynet.is_empty() && !self.onlynet.contains(&endpoint.net()) {
+            return Some(RouteDenial::NotInOnlynet);
+        }
+        match endpoint {
+            PeerEndpoint::Ip(_) => None,
+            PeerEndpoint::TorV3 { .. } => {
+                if self.onion.is_some() || self.proxy.is_some() {
+                    None
+                } else {
+                    Some(RouteDenial::NoOnionRoute)
+                }
+            }
+            PeerEndpoint::I2p { .. } => {
+                if self.sam_session.is_some() {
+                    None
+                } else {
+                    Some(RouteDenial::NoI2pRoute)
+                }
+            }
+        }
+    }
+}
+
+/// Typed dial outcome at the transport seam.
+///
+/// `Transport` covers every local failure: dead or refusing proxy, SOCKS
+/// authentication/protocol failure, dead SAM bridge, SAM negotiation or
+/// naming failure, local policy (`onlynet`), and missing routes. None of
+/// these is evidence about the peer and none may move addrman failure
+/// accounting. `PeerUnreachable` is reserved for outcomes reported past
+/// a working transport (direct TCP refusal, SOCKS peer-unreachable reply
+/// codes, SAM `CANT_REACH_PEER`/`TIMEOUT`).
+#[derive(Debug)]
+pub enum DialFailure {
+    /// Local transport failure; never peer evidence.
+    Transport(io::Error),
+    /// The transport worked and reported the peer unreachable.
+    PeerUnreachable(io::Error),
+}
+
+impl DialFailure {
+    /// Whether this outcome may count as a peer failure in addrman.
+    #[must_use]
+    pub const fn counts_as_peer_failure(&self) -> bool {
+        matches!(self, Self::PeerUnreachable(_))
+    }
+
+    /// The underlying I/O error kind.
+    #[must_use]
+    pub fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::Transport(error) | Self::PeerUnreachable(error) => error.kind(),
+        }
+    }
+
+    /// Flatten back to the I/O error callers report.
+    #[must_use]
+    pub fn into_io(self) -> io::Error {
+        match self {
+            Self::Transport(error) | Self::PeerUnreachable(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for DialFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "transport failure: {error}"),
+            Self::PeerUnreachable(error) => write!(f, "peer unreachable: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DialFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) | Self::PeerUnreachable(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for DialFailure {
+    fn from(error: io::Error) -> Self {
+        // Bare I/O failures inside a transport exchange are local.
+        Self::Transport(error)
+    }
+}
+
+/// The single transport-match dial function.
+///
+/// `Ip` dials direct TCP exactly as before, or through the configured
+/// general SOCKS proxy. `TorV3` dials through SOCKS with the onion name
+/// as a domain target. `I2p` dials through the SAM session. Overlay
+/// names never reach the system resolver and no failure falls back to
+/// direct TCP; a missing route is a typed transport error.
+pub fn connect_peer_stream(
+    endpoint: PeerEndpoint,
+    routes: &DialRoutes,
+    timeout: Duration,
+) -> Result<TcpStream, DialFailure> {
+    if !routes.onlynet.is_empty() && !routes.onlynet.contains(&endpoint.net()) {
+        return Err(DialFailure::Transport(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "dial refused: endpoint network is not in onlynet",
+        )));
+    }
+    match endpoint {
+        PeerEndpoint::Ip(addr) => match routes.proxy {
+            Some(proxy) => socks_connect(
+                proxy,
+                &SocksTarget::Ip(addr),
+                routes.proxy_randomize_credentials,
+                timeout,
+            ),
+            None => match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(stream) => Ok(stream),
+                Err(error) => Err(match error.kind() {
+                    io::ErrorKind::ConnectionRefused => DialFailure::PeerUnreachable(error),
+                    _ => DialFailure::Transport(error),
+                }),
+            },
+        },
+        PeerEndpoint::TorV3 { key, port } => {
+            let Some(proxy) = routes.onion.or(routes.proxy) else {
+                return Err(DialFailure::Transport(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "overlay transport unavailable: no onion proxy route is configured",
+                )));
+            };
+            // Full `<56-char base32>.onion` name: exactly 62 bytes, the
+            // SOCKS domain-length byte 0x3e asserted by transcript tests.
+            let host = format!(
+                "{}.onion",
+                bitcoin_rs_primitives::endpoint::base32_encode(&tor_v3_payload(&key))
+            );
+            debug_assert_eq!(host.len(), 62);
+            socks_connect(proxy, &SocksTarget::Domain(host, port), true, timeout)
+        }
+        PeerEndpoint::I2p { hash, port } => {
+            let Some(session) = &routes.sam_session else {
+                return Err(DialFailure::Transport(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "overlay transport unavailable: no I2P SAM session is configured",
+                )));
+            };
+            session.connect(hash, port)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +771,135 @@ mod tests {
             port: 8333,
         };
         assert_eq!(endpoint_from_addrv2(&unknown), None);
+    }
+
+    #[test]
+    fn overlay_dial_is_unavailable_without_fallback() {
+        for endpoint in [
+            tor_endpoint(),
+            PeerEndpoint::I2p {
+                hash: [1u8; 32],
+                port: 8333,
+            },
+        ] {
+            let Err(error) =
+                connect_peer_stream(endpoint, &DialRoutes::default(), Duration::from_millis(10))
+            else {
+                panic!("overlay must not dial");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(!error.counts_as_peer_failure());
+        }
+    }
+
+    #[test]
+    fn dead_onion_proxy_is_transport_not_peer_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let routes = DialRoutes {
+            onion: Some("127.0.0.1:1".parse()?),
+            ..DialRoutes::default()
+        };
+        let Err(error) = connect_peer_stream(tor_endpoint(), &routes, Duration::from_secs(2))
+        else {
+            panic!("dead proxy must fail the dial");
+        };
+        assert!(matches!(error, DialFailure::Transport(_)));
+        assert!(!error.counts_as_peer_failure());
+        Ok(())
+    }
+
+    #[test]
+    fn onlynet_refusal_is_transport_not_peer_failure() {
+        let routes = DialRoutes {
+            onlynet: vec![NetworkLabel::Ipv4],
+            ..DialRoutes::default()
+        };
+        let Err(error) = connect_peer_stream(tor_endpoint(), &routes, Duration::from_millis(10))
+        else {
+            panic!("onlynet must refuse the dial");
+        };
+        assert!(matches!(error, DialFailure::Transport(_)));
+        assert!(!error.counts_as_peer_failure());
+    }
+
+    #[test]
+    fn route_table_denial_prefilters_unroutable_endpoints() {
+        let ip = PeerEndpoint::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333));
+        let i2p = PeerEndpoint::I2p {
+            hash: [7u8; 32],
+            port: 8333,
+        };
+        // Unrestricted direct routes dial IP without denial.
+        let open = RouteTable::default();
+        assert_eq!(open.denial(&ip), None);
+        // Missing overlay routes deny without spending a dial.
+        assert_eq!(
+            open.denial(&tor_endpoint()),
+            Some(RouteDenial::NoOnionRoute)
+        );
+        assert_eq!(open.denial(&i2p), Some(RouteDenial::NoI2pRoute));
+        // `onlynet` denies first, even for otherwise routable endpoints.
+        let onion_only = RouteTable {
+            onlynet: vec![NetworkLabel::Onion],
+            ..RouteTable::default()
+        };
+        assert_eq!(onion_only.denial(&ip), Some(RouteDenial::NotInOnlynet));
+    }
+
+    #[test]
+    fn direct_tcp_classifies_only_refusal_as_peer_unreachable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Unused local port yields ConnectionRefused -> PeerUnreachable
+        let unused_port: SocketAddr = "127.0.0.1:1".parse()?;
+        let Err(error) = connect_peer_stream(
+            PeerEndpoint::Ip(unused_port),
+            &DialRoutes::default(),
+            Duration::from_millis(200),
+        ) else {
+            panic!("refused dial must fail");
+        };
+        match &error {
+            DialFailure::PeerUnreachable(io_err) => {
+                assert_eq!(io_err.kind(), io::ErrorKind::ConnectionRefused);
+                assert!(
+                    error.counts_as_peer_failure(),
+                    "ConnectionRefused must count as peer failure"
+                );
+            }
+            DialFailure::Transport(_) => {
+                assert_ne!(error.kind(), io::ErrorKind::ConnectionRefused);
+                assert!(
+                    !error.counts_as_peer_failure(),
+                    "Non-refusal must not count as peer failure"
+                );
+            }
+        }
+
+        // Non-routable address with tiny timeout yields TimedOut or NetworkUnreachable -> Transport
+        let blackhole: SocketAddr = "192.0.2.1:8333".parse()?;
+        let Err(error) = connect_peer_stream(
+            PeerEndpoint::Ip(blackhole),
+            &DialRoutes::default(),
+            Duration::from_millis(1),
+        ) else {
+            panic!("timed out dial must fail");
+        };
+        match &error {
+            DialFailure::Transport(_) => {
+                assert_ne!(error.kind(), io::ErrorKind::ConnectionRefused);
+                assert!(
+                    !error.counts_as_peer_failure(),
+                    "Timeout or network error must remain Transport failure"
+                );
+            }
+            DialFailure::PeerUnreachable(io_err) => {
+                assert_eq!(io_err.kind(), io::ErrorKind::ConnectionRefused);
+                assert!(
+                    error.counts_as_peer_failure(),
+                    "ConnectionRefused must count as peer failure"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

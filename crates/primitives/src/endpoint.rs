@@ -3,10 +3,16 @@
 //! A `PeerEndpoint` identifies the logical peer. A socket address is only
 //! the identity for direct-IP peers; Tor v3 and I2P peers are identified by
 //! their overlay keys/hashes and never by a proxy's loopback socket.
+//!
+//! [`PeerAddress`] and [`PeerNetwork`] are the routable projections shared
+//! with the overlay transport; [`NetworkLabel`] and [`EndpointHost`] are the
+//! operator-facing classification and discouragement keys.
 
-use core::fmt;
-use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
 
 use sha3::{Digest, Sha3_256};
 
@@ -306,7 +312,6 @@ impl fmt::Display for PeerEndpoint {
         }
     }
 }
-
 /// Network used by a logical peer destination.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
@@ -344,6 +349,28 @@ impl FromStr for PeerNetwork {
             "onion" => Ok(Self::Onion),
             "i2p" => Ok(Self::I2p),
             _ => Err("expected ipv4, ipv6, onion, or i2p"),
+        }
+    }
+}
+
+impl From<NetworkLabel> for PeerNetwork {
+    fn from(label: NetworkLabel) -> Self {
+        match label {
+            NetworkLabel::Ipv4 => Self::Ipv4,
+            NetworkLabel::Ipv6 => Self::Ipv6,
+            NetworkLabel::Onion => Self::Onion,
+            NetworkLabel::I2p => Self::I2p,
+        }
+    }
+}
+
+impl From<PeerNetwork> for NetworkLabel {
+    fn from(network: PeerNetwork) -> Self {
+        match network {
+            PeerNetwork::Ipv4 => Self::Ipv4,
+            PeerNetwork::Ipv6 => Self::Ipv6,
+            PeerNetwork::Onion => Self::Onion,
+            PeerNetwork::I2p => Self::I2p,
         }
     }
 }

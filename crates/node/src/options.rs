@@ -35,6 +35,8 @@ use bitcoin_rs_storage::StorageBackend;
 
 /// Canonical subnet type shared by every process-input surface.
 pub use bitcoin_rs_p2p::{IpSubnet, PeerNetwork};
+/// Network label for `--onlynet`.
+pub use bitcoin_rs_primitives::NetworkLabel;
 
 /// Parses a network selection spelling.
 pub fn parse_network(value: &str) -> std::result::Result<NetworkSelection, String> {
@@ -189,6 +191,19 @@ fn parse_connect_list(value: &str) -> Result<Vec<String>> {
         .split(',')
         .map(|part| parse_connect_endpoint(part.trim()).map_err(anyhow::Error::msg))
         .collect()
+}
+
+/// Parses one `--onlynet` network label.
+pub fn parse_network_label(
+    value: &str,
+) -> std::result::Result<bitcoin_rs_primitives::NetworkLabel, String> {
+    match value {
+        "ipv4" => Ok(bitcoin_rs_primitives::NetworkLabel::Ipv4),
+        "ipv6" => Ok(bitcoin_rs_primitives::NetworkLabel::Ipv6),
+        "onion" => Ok(bitcoin_rs_primitives::NetworkLabel::Onion),
+        "i2p" => Ok(bitcoin_rs_primitives::NetworkLabel::I2p),
+        other => Err(format!("unknown network label: {other}")),
+    }
 }
 
 /// Parses an operator discouragement-exemption subnet.
@@ -625,24 +640,28 @@ macro_rules! option_rows {
                         cli[#[arg(long = "proxy")]]
                         env["BITCOIN_RS_PROXY", str::parse]
                         toml native("proxy")
+                        conf["proxy"]
                     }
                     /// SOCKS5 route for Tor v3 destinations, passed to the proxy without local DNS.
                     onion_proxy as onion_proxy: Option<SocketAddr> {
                         cli[#[arg(long = "onion-proxy")]]
                         env["BITCOIN_RS_ONION_PROXY", str::parse]
                         toml native("onion_proxy")
+                        conf["onion"]
                     }
                     /// Loopback SAM bridge of an operator-managed IVNP router.
                     i2p_sam as i2p_sam: Option<SocketAddr> {
                         cli[#[arg(long = "i2p-sam")]]
                         env["BITCOIN_RS_I2P_SAM", str::parse]
                         toml native("i2p_sam")
+                        conf["i2psam"]
                     }
                     /// Loopback Tor control endpoint enabling a persistent inbound onion service.
                     tor_control as tor_control: Option<SocketAddr> {
                         cli[#[arg(long = "tor-control")]]
                         env["BITCOIN_RS_TOR_CONTROL", str::parse]
                         toml native("tor_control")
+                        conf["torcontrol"]
                     }
                     /// Tor SAFECOOKIE file; otherwise use NULL authentication.
                     tor_cookie as tor_cookie: Option<PathBuf> {
@@ -655,12 +674,14 @@ macro_rules! option_rows {
                         cli[#[arg(long = "i2p-accept", num_args = 0..=1, default_missing_value = "true")]]
                         env["BITCOIN_RS_I2P_ACCEPT", parse_bool]
                         toml native("i2p_accept")
+                        conf["i2pacceptincoming"]
                     }
                     /// Require SOCKS username/password authentication with fresh credentials per connection.
                     proxy_randomize_credentials as proxy_randomize_credentials: Option<bool> {
                         cli[#[arg(long = "proxy-randomize-credentials", num_args = 0..=1, default_missing_value = "true")]]
                         env["BITCOIN_RS_PROXY_RANDOMIZE_CREDENTIALS", parse_bool]
                         toml native("proxy_randomize_credentials")
+                        conf["proxyrandomize"]
                     }
                     /// Public Bitcoin service port for inbound overlay services.
                     overlay_port as overlay_port: Option<u16> {
@@ -673,6 +694,7 @@ macro_rules! option_rows {
                         cli[#[arg(long = "onlynet", value_delimiter = ',', value_parser = $crate::options::parse_peer_network)]]
                         env["BITCOIN_RS_ONLYNET", parse_peer_networks]
                         toml each("onlynet", parse_peer_network)
+                        conf["onlynet"]
                     }
                     /// Whether fast sync (shallow, early fan-out over a larger
                     /// outbound set) is enabled.
@@ -688,6 +710,26 @@ macro_rules! option_rows {
                         env["BITCOIN_RS_V2_TRANSPORT", parse_bool]
                         toml native("v2_transport")
                         conf["v2transport"]
+                    }
+                    /// Offer BIP331 ancestor package relay to peers. Off by default.
+                    package_relay as p2p_package_relay: Option<bool> {
+                        cli[#[arg(long = "p2p-package-relay", num_args = 0..=1, default_missing_value = "true")]]
+                        env["BITCOIN_RS_P2P_PACKAGE_RELAY", parse_bool]
+                        toml native("p2p_package_relay")
+                    }
+                    /// Announce and accept BIP332 stale-tip headers. Off by default; setting
+                    /// it on a test network is the explicit test override.
+                    stale_tip_relay as p2p_stale_tip_relay: Option<bool> {
+                        cli[#[arg(long = "p2p-stale-tip-relay", num_args = 0..=1, default_missing_value = "true")]]
+                        env["BITCOIN_RS_P2P_STALE_TIP_RELAY", parse_bool]
+                        toml native("p2p_stale_tip_relay")
+                    }
+                    /// Tell BIP332 peers this node prefers stale-tip blocks over headers.
+                    /// Requires `p2p_stale_tip_relay`.
+                    stale_tip_prefers_blocks as p2p_stale_tip_prefers_blocks: Option<bool> {
+                        cli[#[arg(long = "p2p-stale-tip-prefers-blocks", num_args = 0..=1, default_missing_value = "true")]]
+                        env["BITCOIN_RS_P2P_STALE_TIP_PREFERS_BLOCKS", parse_bool]
+                        toml native("p2p_stale_tip_prefers_blocks")
                     }
                 }
                 /// User-supplied RPC overrides.

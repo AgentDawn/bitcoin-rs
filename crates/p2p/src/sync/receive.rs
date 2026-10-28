@@ -109,7 +109,9 @@ impl BlockSync {
             }
         }
 
-        self.switch_branch_if_outweighed();
+        if let Some(demoted_tip) = self.switch_branch_if_outweighed() {
+            self.record_demoted_tip(demoted_tip);
+        }
         // The gate recheck runs after the branch switch so admissibility
         // reads the settled applied tip: a body on a winning branch that
         // just replaced the applied tip must not be judged against the old
@@ -206,10 +208,10 @@ impl BlockSync {
         for (hash, _) in invalid {
             scheduler.stager.discard(hash);
         }
-        for peer_addr in &blamed {
+        for source in &blamed {
             scheduler
                 .window
-                .mark_peer_unresponsive(*peer_addr, Instant::now());
+                .mark_peer_unresponsive(*source, Instant::now());
         }
         tracing::debug!(
             discarded = invalid.len(),
@@ -268,8 +270,10 @@ impl BlockSync {
                 HeaderAdmission::Accepted {
                     announced_tip: Some(tip_hash),
                     active_height,
+                    demoted_tip,
                     ..
                 } => {
+                    self.record_admitted_tips(demoted_tip, Some(tip_hash), source);
                     // A staged retry that now admits is the same
                     // announcement the headers drain credits — the
                     // delivering connection demonstrated the tip even if
@@ -744,7 +748,7 @@ impl BlockSync {
                             .lock()
                             .window
                             .mark_peer_unresponsive(source, now);
-                        tracing::warn!(peer_addr = ?source.addr, %hash, "block sync: peer served mutated block body; disconnecting");
+                        tracing::warn!(peer_addr = ?source.endpoint, %hash, "block sync: peer served mutated block body; disconnecting");
                     }
                 }
             }

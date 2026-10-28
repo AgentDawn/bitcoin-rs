@@ -5,6 +5,7 @@ use super::INBOUND_TX_CHANNEL_LIMIT;
 use super::NodeState;
 use super::P2P_OUTBOUND_BLOCK_RELAY_SLOTS;
 use super::P2P_OUTBOUND_FULL_RELAY_SLOTS;
+use super::PACKAGE_INGRESS_MAX_BYTES;
 use super::TxIndexSpawn;
 use super::build_derived_index_open_spec;
 use super::derived_index_capabilities;
@@ -408,10 +409,10 @@ impl NodeState {
         };
         let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
             bitcoin_rs_p2p::P2pServiceConfig {
-                overlay: Arc::new(bitcoin_rs_p2p::overlay::OverlayConfig {
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
                     identity_dir: config.data_dir.join(&config.p2p.overlay.identity_dir),
                     ..config.p2p.overlay.clone()
-                }),
+                },
                 listen_addrs: config.p2p.listen.clone(),
                 address_book_path: Some(config.data_dir.join("peers.dat")),
                 asmap_path: config.p2p.asmap.clone(),
@@ -451,6 +452,7 @@ impl NodeState {
                     }
                 },
                 v2_transport: config.p2p.v2_transport,
+                relay_offers: config.p2p.relay_offers,
                 ..bitcoin_rs_p2p::P2pServiceConfig::default()
             },
             chainstate.shutdown_reader(),
@@ -463,8 +465,9 @@ impl NodeState {
             .take_inbound_blocks_receiver()
             .ok_or_else(|| anyhow::anyhow!("inbound blocks receiver already taken"))?;
         let (inbound_tx_tx, inbound_tx_rx_raw) =
-            crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundTx>(INBOUND_TX_CHANNEL_LIMIT);
+            crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBody>(INBOUND_TX_CHANNEL_LIMIT);
         let inbound_tx_rx = Mutex::new(Some(inbound_tx_rx_raw));
+        let package_capacity = bitcoin_rs_p2p::PackageCapacity::new(PACKAGE_INGRESS_MAX_BYTES);
         // The template-coordinator wake exists from node birth so the apply
         // path and the gateway can fire it before `run` builds the
         // coordinator; the coordinator attaches itself once constructed.
@@ -709,6 +712,7 @@ impl NodeState {
             p2p,
             inbound_tx_tx,
             inbound_tx_rx,
+            package_capacity,
             transition,
             chainstate,
             followers,

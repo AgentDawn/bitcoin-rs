@@ -46,6 +46,13 @@ pub(super) struct ScriptedChain {
 }
 
 impl ChainQuery for ScriptedChain {
+    fn stale_tip_announcement(
+        &self,
+        _tip: bitcoin_rs_primitives::Hash256,
+        _peer_tips: &[bitcoin_rs_primitives::Hash256],
+    ) -> Option<crate::dispatch::StaleTipHeaders> {
+        None
+    }
     fn headers_after(
         &self,
         _locator_hashes: &[BlockHash],
@@ -150,6 +157,14 @@ impl TxInventory for ScriptedTxs {
             .iter()
             .find(|tx| tx.wtxid().as_bytes() == wtxid.as_bytes())
             .cloned()
+    }
+
+    fn resident_ancestor_package(&self, _wtxid: Wtxid) -> Option<Vec<Wtxid>> {
+        None
+    }
+
+    fn resident_package(&self, _wtxids: &[Wtxid]) -> Option<Vec<Arc<Tx>>> {
+        None
     }
 }
 

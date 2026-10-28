@@ -5,7 +5,7 @@
 //! to manage the in-flight window budget. `crate::BlockStager` owns the
 //! matching inbound staging set. The node sync coordinator drives these
 //! types; it does not own the policy.
-use crate::PeerRemote;
+
 use std::time::{Duration, Instant};
 
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
@@ -183,7 +183,7 @@ const EWMA_MIN_SAMPLE_MS: u64 = 50;
 struct PendingBlock {
     /// The exact connection that owns this request. Same-address
     /// replacement must never inherit it: liveness is checked on the pair
-    /// `(owner.addr, owner.connection_id())`, not the address alone.
+    /// `(owner.endpoint, owner.connection_id())`, not the address alone.
     owner: PeerSource,
     requested_at: Instant,
     height: u32,
@@ -419,11 +419,29 @@ pub(crate) struct DownloadWindow {
     /// time. While inside `staller_cooldown` such a peer is not fan-out
     /// eligible and receives no block requests except as the last-resort peer.
     /// This prevents immediate re-acquisition of the same block stripe.
-    /// Keyed by [`PeerRemote`]: identified peers by endpoint, anonymous
-    /// (e.g. inbound Tor) sessions by [`PeerRemote::AnonymousTor`], which
-    /// carries the connection id, so unidentified stallers stay tracked per
-    /// connection instead of collapsing into one shared anonymous key.
-    recent_stallers: HashMap<PeerRemote, Instant>,
+    recent_stallers: HashMap<StallerKey, Instant>,
+}
+
+/// Identity a staller cooldown attaches to: the logical endpoint for
+/// identified peers, or the connection id for unidentified (anonymous,
+/// e.g. inbound Tor) sessions. Anonymous stallers are tracked per
+/// connection rather than silently skipped: a `None` endpoint must never
+/// collapse every anonymous session into one shared key or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum StallerKey {
+    /// Identified peer, keyed by logical endpoint.
+    Endpoint(crate::PeerEndpoint),
+    /// Unidentified session, keyed by its connection id.
+    Unidentified(crate::ConnectionId),
+}
+
+impl From<PeerSource> for StallerKey {
+    fn from(source: PeerSource) -> Self {
+        match source.endpoint() {
+            Some(endpoint) => Self::Endpoint(endpoint),
+            None => Self::Unidentified(source.connection_id()),
+        }
+    }
 }
 
 impl DownloadWindow {
@@ -1033,7 +1051,7 @@ impl DownloadWindow {
                 stored.info_logged = true;
             }
             tracing::info!(
-                peer_addr = ?episode.owner.addr,
+                peer_addr = ?episode.owner.endpoint,
                 front_hash = %episode.front_hash,
                 front_height = next_apply_height,
                 episode_age_ms = u64::try_from(now.duration_since(episode.since).as_millis())
@@ -1195,9 +1213,9 @@ impl DownloadWindow {
     /// peer delivering each front block just under the adaptive threshold is
     /// never disconnected (same exposure as Core) but is visible here and on
     /// the `node.sync.stall_seconds` gauge.
-    pub(crate) fn stalling_peer(&self) -> Option<(PeerRemote, Instant)> {
+    pub(crate) fn stalling_peer(&self) -> Option<(Option<crate::PeerEndpoint>, Instant)> {
         self.stall
-            .map(|episode| (episode.owner.addr, episode.since))
+            .map(|episode| (episode.owner.endpoint, episode.since))
     }
     /// Advances the cold-start front timer independently of the strong stall
     /// predicate. Returns a duplicate request only after the same apply-front
@@ -1298,6 +1316,29 @@ impl DownloadWindow {
     pub(crate) fn clear_preferred_peer(&mut self) {
         self.preferred_peer = None;
     }
+
+    /// Whether `source` was offered `hash` as a prefix-probe racer: its
+    /// `notfound` answers a question the node asked, so the scheduler
+    /// remembers it even though the owner keeps the request.
+    pub(crate) fn probe_offered(&self, source: PeerSource, hash: &Hash256) -> bool {
+        self.prefix_probe
+            .as_ref()
+            .is_some_and(|probe| probe.hashes.contains(hash) && probe.racers.contains_key(&source))
+    }
+
+    /// Whether `source` is the recorded hedge alternate racing for `hash`:
+    /// its `notfound` answers the duplicate request the node sent, so the
+    /// scheduler remembers it even though the owner keeps the request.
+    pub(crate) fn hedge_offered(&self, source: PeerSource, hash: &Hash256) -> bool {
+        matches!(
+            self.cold_front,
+            Some(ColdFrontState::Racing {
+                alternate,
+                hash: front,
+                owner: _,
+            }) if alternate == source && front == *hash
+        )
+    }
     /// Builds the one-shot common-prefix probe after a deep fallback request.
     pub(crate) fn prefix_probe_plan(
         &self,
@@ -1384,20 +1425,20 @@ impl DownloadWindow {
     }
 
     /// Starts the re-acquisition cooldown for an unresponsive peer.
-    /// Unidentified sessions cool down per connection via
-    /// [`PeerRemote::AnonymousTor`]; they are never silently skipped.
+    /// Unidentified sessions cool down per connection (see
+    /// [`StallerKey`]); they are never silently skipped.
     pub(crate) fn mark_peer_unresponsive(&mut self, source: PeerSource, now: Instant) {
         let cooldown = self.budget.staller_cooldown;
         self.recent_stallers
             .retain(|_, fired_at| now.duration_since(*fired_at) < cooldown);
-        self.recent_stallers.insert(source.addr, now);
+        self.recent_stallers.insert(StallerKey::from(source), now);
     }
 
     /// Whether `source` is in cooldown; such peers are a last resort so a
     /// reconnecting staller cannot immediately reacquire the window front.
     pub(crate) fn peer_in_staller_cooldown(&self, source: PeerSource, now: Instant) -> bool {
         self.recent_stallers
-            .get(&source.addr)
+            .get(&StallerKey::from(source))
             .is_some_and(|fired_at| now.duration_since(*fired_at) < self.budget.staller_cooldown)
     }
 
@@ -1546,7 +1587,7 @@ impl DownloadWindow {
     ///   fails `owns` is cancelled regardless of its racers, and a race left
     ///   with fewer than two racers is cancelled.
     /// INVARIANT: no fact here is compared by address alone.
-    ///   `recent_stallers` is keyed by [`PeerRemote`] (endpoint, or
+    ///   `recent_stallers` is keyed by [`StallerKey`] (endpoint, or
     ///   connection id for unidentified sessions) and stays exempt;
     ///   `stall` is untouched because the conviction paths own its release.
     pub(crate) fn retain_owned_by(&mut self, owns: impl Fn(&PeerSource) -> bool) {
@@ -2004,8 +2045,8 @@ impl DownloadWindow {
         }
         self.preferred_peer = Some(winner);
         tracing::info!(
-            owner = ?owner.addr,
-            winner = ?winner.addr,
+            owner = ?owner.endpoint,
+            winner = ?winner.endpoint,
             winner_is_owner = winner == owner,
             blocks = probe.hashes.len(),
             elapsed_ms = u64::try_from(now.duration_since(probe.started_at).as_millis()).unwrap_or(u64::MAX),
@@ -2042,8 +2083,8 @@ impl DownloadWindow {
                 self.mark_peer_unresponsive(owner, now);
                 self.preferred_peer = Some(alternate);
                 tracing::info!(
-                    owner = ?owner.addr,
-                    winner = ?alternate.addr,
+                    owner = ?owner.endpoint,
+                    winner = ?alternate.endpoint,
                     %hash,
                     "block sync: cold-front hedge elected alternate"
                 );
@@ -2472,13 +2513,13 @@ impl DownloadWindow {
     /// tick's request scan must reach in addition to fresh capacity.
     ///
     /// PRE: expiry has run this tick.
-    /// POST: returns the number of distinct `pending.owner.addr` values.
+    /// POST: returns the number of distinct `pending.owner.endpoint` values.
     /// INVARIANT: each address counts once, however many requests it owns.
     fn owner_address_count(&self) -> usize {
-        let mut owners: SmallVec<[PeerRemote; 16]> = SmallVec::new();
+        let mut owners: SmallVec<[Option<crate::PeerEndpoint>; 16]> = SmallVec::new();
         for pending in self.pending.values() {
-            if !owners.contains(&pending.owner.addr) {
-                owners.push(pending.owner.addr);
+            if !owners.contains(&pending.owner.endpoint) {
+                owners.push(pending.owner.endpoint);
             }
         }
         owners.len()

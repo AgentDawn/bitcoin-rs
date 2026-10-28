@@ -72,8 +72,7 @@ const MAX_PARKED_DIALS: usize = 64;
 pub struct P2pServiceConfig {
     /// Addresses on which inbound P2P connections are accepted.
     pub listen_addrs: Vec<std::net::SocketAddr>,
-    /// Opt-in overlay routing and service configuration.
-    pub overlay: Arc<crate::overlay::OverlayConfig>,
+
     /// Network message-start bytes.
     pub magic: Magic,
     /// Auxiliary peer-book base/legacy path. The owner adds the P2P magic to
@@ -109,6 +108,12 @@ pub struct P2pServiceConfig {
     ///
     /// [`ConnectionShared::v2_transport`]: crate::listener::ConnectionShared::v2_transport
     pub v2_transport: bool,
+    /// The opt-in relay capabilities connections offer: BIP331 ancestor
+    /// package relay and BIP332 stale-tip relay. Both are off by default; a
+    /// peer relays packages or stale tips only after both sides negotiate it.
+    /// The value is final: the node resolves any network policy before it
+    /// reaches the service, and nothing below re-checks the network.
+    pub relay_offers: crate::RelayOffers,
     /// Outbound block-relay-only connection slots (blocks only, no `tx` or
     /// `addr`).
     pub outbound_block_relay_slots: usize,
@@ -116,6 +121,10 @@ pub struct P2pServiceConfig {
     pub outbound_queue_limit: usize,
     /// Inbound block queue capacity.
     pub inbound_block_queue_limit: usize,
+    /// Overlay transports (Tor/I2P): proxies, Tor control, SAM bridge,
+    /// key persistence paths, and the onlynet restriction. Default
+    /// disables every overlay.
+    pub overlay: crate::overlay::OverlayConfig,
 }
 
 impl Default for P2pServiceConfig {
@@ -138,7 +147,8 @@ impl Default for P2pServiceConfig {
             inbound_block_queue_limit: DEFAULT_INBOUND_BLOCK_QUEUE_LIMIT,
             local_services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
             v2_transport: false,
-            overlay: Arc::new(crate::overlay::OverlayConfig::default()),
+            relay_offers: crate::RelayOffers::default(),
+            overlay: crate::overlay::OverlayConfig::default(),
         }
     }
 }
@@ -174,6 +184,22 @@ impl P2pServiceConfig {
             .saturating_sub(self.outbound_block_relay_slots)
     }
 
+    /// Hands the per-connection settings to one start epoch's shared wiring.
+    ///
+    /// PRE: `shared` was built by `ConnectionShared::new` for this start.
+    /// POST: every connection cloned from `shared` reads the configured
+    ///   inbound capacity, services, transport choice, and relay-feature
+    ///   switches.
+    /// INVARIANT: this is the only place the service configuration reaches
+    ///   these `ConnectionShared` fields, and each switch maps to exactly its
+    ///   own field.
+    fn apply_to(&self, shared: &mut crate::listener::ConnectionShared) {
+        shared.max_inbound = self.max_inbound();
+        shared.local_services = self.local_services;
+        shared.v2_transport = self.v2_transport;
+        shared.relay_offers = self.relay_offers;
+        shared.dial_routes = self.overlay.dial_routes();
+    }
 }
 
 /// Errors returned while starting P2P workers.
@@ -188,6 +214,9 @@ pub enum P2pServiceError {
     /// A listener could not bind or run.
     #[error(transparent)]
     Listener(#[from] ListenerError),
+    /// An overlay transport (Tor control, SAM session) could not start.
+    #[error("p2p overlay setup: {0}")]
+    Overlay(io::Error),
 }
 
 /// Errors returned when joining P2P workers after shutdown.
@@ -231,6 +260,7 @@ struct Workers {
     outbound: Option<JoinHandle<()>>,
     bootstrap: Option<JoinHandle<()>>,
     overlay_threads: Vec<JoinHandle<()>>,
+    sam_session: Option<Arc<crate::sam::SamSession>>,
 }
 
 impl Default for Workers {
@@ -242,6 +272,7 @@ impl Default for Workers {
             outbound: None,
             bootstrap: None,
             overlay_threads: Vec::new(),
+            sam_session: None,
         }
     }
 }
@@ -255,6 +286,7 @@ impl Workers {
             outbound: None,
             bootstrap: None,
             overlay_threads: Vec::new(),
+            sam_session: None,
         }
     }
 
@@ -262,6 +294,9 @@ impl Workers {
         self.session_cancel.store(true, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         peer_table.cancel_all();
+        if let Some(session) = &self.sam_session {
+            session.close();
+        }
         addresses.lock().clear();
     }
 
@@ -516,8 +551,8 @@ impl P2pService {
             config.allow_local_addresses,
             config.asmap_path.as_deref(),
         );
-        let overlay = Arc::new(crate::overlay::OverlayTransport::new(Arc::clone(
-            &config.overlay,
+        let overlay = Arc::new(crate::overlay::OverlayTransport::new(Arc::new(
+            config.overlay.clone(),
         )));
         let mut banned = BannedReader::with_protection(
             Arc::new(RwLock::new(Vec::new())),
@@ -612,8 +647,6 @@ impl P2pService {
         *self.session_cancel.lock() = Arc::clone(&session_cancel);
         *self.worker_shutdown.lock() = Arc::clone(&epoch_shutdown);
 
-        self.config.overlay.validate()?;
-
         let mut workers = Workers::new(Arc::clone(&epoch_shutdown), Arc::clone(&session_cancel));
 
         match self.start_workers(
@@ -647,6 +680,7 @@ impl P2pService {
         peer_ready: &Arc<dyn Fn(crate::PeerSource) + Send + Sync>,
         extras: crate::listener::ListenerExtras,
     ) -> Result<(), P2pServiceError> {
+        self.config.overlay.validate()?;
         let mut bound_listeners = Vec::with_capacity(self.config.listen_addrs.len());
         for addr in &self.config.listen_addrs {
             if !self
@@ -676,15 +710,19 @@ impl P2pService {
             sync_wake_tx.cloned(),
             extras,
         );
-        shared.max_inbound = self.config.max_inbound();
-        shared.local_services = self.config.local_services;
-        shared.v2_transport = self.config.v2_transport;
+        self.config.apply_to(&mut shared);
         shared.overlay = Arc::clone(&self.overlay);
         shared.address_book = Some(Arc::clone(&self.address_book));
+        self.address_book.set_addrv2_gossip(
+            self.config.overlay.tor_configured(),
+            self.config.overlay.i2p_configured(),
+        );
         shared = shared.with_shared_outbound(&self.shared_outbound);
 
-        let listeners = self.overlay.start(&shared, &workers.shutdown)?;
-        workers.listeners.extend(listeners);
+        let worker_shutdown = self.worker_shutdown.lock().clone();
+        workers
+            .listeners
+            .extend(self.overlay.start(&shared, &worker_shutdown)?);
         for (listener_addr, listener) in bound_listeners {
             let shutdown = Arc::clone(&workers.shutdown);
             let shared = shared.clone();
@@ -694,6 +732,10 @@ impl P2pService {
             workers.listeners.push(handle);
         }
 
+        // Snapshot the fully populated dial routes (SAM session included)
+        // before `shared` moves into the outbound worker: overlay
+        // configuration never changes after this start.
+        let routes = crate::RouteTable::from_routes(&shared.dial_routes);
         let dial_allowance = shared.block_sync.clone();
         let outbound = self.spawn_outbound_worker(shared, &workers.shutdown)?;
         workers.outbound = Some(outbound);
@@ -702,6 +744,7 @@ impl P2pService {
             dial_allowance,
             chain_query.cloned(),
             &workers.shutdown,
+            routes,
         )?;
         workers.bootstrap = bootstrap;
 
@@ -859,6 +902,7 @@ impl P2pService {
         block_sync: Option<Arc<crate::sync::BlockSync>>,
         chain_query: Option<Arc<dyn crate::ChainQuery>>,
         shutdown: &Arc<AtomicBool>,
+        routes: crate::RouteTable,
     ) -> Result<Option<JoinHandle<()>>, io::Error> {
         if !self.config.fixed_peers.is_empty() {
             let shutdown = Arc::clone(shutdown);
@@ -904,6 +948,7 @@ impl P2pService {
             address_book: Arc::clone(&self.address_book),
             banned: self.banned_reader(),
             manual_nodes: Arc::clone(&self.added_nodes),
+            routes,
         };
         thread::Builder::new()
             .name("bitcoin-rs-address-maintenance".to_owned())
@@ -917,19 +962,20 @@ impl P2pService {
         // and its overlay startup polls this counter, so this is what lets
         // it abort instead of making this call wait out its budget.
         self.stop_requests.fetch_add(1, Ordering::AcqRel);
-        // Capture restart anchors before cancellation: `anchor_peers` skips
-        // cancelled leases, so a later capture would always be empty.
+        // Capture before cancelling: `anchor_peers` excludes cancelled leases,
+        // so cancelling first would leave nothing to persist for restart.
         let demonstrated = anchor_peers(&self.peer_table, &self.address_book);
-        if !demonstrated.is_empty() {
-            self.address_book
-                .remember_anchors(&demonstrated, crate::addrman::now());
-        }
         if let Some(workers) = self.workers.lock().as_mut() {
             workers.cancel(&self.peer_table, &self.overlay_addresses);
         }
         self.worker_shutdown.lock().store(true, Ordering::Release);
         self.session_cancel.lock().store(true, Ordering::Release);
         self.overlay_addresses.lock().clear();
+        if !demonstrated.is_empty() {
+            self.address_book
+                .remember_anchors(&demonstrated, crate::addrman::now());
+        }
+
         self.peer_table
             .set_network_active(&self.network_active, false);
         self.address_book
@@ -1309,6 +1355,7 @@ fn spawn_feeler(
     let mut addresses: Vec<_> = active.keys().copied().collect();
     addresses.extend_from_slice(&connected);
     let policy = shared.banned.automatic_snapshot(SystemTime::now());
+    let routes = crate::RouteTable::from_routes(&shared.dial_routes);
     let Some(addr) = book.feeler(&addresses, &connected, crate::addrman::now(), |addr| {
         !is_manual_endpoint(manual, addr) && policy.allows(addr.address())
     }) else {
@@ -1369,7 +1416,7 @@ fn bootstrap_fixed_peer_endpoints<R, I>(
             break 'endpoints;
         }
         // Typed endpoints dial without any DNS: an onion/I2P fixed peer
-        // reaches `OverlayTransport::connect` and fails transport-unavailable
+        // reaches `connect_peer_stream` and fails transport-unavailable
         // there, never a system-DNS lookup or a direct-TCP fallback.
         // Malformed overlay names are rejected locally and MUST NOT fall
         // through to system DNS resolution.
@@ -1730,11 +1777,11 @@ fn retire_extra_full_relay_connection(
     }) else {
         return;
     };
-    if session.addr.endpoint().is_some_and(|endpoint| {
+    if session.endpoint.is_some_and(|endpoint| {
         peer_table.disconnect_connection(endpoint, session.lease.connection_id())
     }) {
         tracing::info!(
-            peer_addr = ?session.addr,
+            peer_addr = ?session.endpoint,
             "p2p retiring the extra full-relay connection: the tip is moving again"
         );
     }
@@ -1791,7 +1838,7 @@ fn newest_excess_full_relay(
         .find(|session| {
             now.saturating_duration_since(session.lease.connected_at())
                 >= crate::download_window::MINIMUM_CONNECT_TIME
-                && !is_downloading(session.lease.source(session.addr))
+                && !is_downloading(session.lease.source(session.endpoint))
         })
         .cloned()
 }
@@ -1839,7 +1886,11 @@ struct AddressMaintenance {
     chain_query: Option<Arc<dyn crate::ChainQuery>>,
     address_book: Arc<crate::addrman::AddressBook>,
     banned: BannedReader,
-    manual_nodes: Arc<RwLock<Vec<PeerEndpoint>>>,
+    manual_nodes: Arc<RwLock<Vec<crate::PeerEndpoint>>>,
+    /// Immutable snapshot of the local dial routes, taken after overlay
+    /// startup. Selection denies unroutable endpoints before any worker,
+    /// thread, or address-book claim is spent.
+    routes: crate::RouteTable,
 }
 
 fn park_automatic_dial(
@@ -2059,7 +2110,11 @@ fn run_address_maintenance(maintenance: &AddressMaintenance) {
             ) {
                 for seed in &maintenance.seeds {
                     match crate::peer::DnsResolver::resolve(&resolver, seed) {
-                        Ok(addresses) => maintenance.address_book.learn_dns(seed, &addresses, now),
+                        Ok(addresses) => maintenance.address_book.learn_dns(
+                            seed,
+                            &addresses,
+                            now,
+                        ),
                         Err(error) => tracing::warn!(seed, %error, "DNS bootstrap unavailable"),
                     }
                 }
@@ -2215,7 +2270,8 @@ mod tests {
     use super::*;
     use crate::PeerSource;
     use bitcoin_rs_primitives::PeerEndpoint;
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn feeler_poisson_delay_matches_actual_core_uniform_vectors() {
@@ -2233,6 +2289,53 @@ mod tests {
 
     fn idle_ready() -> Arc<dyn Fn(PeerSource) + Send + Sync> {
         Arc::new(|_source: PeerSource| {})
+    }
+
+    #[test]
+    fn relay_feature_switches_default_off_and_reach_connections_independently() {
+        let (headers, _) = crossbeam_channel::bounded(1);
+        let (blocks, _) = crossbeam_channel::bounded(1);
+        let mut shared = crate::listener::ConnectionShared::new(
+            Arc::new(crate::PeerTable::new()),
+            BannedReader::fixture_empty(),
+            Arc::new(crate::NetworkActivity::from_shared(Arc::new(
+                AtomicBool::new(true),
+            ))),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Magic::REGTEST,
+            headers,
+            blocks,
+            None,
+            None,
+            crate::listener::ListenerExtras::default(),
+        );
+        P2pServiceConfig::default().apply_to(&mut shared);
+        assert_eq!(shared.relay_offers, crate::RelayOffers::default());
+
+        for offers in [
+            crate::RelayOffers {
+                package_relay: true,
+                ..crate::RelayOffers::default()
+            },
+            crate::RelayOffers {
+                stale_tip_relay: true,
+                ..crate::RelayOffers::default()
+            },
+            crate::RelayOffers {
+                stale_tip_relay: true,
+                stale_tip_prefers_blocks: true,
+                ..crate::RelayOffers::default()
+            },
+            crate::RelayOffers::default(),
+        ] {
+            P2pServiceConfig {
+                relay_offers: offers,
+                ..P2pServiceConfig::default()
+            }
+            .apply_to(&mut shared);
+            assert_eq!(shared.relay_offers, offers);
+        }
     }
 
     #[test]
@@ -2308,6 +2411,35 @@ mod tests {
             .expect("empty listen set starts");
         service.shutdown();
         service.join().expect("clean join");
+    }
+
+    #[test]
+    fn overlay_workers_are_retained_for_join_and_rollback() {
+        let dir = tempfile::tempdir().expect("identity dir");
+        let mut config = P2pServiceConfig::default();
+        config.overlay.onion_proxy = Some(SocketAddr::from(([127, 0, 0, 1], 19051)));
+        config.overlay.tor_control = Some(SocketAddr::from(([127, 0, 0, 1], 19052)));
+        config.overlay.identity_dir = dir.path().to_path_buf();
+        let service = P2pService::new(config, Arc::new(AtomicBool::new(false)));
+        service
+            .start(
+                None,
+                None,
+                &idle_ready(),
+                crate::listener::ListenerExtras::default(),
+            )
+            .expect("overlay start succeeds");
+        {
+            let workers = service.workers.lock();
+            let workers = workers.as_ref().expect("workers installed");
+            assert_eq!(
+                workers.listeners.len(),
+                1,
+                "overlay.start handles must be retained for rollback and join"
+            );
+        }
+        service.shutdown();
+        service.join().expect("join waits for overlay teardown");
     }
 
     #[test]
@@ -2556,10 +2688,9 @@ mod tests {
         assert_eq!(
             newest_excess_full_relay(&table, 2, now, |_| false)
                 .expect("the pinned connection is not a candidate")
-                .addr
-                .endpoint()
+                .endpoint
                 .expect("identified excess peer"),
-            excess.addr.endpoint().expect("identified excess peer"),
+            excess.endpoint.expect("identified excess peer"),
             "the newest automatic connection stays the victim while a pinned one is newer"
         );
     }
@@ -2632,7 +2763,7 @@ mod tests {
         table.register(addr(4), downloading);
         let source = table
             .lease(addr(4))
-            .map(|lease| lease.source(addr(4)))
+            .map(|lease| lease.source(Some(addr(4))))
             .expect("the downloading excess peer is registered");
 
         assert!(
@@ -2798,6 +2929,7 @@ mod tests {
                 chain_query: None,
                 address_book: book,
                 banned: BannedReader::fixture_empty(),
+                routes: crate::RouteTable::default(),
             },
             rx,
         )
@@ -2862,6 +2994,8 @@ mod tests {
             table.register(addr, lease.clone());
             let info = crate::PeerInfo {
                 addr: crate::PeerRemote::Endpoint(addr),
+                endpoint: Some(addr),
+                network: addr.net(),
                 version: 70016,
                 wtxid_relay: false,
                 relay_transactions: true,
@@ -2873,9 +3007,10 @@ mod tests {
                 best_known_height: 0,
                 conn_time: 0,
                 inbound: false,
-                addr_bind: addr
-                    .socket_addr()
-                    .unwrap_or_else(|| panic!("expected IP fixture")),
+                addr_bind: crate::TransportRemote::new(
+                    addr.socket_addr()
+                        .unwrap_or_else(|| panic!("expected IP fixture")),
+                ),
                 time_offset: 0,
                 counters: Arc::new(crate::PeerCounters::default()),
                 transport: crate::TransportProtocol::V1,
@@ -3404,7 +3539,7 @@ mod tests {
             assert!(table.publish_info(address, &lease, info));
             if port != 1 {
                 assert!(table.note_announced_tip(
-                    lease.source(address),
+                    lease.source(Some(address)),
                     bitcoin_rs_primitives::Hash256::from_le_bytes(&[7; 32]),
                     Some(2)
                 ));
@@ -3675,6 +3810,34 @@ mod tests {
             "a different port is a different endpoint"
         );
     }
+    #[test]
+    fn onlynet_prefilter_selects_no_forbidden_network_dial() {
+        let (mut maintenance, queue) = maintenance_fixture(4);
+        maintenance.routes.onlynet = vec![crate::NetworkLabel::Onion];
+        let now = 10_000;
+        queue_address_candidates(&maintenance, now, SystemTime::now(), 0);
+        assert!(
+            queue.try_recv().is_err(),
+            "an IP-heavy book under onlynet=onion must queue no ordinary dial"
+        );
+        let book = &maintenance.address_book;
+        let anchor = book
+            .select(&[], &[], now, u64::MAX, |_| true)
+            .expect("eligible ordinary candidate");
+        book.succeeded(anchor, 9, now);
+        book.remember_anchors(&[anchor], now);
+        assert_eq!(book.take_restart_anchors(now), vec![anchor]);
+        assert!(
+            book.anchor_eligible(anchor, &[], now),
+            "the anchor would otherwise be selectable"
+        );
+        let mut anchors = VecDeque::from(vec![anchor]);
+        queue_restart_anchors(&maintenance, &mut anchors, &mut None, &mut Vec::new(), now);
+        assert!(
+            queue.try_recv().is_err(),
+            "anchor selection must honor the route prefilter"
+        );
+    }
     fn register_ready_block_peer(table: &crate::PeerTable, addr: PeerEndpoint) -> crate::PeerLease {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new_block_relay(sender);
@@ -3696,7 +3859,7 @@ mod tests {
         table.register(addr, lease.clone());
         assert!(table.publish_info(addr, &lease, info));
         assert!(table.note_announced_tip(
-            lease.source(addr),
+            lease.source(Some(addr)),
             bitcoin_rs_primitives::Hash256::from_le_bytes(&[7; 32]),
             Some(1)
         ));
@@ -3833,7 +3996,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_publishes_captured_anchors_without_a_maintenance_worker_or_join() {
+    fn shutdown_captures_anchors_before_cancelling_workers() {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().join("peers.dat");
         let service = P2pService::new(
@@ -3849,9 +4012,17 @@ mod tests {
         let now = crate::addrman::now();
         service.address_book.learn_dns("fixture", &[addr], now);
         service.address_book.succeeded(addr, 9, now);
-        let _lease = register_ready_block_peer(&service.peer_table, addr);
-        assert!(service.workers.lock().is_none());
+        let lease = register_ready_block_peer(&service.peer_table, addr);
+        // Install an epoch so `shutdown` runs its worker-cancellation path
+        // (`cancel_all`); without it the anchor capture is never racing a
+        // cancel and the test would pass even with the old ordering.
+        *service.workers.lock() = Some(Workers::default());
+        assert!(service.workers.lock().is_some());
         service.shutdown();
+        assert!(
+            lease.is_cancelled(),
+            "shutdown must cancel live sessions"
+        );
         let restored =
             crate::addrman::AddressBook::open(Some(path), Magic::REGTEST.to_bytes(), true, None);
         assert_eq!(restored.take_restart_anchors(now), vec![addr]);
@@ -4079,6 +4250,13 @@ mod tests {
         pause: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     }
     impl crate::ChainQuery for ServiceTip {
+        fn stale_tip_announcement(
+            &self,
+            _: bitcoin_rs_primitives::Hash256,
+            _: &[bitcoin_rs_primitives::Hash256],
+        ) -> Option<crate::dispatch::StaleTipHeaders> {
+            None
+        }
         fn headers_after(
             &self,
             _: &[bitcoin_rs_primitives::BlockHash],
@@ -4610,4 +4788,497 @@ mod tests {
         assert!(bounded_rx.try_recv().is_err());
     }
 
+    /// Structurally valid I2P destination (384 zero key bytes plus an
+    /// Ed25519/X25519 key certificate), base64-encoded.
+    fn sam_destination() -> String {
+        format!("{}BQAEAAcABA==", "A".repeat(512))
+    }
+
+    /// [`sam_destination`] followed by 64 private key bytes.
+    fn sam_private_destination() -> String {
+        format!(
+            "{}BQAEAAcABAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "A".repeat(512)
+        )
+    }
+
+    /// The endpoint a session on the fixture bridge publishes.
+    fn sam_endpoint() -> crate::PeerEndpoint {
+        let bytes =
+            crate::sam::i2p_base64_decode(&sam_destination()).expect("fixture destination decodes");
+        crate::PeerEndpoint::I2p {
+            hash: crate::sam::destination_hash(&bytes),
+            port: 8333,
+        }
+    }
+
+    /// Shared state of one [`SamBridge`].
+    struct BridgeState {
+        /// While false, the `SESSION CREATE` reply is withheld.
+        release: AtomicBool,
+        stop: AtomicBool,
+        /// How many leading `HELLO` commands are answered with version 3.1,
+        /// which the client refuses at once.
+        unsupported_hellos: AtomicUsize,
+        create_seen: Sender<()>,
+        hung_up: Sender<()>,
+    }
+
+    /// Scripted SAM bridge. It answers every command at once, except that
+    /// the `SESSION CREATE` reply waits for `release`: the pinned bridge
+    /// answers it only once its destination is ready, which can take two
+    /// minutes.
+    struct SamBridge {
+        addr: SocketAddr,
+        state: Arc<BridgeState>,
+        /// One signal per `SESSION CREATE` the bridge received.
+        create_seen: Receiver<()>,
+        /// One signal per client that closed its connection while the
+        /// `SESSION CREATE` reply was held.
+        hung_up: Receiver<()>,
+        accept: Option<JoinHandle<()>>,
+        connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    }
+
+    impl SamBridge {
+        /// A bridge that withholds the `SESSION CREATE` reply until
+        /// [`SamBridge::release`].
+        fn holding_session_create() -> Self {
+            Self::spawn(0)
+        }
+
+        /// A bridge whose first `HELLO` negotiates 3.1, which the client
+        /// refuses for good, and whose later ones negotiate 3.3.
+        fn refusing_first_hello() -> Self {
+            // No client has connected yet, so releasing here is not a race.
+            let bridge = Self::spawn(1);
+            bridge.release();
+            bridge
+        }
+
+        /// Starts a bridge that holds `SESSION CREATE` replies until
+        /// [`SamBridge::release`].
+        fn spawn(unsupported_hellos: usize) -> Self {
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .expect("bind sam bridge");
+            let addr = listener.local_addr().expect("sam bridge address");
+            let (create_seen_tx, create_seen) = crossbeam_channel::unbounded();
+            let (hung_up_tx, hung_up) = crossbeam_channel::unbounded();
+            let state = Arc::new(BridgeState {
+                release: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
+                unsupported_hellos: AtomicUsize::new(unsupported_hellos),
+                create_seen: create_seen_tx,
+                hung_up: hung_up_tx,
+            });
+            let connections = Arc::new(Mutex::new(Vec::new()));
+            let accept = {
+                let state = Arc::clone(&state);
+                let connections = Arc::clone(&connections);
+                thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        let Ok(stream) = stream else { break };
+                        if state.stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let state = Arc::clone(&state);
+                        connections
+                            .lock()
+                            .push(thread::spawn(move || serve_sam_connection(&stream, &state)));
+                    }
+                })
+            };
+            Self {
+                addr,
+                state,
+                create_seen,
+                hung_up,
+                accept: Some(accept),
+                connections,
+            }
+        }
+
+        /// Answers every withheld and later `SESSION CREATE`.
+        fn release(&self) {
+            self.state.release.store(true, Ordering::Release);
+        }
+    }
+
+    impl Drop for SamBridge {
+        fn drop(&mut self) {
+            self.state.stop.store(true, Ordering::Release);
+            self.release();
+            // A throwaway connection wakes the blocking accept loop.
+            let _ = TcpStream::connect(self.addr);
+            if let Some(accept) = self.accept.take() {
+                let _ = accept.join();
+            }
+            let connections = std::mem::take(&mut *self.connections.lock());
+            for connection in connections {
+                let _ = connection.join();
+            }
+        }
+    }
+
+    /// Releases a bridge's hold when dropped, so a start parked on a held
+    /// reply ends on every exit path, a failed assertion included.
+    struct ReleaseOnDrop(Arc<BridgeState>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release.store(true, Ordering::Release);
+        }
+    }
+
+    fn timed_out(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        )
+    }
+
+    /// Waits out the withheld `SESSION CREATE` reply. False when the bridge
+    /// stopped, or the client closed the connection, before the release.
+    fn wait_for_release(reader: &mut impl std::io::Read, state: &BridgeState) -> bool {
+        let mut byte = [0u8; 1];
+        while !state.release.load(Ordering::Acquire) {
+            if state.stop.load(Ordering::Acquire) {
+                return false;
+            }
+            match reader.read(&mut byte) {
+                Ok(read) if read > 0 => {}
+                Err(error) if timed_out(&error) => {}
+                // End of stream or a reset: the client gave up on the reply.
+                Ok(_) | Err(_) => {
+                    let _ = state.hung_up.send(());
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The bridge's reply to `command`; `None` ends the connection.
+    fn bridge_reply(
+        command: &str,
+        state: &BridgeState,
+        reader: &mut impl std::io::Read,
+    ) -> Option<String> {
+        let destination = sam_destination();
+        if command.starts_with("HELLO") {
+            let refused = state
+                .unsupported_hellos
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            let version = if refused { "3.1" } else { "3.3" };
+            Some(format!("HELLO REPLY RESULT=OK VERSION={version}\n"))
+        } else if command.starts_with("DEST GENERATE") {
+            Some(format!(
+                "DEST REPLY PUB={destination} PRIV={}\n",
+                sam_private_destination()
+            ))
+        } else if command.starts_with("SESSION CREATE") {
+            let _ = state.create_seen.send(());
+            wait_for_release(reader, state)
+                .then(|| format!("SESSION STATUS RESULT=OK DESTINATION={destination}\n"))
+        } else if command.starts_with("NAMING LOOKUP") {
+            Some(format!(
+                "NAMING REPLY RESULT=OK NAME=ME VALUE={destination}\n"
+            ))
+        } else {
+            Some("SESSION STATUS RESULT=I2P_ERROR\n".to_owned())
+        }
+    }
+
+    /// Serves one bridge connection until the client or the bridge ends it.
+    fn serve_sam_connection(stream: &TcpStream, state: &BridgeState) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        // A short read timeout lets the worker notice `stop`, and a client
+        // that closed its end while a reply is held.
+        if stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .is_err()
+        {
+            return;
+        }
+        let Ok(clone) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(clone);
+        let mut writer = stream;
+        let mut pending = Vec::new();
+        while !state.stop.load(Ordering::Acquire) {
+            match reader.read_until(b'\n', &mut pending) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) if timed_out(&error) => continue,
+                Err(_) => return,
+            }
+            if pending.last() != Some(&b'\n') {
+                continue;
+            }
+            let command = String::from_utf8_lossy(&pending).trim_end().to_owned();
+            pending.clear();
+            let Some(reply) = bridge_reply(&command, state, &mut reader) else {
+                return;
+            };
+            if writer.write_all(reply.as_bytes()).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A service whose only overlay is the I2P bridge at `bridge`.
+    fn i2p_service(bridge: SocketAddr) -> P2pService {
+        P2pService::new(
+            P2pServiceConfig {
+                overlay: crate::overlay::OverlayConfig {
+                    i2p_sam: Some(bridge),
+                    ..crate::overlay::OverlayConfig::default()
+                },
+                ..P2pServiceConfig::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Polls `condition` until it holds; false once `limit` has passed.
+    fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !condition() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// A `shutdown` must end a `start` parked in the SAM bridge's readiness
+    /// wait: the wait lasts up to two minutes, and `shutdown` itself needs
+    /// the worker slot that start holds. The failed start publishes neither
+    /// a route nor an address, and a restart the operator then permits works.
+    ///
+    /// Removing the cancellation (the stop counter in the startup predicate,
+    /// or its increment in `shutdown`) leaves the start parked until the gate
+    /// opens, so `interrupted` fails.
+    #[test]
+    fn shutdown_interrupts_an_i2p_start_held_in_root_readiness_and_a_restart_publishes() {
+        let bridge = SamBridge::holding_session_create();
+        let service = i2p_service(bridge.addr);
+        let queued: crate::PeerEndpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333)).into();
+        service
+            .outbound_tx
+            .try_send(OutboundDial::auto(queued))
+            .expect("queue a dial for the route probe");
+
+        let (held, interrupted, hung_up, started) = thread::scope(|scope| {
+            let _unhold = ReleaseOnDrop(Arc::clone(&bridge.state));
+            let start = scope.spawn(|| {
+                service.start(
+                    None,
+                    None,
+                    &idle_ready(),
+                    crate::listener::ListenerExtras::default(),
+                )
+            });
+            // The bridge has the `SESSION CREATE` and is withholding its
+            // reply, so the start is inside the readiness wait.
+            let held = bridge
+                .create_seen
+                .recv_timeout(Duration::from_secs(10))
+                .is_ok();
+            let stopper = scope.spawn(|| service.shutdown());
+            let interrupted = wait_until(Duration::from_secs(10), || start.is_finished());
+            // The bridge still holds its reply, so the only way it learns of
+            // the abandoned root is the client closing that connection.
+            let hung_up = bridge.hung_up.recv_timeout(Duration::from_secs(5)).is_ok();
+            bridge.release();
+            let started = start.join().expect("start thread");
+            stopper.join().expect("shutdown thread");
+            (held, interrupted, hung_up, started)
+        });
+
+        assert!(held, "the start never reached the bridge's readiness wait");
+        assert!(
+            interrupted,
+            "shutdown must end a start held in root readiness"
+        );
+        assert!(
+            matches!(
+                &started,
+                Err(P2pServiceError::Overlay(error)) if error.kind() == io::ErrorKind::Interrupted
+            ),
+            "an interrupted start reports the cancellation, got {started:?}"
+        );
+        assert!(
+            service.overlay_addresses().is_empty(),
+            "an interrupted start publishes no overlay address"
+        );
+        assert!(
+            service.workers.lock().is_none(),
+            "an interrupted start publishes no workers, so no route"
+        );
+        assert_eq!(
+            service.outbound_rx.lock().len(),
+            1,
+            "no outbound worker exists to drain the queued dial"
+        );
+        assert!(
+            hung_up,
+            "the abandoned root exchange must be closed, not left on the bridge"
+        );
+        service
+            .join()
+            .expect("an interrupted start leaves the service joinable");
+
+        service
+            .outbound_rx
+            .lock()
+            .try_recv()
+            .expect("drain the probe dial");
+        service.set_network_active(true);
+        service
+            .start(
+                None,
+                None,
+                &idle_ready(),
+                crate::listener::ListenerExtras::default(),
+            )
+            .expect("a restart after the interrupted start");
+        assert_eq!(service.overlay_addresses(), vec![sam_endpoint()]);
+        service.shutdown();
+        service.join().expect("restarted join");
+        assert_eq!(
+            service.overlay_addresses(),
+            Vec::<crate::PeerEndpoint>::new()
+        );
+    }
+
+    /// A failed `start` tears its own epoch down while it still holds the
+    /// worker slot, so a `start` that follows cannot publish before that
+    /// teardown ends, and the teardown cannot erase what the next epoch
+    /// published. The failed teardown's address-list clear is its last step
+    /// and is parked here; its peer cancellation, the step before it,
+    /// reports through the registered peer.
+    ///
+    /// Releasing the slot before the teardown, or dropping the teardown's
+    /// cancellation, fails this test: the slot is free once the peer is
+    /// cancelled, the next start reaches the bridge while the teardown is
+    /// still parked, or the peer is never cancelled. The final address
+    /// assertion is an end-to-end check of the surviving epoch, not the
+    /// discriminating one.
+    #[test]
+    fn failed_start_finishes_its_teardown_before_the_next_start_can_publish() {
+        /// What the race scenario observed, read only after every thread ended.
+        struct Observed {
+            /// The failed start's teardown reached its peer cancellation.
+            torn_down: bool,
+            /// The worker slot was still held at that point.
+            slot_held: bool,
+            /// The bridge observation while the prior teardown was parked.
+            early_create: Result<(), crossbeam_channel::RecvTimeoutError>,
+            /// The next start reached the bridge once the teardown ended.
+            reached_bridge: bool,
+            failed: Result<(), P2pServiceError>,
+            next: Result<(), P2pServiceError>,
+        }
+        // The first start's key step meets a bridge that does not speak 3.3,
+        // which fails at once and for good; the next start meets a healthy one.
+        let bridge = SamBridge::refusing_first_hello();
+        let service = i2p_service(bridge.addr);
+        let (frames, _outbound) = crossbeam_channel::unbounded();
+        let peer = crate::PeerLease::new(frames);
+        service.peer_table.register(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 8334)),
+            peer.clone(),
+        );
+
+        let observed = thread::scope(|scope| {
+            let parked = service.overlay_addresses.lock();
+            let failed = scope.spawn(|| {
+                service.start(
+                    None,
+                    None,
+                    &idle_ready(),
+                    crate::listener::ListenerExtras::default(),
+                )
+            });
+            let torn_down = wait_until(Duration::from_secs(10), || peer.is_cancelled());
+            let slot_held = service.workers.try_lock().is_none();
+            let next = scope.spawn(|| {
+                service.start(
+                    None,
+                    None,
+                    &idle_ready(),
+                    crate::listener::ListenerExtras::default(),
+                )
+            });
+            // Only the next start sends `SESSION CREATE`; the failed one stops
+            // at its first `HELLO`. While the failed teardown is parked, the
+            // next start cannot take the slot, so it cannot reach the bridge.
+            // This probe is bounded: it can miss a late scheduler, but it can
+            // never fail a correct implementation. The slot probe above is the
+            // deterministic check.
+            let early_create = bridge.create_seen.recv_timeout(Duration::from_millis(500));
+            drop(parked);
+            let failed = failed.join().expect("failed start thread");
+            let next = next.join().expect("next start thread");
+            let reached_bridge = bridge
+                .create_seen
+                .recv_timeout(Duration::from_secs(5))
+                .is_ok();
+            Observed {
+                torn_down,
+                slot_held,
+                early_create,
+                reached_bridge,
+                failed,
+                next,
+            }
+        });
+
+        assert!(
+            observed.torn_down,
+            "the failed start must cancel its peers in its teardown"
+        );
+        assert!(
+            observed.slot_held,
+            "the failed start must keep the worker slot until its teardown ends"
+        );
+        assert!(
+            matches!(
+                observed.early_create,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            ),
+            "the live bridge must receive no new root while the prior teardown is running"
+        );
+        assert!(
+            observed.reached_bridge,
+            "the next start proceeds once the failed teardown has ended"
+        );
+        assert!(
+            matches!(
+                &observed.failed,
+                Err(P2pServiceError::Overlay(error)) if error.kind() == io::ErrorKind::Unsupported
+            ),
+            "the first start fails on the bridge's version, got {:?}",
+            observed.failed
+        );
+        observed.next.expect("the start after the failed one");
+        assert_eq!(
+            service.overlay_addresses(),
+            vec![sam_endpoint()],
+            "the failed teardown must not clear what the next epoch published"
+        );
+        assert!(
+            service.workers.lock().is_some(),
+            "the next epoch owns the worker slot"
+        );
+        service.shutdown();
+        service.join().expect("join");
+    }
 }

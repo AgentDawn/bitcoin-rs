@@ -210,6 +210,13 @@ struct Manager {
     /// [`AddressBook::gossip`] projects IP rows as legacy `addr`;
     /// [`AddressBook::gossip_addrv2`] projects enabled transports as `addrv2`.
     gossip_cache: Option<(Instant, Vec<GossipRow>)>,
+    addrv2_cursor: usize,
+    addrv2_cache: Option<(
+        Instant,
+        bool,
+        bool,
+        Vec<bitcoin::p2p::address::AddrV2Message>,
+    )>,
     pending: HashMap<PeerEndpoint, PendingClaim>,
     collisions: Vec<PeerEndpoint>,
 }
@@ -326,6 +333,8 @@ impl Manager {
             published: false,
             gossip_cursor: 0,
             gossip_cache: None,
+            addrv2_cursor: 0,
+            addrv2_cache: None,
             pending: HashMap::new(),
             collisions: Vec::new(),
         }
@@ -903,11 +912,15 @@ impl AddressBook {
         self.addrv2_gossip[1].store(i2p_enabled, std::sync::atomic::Ordering::Release);
     }
 
-    /// One `addrv2` gossip round over the shared cursor/cache selection,
-    /// projected to the enabled transports as BIP155 rows. IP is always
-    /// carried; overlay endpoints only when their transport is configured.
-    /// Shares rotation and TTL with [`AddressBook::gossip`]: a cached
-    /// selection is projected, not re-rotated, until expiry.
+    /// One `addrv2` gossip round: every non-terrible record whose
+    /// transport is enabled, as BIP155 rows. IP is always carried;
+    /// overlay endpoints only when their transport is configured.
+    /// Rotation and caching mirror [`AddressBook::gossip`]: successive
+    /// rounds continue from the `addrv2` cursor instead of replaying the
+    /// first insertion-order records, and the wire reply is stable until
+    /// its TTL expires. The overlay flags are read fresh on every call
+    /// and key the cache, so a reconfigured transport is applied on the
+    /// next reply rather than served stale.
     pub(crate) fn gossip_addrv2(&self, now: u64) -> Vec<bitcoin::p2p::address::AddrV2Message> {
         self.gossip_addrv2_at(now, Instant::now())
     }
@@ -919,17 +932,35 @@ impl AddressBook {
         let tor = self.addrv2_gossip[0].load(std::sync::atomic::Ordering::Acquire);
         let i2p = self.addrv2_gossip[1].load(std::sync::atomic::Ordering::Acquire);
         let mut manager = self.state.lock();
-        Self::shared_rows(&mut manager, now, tick)
-            .into_iter()
-            .filter(|row| crate::endpoint::addrv2_gossip_enabled(row.endpoint, tor, i2p))
-            .map(|row| {
-                crate::endpoint::endpoint_to_addrv2(
-                    row.endpoint,
-                    row.last_seen,
-                    bitcoin::p2p::ServiceFlags::from(row.services),
-                )
-            })
-            .collect()
+        if let Some((expires, cached_tor, cached_i2p, response)) = &manager.addrv2_cache {
+            if tick < *expires && *cached_tor == tor && *cached_i2p == i2p {
+                return response.clone();
+            }
+        }
+        let len = manager.stored.records.len();
+        let start = manager.addrv2_cursor.checked_rem(len).unwrap_or_default();
+        let mut gossip = Vec::with_capacity(MAX_GOSSIP.min(len));
+        for offset in 0..len {
+            let index = (start + offset) % len;
+            manager.addrv2_cursor = (index + 1) % len;
+            let entry = &manager.stored.records[index];
+            if entry.terrible(now) {
+                continue;
+            }
+            if !crate::endpoint::addrv2_gossip_enabled(entry.endpoint, tor, i2p) {
+                continue;
+            }
+            gossip.push(crate::endpoint::endpoint_to_addrv2(
+                entry.endpoint,
+                u32::try_from(entry.last_seen).unwrap_or(u32::MAX),
+                bitcoin::p2p::ServiceFlags::from(entry.services.unwrap_or(0)),
+            ));
+            if gossip.len() == MAX_GOSSIP {
+                break;
+            }
+        }
+        manager.addrv2_cache = Some((tick + GOSSIP_CACHE_TTL, tor, i2p, gossip.clone()));
+        gossip
     }
 
     /// Failure count recorded for `addr` (test observability for dial
@@ -1674,6 +1705,7 @@ fn read_anchors<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_seq(Anchors)
 }
 
+
 fn validate_anchors(stored: &Stored) -> io::Result<()> {
     let mut anchors = HashSet::new();
     if stored.anchors.len() > MAX_ANCHORS {
@@ -1753,6 +1785,7 @@ fn validate_current(
     }
     Ok(())
 }
+
 fn read_book(
     path: &Path,
     magic: Option<[u8; 4]>,

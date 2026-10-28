@@ -1,6 +1,7 @@
 //! Public peer metadata published after a successful handshake.
 
 use crate::PeerRemote;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bitcoin::p2p::message_network::VersionMessage;
@@ -41,6 +42,10 @@ impl PeerRole {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[expect(clippy::struct_excessive_bools)]
 pub struct PeerInfo {
+    /// Logical peer endpoint; `None` for unidentified inbound sessions.
+    pub endpoint: Option<PeerEndpoint>,
+    /// Network classification, set at accept/dial construction.
+    pub network: NetworkLabel,
     /// Logical remote Bitcoin endpoint.
     pub addr: PeerRemote,
     /// Protocol version advertised by the remote.
@@ -79,7 +84,7 @@ pub struct PeerInfo {
     /// on this connection -- not the peer's. Reporting the peer's address
     /// twice, as this used to, tells an operator listening on several
     /// interfaces nothing about which one carried the connection.
-    pub addr_bind: std::net::SocketAddr,
+    pub addr_bind: TransportRemote,
     /// Seconds the peer's clock is ahead of this node's, from its version.
     pub time_offset: i64,
     /// Live traffic counters for the connection.
@@ -99,10 +104,36 @@ impl PeerInfo {
         version_received_time: u64,
         counters: Arc<PeerCounters>,
     ) -> Self {
+        let remote: PeerRemote = addr.into();
+        let Some(endpoint) = remote.endpoint() else {
+            return Self {
+                addr: remote,
+                endpoint: None,
+                network: NetworkLabel::Onion,
+                version: version.version,
+                wtxid_relay: false,
+                relay_transactions: version.relay,
+                compact_block_relay: false,
+                send_headers: false,
+                services: version.services.to_u64(),
+                user_agent: version.user_agent.clone(),
+                start_height: version.start_height,
+                best_known_height: version.start_height,
+                conn_time,
+                inbound: true,
+                addr_bind: TransportRemote::new(addr_bind),
+                // Freeze the offset at version receipt, not handshake completion.
+                time_offset: version
+                    .timestamp
+                    .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX)),
+                counters,
+                transport: crate::TransportProtocol::V1,
+            };
+        };
         Self {
             inbound: true,
-            ..Self::outbound_from_version(
-                addr,
+            ..Self::outbound_from_version_endpoint(
+                endpoint,
                 addr_bind,
                 version,
                 conn_time,
@@ -122,8 +153,34 @@ impl PeerInfo {
         version_received_time: u64,
         counters: Arc<PeerCounters>,
     ) -> Self {
+        let remote: PeerRemote = addr.into();
+        Self::outbound_from_version_endpoint(
+            remote
+                .endpoint()
+                .unwrap_or_else(|| panic!("expected identified peer")),
+            addr_bind,
+            version,
+            conn_time,
+            version_received_time,
+            counters,
+        )
+    }
+
+    /// Endpoint-identified form of [`Self::outbound_from_version`]: the
+    /// logical peer is `endpoint`; `addr_bind` is only the local socket.
+    #[must_use]
+    pub(crate) fn outbound_from_version_endpoint(
+        endpoint: PeerEndpoint,
+        addr_bind: SocketAddr,
+        version: &VersionMessage,
+        conn_time: u64,
+        version_received_time: u64,
+        counters: Arc<PeerCounters>,
+    ) -> Self {
         Self {
-            addr: addr.into(),
+            addr: endpoint.into(),
+            endpoint: Some(endpoint),
+            network: endpoint.net(),
             version: version.version,
             wtxid_relay: false,
             relay_transactions: version.relay,
@@ -135,7 +192,7 @@ impl PeerInfo {
             best_known_height: version.start_height,
             conn_time,
             inbound: false,
-            addr_bind,
+            addr_bind: TransportRemote::new(addr_bind),
             // Freeze the offset at version receipt, not handshake completion.
             time_offset: version
                 .timestamp
@@ -281,6 +338,10 @@ mod tests {
         let table = PeerTable::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(tx);
+        let bind_socket = bind
+            .endpoint()
+            .and_then(crate::PeerEndpoint::socket_addr)
+            .unwrap_or_else(|| panic!("expected IP fixture"));
         assert!(!table.register(peer, lease.clone()));
         assert!(
             table.publish_info(
@@ -288,9 +349,7 @@ mod tests {
                 &lease,
                 PeerInfo::inbound_from_version(
                     peer,
-                    bind.endpoint()
-                        .and_then(crate::PeerEndpoint::socket_addr)
-                        .unwrap_or_else(|| panic!("expected IP fixture")),
+                    bind_socket,
                     &fake_version(),
                     0,
                     0,
@@ -302,19 +361,14 @@ mod tests {
 
         let infos = table.infos();
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].addr, peer);
+        assert_eq!(infos[0].endpoint, peer.endpoint());
         assert_eq!(
             infos[0].addr_bind,
-            bind.endpoint()
-                .and_then(crate::PeerEndpoint::socket_addr)
-                .unwrap_or_else(|| panic!("expected IP fixture"))
+            crate::TransportRemote::new(bind_socket)
         );
         assert_ne!(
-            infos[0]
-                .addr
-                .endpoint()
-                .and_then(crate::PeerEndpoint::socket_addr),
-            Some(infos[0].addr_bind)
+            infos[0].endpoint,
+            Some(crate::PeerEndpoint::Ip(infos[0].addr_bind.socket_addr()))
         );
     }
 
@@ -414,6 +468,23 @@ mod tests {
         assert_eq!(
             peer_info_with_services(1_u64 << 63).services_names(),
             Vec::<&'static str>::new()
+        );
+    }
+
+    #[test]
+    fn anonymous_tor_inbound_preserves_identity_and_onion_network() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new_inbound(tx);
+        let remote = PeerRemote::AnonymousTor(lease.connection_id());
+        let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let info = PeerInfo::inbound_from_version(remote, bind, &fake_version(), 0, 0, counters());
+        assert!(info.inbound, "anonymous handshake stays inbound");
+        assert_eq!(info.endpoint, None, "no destination is fabricated");
+        assert_eq!(info.addr, remote, "AnonymousTor identity is preserved");
+        assert_eq!(
+            info.network,
+            NetworkLabel::Onion,
+            "anonymous inbound records Onion"
         );
     }
 }

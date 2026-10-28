@@ -1214,7 +1214,7 @@ fn a_terminal_low_work_page_demotes_the_source() -> TestResult {
     let session = peers
         .sessions()
         .into_iter()
-        .find(|session| session.addr == addr)
+        .find(|session| session.endpoint == addr.endpoint())
         .ok_or_else(|| std::io::Error::other("session vanished"))?;
     assert_eq!(
         session.headers_horizon,

@@ -342,6 +342,31 @@ impl CoreValue for Option<SocketAddr> {
     }
 }
 
+impl CoreValue for Option<Vec<bitcoin_rs_node::options::NetworkLabel>> {
+    fn apply(key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
+        let mut parsed = Vec::new();
+        for item in value.split(',') {
+            match bitcoin_rs_node::options::parse_network_label(item.trim()) {
+                Ok(label) => {
+                    if !parsed.contains(&label) {
+                        parsed.push(label);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!("{key}={value:?} names an unknown network"));
+                }
+            }
+        }
+        let entries = slot.get_or_insert_with(Vec::new);
+        for label in parsed {
+            if !entries.contains(&label) {
+                entries.push(label);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl CoreValue for Option<Vec<bitcoin_rs_node::options::PeerNetwork>> {
     fn apply(key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
         let mut parsed = Vec::new();
@@ -675,6 +700,44 @@ mod feature_option_tests {
             Ok(_) => panic!("configuration must be refused"),
             Err(error) => error.to_string(),
         }
+    }
+
+    #[test]
+    fn relay_switches_are_bare_cli_flags_and_the_command_line_beats_environment() -> Result<()> {
+        let off = load(&[], &[])?.p2p;
+        assert!(
+            !off.relay_offers.package_relay
+                && !off.relay_offers.stale_tip_relay
+                && !off.relay_offers.stale_tip_prefers_blocks
+        );
+
+        let on = load(
+            &[
+                "--p2p-package-relay",
+                "--p2p-stale-tip-relay",
+                "--p2p-stale-tip-prefers-blocks",
+            ],
+            &[],
+        )?
+        .p2p;
+        assert!(
+            on.relay_offers.package_relay
+                && on.relay_offers.stale_tip_relay
+                && on.relay_offers.stale_tip_prefers_blocks
+        );
+
+        let env_on = load(&[], &[("BITCOIN_RS_P2P_PACKAGE_RELAY", "true")])?.p2p;
+        assert!(env_on.relay_offers.package_relay);
+        let cli_off = load(
+            &["--p2p-package-relay=false"],
+            &[("BITCOIN_RS_P2P_PACKAGE_RELAY", "true")],
+        )?
+        .p2p;
+        assert!(!cli_off.relay_offers.package_relay);
+
+        let dangling = refusal(&["--p2p-stale-tip-prefers-blocks"], &[]);
+        assert!(dangling.contains("--p2p-stale-tip-relay"));
+        Ok(())
     }
 
     #[test]

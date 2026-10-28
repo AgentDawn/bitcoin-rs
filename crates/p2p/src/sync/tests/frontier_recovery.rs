@@ -269,7 +269,7 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick() -> TestResult {
         !peers
             .sessions()
             .iter()
-            .any(|session| session.addr == low),
+            .any(|session| session.endpoint == low.endpoint()),
         "the failed probe source must be evicted instead of lingering table-resident",
     );
 
@@ -287,8 +287,8 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick() -> TestResult {
         sync.scheduler
             .lock()
             .header_request()
-            .map(|request| request.source.addr),
-        Some(high),
+            .map(|request| request.source.endpoint),
+        Some(high.endpoint()),
         "the fallback owner must hold the pending request"
     );
     assert!(high_rx.try_recv().is_err());
@@ -328,8 +328,8 @@ fn failed_probe_send_excludes_dead_highest_peer_from_header_fallback() -> TestRe
         sync.scheduler
             .lock()
             .header_request()
-            .map(|request| request.source.addr),
-        Some(live),
+            .map(|request| request.source.endpoint),
+        Some(live.endpoint()),
         "the lower live peer must own the fallback request"
     );
     assert!(live_rx.try_recv().is_err());
@@ -382,15 +382,15 @@ fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick() -> TestResult 
         !peers
             .sessions()
             .iter()
-            .any(|session| session.addr == dead),
+            .any(|session| session.endpoint == dead.endpoint()),
         "the dead peer session must not survive into the next tick",
     );
     assert_ne!(
         sync.scheduler
             .lock()
             .header_request()
-            .map(|request| request.source.addr),
-        Some(dead),
+            .map(|request| request.source.endpoint),
+        Some(dead.endpoint()),
         "the pending request must not be keyed to the dead addr",
     );
     let request = next_getheaders(&live_rx)?;
@@ -419,14 +419,14 @@ fn reconciler_sweeps_cancelled_lease_sessions_within_one_tick() -> TestResult {
         peers
             .sessions()
             .iter()
-            .any(|session| session.addr == addr)
+            .any(|session| session.endpoint == addr.endpoint())
     );
     sync.tick();
     assert!(
         !peers
             .sessions()
             .iter()
-            .any(|session| session.addr == addr),
+            .any(|session| session.endpoint == addr.endpoint()),
         "the reconciler must sweep cancelled-lease sessions",
     );
     Ok(())

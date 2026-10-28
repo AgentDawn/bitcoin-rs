@@ -1,6 +1,7 @@
 //! Per-connection identity and cancellation.
 
 use bitcoin_rs_primitives::PeerEndpoint;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -115,12 +116,6 @@ where
     }
 }
 
-impl From<PeerSource> for PeerRemote {
-    fn from(source: PeerSource) -> Self {
-        Self::from_source(source)
-    }
-}
-
 impl std::fmt::Display for PeerRemote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -150,8 +145,8 @@ impl std::str::FromStr for PeerRemote {
 /// Attribution token for an event delivered by one connection.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PeerSource {
-    /// Remote connection identity at delivery time.
-    pub(crate) addr: PeerRemote,
+    /// Logical peer endpoint; `None` for unidentified inbound sessions.
+    pub(crate) endpoint: Option<crate::PeerEndpoint>,
     connection_id: ConnectionId,
 }
 
@@ -165,14 +160,24 @@ impl PeerSource {
     /// Logical endpoint of the delivering peer, if identified.
     #[must_use]
     pub fn endpoint(&self) -> Option<crate::PeerEndpoint> {
-        self.addr.endpoint()
+        self.endpoint
+    }
+
+    /// Remote identity for table keys: the endpoint when identified,
+    /// otherwise the anonymous connection.
+    #[must_use]
+    pub fn remote(&self) -> PeerRemote {
+        PeerRemote::from(*self)
     }
 
     /// Mints a source with a fresh process-unique identity for tests.
     #[cfg(test)]
     pub(crate) fn for_test(addr: impl Into<PeerRemote>) -> Self {
         Self {
-            addr: addr.into(),
+            endpoint: {
+                let remote: PeerRemote = addr.into();
+                remote.endpoint()
+            },
             connection_id: ConnectionId::allocate(),
         }
     }
@@ -181,16 +186,34 @@ impl PeerSource {
     #[cfg(test)]
     pub(crate) fn for_test_endpoint(endpoint: crate::PeerEndpoint) -> Self {
         Self {
-            addr: crate::PeerRemote::Endpoint(endpoint),
+            endpoint: Some(endpoint),
             connection_id: ConnectionId::allocate(),
         }
+    }
+
+    /// Mints an unidentified source for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test_unidentified() -> Self {
+        Self {
+            endpoint: None,
+            connection_id: ConnectionId::allocate(),
+        }
+    }
+}
+
+impl From<PeerSource> for PeerRemote {
+    fn from(source: PeerSource) -> Self {
+        source
+            .endpoint
+            .map_or(Self::AnonymousTor(source.connection_id), Self::Endpoint)
     }
 }
 
 impl From<PeerSource> for bitcoin_rs_mempool::PeerToken {
     fn from(source: PeerSource) -> Self {
         Self {
-            addr: source.addr.endpoint(),
+            endpoint: source.endpoint,
+            addr: PeerRemote::from(source).endpoint(),
             connection_id: source.connection_id.get(),
         }
     }
@@ -200,10 +223,7 @@ impl From<bitcoin_rs_mempool::PeerToken> for PeerSource {
     fn from(token: bitcoin_rs_mempool::PeerToken) -> Self {
         let connection_id = ConnectionId(token.connection_id);
         Self {
-            addr: token.addr.map_or(
-                PeerRemote::AnonymousTor(connection_id),
-                PeerRemote::Endpoint,
-            ),
+            endpoint: token.endpoint,
             connection_id,
         }
     }
@@ -1156,7 +1176,7 @@ impl PeerLease {
         if counter.fetch_add(1, Ordering::AcqRel) >= MAX_UNSOLICITED_BLOCK_FORWARDS {
             counter.fetch_sub(1, Ordering::AcqRel);
             tracing::debug!(
-                peer_addr = ?source.addr,
+                peer_addr = ?source.endpoint,
                 %hash,
                 limit = MAX_UNSOLICITED_BLOCK_FORWARDS,
                 "p2p dropping unsolicited block: per-connection forward bound reached"
@@ -1174,17 +1194,17 @@ impl PeerLease {
 
     /// Stamps an inbound event with this connection's identity and endpoint.
     #[must_use]
-    pub fn source(&self, addr: impl Into<PeerRemote>) -> PeerSource {
+    pub fn source(&self, endpoint: Option<crate::PeerEndpoint>) -> PeerSource {
         PeerSource {
-            addr: addr.into(),
+            endpoint,
             connection_id: self.id,
         }
     }
 
     /// Stamps an event for a direct-IP connection at `addr`.
     #[must_use]
-    pub fn source_ip(&self, addr: std::net::SocketAddr) -> PeerSource {
-        self.source(crate::accepted_ip_identity(addr))
+    pub fn source_ip(&self, addr: SocketAddr) -> PeerSource {
+        self.source(Some(crate::accepted_ip_identity(addr)))
     }
 
     /// Queues a message for this connection's writer.
@@ -1379,9 +1399,17 @@ mod tests {
         (PeerLease::new(tx).with_shared_budget(shared), rx)
     }
 
-    fn peer_info(addr: PeerEndpoint, conn_time: u64) -> crate::PeerInfo {
-        crate::PeerInfo {
+    fn peer_info(
+        addr: crate::PeerEndpoint,
+        conn_time: u64,
+    ) -> Result<crate::PeerInfo, Box<dyn std::error::Error>> {
+        let ip = addr
+            .as_ip()
+            .ok_or_else(|| std::io::Error::other("ip test peer"))?;
+        Ok(crate::PeerInfo {
             addr: addr.into(),
+            endpoint: Some(addr),
+            network: addr.net(),
             version: 70_016,
             wtxid_relay: false,
             relay_transactions: true,
@@ -1393,13 +1421,11 @@ mod tests {
             best_known_height: 0,
             conn_time,
             inbound: false,
-            addr_bind: addr
-                .socket_addr()
-                .unwrap_or_else(|| panic!("expected IP fixture")),
+            addr_bind: crate::TransportRemote::new(ip),
             time_offset: 0,
             counters: std::sync::Arc::new(crate::PeerCounters::default()),
             transport: crate::TransportProtocol::V1,
-        }
+        })
     }
 
     #[test]
@@ -1452,7 +1478,7 @@ mod tests {
         let (old_tx, _old_rx) = crossbeam_channel::unbounded();
         let old = PeerLease::new(old_tx);
         assert!(!table.register(addr, old.clone()));
-        assert!(table.publish_info(addr, &old, peer_info(addr, 1)));
+        assert!(table.publish_info(addr, &old, peer_info(addr, 1)?));
 
         let (replacement_tx, _replacement_rx) = crossbeam_channel::unbounded();
         let replacement = PeerLease::new(replacement_tx);
@@ -1460,14 +1486,14 @@ mod tests {
         assert!(old.is_cancelled());
         assert_eq!(table.infos(), []);
         assert_eq!(table.ready_source(addr), None);
-        assert!(!table.publish_info(addr, &old, peer_info(addr, 2)));
+        assert!(!table.publish_info(addr, &old, peer_info(addr, 2)?));
         assert_eq!(table.infos(), []);
 
-        assert!(table.publish_info(addr, &replacement, peer_info(addr, 3)));
-        assert_eq!(table.infos(), vec![peer_info(addr, 3)]);
+        assert!(table.publish_info(addr, &replacement, peer_info(addr, 3)?));
+        assert_eq!(table.infos(), vec![peer_info(addr, 3)?]);
         assert_eq!(
             table.ready_source(addr),
-            Some(replacement.source(addr))
+            Some(replacement.source(Some(addr)))
         );
         assert!(
             table
@@ -1484,19 +1510,19 @@ mod tests {
         let (old_tx, _old_rx) = crossbeam_channel::unbounded();
         let old = PeerLease::new(old_tx);
         table.register(addr, old.clone());
-        let stale_source = old.source(addr);
+        let stale_source = old.source(Some(addr));
 
         let (replacement_tx, _replacement_rx) = crossbeam_channel::unbounded();
         let replacement = PeerLease::new(replacement_tx);
         table.register(addr, replacement.clone());
-        table.publish_info(addr, &replacement, peer_info(addr, 2));
+        table.publish_info(addr, &replacement, peer_info(addr, 2)?);
 
         assert!(!table.disconnect_source(stale_source));
         assert!(!replacement.is_cancelled());
         assert!(table.is_connected(addr));
-        assert_eq!(table.infos(), vec![peer_info(addr, 2)]);
+        assert_eq!(table.infos(), vec![peer_info(addr, 2)?]);
 
-        assert!(table.disconnect_source(replacement.source(addr)));
+        assert!(table.disconnect_source(replacement.source(Some(addr))));
         assert!(replacement.is_cancelled());
         assert!(!table.is_connected(addr));
         assert_eq!(table.infos(), []);
@@ -1511,7 +1537,7 @@ mod tests {
         let (old_tx, _old_rx) = crossbeam_channel::unbounded();
         let old = PeerLease::new(old_tx);
         table.register(addr, old.clone());
-        assert!(table.publish_info(addr, &old, peer_info(addr, 1)));
+        assert!(table.publish_info(addr, &old, peer_info(addr, 1)?));
         let Some(snapshot) = table.ready_peers().pop() else {
             return Err(std::io::Error::other("ready peer snapshot missing").into());
         };
@@ -1521,7 +1547,7 @@ mod tests {
         table.register(addr, replacement.clone());
 
         assert!(table.lease_source(snapshot).is_none());
-        assert!(table.lease_source(replacement.source(addr)).is_some());
+        assert!(table.lease_source(replacement.source(Some(addr))).is_some());
         Ok(())
     }
 

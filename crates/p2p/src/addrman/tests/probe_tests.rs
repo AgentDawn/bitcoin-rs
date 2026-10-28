@@ -165,6 +165,7 @@ fn connected_collision_good_uses_ip_not_port_but_not_linked_ipv6_group() {
     assert_eq!(state(&book, target()).last_success, EPOCH - 20_000);
 }
 
+
 #[test]
 fn anchors_consume_durably_and_return_original_metadata_only_before_dispatch() {
     let directory = tempfile::tempdir().expect("directory");

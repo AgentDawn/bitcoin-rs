@@ -34,7 +34,7 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders() -> TestResult
     );
     assert!(
         sync.scheduler.lock().header_request().is_some_and(
-            |request| request.source.addr == invalid_peer
+            |request| request.source.endpoint == invalid_peer.endpoint()
         ),
         "a pending getheaders must name the invalid peer before its batch arrives"
     );
@@ -331,7 +331,7 @@ fn same_address_reconnect_does_not_inherit_stalled_inflight() -> TestResult {
         &lease,
         synthetic_peer(winner, 100),
     );
-    let replacement = lease.source(winner);
+    let replacement = lease.source(winner.endpoint());
     sync.on_peer_ready(replacement);
     assert!(
         sync.scheduler.lock().window.preferred_peer().is_none(),
@@ -460,7 +460,7 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout() 
         assert!(!scheduler.window.has_request_capacity(&scheduler.stager));
         assert_eq!(
             scheduler.window.stalling_peer().map(|(addr, _)| addr),
-            Some(staller)
+            Some(staller.endpoint())
         );
     }
     assert!(honest_rx.try_recv().is_err());
