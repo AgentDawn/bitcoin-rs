@@ -48,6 +48,18 @@ struct PackageAttempt {
     package_error: Option<AcceptanceRejectReason>,
 }
 
+/// Orders an arbitrary-order child-with-parents package for submission.
+///
+/// The returned vec is topologically ordered (independent parents sorted by
+/// txid, child last) but deliberately NOT fully structure-checked: package
+/// weight, intra-package conflicts, and package order are validated by
+/// [`crate::package::check_structure`], which
+/// [`MempoolGateway::submit_package_with_times`] runs as the single
+/// authoritative structural gate (snapshot restore enters there directly, so
+/// the check cannot live here without charging local submission a duplicate
+/// pass). This function stays private with [`MempoolGateway::submit_local_package`]
+/// as its only caller, so its output always flows through that gate and can
+/// never reach admission unchecked.
 fn ordered(mut txs: Vec<Tx>) -> Result<Vec<Tx>, SubmitError> {
     if txs.is_empty() || txs.len() > crate::standardness::MAX_PACKAGE_COUNT {
         return Err(AcceptanceRejectReason::PackageCount.into());

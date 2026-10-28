@@ -841,9 +841,11 @@ impl VerifiedSnapshotArtifact {
             .byte_len()
             .checked_add(1)
             .ok_or(RawSeedError::Integrity)?;
-        // Buffer the small header/output/script reads in memory. The buffer
-        // sits below the tee, so the digest still covers exactly the bytes
-        // the decoder consumes; prefetch never reaches the hash.
+        // Seeding issues one tiny read per output header and script, so the
+        // capped file reader is buffered in memory. The buffer sits below
+        // the tee on the consumed-byte side, so the witnessed length and
+        // digest still cover exactly what the parser reads while the file
+        // sees bulk reads; prefetch never reaches the hash.
         let capped = Read::by_ref(&mut self.file).take(limit);
         let mut buffered = BufReader::new(capped);
         let mut tee = TeeReader::new(&mut buffered);

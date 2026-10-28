@@ -185,6 +185,7 @@ impl BlockSync {
             let Some(request) = request else {
                 continue;
             };
+
             let inventory = request
                 .entries()
                 .map(|(_, hash)| {
