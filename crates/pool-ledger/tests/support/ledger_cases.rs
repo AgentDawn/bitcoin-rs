@@ -1568,6 +1568,36 @@ fn reversing_credits_that_were_already_reserved_creates_an_explicit_deficit() {
 }
 
 #[test]
+fn cancelling_a_batch_of_reversed_credits_repays_the_deficit_first() {
+    let fund = funded(0, 1_000_001);
+    let batch = prepared(&fund);
+    fund.chain.set_block(100, hash(0xDD));
+    fund.ledger
+        .reconcile_rounds(&fund.chain)
+        .fixture("displaced");
+    fund.ledger
+        .cancel_prepared(&batch.id, CancelBasis::NeverHandedToSigner)
+        .fixture("cancel");
+    let balance = fund.ledger.balance(MinerId(1)).fixture("balance");
+    assert_eq!(
+        (
+            balance.available_sat,
+            balance.reserved_sat,
+            balance.deficit_sat
+        ),
+        (0, 0, 0),
+        "a reversed reward never becomes payable again"
+    );
+    assert_eq!(
+        fund.ledger
+            .prepare_payout_batch(idem(2), policy())
+            .fixture("prepare again"),
+        None
+    );
+    fund.ledger.check_invariants().fixture("invariants");
+}
+
+#[test]
 fn unseen_rounds_stop_being_monitored_after_the_watch_depth() {
     let fund = staged(0, 1_000_001);
     fund.chain.set_block(100, hash(0xDD));

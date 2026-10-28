@@ -2180,9 +2180,13 @@ fn release_reservation(tables: &Tables<'_>, batch: &PayoutBatch) -> Result<(), L
         balance.reserved_sat = balance.reserved_sat.checked_sub(amount).ok_or_else(|| {
             LedgerError::Corrupt("releasing a payout exceeds the reservation".into())
         })?;
+        // Released money first repays any deficit left by a reversed reward, so a reorged
+        // reward can never become payable again through a cancelled or failed batch.
+        let offset = balance.deficit_sat.min(amount);
+        balance.deficit_sat -= offset;
         balance.available_sat = balance
             .available_sat
-            .checked_add(amount)
+            .checked_add(amount - offset)
             .ok_or(LedgerError::Overflow("available balance"))?;
         Ok(())
     })
