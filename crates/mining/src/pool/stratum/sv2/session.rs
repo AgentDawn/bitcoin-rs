@@ -1832,22 +1832,26 @@ impl ProtocolSession {
         if matches!(pending.kind, PendingKind::Block) {
             return Err(SessionError::BlockRequiresSubmission);
         }
-        let Some(pending) = self.pending.remove(&ticket.0) else {
-            return Ok(false);
-        };
-        if !self.channels.contains_key(&pending.channel_id) {
+        // Queue before removing the ticket: a full outbound queue must leave
+        // the pending acknowledgement in place for a later retry instead of
+        // dropping a share the ledger already recorded.
+        let (channel_id, sequence_number, difficulty) =
+            (pending.channel_id, pending.sequence_number, pending.difficulty);
+        if !self.channels.contains_key(&channel_id) {
+            self.pending.remove(&ticket.0);
             return Ok(false);
         }
         self.queue(
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
             CHANNEL_BIT_SUBMIT_SHARES_SUCCESS,
             SubmitSharesSuccess {
-                channel_id: pending.channel_id,
-                last_sequence_number: pending.sequence_number,
+                channel_id,
+                last_sequence_number: sequence_number,
                 new_submits_accepted_count: 1,
-                new_shares_sum: pending.difficulty,
+                new_shares_sum: difficulty,
             },
         )?;
+        self.pending.remove(&ticket.0);
         Ok(true)
     }
 
@@ -1867,22 +1871,26 @@ impl ProtocolSession {
         {
             return Ok(false);
         }
-        let Some(pending) = self.pending.remove(&submission.ticket.0) else {
-            return Ok(false);
-        };
-        if !self.channels.contains_key(&pending.channel_id) {
+        // Queue before removing the ticket: a full outbound queue must leave
+        // the pending acknowledgement in place for a later retry instead of
+        // dropping a block the ledger already recorded.
+        let (channel_id, sequence_number, difficulty) =
+            (pending.channel_id, pending.sequence_number, pending.difficulty);
+        if !self.channels.contains_key(&channel_id) {
+            self.pending.remove(&submission.ticket.0);
             return Ok(false);
         }
         self.queue(
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
             CHANNEL_BIT_SUBMIT_SHARES_SUCCESS,
             SubmitSharesSuccess {
-                channel_id: pending.channel_id,
-                last_sequence_number: pending.sequence_number,
+                channel_id,
+                last_sequence_number: sequence_number,
                 new_submits_accepted_count: 1,
-                new_shares_sum: pending.difficulty,
+                new_shares_sum: difficulty,
             },
         )?;
+        self.pending.remove(&submission.ticket.0);
         Ok(true)
     }
 
@@ -1915,15 +1923,17 @@ impl ProtocolSession {
         if pending.block_hash != Some(submission.block_hash) {
             return Ok(false);
         }
-        let Some(pending) = self.pending.remove(&submission.ticket.0) else {
-            return Ok(false);
-        };
-        if !self.channels.contains_key(&pending.channel_id) {
+        // Queue before removing the ticket: a full outbound queue must leave
+        // the pending acknowledgement in place for a later retry instead of
+        // dropping it unsent.
+        let (channel_id, sequence_number) = (pending.channel_id, pending.sequence_number);
+        if !self.channels.contains_key(&channel_id) {
+            self.pending.remove(&submission.ticket.0);
             return Ok(false);
         }
         let msg = SubmitSharesError {
-            channel_id: pending.channel_id,
-            sequence_number: pending.sequence_number,
+            channel_id,
+            sequence_number,
             error_code,
         };
         self.queue(
@@ -1931,6 +1941,7 @@ impl ProtocolSession {
             CHANNEL_BIT_SUBMIT_SHARES_ERROR,
             msg,
         )?;
+        self.pending.remove(&submission.ticket.0);
         Ok(true)
     }
 
@@ -1951,15 +1962,17 @@ impl ProtocolSession {
         if matches!(pending.kind, PendingKind::Block) {
             return Err(SessionError::BlockRequiresSubmission);
         }
-        let Some(pending) = self.pending.remove(&ticket.0) else {
-            return Ok(false);
-        };
-        if !self.channels.contains_key(&pending.channel_id) {
+        // Queue before removing the ticket: a full outbound queue must leave
+        // the pending refusal in place for a later retry instead of dropping
+        // a share the host already judged.
+        let (channel_id, sequence_number) = (pending.channel_id, pending.sequence_number);
+        if !self.channels.contains_key(&channel_id) {
+            self.pending.remove(&ticket.0);
             return Ok(false);
         }
         let msg = SubmitSharesError {
-            channel_id: pending.channel_id,
-            sequence_number: pending.sequence_number,
+            channel_id,
+            sequence_number,
             error_code,
         };
         self.queue(
@@ -1967,6 +1980,7 @@ impl ProtocolSession {
             CHANNEL_BIT_SUBMIT_SHARES_ERROR,
             msg,
         )?;
+        self.pending.remove(&ticket.0);
         Ok(true)
     }
 
