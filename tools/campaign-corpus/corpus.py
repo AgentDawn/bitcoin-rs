@@ -2066,13 +2066,58 @@ def _synced(fh: BinaryIO) -> None:
     os.fsync(fh.fileno())
 
 
+def build_archive_from_index(
+    freeze: Freeze,
+    index_path: Path,
+    source_dir: Path,
+    archive_path: Path,
+    manifest_path: Path,
+) -> CorpusSummary:
+    """Pack a byte-identical archive from a verified index.
+
+    The payload stream fully verifies its sources while yielding (source
+    pre-hash, top-level span gate, per-payload hash/linkage, trailing
+    logical digest), so the packed bytes are the logical stream the index
+    fingerprinted. The published manifest digest and size must equal the
+    index logical digest and size; a mismatch unpublishes both outputs and
+    fails instead of leaving divergent digests behind.
+    """
+    doc = _load_index(index_path)
+    _check_index_digest(doc)
+    chosen = _check_index_against_freeze(freeze, doc)
+    summary = _run_writer(
+        freeze,
+        chosen.corpus_id,
+        archive_path,
+        manifest_path,
+        (
+            (block_hash, payload)
+            for _, block_hash, payload in iter_indexed_payloads(
+                freeze, index_path, source_dir
+            )
+        ),
+    )
+    if (
+        summary.archive_sha256 != doc.logical_sha256
+        or summary.archive_size != doc.logical_size
+    ):
+        with contextlib.suppress(OSError):
+            archive_path.unlink()
+        with contextlib.suppress(OSError):
+            manifest_path.unlink()
+        raise ContractError(
+            "packed archive digest does not match the index logical digest"
+        )
+    return summary
+
+
 def _run_writer(
     freeze: Freeze,
     corpus_id: str,
     archive_path: Path,
     manifest_path: Path,
     items: Iterable[tuple[str | None, bytes]],
-) -> None:
+) -> CorpusSummary:
     if archive_path.resolve() == manifest_path.resolve():
         raise ContractError("archive and manifest paths must differ")
     _refuse_existing(archive_path)
@@ -2106,6 +2151,7 @@ def _run_writer(
     print(f"wrote {archive_path} ({summary.archive_size} bytes)")
     print(f"wrote {manifest_path}")
     print(f"archive sha256 {summary.archive_sha256}")
+    return summary
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2148,6 +2194,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     verify_index_cmd.add_argument("--index", type=Path, required=True)
     verify_index_cmd.add_argument("--source-dir", type=Path, required=True)
+
+    build_archive_cmd = sub.add_parser(
+        "build-archive", help="pack a byte-identical archive from a verified index"
+    )
+    build_archive_cmd.add_argument("--index", type=Path, required=True)
+    build_archive_cmd.add_argument("--source-dir", type=Path, required=True)
+    build_archive_cmd.add_argument("--archive", type=Path, required=True)
+    build_archive_cmd.add_argument("--manifest", type=Path, required=True)
 
     args = parser.parse_args(argv)
     freeze = load_freeze()
@@ -2199,6 +2253,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "verify-index":
         verify_index(freeze, args.index, args.source_dir)
         print(f"verified {args.index}")
+    elif args.command == "build-archive":
+        summary = build_archive_from_index(
+            freeze, args.index, args.source_dir, args.archive, args.manifest
+        )
+        print(f"wrote {args.archive} ({summary.archive_size} bytes)")
+        print(f"archive sha256 {summary.archive_sha256}")
     return 0
 
 
