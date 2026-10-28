@@ -284,7 +284,8 @@ Options:
                                and untracked (not ignored) build input (Cargo.toml, Cargo.lock,
                                rust-toolchain.toml, .cargo/, bin/, crates/) into
                                bitcoin-rs-source-identity.json and refuses (exit 1) when any input is
-                               newer than the binary, a tracked input is missing, or git cannot list them
+                               newer than the binary, a tracked input is missing, git cannot list them,
+                               the root lacks Cargo.toml and crates/ inputs, or the binary is unreadable
   --allow-stale-bitcoin-rs     Run anyway when that guard fails; the evidence JSON records
                                stale_allowed=true and the binary is not tied to the recorded sources
 
@@ -664,8 +665,12 @@ if "binary_mtime" in entry and newest_mtime:
 else:
     entry["stale"] = None
 problems = []
-if not files and not (entry.get("binary_mtime") or entry.get("binary_unreadable")):
-    problems.append("no build inputs listed and the binary is unreadable")
+if not files:
+    problems.append("no build inputs listed under the source root")
+if "Cargo.toml" not in files or not any(rel.startswith("crates/") for rel in files):
+    problems.append("source root lacks the bitcoin-rs workspace inputs (Cargo.toml, crates/)")
+if "binary_unreadable" in entry:
+    problems.append("the bitcoin-rs binary is unreadable, so it cannot be tied to the sources")
 if missing:
     problems.append("tracked build inputs missing from disk: %s" % ", ".join(sorted(missing)[:5]))
 if unreadable:
