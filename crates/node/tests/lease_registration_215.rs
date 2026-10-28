@@ -52,7 +52,7 @@ fn info(addr: SocketAddr) -> PeerInfo {
         wtxid_relay: false,
         relay_transactions: true,
         compact_block_relay: false,
-        addr,
+        addr: addr.into(),
         send_headers: false,
         version: 70_016,
         services: 1,
