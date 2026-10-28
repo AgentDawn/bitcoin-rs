@@ -576,6 +576,10 @@ impl NodeConfig {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
     /// Validates the portable index bundle request.
     ///
     /// PRE: none; this reads only resolved fields and opens no path.

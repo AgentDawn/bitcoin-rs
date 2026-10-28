@@ -598,6 +598,7 @@ mod tests {
     use super::release_unavailable_body;
     use crate::connection::PeerSource;
     use crate::download_window::DownloadWindow;
+    use crate::download_window::RefusalFilter;
     use bitcoin_rs_primitives::Hash256;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
@@ -662,8 +663,12 @@ mod tests {
             chainwork: ChainWork::from(11_u64),
             hash: bitcoin_rs_primitives::Hash256::from(tip_header.compute_hash()),
         };
+        let never_refused = |_: bitcoin_rs_primitives::Hash256| false;
+        let mut refusals = RefusalFilter::new(&never_refused);
         let request = window
-            .next_peer_request(&mut stager, owner, false, &chain_tip, 1, 10, 0, &tree, now)
+            .next_peer_request(
+                &mut stager, owner, false, &chain_tip, 1, 10, 0, &tree, now, &mut refusals,
+            )
             .unwrap_or_else(|| panic!("window must plan the test prefix"));
         let (_, hash) = request
             .entries()

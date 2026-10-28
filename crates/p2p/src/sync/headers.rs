@@ -1634,8 +1634,7 @@ mod stale_tip_routing_tests {
 
         fn commit_window(
             &self,
-            _blocks: &[&bitcoin_rs_primitives::Block],
-            _bodies: &[bytes::Bytes],
+            _payloads: &[&bitcoin_rs_primitives::BlockPayload],
         ) -> Result<usize, WindowCommitError> {
             Ok(0)
         }
@@ -1643,10 +1642,7 @@ mod stale_tip_routing_tests {
         fn switch_to_branch(
             &self,
             _target: bitcoin_rs_chain::NodeId,
-            _staged_body: &mut dyn FnMut(
-                Hash256,
-            )
-                -> Option<(bitcoin_rs_primitives::Block, bytes::Bytes)>,
+            _staged_body: &mut dyn FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
             _connected_body: &mut dyn FnMut(Hash256),
         ) -> Result<(), bitcoin_rs_chainstate::reorg::ReorgError> {
             Ok(())
