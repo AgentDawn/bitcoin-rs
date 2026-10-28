@@ -452,10 +452,16 @@ impl Ledger {
         Ok(removed)
     }
 
+    /// Largest delete batch in one [`Self::prune_shares`] write transaction.
+    /// Pruning streams the doomed range in batches of this size, releasing the
+    /// writer lock between commits, so one call never buffers every doomed key
+    /// or holds the lock across an unbounded commit.
+    const PRUNE_BATCH_SIZE: usize = 1024;
+
     /// Delete the oldest shares, keeping the newest shares that hold at least `keep_work` work.
     /// `keep_work` must cover the PPLNS window. A block found later for an older solving share
     /// fails with [`LedgerError::WindowPruned`] instead of using a short window.
-    /// Returns the number of shares deleted.
+    /// Deletes stream in bounded batches; returns the total number deleted.
     ///
     /// # Errors
     /// Returns [`LedgerError::InvalidInput`] if `keep_work` is below the window, or an
@@ -466,12 +472,15 @@ impl Ledger {
                 "keep_work must cover the PPLNS window",
             ));
         }
-        let txn = self.db.begin_write()?;
-        let removed = {
-            let tables = Tables::open(&txn)?;
+        // Find the retention boundary on a read snapshot: the walk is
+        // read-only and must not hold the writer lock. Sequence numbers only
+        // grow, so the exclusive boundary stays valid while batches commit.
+        let (boundary, cumulative) = {
+            let read = self.db.begin_read()?;
+            let shares = read.open_table(SHARES)?;
             let mut cumulative: u128 = 0;
-            let mut boundary: Option<u64> = None;
-            for item in tables.shares.rows_iter()?.rev() {
+            let mut boundary = None;
+            for item in shares.rows_iter()?.rev() {
                 let (key, value) = item?;
                 let (_, work) = decode_share(value.value())?;
                 cumulative = cumulative
@@ -485,35 +494,58 @@ impl Ledger {
             let Some(boundary) = boundary else {
                 return Ok(0);
             };
-            let doomed: Vec<u64> = tables
-                .shares
-                .range(..boundary)?
-                .map(|item| item.map(|(key, _)| key.value()))
-                .collect::<Result<Vec<u64>, LedgerError>>()?;
-            if doomed.is_empty() {
-                return Ok(0);
-            }
-            for seq in &doomed {
-                tables.shares.remove(*seq)?;
-            }
-            let previous = meta_u64(&tables.meta_u64, M_PRUNED_BELOW)?;
-            if boundary > previous {
-                tables.meta_u64.insert(M_PRUNED_BELOW, boundary)?;
-            }
-            let removed =
-                u64::try_from(doomed.len()).map_err(|_| LedgerError::Overflow("count"))?;
-            append_audit(
-                &tables,
-                AuditKind::SharesPruned,
-                0,
-                &ZERO_HASH,
-                &ZERO_HASH,
-                [boundary, removed, low64(cumulative)],
-            )?;
-            removed
+            (boundary, cumulative)
         };
-        self.commit(txn, OP_PRUNE_SHARES)?;
-        Ok(removed)
+        let mut removed_total: u64 = 0;
+        loop {
+            let txn = self.db.begin_write()?;
+            let removed = {
+                let tables = Tables::open(&txn)?;
+                let doomed: Vec<u64> = tables
+                    .shares
+                    .range(..boundary)?
+                    .take(Self::PRUNE_BATCH_SIZE)
+                    .map(|item| item.map(|(key, _)| key.value()))
+                    .collect::<Result<Vec<u64>, LedgerError>>()?;
+                if doomed.is_empty() {
+                    break;
+                }
+                for seq in &doomed {
+                    tables.shares.remove(*seq)?;
+                }
+                let batch = u64::try_from(doomed.len())
+                    .map_err(|_| LedgerError::Overflow("count"))?;
+                let previous = meta_u64(&tables.meta_u64, M_PRUNED_BELOW)?;
+                // Advance past this batch; the final partial batch restores
+                // the exact floor. Batches ascend, so every remaining key
+                // exceeds the floor even before the last batch lands.
+                let floor = if doomed.len() < Self::PRUNE_BATCH_SIZE {
+                    boundary
+                } else {
+                    doomed
+                        .last()
+                        .and_then(|last| last.checked_add(1))
+                        .ok_or(LedgerError::Overflow("count"))?
+                };
+                if floor > previous {
+                    tables.meta_u64.insert(M_PRUNED_BELOW, floor)?;
+                }
+                append_audit(
+                    &tables,
+                    AuditKind::SharesPruned,
+                    0,
+                    &ZERO_HASH,
+                    &ZERO_HASH,
+                    [boundary, batch, low64(cumulative)],
+                )?;
+                batch
+            };
+            self.commit(txn, OP_PRUNE_SHARES)?;
+            removed_total = removed_total
+                .checked_add(removed)
+                .ok_or(LedgerError::Overflow("count"))?;
+        }
+        Ok(removed_total)
     }
 
     /// The PPLNS window ending at the newest share: `(account, work)` ascending by account.

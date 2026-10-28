@@ -1146,6 +1146,24 @@ fn the_window_slides_across_blocks_and_snapshots_are_frozen() {
 }
 
 #[test]
+fn pruning_streams_bounded_batches() {
+    let (_dir, ledger) = plain_ledger(100);
+    // 1200 unit-work shares force two delete batches at 1024.
+    for nonce in 0..1200u32 {
+        ledger.record_share(&share(1, 1, nonce, 1)).fixture("share");
+    }
+    assert_eq!(ledger.share_count().fixture("count"), 1200);
+    // Keep the newest 100 work units: 1100 pruned in 1024 + 76.
+    assert_eq!(ledger.prune_shares(100).fixture("prune"), 1100);
+    assert_eq!(ledger.share_count().fixture("count"), 100);
+    assert_eq!(
+        ledger.current_window().fixture("window"),
+        vec![(MinerId(1), 100)]
+    );
+    assert_eq!(ledger.prune_shares(100).fixture("nothing left"), 0);
+}
+
+#[test]
 fn short_history_uses_all_work_and_pruning_protects_old_windows() {
     let (_dir, ledger) = plain_ledger(100);
     for account in 1..=6 {
