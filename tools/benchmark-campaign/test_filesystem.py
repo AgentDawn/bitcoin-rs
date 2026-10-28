@@ -575,6 +575,29 @@ class NoDoubleCountTests(unittest.TestCase):
             }
             self.assertEqual(delta_bytes(sample, after), 10 * filesystem.SECTOR_BYTES)
 
+    def test_partition_of_stacked_device_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base = root / "sys"
+            disk = root / "devices" / "md0"
+            (disk / "slaves" / "sda").mkdir(parents=True)
+            (disk / "slaves" / "sdb").mkdir()
+            part = disk / "md0p1"
+            (part / "slaves").mkdir(parents=True)
+            (part / "holders").mkdir()
+            (part / "partition").write_text("1\n", encoding="utf-8")
+            (part / "stat").write_text(_stat_text(100), encoding="utf-8")
+            sys_base.mkdir()
+            (sys_base / "259:1").symlink_to(part)
+            table = _standard_table(root, _standard_mount("259:1", "/data"))
+            handle, scope = identify_scope(
+                "/data/x", mountinfo_path=table, sys_base=sys_base
+            )
+            self.assertIsNone(handle)
+            self.assertEqual(scope["status"], "unavailable")
+            self.assertEqual(scope["scope_kind"], "ambiguous_multi_device")
+            self.assertEqual(scope["stacked_slaves"], ["sda", "sdb"])
+
 
 class DeltaTests(unittest.TestCase):
     def _sample(self, sectors: int) -> filesystem.CounterSample:

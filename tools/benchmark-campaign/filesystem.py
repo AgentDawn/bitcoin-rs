@@ -509,6 +509,26 @@ def identify_scope(
     ]
     partition = (real_sys / "partition").exists()
     disk_dir = real_sys.parent if partition else real_sys
+    if partition:
+        # A partition of a stacked device (md/dm partition) lists no slaves of
+        # its own; the parent disk's topology decides whether it is stacked.
+        # Only the partition's own counter is still the one read.
+        parent_slaves_dir = disk_dir / "slaves"
+        mechanisms.append(str(parent_slaves_dir))
+        parent_slaves = _child_names(parent_slaves_dir)
+        if parent_slaves is None:
+            info.update(
+                status="unavailable",
+                scope_kind="unavailable",
+                majmin=chosen,
+                sysfs_stat=str(stat_path),
+                reason=(
+                    f"cannot list {parent_slaves_dir}: device topology is "
+                    "unreadable, so stacking cannot be ruled out"
+                ),
+            )
+            return None, info
+        slaves = slaves + [name for name in parent_slaves if name not in slaves]
     queue_dir = disk_dir / "queue"
     mechanisms.append(str(queue_dir))
     model_path = disk_dir / "device" / "model"
