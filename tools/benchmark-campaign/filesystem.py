@@ -152,15 +152,12 @@ def unescape_mountinfo(field: str) -> str:
 def _read_text(
     path: Path | str, errors: str = "replace", newline: str | None = None
 ) -> str | None:
+    # Path.open (not read_text) so ``newline`` is honored on Python 3.12,
+    # whose read_text lacks the argument; universal-newline translation
+    # would rewrite raw carriage returns inside mountinfo records.
     try:
-        if newline is None:
-            return Path(path).read_text(encoding="utf-8", errors=errors)
-        try:
-            return Path(path).read_text(
-                encoding="utf-8", errors=errors, newline=newline
-            )
-        except TypeError:
-            return Path(path).read_text(encoding="utf-8", errors=errors)
+        with Path(path).open(encoding="utf-8", errors=errors, newline=newline) as file:
+            return file.read()
     except OSError:
         return None
 

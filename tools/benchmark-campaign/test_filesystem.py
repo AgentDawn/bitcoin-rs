@@ -201,6 +201,31 @@ class EscapeTests(unittest.TestCase):
             ["/data\x0braw", "/other\x0craw", "/car\riageraw"],
         )
 
+    def test_mountinfo_keeps_carriage_return_without_read_text_newline(
+        self,
+    ) -> None:
+        # Python 3.12 Path.read_text has no ``newline`` argument; the reader
+        # must still disable newline translation so a raw CR survives.
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / "mountinfo"
+            table.write_bytes(
+                b"1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                b"2 1 8:2 / /car\riage rw - ext4 /dev/sda2 rw\n"
+            )
+
+            def _no_newline(
+                self: Path, encoding: str | None = None, errors: str | None = None
+            ) -> str:
+                # 3.12 read_text always applies universal-newline translation.
+                text = self.read_bytes().decode(encoding or "utf-8", errors or "strict")
+                return text.replace("\r\n", "\n").replace("\r", "\n")
+
+            with mock.patch.object(Path, "read_text", _no_newline):
+                mounts = read_mountinfo(table)
+        self.assertEqual(
+            [mount["mountpoint"] for mount in mounts], ["/", "/car\riage"]
+        )
+
     def test_mountinfo_malformed_lines_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             table = Path(tmp) / "mountinfo"
@@ -495,21 +520,14 @@ class ScopeLabelTests(unittest.TestCase):
             sys_base = root / "sys"
             sys_base.mkdir()
             table = _standard_table(root, _standard_mount("8:1", "/"))
-            real_read = Path.read_text
+            real_open = Path.open
 
-            def _denied(
-                self: Path,
-                encoding: str | None = None,
-                errors: str | None = None,
-                newline: str | None = None,
-            ) -> str:
+            def _denied(self: Path, *args: object, **kwargs: object) -> object:
                 if self == table:
                     raise PermissionError(13, "Permission denied")
-                return real_read(
-                    self, encoding=encoding, errors=errors, newline=newline
-                )
+                return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
 
-            with mock.patch.object(Path, "read_text", _denied):
+            with mock.patch.object(Path, "open", _denied):
                 handle, scope = identify_scope(
                     "/", mountinfo_path=table, sys_base=sys_base
                 )
