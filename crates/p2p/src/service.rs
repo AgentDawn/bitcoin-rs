@@ -961,13 +961,15 @@ impl P2pService {
         // and its overlay startup polls this counter, so this is what lets
         // it abort instead of making this call wait out its budget.
         self.stop_requests.fetch_add(1, Ordering::AcqRel);
+        // Capture before cancelling: `anchor_peers` excludes cancelled leases,
+        // so cancelling first would leave nothing to persist for restart.
+        let demonstrated = anchor_peers(&self.peer_table, &self.address_book);
         if let Some(workers) = self.workers.lock().as_mut() {
             workers.cancel(&self.peer_table, &self.overlay_addresses);
         }
         self.worker_shutdown.lock().store(true, Ordering::Release);
         self.session_cancel.lock().store(true, Ordering::Release);
         self.overlay_addresses.lock().clear();
-        let demonstrated = anchor_peers(&self.peer_table, &self.address_book);
         if !demonstrated.is_empty() {
             self.address_book
                 .remember_anchors(&demonstrated, crate::addrman::now());
@@ -3992,7 +3994,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_publishes_captured_anchors_without_a_maintenance_worker_or_join() {
+    fn shutdown_captures_anchors_before_cancelling_workers() {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().join("peers.dat");
         let service = P2pService::new(
@@ -4008,9 +4010,17 @@ mod tests {
         let now = crate::addrman::now();
         service.address_book.learn_dns("fixture", &[addr], now);
         service.address_book.succeeded(addr, 9, now);
-        let _lease = register_ready_block_peer(&service.peer_table, addr);
-        assert!(service.workers.lock().is_none());
+        let lease = register_ready_block_peer(&service.peer_table, addr);
+        // Install an epoch so `shutdown` runs its worker-cancellation path
+        // (`cancel_all`); without it the anchor capture is never racing a
+        // cancel and the test would pass even with the old ordering.
+        *service.workers.lock() = Some(Workers::default());
+        assert!(service.workers.lock().is_some());
         service.shutdown();
+        assert!(
+            lease.is_cancelled(),
+            "shutdown must cancel live sessions"
+        );
         let restored =
             crate::addrman::AddressBook::open(Some(path), Magic::REGTEST.to_bytes(), true, None);
         assert_eq!(restored.take_restart_anchors(now), vec![addr]);
