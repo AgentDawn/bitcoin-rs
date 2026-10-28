@@ -30,7 +30,7 @@ use super::artifact::{
     ARTIFACT_VERSION, ArtifactHeader, CANCEL_POLL_RECORDS, HEADER_LEN, ReadFault, RecordReader,
     RowAssembler, TxLookupRecord, into_digest, open_hashed,
 };
-use super::chain::{BaseCount, ChainBase, Located};
+use super::chain::{BaseCount, ChainBase};
 use super::manifest::{
     BundleFamily, IndexBundleManifestV1, MANIFEST_FILE, MAX_MANIFEST_BYTES, ValidatedManifest,
 };
@@ -47,6 +47,7 @@ use crate::{
 };
 use bitcoin_rs_chain::{BlockBodySource, BlockTreeReader, TipSnapshot};
 use bitcoin_rs_primitives::{BlockHash, Hash256, layout::ParsedBlock};
+use bitcoin_rs_storage::PrefixScanLimit;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -130,17 +131,23 @@ pub(crate) fn reset_interrupted_import(
     if watermarks.tx_lookup.is_some() {
         return Ok(false);
     }
-    let mut leftover = false;
-    reader
-        .snapshot()?
-        .for_each_row(TxIndexFamily::TxConfirmed, &mut |_, _| {
-            leftover = true;
-            Ok(ControlFlow::Break(()))
-        })?;
-    if leftover {
-        writer.reset_capabilities(IndexCapabilities::TX_LOOKUP)?;
+    // One bounded row decides the probe: any `TxConfirmed` row without a
+    // watermark is leftover from an interrupted import. The old
+    // whole-family visitor materialized the family on some backends just
+    // to answer this existence check.
+    let probe = reader.snapshot()?.scan_family_page(
+        TxIndexFamily::TxConfirmed,
+        None,
+        PrefixScanLimit {
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        },
+    )?;
+    if probe.rows.is_empty() {
+        return Ok(false);
     }
-    Ok(leftover)
+    writer.reset_capabilities(IndexCapabilities::TX_LOOKUP)?;
+    Ok(true)
 }
 
 fn read_manifest(path: &Path) -> Result<IndexBundleManifestV1, IndexBundleError> {
@@ -233,113 +240,137 @@ enum LocatorOutcome {
 /// Every locator must equal a real top-level block transaction boundary.
 /// Bytes that merely decode to a transaction elsewhere in the block (an
 /// embedded serialization inside a script or witness) never resolve a
-/// locator, even when the decoded id matches. The check loads the receiver's
-/// whole body for the record height and requires the recorded offset and
-/// length to equal one parsed transaction span before comparing ids.
+/// locator, even when the decoded id matches. Verification runs in height
+/// order after the stream: each covered body is loaded and parsed once no
+/// matter how the txid-prefix-ordered records scatter one block's
+/// transactions.
 struct LocatorCheck<'a> {
     chain: &'a ChainBase,
     tree: &'a BlockTreeReader,
     source: &'a dyn BlockBodySource,
-    cached: Option<(u32, Hash256, Vec<u8>)>,
+    /// Bundle positions grouped by height for the height-ordered pass.
+    /// Streaming collects; verification drains in ascending height so each
+    /// body is read and parsed once. This holds one small entry per bundle
+    /// position until its height verifies: any bundle whose records can be
+    /// validated in feasible time fits comfortably, while a per-record
+    /// re-parse (the previous shape) never finishes large bundles at all.
+    /// A bounded block cache cannot replace this grouping because records
+    /// arrive in txid-prefix order, so every block's transactions scatter
+    /// across the whole stream.
+    pending: HashMap<u32, Vec<(TxPosition, [u8; 32])>>,
     /// Positions the bundle carries per height, for the completeness check.
     counts: HashMap<u32, u64>,
     outcome: LocatorOutcome,
 }
 
 impl LocatorCheck<'_> {
-    /// Resolves every position of `record` against a top-level transaction
-    /// boundary and requires full transaction id equality; a prefix match
-    /// never resolves a locator.
+    /// Files every position of `record` under its height for the
+    /// height-ordered verification pass.
+    ///
+    /// Chain identity faults report at once, preserving the validating
+    /// pass's fault order; bodies stay untouched here. The later pass loads
+    /// each covered body once no matter how the txid-prefix-ordered records
+    /// scatter one block's transactions.
     fn check(&mut self, record: &TxLookupRecord<'_>) -> Result<(), IndexBundleError> {
         if !matches!(self.outcome, LocatorOutcome::Verified) {
             return Ok(());
         }
         let height = record.height;
-        let hash = self.chain.hash_at(self.tree, height).ok_or_else(|| {
+        self.chain.hash_at(self.tree, height).ok_or_else(|| {
             IndexBundleError::Identity(
                 "the receiver chain has no block at a record height".to_owned(),
             )
         })?;
-        for &position in record.positions {
-            match self.resolve_strict(height, hash, position)? {
-                Located::Found(tx) if tx.txid().0.to_le_bytes() == record.txid => {
-                    *self.counts.entry(height).or_default() += 1;
-                }
-                Located::Found(_) | Located::Mismatch => {
-                    self.outcome = LocatorOutcome::Mismatch { height };
-                    return Ok(());
-                }
-                Located::BodyMissing => {
-                    self.outcome = LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
-                    return Ok(());
-                }
-            }
-        }
+        self.pending.entry(height).or_default().extend(
+            record
+                .positions
+                .iter()
+                .map(|&position| (position, record.txid)),
+        );
         Ok(())
     }
 
-    /// Resolves `position` to the top-level transaction at that exact span.
+    /// Checks one height's collected positions against its block boundaries.
     ///
-    /// A ranged read that merely decodes is not enough: the offset and length
-    /// must equal one parsed transaction span of the receiver's whole body.
-    /// An out-of-range position or bytes that decode away from any boundary
-    /// report `Mismatch`; an absent or pruned body reports `BodyMissing`.
-    fn resolve_strict(
+    /// The body is loaded and parsed once for the height; the parsed spans
+    /// answer every scattered position, so a block shared by many records
+    /// costs one read and one parse instead of one per record. A position
+    /// matches only a real top-level transaction span with an equal full id:
+    /// bytes that merely decode elsewhere never resolve. Returns the block's
+    /// transaction count, or `None` when a terminal outcome was recorded
+    /// (missing body or mismatch) and verification must stop.
+    fn verify_height_positions(
         &mut self,
         height: u32,
         hash: Hash256,
-        position: TxPosition,
-    ) -> Result<Located, IndexBundleError> {
-        let hit = self
-            .cached
-            .as_ref()
-            .is_some_and(|(held_height, held_hash, _)| {
-                *held_height == height && *held_hash == hash
-            });
-        if !hit {
-            match self.source.block_body(height, BlockHash::from(hash)) {
-                Ok(Some(body)) => self.cached = Some((height, hash, body)),
-                Ok(None) => return Ok(Located::BodyMissing),
-                Err(error) => {
-                    return Err(IndexBundleError::BodyRead {
-                        height,
-                        reason: error.to_string(),
-                    });
-                }
+        positions: &[(TxPosition, [u8; 32])],
+    ) -> Result<Option<u64>, IndexBundleError> {
+        let body = match self.source.block_body(height, BlockHash::from(hash)) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                self.outcome = LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
+                return Ok(None);
             }
-        }
-        let body = self
-            .cached
-            .as_ref()
-            .map_or(&[][..], |(_, _, body)| body.as_slice());
+            Err(error) => {
+                return Err(IndexBundleError::BodyRead {
+                    height,
+                    reason: error.to_string(),
+                });
+            }
+        };
         let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
+            ParsedBlock::parse_exact(&body).map_err(|error| IndexBundleError::BodyRead {
                 height,
                 reason: format!("block does not parse: {error}"),
             })?;
+        for &(position, expected) in positions {
+            if Self::position_matches(&parsed, position, expected) {
+                *self.counts.entry(height).or_default() += 1;
+            } else {
+                self.outcome = LocatorOutcome::Mismatch { height };
+                return Ok(None);
+            }
+        }
+        Ok(Some(u64::try_from(parsed.tx_count()).unwrap_or(u64::MAX)))
+    }
+
+    /// Resolves one collected position against the parsed block's spans.
+    ///
+    /// A ranged read that merely decodes is not enough: the offset and length
+    /// must equal one parsed transaction span, and the full id there must
+    /// equal the expected one. An out-of-range position, bytes that decode
+    /// away from any boundary, or an id mismatch never resolves.
+    fn position_matches(
+        parsed: &ParsedBlock,
+        position: TxPosition,
+        expected: [u8; 32],
+    ) -> bool {
         for tx in parsed.transactions() {
             let span = tx.span();
             if is_top_level_span(position, span.start(), span.len()) {
-                return Ok(Located::Found(tx.materialize()));
+                return tx.materialize().txid().0.to_le_bytes() == expected;
             }
         }
-        Ok(Located::Mismatch)
+        false
     }
 
-    /// Compares all transactions in the covered range.
+    /// Verifies every collected locator in height order, then compares all
+    /// transactions in the covered range.
     ///
-    /// Every bundle position already proved to be a real boundary with a
-    /// matching id, and distinct bundle keys prove distinct locators, so the
-    /// bundle is complete exactly when its per-height position count equals
-    /// the receiver's per-height transaction count. A missing body withholds
-    /// instead of refusing; a count mismatch refuses before any write, so an
-    /// incomplete bundle never receives the complete watermark.
-    fn verify_completeness(
+    /// Strict checks run for every height before any completeness check, so
+    /// the reported fault order keeps locator mismatch ahead of omitted
+    /// transactions. Each covered body is loaded and parsed once; heights
+    /// without bundle positions reuse the metadata count when the source
+    /// keeps it. A missing body withholds instead of refusing; a count
+    /// mismatch refuses before any write, so an incomplete bundle never
+    /// receives the complete watermark.
+    fn verify_locators(
         &mut self,
         floor: u32,
         base: u32,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), IndexBundleError> {
+        let mut block_counts: HashMap<u32, u64> = HashMap::new();
         for height in floor..=base {
             if u64::from(height) % CANCEL_POLL_RECORDS == 0 && cancelled() {
                 return Err(IndexBundleError::Cancelled);
@@ -349,12 +380,22 @@ impl LocatorCheck<'_> {
                     "the receiver chain has no block at a covered height".to_owned(),
                 )
             })?;
-            let expected = if let Some(count) = self.block_tx_count(height, hash)? {
-                count
-            } else {
-                self.outcome = LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
-                return Ok(());
+            let count = match self.verify_height_count(height, hash)? {
+                Some(count) => count,
+                // A terminal locator outcome is already recorded;
+                // completeness is unreachable.
+                None => return Ok(()),
             };
+            block_counts.insert(height, count);
+        }
+        for height in floor..=base {
+            if u64::from(height) % CANCEL_POLL_RECORDS == 0 && cancelled() {
+                return Err(IndexBundleError::Cancelled);
+            }
+            // The strict phase above ran every height without a terminal
+            // outcome, so a recorded count exists for each; zero fails
+            // closed toward refusal.
+            let expected = block_counts.get(&height).copied().unwrap_or(0);
             if let Some(error) = incomplete_at(&self.counts, height, expected) {
                 return Err(error);
             }
@@ -362,11 +403,34 @@ impl LocatorCheck<'_> {
         Ok(())
     }
 
+    /// Returns one height's transaction count for the completeness check:
+    /// collected positions are verified against a single parse of the body,
+    /// while a height without positions reuses the metadata count when the
+    /// source keeps it. Returns `None` when a terminal outcome was recorded
+    /// (missing body or mismatch) and verification must stop.
+    fn verify_height_count(
+        &mut self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<u64>, IndexBundleError> {
+        match self.pending.remove(&height) {
+            Some(positions) => self.verify_height_positions(height, hash, &positions),
+            None => {
+                if let Some(count) = self.block_tx_count(height, hash)? {
+                    Ok(Some(count))
+                } else {
+                    self.outcome = LocatorOutcome::Withheld(Withheld::BodyUnavailable { height });
+                    Ok(None)
+                }
+            }
+        }
+    }
+
     /// Transactions the receiver holds in `(height, hash)`, or `None` when the
     /// body is absent or pruned. Metadata answers without I/O when the source
     /// keeps it; otherwise the whole body is parsed for its count.
     fn block_tx_count(
-        &mut self,
+        &self,
         height: u32,
         hash: Hash256,
     ) -> Result<Option<u64>, IndexBundleError> {
@@ -381,30 +445,18 @@ impl LocatorCheck<'_> {
                 }
             });
         }
-        let hit = self
-            .cached
-            .as_ref()
-            .is_some_and(|(held_height, held_hash, _)| {
-                *held_height == height && *held_hash == hash
-            });
-        if !hit {
-            match self.source.block_body(height, BlockHash::from(hash)) {
-                Ok(Some(body)) => self.cached = Some((height, hash, body)),
-                Ok(None) => return Ok(None),
-                Err(error) => {
-                    return Err(IndexBundleError::BodyRead {
-                        height,
-                        reason: error.to_string(),
-                    });
-                }
+        let body = match self.source.block_body(height, BlockHash::from(hash)) {
+            Ok(Some(body)) => body,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                return Err(IndexBundleError::BodyRead {
+                    height,
+                    reason: error.to_string(),
+                });
             }
-        }
-        let body = self
-            .cached
-            .as_ref()
-            .map_or(&[][..], |(_, _, body)| body.as_slice());
+        };
         let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
+            ParsedBlock::parse_exact(&body).map_err(|error| IndexBundleError::BodyRead {
                 height,
                 reason: format!("block does not parse: {error}"),
             })?;
@@ -464,7 +516,7 @@ fn validate_artifact(
             chain,
             tree: host.block_tree,
             source,
-            cached: None,
+            pending: HashMap::new(),
             counts: HashMap::new(),
             outcome: LocatorOutcome::Verified,
         }),
@@ -493,7 +545,7 @@ fn validate_artifact(
     framing?;
     if let Some(check) = locators.as_mut() {
         if matches!(check.outcome, LocatorOutcome::Verified) {
-            check.verify_completeness(
+            check.verify_locators(
                 manifest.tx_lookup.floor,
                 manifest.identity.base_height,
                 host.cancelled,

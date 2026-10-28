@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 
 use bitcoin_rs_primitives::{Hash256, OutPoint, Txid, varint};
 use bitcoin_rs_storage::checkpoint::CheckpointReference;
@@ -830,8 +830,12 @@ impl VerifiedSnapshotArtifact {
             .byte_len()
             .checked_add(1)
             .ok_or(RawSeedError::Integrity)?;
-        let mut capped = Read::by_ref(&mut self.file).take(limit);
-        let mut tee = TeeReader::new(&mut capped);
+        // Buffer the small header/output/script reads in memory. The buffer
+        // sits below the tee, so the digest still covers exactly the bytes
+        // the decoder consumes; prefetch never reaches the hash.
+        let capped = Read::by_ref(&mut self.file).take(limit);
+        let mut buffered = BufReader::new(capped);
+        let mut tee = TeeReader::new(&mut buffered);
         let stream = read_raw_snapshot_stream(&mut tee, emit)?;
         let (digest, len) = tee.finish();
         let bound = len == self.witness.len

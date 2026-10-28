@@ -41,6 +41,27 @@ pub(super) enum SeedFlow {
 }
 
 impl Worker {
+    /// Clears an interrupted `ScriptLive` seed before the forward loop
+    /// replays from genesis. Rows without a watermark are seed debris by
+    /// construction (ordinary commits stamp the watermark with every batch),
+    /// so a reset here only fires after an unclean shutdown or a failed
+    /// seed; ordinary replay progress always carries a watermark. A reset
+    /// advances the fence, so the pass that cleared simply stalls and the
+    /// next pass replays from a clean family.
+    fn clear_interrupted_seed_for_replay(&self) -> Result<(), DerivedIndexWorkerError> {
+        if !self.enabled.contains(IndexCapability::ScriptLive) {
+            return Ok(());
+        }
+        if self
+            .writer
+            .reset_interrupted_script_live_seed()
+            .map_err(DerivedIndexWorkerError::Index)?
+        {
+            tracing::warn!("cleared ScriptLive rows left by an interrupted seed before replay");
+        }
+        Ok(())
+    }
+
     /// Artifact or retained-history seed dispatch for a missing `ScriptLive` watermark.
     ///
     /// The worker bundle is the only active holder besides at most one queued
@@ -91,28 +112,34 @@ impl Worker {
         }
         let Some(slot) = self.seed_slot.as_ref() else {
             // No composition wiring (tests, `ScriptLive` without a snapshot
-            // source): genesis replay covers the cold start.
+            // source): genesis replay covers the cold start. An interrupted
+            // seed may have left rows without a watermark; replay would
+            // publish over the mix, so clear them here rather than only
+            // before another artifact seed.
+            self.clear_interrupted_seed_for_replay()?;
             return Ok(SeedFlow::FallThrough {
                 want_on_stall: false,
             });
         };
-        match slot.take() {
-            Some(artifact) => {
-                // A usable artifact arrived: the scoped outage, if set, is
-                // over. Demand moves into the worker bundle with the artifact.
-                self.runtime.clear_script_live();
-                *self.seed_bundle.lock() = Some(SeedBundle {
-                    artifact: Some(artifact),
-                    lease: None,
-                });
-                self.seed_from_bundle()
-            }
+        if let Some(artifact) = slot.take() {
+            // A usable artifact arrived: the scoped outage, if set, is
+            // over. Demand moves into the worker bundle with the artifact.
+            self.runtime.clear_script_live();
+            *self.seed_bundle.lock() = Some(SeedBundle {
+                artifact: Some(artifact),
+                lease: None,
+            });
+            self.seed_from_bundle()
+        } else {
             // No token and no bundle. The forward loop runs the replay leg
             // when grantable; `want()` if it stalls keeps demand set so a
-            // later token lands without a history spin.
-            None => Ok(SeedFlow::FallThrough {
+            // later token lands without a history spin. Clear interrupted
+            // seed rows before entering replay, not only before another
+            // artifact seed.
+            self.clear_interrupted_seed_for_replay()?;
+            Ok(SeedFlow::FallThrough {
                 want_on_stall: true,
-            }),
+            })
         }
     }
 

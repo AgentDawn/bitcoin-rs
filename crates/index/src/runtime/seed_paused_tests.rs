@@ -271,6 +271,10 @@ impl TxIndexWriter for GatedWriter {
         self.inner.reset_capabilities(capabilities)
     }
 
+    fn reset_interrupted_script_live_seed(&self) -> Result<bool, IndexError> {
+        self.inner.reset_interrupted_script_live_seed()
+    }
+
     fn anchor_watermark(
         &self,
         capabilities: IndexCapabilities,

@@ -578,11 +578,14 @@ impl AssumeUtxoManager {
         &self,
         state: VerifiedSnapshotState,
     ) -> Result<(), AssumeUtxoError> {
+        // The anchor resolves under the lifecycle guard, so the `pinned`
+        // reference `install_verified` pairs with the state was resolved
+        // from the same guarded epoch that `require_unactivated` checks.
+        let _lifecycle = self.lifecycle.lock();
         let pinned = self
             .network
             .assume_utxo_for_height(state.height())
             .ok_or(AssumeUtxoError::UntrustedSnapshotHeight(state.height()))?;
-        let _lifecycle = self.lifecycle.lock();
         self.require_unactivated()?;
         self.install_verified(state, pinned)
     }

@@ -290,9 +290,11 @@ pub(super) fn write_coins_sealed(
     state: VerifiedSnapshotState,
     pinned: &AssumeUtxoData,
 ) -> Result<(UtxoSet, CoinStats, Option<bitcoin_rs_utxo::V4Witness>)> {
+    // The directory resolves before the proof is consumed, so a directory
+    // failure returns with `state` still owned by the caller for retry.
+    let directory = archive_directory(data_dir, pinned.block_hash)?;
     let (set, stats) = state.into_parts();
     let trailer = stats.muhash.finalize();
-    let directory = archive_directory(data_dir, pinned.block_hash)?;
     let witness = write_archive(&directory, "coins.dat", |writer| {
         let (_, _, witness) = bitcoin_rs_utxo::snapshot::write_snapshot_witnessed(
             &set,
