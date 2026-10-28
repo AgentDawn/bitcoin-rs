@@ -23,6 +23,7 @@
 //! total order.
 
 use super::manifest::BundleFamily;
+use crate::IndexError;
 use crate::types::{HEIGHT_SIZE, HashPrefixRow, TX_POSITION_SIZE, TxPosition, positions_are_valid};
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
@@ -322,6 +323,15 @@ fn probe_end(reader: &mut impl Read) -> io::Result<bool> {
 /// Sink of one folded row: the stored key and its packed position value.
 type RowEmit<'a, E> = dyn FnMut(HashPrefixRow, &[u8]) -> Result<(), E> + 'a;
 
+/// Cap on the positions folded into one stored row.
+///
+/// One serialized block holds at most ~66k transactions even at a 60-byte
+/// minimum encoding, so twice that can never trigger on an honest bundle
+/// while bounding importer RSS under one megabyte (131,072 x 6 bytes). Past
+/// the cap the import fails closed: rows sharing one key must commit as one
+/// value, so there is no sound way to split them.
+const MAX_FOLDED_POSITIONS: usize = 131_072;
+
 /// Folds consecutive records that share one stored key into one row value.
 ///
 /// Distinct transactions whose ids collide on the 8-byte prefix inside one
@@ -335,17 +345,24 @@ pub(super) struct RowAssembler {
 
 impl RowAssembler {
     /// Adds `record`; a completed previous row is handed to `emit` first.
-    pub(super) fn push<E>(
+    ///
+    /// Refuses with [`IndexError::MutationSizeOverflow`] past
+    /// [`MAX_FOLDED_POSITIONS`]: a malicious bundle must not grow importer
+    /// RSS without bound before any row is written.
+    pub(super) fn push(
         &mut self,
         record: &TxLookupRecord<'_>,
-        emit: &mut RowEmit<'_, E>,
-    ) -> Result<(), E> {
+        emit: &mut RowEmit<'_, IndexError>,
+    ) -> Result<(), IndexError> {
         let mut prefix = [0_u8; 8];
         prefix.copy_from_slice(&record.txid[..8]);
         let row = HashPrefixRow::new(prefix, record.height);
         if self.row != Some(row) {
             self.flush(emit)?;
             self.row = Some(row);
+        }
+        if self.positions.len().saturating_add(record.positions.len()) > MAX_FOLDED_POSITIONS {
+            return Err(IndexError::MutationSizeOverflow);
         }
         self.positions.extend_from_slice(record.positions);
         Ok(())
@@ -417,6 +434,7 @@ pub(super) fn hash_file(path: &Path) -> io::Result<([u8; 32], u64)> {
 #[expect(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::IndexError;
     use std::io::Cursor;
 
     fn txid(prefix: u8, tail: u8) -> [u8; 32] {
@@ -523,7 +541,7 @@ mod tests {
         let mut reader = RecordReader::new(Cursor::new(payload.as_slice()), &header, 0);
         let mut assembler = RowAssembler::default();
         let mut folded: Vec<(HashPrefixRow, Vec<u8>)> = Vec::new();
-        let mut emit = |row: HashPrefixRow, value: &[u8]| -> Result<(), ()> {
+        let mut emit = |row: HashPrefixRow, value: &[u8]| -> Result<(), IndexError> {
             folded.push((row, value.to_vec()));
             Ok(())
         };
@@ -621,6 +639,45 @@ mod tests {
             reason(read_all(&lone, &empty_record, 0)),
             "record carries no positions"
         );
+    }
+
+    #[test]
+    fn folder_refuses_a_row_past_the_position_quota() {
+        // Every record shares one stored key but carries a distinct full id,
+        // so all of their valid positions fold into a single row value.
+        const PER_RECORD: usize = 255;
+        let records = MAX_FOLDED_POSITIONS / PER_RECORD + 2;
+        let mut payload = Vec::new();
+        for suffix in 0..records {
+            let mut id = [0xAA_u8; 32];
+            id[8..12].copy_from_slice(
+                &u32::try_from(suffix)
+                    .expect("test count fits u32")
+                    .to_be_bytes(),
+            );
+            let per_record = u32::try_from(PER_RECORD).expect("test quota fits u32");
+            let positions: Vec<TxPosition> = (0..per_record)
+                .map(|index| TxPosition::new(index.saturating_mul(100), 60))
+                .collect();
+            write_record(&mut payload, &id, 7, &positions).expect("in-memory write");
+        }
+        let record_count = u64::try_from(records).expect("test count fits u64");
+        let payload_bytes = u64::try_from(payload.len()).expect("test payload fits u64");
+        let header_value = header(record_count, payload_bytes, 7);
+        let mut reader = RecordReader::new(Cursor::new(payload.as_slice()), &header_value, 0);
+        let mut assembler = RowAssembler::default();
+        let mut emit = |_: HashPrefixRow, _: &[u8]| -> Result<(), IndexError> { Ok(()) };
+        let mut refused = false;
+        while let Some(record) = reader.next_record().expect("frames") {
+            if matches!(
+                assembler.push(&record, &mut emit),
+                Err(IndexError::MutationSizeOverflow)
+            ) {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "folding past the quota must fail closed");
     }
 
     #[test]
