@@ -20,8 +20,9 @@ use bitcoin_rs_primitives::{
 use crate::error::RpcError;
 
 use crate::compressed_tx::{
-    LookupError, MAX_RESOLVER_STATE_BYTES, MAX_RETAINED_BODIES, MAX_RETAINED_BODY_BYTES,
-    MAX_RETAINED_BYTES_TOTAL, MAX_RETAINED_INDEX_BYTES, PrevoutResolver, ResolvedPrevout,
+    LookupError, MAX_CUMULATIVE_BODY_BYTES, MAX_CUMULATIVE_BODY_LOADS, MAX_RESOLVER_STATE_BYTES,
+    MAX_RETAINED_BODIES, MAX_RETAINED_BODY_BYTES, MAX_RETAINED_BYTES_TOTAL,
+    MAX_RETAINED_INDEX_BYTES, PrevoutResolver, ResolvedPrevout,
 };
 
 use bitcoin::hex::DisplayHex as _;
@@ -1002,9 +1003,11 @@ fn retained_tx_bytes(txs: &[Tx]) -> usize {
 /// each retained body once in a scope that drops the parsed block before
 /// the next body is read. Retained materialized transactions are charged
 /// against the body and combined budgets and evicted with their body, so
-/// the cache lifetime stays bounded. Missing, corrupt, and unreadable
-/// bodies stay distinct ([`LookupError`]) because the codec degrades them
-/// differently.
+/// the cache lifetime stays bounded. Cumulative loads and bytes bound the
+/// total read/parse/materialize/txid work under the exclusion and fail
+/// closed; codecs group height-known lookups so each body loads once.
+/// Missing, corrupt, and unreadable bodies stay distinct ([`LookupError`])
+/// because the codec degrades them differently.
 pub(crate) struct RpcPrevoutResolver<'ctx> {
     ctx: &'ctx Context,
     view: AppliedView,
@@ -1014,6 +1017,13 @@ pub(crate) struct RpcPrevoutResolver<'ctx> {
     bodies: Vec<RetainedBody>,
     retained_tx_bytes: usize,
     retained_index_bytes: usize,
+    /// Cumulative body loads performed (distinct reads; eviction reloads
+    /// count again, so cycling past the retained slots cannot do unbounded
+    /// parse work under the exclusion). Never decremented.
+    loads: usize,
+    /// Cumulative body bytes read, bounding total parse work. Never
+    /// decremented.
+    loaded_bytes: usize,
     memo: HashMap<OutPoint, Option<ResolvedPrevout>>,
     state_bytes: usize,
 }
@@ -1036,6 +1046,8 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
             bodies: Vec::new(),
             retained_tx_bytes: 0,
             retained_index_bytes: 0,
+            loads: 0,
+            loaded_bytes: 0,
             memo: HashMap::new(),
             state_bytes: 0,
         })
@@ -1057,6 +1069,12 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
     }
 
     /// Ensures the body at `height` is retained, evicting oldest-first.
+    /// Cumulative loads and bytes fail closed before doing body I/O or
+    /// parsing: without them a request cycling more heights than the
+    /// retained slots could pay a full body read, parse, materialization,
+    /// and txid pass per input while holding the stable-chainstate
+    /// exclusion. Codecs group height-known lookups so each body loads
+    /// once; this budget backstops the rest.
     fn ensure_body(&mut self, height: u32) -> Result<(), LookupError> {
         if self.bodies.iter().any(|body| body.height == height) {
             return Ok(());
@@ -1075,6 +1093,13 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
             .block_body_source
             .as_ref()
             .ok_or(LookupError::BodyMissing(height))?;
+        // Fail closed before body I/O so the exclusion never pays for more
+        // than a bounded number of loads.
+        if self.loads >= MAX_CUMULATIVE_BODY_LOADS {
+            return Err(LookupError::LimitExceeded(
+                crate::compressed_tx::Limit::Loads,
+            ));
+        }
         let bytes = source
             .block_body(height, record.hash)
             .map_err(|error| match error {
@@ -1087,6 +1112,13 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
                 crate::compressed_tx::Limit::BodyBytes,
             ));
         }
+        if self.loaded_bytes.saturating_add(bytes.len()) > MAX_CUMULATIVE_BODY_BYTES {
+            return Err(LookupError::LimitExceeded(
+                crate::compressed_tx::Limit::LoadBytes,
+            ));
+        }
+        self.loads += 1;
+        self.loaded_bytes = self.loaded_bytes.saturating_add(bytes.len());
         // Pre-charge the transient index space this body will occupy.
         let index_bytes = bytes.len() / 60 * 40;
         if index_bytes > MAX_RETAINED_INDEX_BYTES {

@@ -45,6 +45,7 @@ use bitcoin_rs_primitives::{
     Amount, LockTime, OutPoint, Script, Sequence, SighashCache, Tx, TxIn, TxOut, Txid, Witness,
     consensus_bytes, varint,
 };
+use hashbrown::HashMap;
 
 use crate::error::RpcError;
 
@@ -64,6 +65,17 @@ pub(crate) const MAX_RETAINED_INDEX_BYTES: usize = 12 * 1024 * 1024;
 pub(crate) const MAX_RETAINED_BYTES_TOTAL: usize = 32 * 1024 * 1024;
 /// Memoized resolver state (prevout memo entries) budget for one call.
 pub(crate) const MAX_RESOLVER_STATE_BYTES: usize = 8 * 1024 * 1024;
+/// Cumulative body loads (distinct reads plus eviction reloads) one
+/// resolver call may perform. Bounds the total body-read/parse/materialize/
+/// txid work under the stable-chainstate exclusion (snapshot isolation: one
+/// uninterrupted chainstate read) even when retained budgets stay satisfied
+/// through eviction; exceeding it fails closed. Sized at twice the retained
+/// slots so a grouped pass over a handful of heights succeeds while a
+/// cycling pass cannot reload forever.
+pub(crate) const MAX_CUMULATIVE_BODY_LOADS: usize = MAX_RETAINED_BODIES * 2;
+/// Cumulative body bytes one resolver call may read, bounding total parse
+/// work under the exclusion to twice the retained-body ceiling.
+pub(crate) const MAX_CUMULATIVE_BODY_BYTES: usize = MAX_RETAINED_BODY_BYTES * 2;
 
 /// Cancellation is polled once per this many codec inputs.
 const CANCELLATION_POLL_INPUTS: usize = 256;
@@ -85,13 +97,17 @@ pub(crate) struct ResolvedPrevout {
     pub confirmed_height: Option<u32>,
 }
 
-/// Which retained resolver budget a [`LookupError::LimitExceeded`] hit.
+/// Which resolver budget a [`LookupError::LimitExceeded`] hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Limit {
     /// Too many retained bodies.
     Bodies,
     /// Retained body bytes.
     BodyBytes,
+    /// Cumulative body loads (distinct reads plus eviction reloads).
+    Loads,
+    /// Cumulative body bytes read.
+    LoadBytes,
     /// Retained flat-index bytes.
     IndexBytes,
     /// Memoized resolver state bytes.
@@ -117,7 +133,7 @@ pub(crate) enum LookupError {
     /// The body at this height could not be read.
     #[error("block body at height {0} could not be read")]
     BodyReadFailed(u32),
-    /// A retained resolver budget ran out; the call may be retried.
+    /// A resolver budget ran out; the call may be retried.
     #[error("compressed transaction resource limit exceeded")]
     LimitExceeded(Limit),
     /// The caller cancelled while resolving.
@@ -128,8 +144,8 @@ pub(crate) enum LookupError {
 /// Context source for one compress or decompress call.
 ///
 /// Implementations may retain bounded per-call state (see the
-/// `MAX_RETAINED_*` ceilings); `&mut self` carries it, so no interior
-/// mutability or second cache owner exists.
+/// `MAX_RETAINED_*` and `MAX_CUMULATIVE_*` ceilings); `&mut self` carries
+/// it, so no interior mutability or second cache owner exists.
 ///
 /// `flat_output_index` (cumulative outputs before `txid` in `height`,
 /// plus `vout`) and `outpoint_at` must be exact inverses on one block;
@@ -157,7 +173,7 @@ pub(crate) trait PrevoutResolver {
 
 /// Codec failure. Each variant maps to exactly one [`RpcError`]:
 /// structural malformation is `-22`, oversize input or output is `-8`,
-/// retained-budget exhaustion and cancellation are retryable `-1`,
+/// budget exhaustion and cancellation are retryable `-1`,
 /// a proved-absent prevout during decompress is `-5`.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CodecError {
@@ -171,7 +187,7 @@ pub(crate) enum CodecError {
     /// its supported range.
     #[error("compressed transaction value exceeds its supported range")]
     Overflow,
-    /// A retained resolver budget ran out.
+    /// A resolver budget ran out.
     #[error("compressed transaction resource limit exceeded")]
     LimitExceeded(Limit),
     /// A transaction must carry at least one input and one output.
@@ -853,6 +869,67 @@ fn sequence_value(code: u8, reader: &mut Reader<'_>) -> Result<u32, CodecError> 
 // Compress
 // ---------------------------------------------------------------------
 
+/// Groups input indices needing flat-index lookups by required height, in
+/// first-appearance order. Heights are already known from the resolved
+/// prevouts; inputs degraded to raw outpoints or lacking confirmation need
+/// no lookup and stay out of every group.
+fn flat_lookup_groups(
+    tx: &Tx,
+    resolved: &[Option<ResolvedPrevout>],
+    degraded: &[Option<String>],
+) -> (Vec<u32>, HashMap<u32, Vec<usize>>) {
+    let mut order: Vec<u32> = Vec::new();
+    let mut members: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, _) in tx.inputs.iter().enumerate() {
+        if degraded.get(index).and_then(Option::as_ref).is_some() {
+            continue;
+        }
+        let Some(prevout) = resolved.get(index).and_then(Option::as_ref) else {
+            continue;
+        };
+        let Some(height) = prevout.confirmed_height else {
+            continue;
+        };
+        if !members.contains_key(&height) {
+            order.push(height);
+        }
+        members.entry(height).or_default().push(index);
+    }
+    (order, members)
+}
+
+/// Resolves flat output indices grouped by height so each body is loaded
+/// once: one height's lookups run consecutively, keeping every lookup a
+/// retained-body hit instead of evicting and reloading the body per input.
+/// Cancellation is polled like the per-input passes.
+fn resolve_flats_grouped(
+    tx: &Tx,
+    resolver: &mut dyn PrevoutResolver,
+    order: &[u32],
+    members: &HashMap<u32, Vec<usize>>,
+) -> Result<Vec<Option<Result<Option<u32>, LookupError>>>, CodecError> {
+    let mut results: Vec<Option<Result<Option<u32>, LookupError>>> = vec![None; tx.inputs.len()];
+    let mut polls = 0_usize;
+    for &height in order {
+        let Some(indices) = members.get(&height) else {
+            continue;
+        };
+        for &index in indices {
+            if polls % CANCELLATION_POLL_INPUTS == 0 && resolver.cancelled() {
+                return Err(CodecError::Cancelled);
+            }
+            polls += 1;
+            let input = &tx.inputs[index];
+            results[index] = Some(resolver.flat_output_index(
+                height,
+                &input.previous_output.txid,
+                input.previous_output.vout,
+            ));
+        }
+    }
+    Ok(results)
+}
+
 /// Per-input encoding plan, computed after prevout resolution.
 struct Plan {
     outpoint_compressed: bool,
@@ -944,6 +1021,21 @@ pub(crate) fn compress_transaction(
     }
     let min_height = min_height.unwrap_or(0);
 
+    // Group flat-index lookups by required height so each body is loaded
+    // once: heights are already known from the resolved prevouts, so running
+    // one height's lookups consecutively keeps every lookup a retained-body
+    // hit instead of evicting and reloading the body per input. Heights run
+    // in first-appearance order to keep failure precedence closest to input
+    // order. Results are cached per input; the plan pass below still runs in
+    // input order, so warnings keep their `UTXO(i)` order and content, and
+    // proved-absent inputs still degrade rather than fail.
+    let mut flat_results: Vec<Option<Result<Option<u32>, LookupError>>> =
+        vec![None; tx.inputs.len()];
+    if options.compress_outpoints {
+        let (order, members) = flat_lookup_groups(tx, &resolved, &degraded);
+        flat_results = resolve_flats_grouped(tx, resolver, &order, &members)?;
+    }
+
     // Per-input encoding plan.
     let mut plans: Vec<Plan> = Vec::with_capacity(tx.inputs.len());
     let mut warnings: Vec<String> = Vec::new();
@@ -961,12 +1053,8 @@ pub(crate) fn compress_transaction(
                 (None, None) => Some("prevout not found".to_owned()),
                 (Some(prevout), None) => match prevout.confirmed_height {
                     None => Some("prevout is unconfirmed".to_owned()),
-                    Some(height) => match resolver.flat_output_index(
-                        height,
-                        &input.previous_output.txid,
-                        input.previous_output.vout,
-                    ) {
-                        Ok(Some(flat)) => {
+                    Some(height) => match flat_results[index] {
+                        Some(Ok(Some(flat))) => {
                             height_offset = u64::from(
                                 height.checked_sub(min_height).ok_or(CodecError::Overflow)?,
                             );
@@ -974,23 +1062,26 @@ pub(crate) fn compress_transaction(
                             outpoint_compressed = true;
                             None
                         }
-                        Ok(None) => Some("prevout transaction not found in its block".to_owned()),
-                        Err(LookupError::LimitExceeded(limit)) => {
+                        Some(Ok(None)) => {
+                            Some("prevout transaction not found in its block".to_owned())
+                        }
+                        Some(Err(LookupError::LimitExceeded(limit))) => {
                             return Err(CodecError::LimitExceeded(limit));
                         }
-                        Err(LookupError::Cancelled) => return Err(CodecError::Cancelled),
-                        Err(LookupError::Missing) => {
+                        Some(Err(LookupError::Cancelled)) => return Err(CodecError::Cancelled),
+                        Some(Err(LookupError::Missing)) => {
                             Some("prevout context is unavailable".to_owned())
                         }
-                        Err(LookupError::BodyMissing(h)) => {
+                        Some(Err(LookupError::BodyMissing(h))) => {
                             Some(format!("prevout block body at height {h} is unavailable"))
                         }
-                        Err(LookupError::CorruptBody(h)) => {
+                        Some(Err(LookupError::CorruptBody(h))) => {
                             Some(format!("prevout block body at height {h} is corrupt"))
                         }
-                        Err(LookupError::BodyReadFailed(h)) => Some(format!(
+                        Some(Err(LookupError::BodyReadFailed(h))) => Some(format!(
                             "prevout block body at height {h} could not be read"
                         )),
+                        None => Some("prevout context is unavailable".to_owned()),
                     },
                 },
             };
@@ -1136,6 +1227,19 @@ enum SigParts {
     },
 }
 
+/// One input's parsed fields: everything the byte stream says before any
+/// resolver call. Splitting parse from resolution lets the resolver run
+/// grouped by required height (each body loaded once) instead of cycling
+/// retained bodies in input order.
+struct ParsedInput {
+    /// Compressed outpoint reference; `None` carries `raw_outpoint`.
+    height_flat: Option<(u32, u32)>,
+    /// Literal outpoint when `height_flat` is `None`.
+    raw_outpoint: Option<OutPoint>,
+    sequence: u32,
+    signature: SigParts,
+}
+
 struct InputParts {
     outpoint: OutPoint,
     resolved: Option<ResolvedPrevout>,
@@ -1235,6 +1339,65 @@ fn recover_pubkey(cache: &SighashCache<'_>, request: &Recovery<'_>) -> Result<Ve
     Err(CodecError::SignatureUnrecoverable)
 }
 
+/// Resolves compressed outpoints grouped by required height so each body is
+/// loaded once no matter how inputs interleave heights. Heights run in
+/// first-appearance order to keep failure precedence closest to input
+/// order. Raw outpoints need no body and stay out of every group; their
+/// slots hold `None`.
+fn resolve_outpoints_grouped(
+    parsed: &[ParsedInput],
+    resolver: &mut dyn PrevoutResolver,
+) -> Result<Vec<Option<Result<Option<(OutPoint, ResolvedPrevout)>, LookupError>>>, CodecError> {
+    let mut order: Vec<u32> = Vec::new();
+    let mut members: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, part) in parsed.iter().enumerate() {
+        if let Some((height, _)) = part.height_flat {
+            if !members.contains_key(&height) {
+                order.push(height);
+            }
+            members.entry(height).or_default().push(index);
+        }
+    }
+    let mut located: Vec<Option<Result<Option<(OutPoint, ResolvedPrevout)>, LookupError>>> =
+        vec![None; parsed.len()];
+    let mut polls = 0_usize;
+    for &height in &order {
+        let Some(indices) = members.get(&height) else {
+            continue;
+        };
+        for &index in indices {
+            if polls % CANCELLATION_POLL_INPUTS == 0 && resolver.cancelled() {
+                return Err(CodecError::Cancelled);
+            }
+            polls += 1;
+            let Some((_, flat)) = parsed[index].height_flat else {
+                continue;
+            };
+            located[index] = Some(resolver.outpoint_at(height, flat));
+        }
+    }
+    Ok(located)
+}
+
+/// Fetches the prevout for a compressed signature whose outpoint arrived
+/// raw. Context is mandatory exactly when reconstruction consumes it: every
+/// compressed signature needs its prevout script. Compressed outpoints
+/// already carry their resolution, so they pass through untouched.
+fn resolve_sig_prevout(
+    resolver: &mut dyn PrevoutResolver,
+    outpoint: &OutPoint,
+    resolved: Option<ResolvedPrevout>,
+) -> Result<Option<ResolvedPrevout>, CodecError> {
+    match resolved {
+        Some(prevout) => Ok(Some(prevout)),
+        None => match resolver.prevout(outpoint) {
+            Ok(Some(prevout)) => Ok(Some(prevout)),
+            Ok(None) => Err(CodecError::PrevoutMissing(*outpoint)),
+            Err(error) => Err(lookup_failure(error, CodecError::PrevoutMissing(*outpoint))),
+        },
+    }
+}
+
 /// The parsed, context-resolved skeleton of one compressed transaction:
 /// everything [`decompress_prepare`] reads while the stable chainstate
 /// excludes transitions. No public-key recovery has run yet, so holding a
@@ -1312,7 +1475,12 @@ pub(crate) fn decompress_prepare(
 
     let (input_meta, output_meta) = decode_bits(&mut reader, input_count, output_count)?;
 
-    let mut inputs: Vec<InputParts> = Vec::with_capacity(input_count);
+    // Parse every input before touching the resolver: the byte stream fixes
+    // the input order, but resolution runs grouped by height below. Parse
+    // runs ahead of resolution, so a malformed tail surfaces before an
+    // unresolvable early input; both are refusals, and single-fault inputs
+    // map exactly as before.
+    let mut parsed: Vec<ParsedInput> = Vec::with_capacity(input_count);
     for index in 0..input_count {
         if index % CANCELLATION_POLL_INPUTS == 0 && resolver.cancelled() {
             return Err(CodecError::Cancelled);
@@ -1324,17 +1492,11 @@ pub(crate) fn decompress_prepare(
         let seq_code = (meta >> 3) & 0x03;
         let outpoint_compressed = meta & 0x20 != 0;
 
-        let (outpoint, resolved) = if outpoint_compressed {
+        let (height_flat, raw_outpoint) = if outpoint_compressed {
             let offset = read_u32_varint(&mut reader)?;
             let flat = read_u32_varint(&mut reader)?;
             let height = min_height.checked_add(offset).ok_or(CodecError::Overflow)?;
-            match resolver.outpoint_at(height, flat) {
-                Ok(Some(found)) => (found.0, Some(found.1)),
-                Ok(None) => return Err(CodecError::BodyMissing(height)),
-                Err(error) => {
-                    return Err(lookup_failure(error, CodecError::BodyMissing(height)));
-                }
-            }
+            (Some((height, flat)), None)
         } else {
             let mut txid_bytes = [0_u8; 32];
             txid_bytes.copy_from_slice(reader.take(32)?);
@@ -1343,7 +1505,7 @@ pub(crate) fn decompress_prepare(
                 Txid(bitcoin_rs_primitives::Hash256::from_le_bytes(&txid_bytes)),
                 vout,
             );
-            (outpoint, None)
+            (None, Some(outpoint))
         };
 
         let signature = if sig_compressed {
@@ -1386,19 +1548,50 @@ pub(crate) fn decompress_prepare(
         };
         let sequence = sequence_value(seq_code, &mut reader)?;
 
-        // Context is mandatory exactly when reconstruction consumes it:
-        // every compressed signature needs its prevout script.
+        parsed.push(ParsedInput {
+            height_flat,
+            raw_outpoint,
+            sequence,
+            signature,
+        });
+    }
+
+    // Group outpoint resolution by required height so each body is loaded
+    // once no matter how inputs interleave heights.
+    let mut located = resolve_outpoints_grouped(&parsed, &mut *resolver)?;
+
+    // Assemble in input order, preserving per-input error mapping. Raw
+    // outpoints with compressed signatures still resolve their prevout here
+    // in input order; the cumulative body-load budget fails those closed if
+    // they cycle past the retained slots.
+    let mut inputs: Vec<InputParts> = Vec::with_capacity(input_count);
+    for (index, part) in parsed.into_iter().enumerate() {
+        if index % CANCELLATION_POLL_INPUTS == 0 && resolver.cancelled() {
+            return Err(CodecError::Cancelled);
+        }
+        let ParsedInput {
+            height_flat,
+            raw_outpoint,
+            sequence,
+            signature,
+        } = part;
+        let sig_compressed = matches!(signature, SigParts::Compressed { .. });
+        let (outpoint, resolved) = match height_flat {
+            Some((height, _)) => match located[index].take() {
+                Some(Ok(Some(found))) => (found.0, Some(found.1)),
+                Some(Ok(None)) => return Err(CodecError::BodyMissing(height)),
+                Some(Err(error)) => {
+                    return Err(lookup_failure(error, CodecError::BodyMissing(height)));
+                }
+                None => return Err(CodecError::BodyMissing(height)),
+            },
+            None => match raw_outpoint {
+                Some(outpoint) => (outpoint, None),
+                None => return Err(CodecError::Truncated),
+            },
+        };
         let resolved = if sig_compressed {
-            match resolved {
-                Some(prevout) => Some(prevout),
-                None => match resolver.prevout(&outpoint) {
-                    Ok(Some(prevout)) => Some(prevout),
-                    Ok(None) => return Err(CodecError::PrevoutMissing(outpoint)),
-                    Err(error) => {
-                        return Err(lookup_failure(error, CodecError::PrevoutMissing(outpoint)));
-                    }
-                },
-            }
+            resolve_sig_prevout(&mut *resolver, &outpoint, resolved)?
         } else {
             resolved
         };

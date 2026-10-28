@@ -1774,3 +1774,192 @@ fn production_resolver_clones_only_the_requested_output() {
     assert!(resolver.prevout(&OutPoint::new(txid, 9)).unwrap().is_none());
     assert!(resolver.outpoint_at(100, 9).unwrap().is_none());
 }
+
+/// Counts body reads per height so tests prove each body loads once.
+struct CountingBodies {
+    bodies: HashMap<u32, Vec<u8>>,
+    loads: std::sync::Mutex<HashMap<u32, usize>>,
+}
+
+impl bitcoin_rs_chain::BlockBodySource for CountingBodies {
+    fn block_body(
+        &self,
+        height: u32,
+        _hash: bitcoin_rs_primitives::BlockHash,
+    ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+        if let Some(body) = self.bodies.get(&height) {
+            *self.loads.lock().unwrap().entry(height).or_default() += 1;
+            Ok(Some(body.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Builds one single-output funding block per `heights` entry, wires the
+/// records plus a counting body source into a fresh [`Context`], and funds
+/// the UTXO set so the compress pass resolves prevouts without body reads.
+/// Returns the context, the source, and the funding txids in height order.
+fn cycling_fixture(
+    heights: &[u32],
+) -> (
+    crate::context::Context,
+    std::sync::Arc<CountingBodies>,
+    Vec<Txid>,
+) {
+    use std::sync::Arc;
+
+    let mut ctx = crate::context::Context::new();
+    let mut bodies = HashMap::new();
+    let mut txids = Vec::new();
+    let mut changes = bitcoin_rs_utxo::contract::BlockChanges::default();
+    for (slot, &height) in heights.iter().enumerate() {
+        let funding = funding_tx(TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: Script::from_bytes(vec![0x6a, u8::try_from(slot).unwrap()]),
+        });
+        let txid = funding.txid();
+        let mut block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        block.txs = vec![funding.clone()];
+        bodies.insert(height, consensus_bytes(&block));
+        changes.add(bitcoin_rs_utxo::contract::UtxoAdd::new(
+            OutPoint::new(txid, 0),
+            funding.outputs[0].clone(),
+            false,
+            height,
+        ));
+        ctx.chain
+            .add_block(bitcoin_rs_index::block_log::BlockRecord {
+                hash: bitcoin_rs_primitives::BlockHash::from(
+                    bitcoin_rs_primitives::Hash256::from_le_bytes(
+                        &[u8::try_from(height).unwrap(); 32],
+                    ),
+                ),
+                height,
+                body_size: 0,
+                header: None,
+                tx_count: 1,
+                time: 0,
+            });
+        txids.push(txid);
+    }
+    bitcoin_rs_utxo::contract::commit_block_changes(
+        &ctx.chain.utxo.fixture_set(),
+        &changes,
+        &bitcoin_rs_primitives::Hash256::default(),
+    )
+    .unwrap();
+    let source = Arc::new(CountingBodies {
+        bodies,
+        loads: std::sync::Mutex::new(HashMap::new()),
+    });
+    let object: Arc<dyn bitcoin_rs_chain::BlockBodySource> = source.clone();
+    ctx.chain.block_body_source = Some(object);
+    (ctx, source, txids)
+}
+
+/// Builds a spender with `inputs` inputs round-robining `txids` (vout 0),
+/// empty authorizations, and one change output.
+fn cycling_spend(txids: &[Txid], inputs: usize) -> Tx {
+    Tx {
+        version: 2,
+        inputs: txids
+            .iter()
+            .cycle()
+            .take(inputs)
+            .map(|txid| TxIn {
+                previous_output: OutPoint::new(*txid, 0),
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect(),
+        outputs: vec![TxOut {
+            value: Amount::from_sat(40_000),
+            script_pubkey: p2wpkh_script([7_u8; 20]),
+        }],
+        lock_time: LockTime::ZERO,
+    }
+}
+
+fn assert_loads(source: &CountingBodies, heights: &[u32], per_height: usize) {
+    let loads = source.loads.lock().unwrap();
+    assert_eq!(loads.len(), heights.len(), "{loads:?}");
+    let mut total = 0_usize;
+    for height in heights {
+        let count = loads.get(height).copied().unwrap_or(0);
+        assert_eq!(count, per_height, "height {height}");
+        total += count;
+    }
+    assert_eq!(total, heights.len() * per_height);
+}
+
+/// Five heights cycling through the four-body cache: grouped resolution
+/// loads each body once instead of paying a full body read, parse,
+/// materialization, and txid pass per input inside the stable-chainstate
+/// exclusion. Ten inputs round-robin five heights; the counting source
+/// proves five total loads (one per height), and both codec passes
+/// round-trip the spending transaction.
+#[test]
+fn five_heights_cycling_loads_each_body_once() {
+    use std::sync::Arc;
+
+    let heights: Vec<u32> = (100..105).collect();
+    let (ctx, source, txids) = cycling_fixture(&heights);
+    let ctx = Arc::new(ctx);
+    let spend = cycling_spend(&txids, 10);
+
+    // Compress: prevouts hit the UTXO set, so all five body loads happen in
+    // the grouped flat-index pass — one per height despite round-robin inputs.
+    let latch = bitcoin_rs_chain::LatchReader::fixture_never();
+    let mut resolver = crate::context::RpcPrevoutResolver::new(&ctx, latch).unwrap();
+    let (compressed, warnings) = compress_transaction(
+        &spend,
+        &mut resolver,
+        CompressOptions {
+            compress_outpoints: true,
+        },
+    )
+    .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_loads(&source, &heights, 1);
+
+    // Decompress resolves the same five heights grouped: one load each,
+    // restoring the exact spending transaction.
+    let latch = bitcoin_rs_chain::LatchReader::fixture_never();
+    let mut resolver = crate::context::RpcPrevoutResolver::new(&ctx, latch).unwrap();
+    let plan = super::decompress_prepare(&compressed, &mut resolver).unwrap();
+    let restored = super::decompress_finalize(plan, &resolver).unwrap();
+    assert_eq!(&restored, &spend);
+    assert_loads(&source, &heights, 2);
+}
+
+/// Past the grouped handful, the cumulative body-load budget fails closed:
+/// ten distinct heights need ten loads against a budget of eight, so the
+/// call refuses with `LimitExceeded` after bounded work instead of
+/// materializing every body under the exclusion.
+#[test]
+fn cumulative_body_budget_fails_closed_past_grouped_heights() {
+    use std::sync::Arc;
+
+    let heights: Vec<u32> = (100..110).collect();
+    let (ctx, source, txids) = cycling_fixture(&heights);
+    let ctx = Arc::new(ctx);
+    let spend = cycling_spend(&txids, 10);
+
+    let latch = bitcoin_rs_chain::LatchReader::fixture_never();
+    let mut resolver = crate::context::RpcPrevoutResolver::new(&ctx, latch).unwrap();
+    let error = compress_transaction(
+        &spend,
+        &mut resolver,
+        CompressOptions {
+            compress_outpoints: true,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error, CodecError::LimitExceeded(super::Limit::Loads));
+    // Bounded work: eight loads happened; the ninth failed before body I/O.
+    let loads = source.loads.lock().unwrap();
+    let total: usize = loads.values().sum();
+    assert_eq!(total, super::MAX_CUMULATIVE_BODY_LOADS);
+}
