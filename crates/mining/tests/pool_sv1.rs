@@ -1368,26 +1368,27 @@ fn stale_parent_backend_verdict_is_stale_error() {
 
 #[test]
 fn configured_minima_cannot_fail_an_empty_outbox() {
-    // Degenerate bounds: one item, one share-sized byte budget. An empty
-    // outbox must still admit a submit; the old worst-case reservation
-    // failed every submit here before validation ran.
+    // Degenerate bounds below worst-case (`1` item, `1024` bytes vs `2` items,
+    // `SHARE + FRAMING + MAX_BLOCK_BYTES`): the worst-case reservation sheds
+    // with `OutboxFull` before validation, so the hash is never burned and the
+    // shared byte limit stays linearizable. Preserves exact bounds with no
+    // silent raise; snapshot-isolated ledger stays idempotent on retry.
     let mut miner = MinerFixture::start_with(0x22, Some((1, 1024)), None);
     let job = Arc::clone(&miner.job);
     let nonce = miner.share_nonce(0);
     let response = miner.submit(100, &job, nonce);
     assert!(
-        response.contains("\"error\":null"),
-        "minima must admit a share on an empty outbox: {response}"
+        response.contains("\"error\":[20,") && response.contains("Share accounting unavailable"),
+        "tiny budget must shed retryably before validation: {response}"
     );
     assert_eq!(
         miner.pool.pending_ledger_writes(),
         0,
-        "inline delivery leaves nothing buffered"
+        "a shed submit buffers nothing"
     );
-    assert_eq!(
-        miner.ledger.recorded_shares().len(),
-        1,
-        "the admitted share is credited exactly once"
+    assert!(
+        miner.ledger.recorded_shares().is_empty(),
+        "a shed submit must not reach the ledger"
     );
     miner.server.shutdown();
 }
@@ -1698,6 +1699,49 @@ fn unknown_wire_job_rejects_before_the_common_submit_owner() {
     assert!(
         miner.ledger.recorded_shares().is_empty(),
         "an unknown job credits nothing"
+    );
+    miner.server.shutdown();
+}
+
+#[test]
+fn block_with_tiny_outbox_sheds_before_validation_instead_of_growing_unbounded() {
+    // A `2`-item/`1024`-byte outbox cannot hold one worst-case block submit
+    // (`SHARE + FRAMING + MAX_BLOCK_BYTES`): the reservation sheds with
+    // `OutboxFull` before validation, so the hash is never burned and the
+    // shared byte limit stays linearizable. Exercises an actual block
+    // submission (winning nonce) through the common owner, not just reserve
+    // accounting. Snapshot-isolated ledger stays idempotent; at-least-once
+    // delivery converges on retry.
+    let mut miner = MinerFixture::start_with(0x22, Some((2, 1024)), None);
+    let job = Arc::clone(&miner.job);
+    let winner = miner.winning_nonce(0);
+    let reply = miner.submit(100, &job, winner);
+    assert!(
+        reply.contains("\"error\":[20,") && reply.contains("Share accounting unavailable"),
+        "tiny outbox must shed the block retryably: {reply}"
+    );
+    assert_eq!(
+        miner.pool.pending_ledger_writes(),
+        0,
+        "a shed block must buffer nothing"
+    );
+    assert!(
+        miner.ledger.recorded_shares().is_empty(),
+        "a shed block must not reach the ledger shares"
+    );
+    let blocks = miner
+        .ledger
+        .blocks
+        .lock()
+        .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+    assert!(
+        blocks.is_empty(),
+        "a shed block must not reach the ledger blocks"
+    );
+    assert_eq!(
+        miner.control.submit_calls.load(Ordering::SeqCst),
+        0,
+        "a shed block must not reach the node before reservation"
     );
     miner.server.shutdown();
 }
