@@ -64,6 +64,7 @@ fn export_page_limit() -> PrefixScanLimit {
     clippy::type_complexity,
     reason = "the page emitter signature is the streaming interface; an alias would hide the output contract"
 )]
+#[cfg(test)]
 fn stream_family_pages(
     snapshot: &dyn TxIndexSnapshot,
     limit: PrefixScanLimit,
