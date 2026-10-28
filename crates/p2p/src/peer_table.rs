@@ -8,41 +8,9 @@
 //! mutate peer sessions only through this type, so the registration,
 //! replacement, and cancellation rules have exactly one implementation.
 
-use bitcoin_rs_primitives::PeerEndpoint;
-
-/// Private session-table key: a known endpoint, or an unidentified
-/// connection distinguished only by its connection id. Only the peer
-/// table constructs these; eviction consumes them through the table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum SessionKey {
-    /// Session identified by its logical endpoint.
-    Endpoint(PeerEndpoint),
-    /// Anonymous session; coexists with any other session.
-    Unidentified(ConnectionId),
-}
-
-impl SessionKey {
-    /// Key for a source token.
-    #[must_use]
-    fn from_source(source: PeerSource) -> Self {
-        match source.endpoint() {
-            Some(endpoint) => Self::Endpoint(endpoint),
-            None => Self::Unidentified(source.connection_id()),
-        }
-    }
-
-    /// Logical endpoint, if identified.
-    #[must_use]
-    fn endpoint(self) -> Option<PeerEndpoint> {
-        match self {
-            Self::Endpoint(endpoint) => Some(endpoint),
-            Self::Unidentified(_) => None,
-        }
-    }
-}
+use crate::{PeerEndpoint, PeerRemote};
 use std::hash::{BuildHasher, RandomState};
-#[cfg(test)]
-use std::net::SocketAddr;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -63,6 +31,8 @@ use crate::peer_info::PeerRole;
 pub struct PeerSession {
     /// Logical peer endpoint; `None` for unidentified sessions.
     pub endpoint: Option<PeerEndpoint>,
+    /// Logical remote Bitcoin endpoint.
+    pub addr: PeerRemote,
     /// Control handle for the connection.
     pub lease: PeerLease,
     /// Handshake metadata, `None` while the handshake is still in progress.
@@ -136,9 +106,10 @@ impl Entry {
         }
     }
 
-    fn session(&self, key: SessionKey) -> PeerSession {
+    fn session(&self, addr: PeerRemote) -> PeerSession {
         PeerSession {
-            endpoint: key.endpoint(),
+            endpoint: addr.endpoint(),
+            addr,
             lease: self.lease.clone(),
             info: self.info.clone(),
             demonstrated_tips: self.demonstrated_tips.clone(),
@@ -155,7 +126,7 @@ impl Entry {
 /// exactly once, either in `map` or in `retired`/`settled_*`.
 #[derive(Debug, Default)]
 struct TableView {
-    map: HashMap<SessionKey, Entry>,
+    map: HashMap<PeerRemote, Entry>,
     /// Counter sets of dropped connections whose teardown may still be in
     /// flight.
     retired: Vec<Arc<PeerCounters>>,
@@ -165,7 +136,7 @@ struct TableView {
 }
 
 impl std::ops::Deref for TableView {
-    type Target = HashMap<SessionKey, Entry>;
+    type Target = HashMap<PeerRemote, Entry>;
 
     fn deref(&self) -> &Self::Target {
         &self.map
@@ -176,10 +147,6 @@ impl std::ops::DerefMut for TableView {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.map
     }
-}
-
-fn key_for(endpoint: PeerEndpoint, _lease: &PeerLease) -> SessionKey {
-    SessionKey::Endpoint(endpoint)
 }
 
 fn live_sessions_of(entries: &TableView) -> Vec<PeerSource> {
@@ -209,13 +176,24 @@ impl PeerTable {
         Self::default()
     }
 
+    /// The transport owner revokes its epoch, then asks the table to wake only
+    /// that epoch's leases. Connection owners retain identity-checked removal;
+    /// neither a late teardown nor a replacement epoch can remove its successor.
+    pub(crate) fn cancel_transport_epoch(&self, epoch: &Arc<AtomicBool>) {
+        for entry in self.entries.read().values() {
+            if entry.lease.belongs_to_transport_epoch(epoch) {
+                entry.lease.cancel();
+            }
+        }
+    }
+
     /// Registers `lease` as the live connection at `addr`, cancelling and
     /// replacing any predecessor. Returns whether a different connection was
     /// replaced; re-registering the same connection is a no-op that keeps its
     /// published metadata.
-    pub fn register(&self, endpoint: PeerEndpoint, lease: PeerLease) -> bool {
-        let key = key_for(endpoint, &lease);
-        Self::register_locked(&mut self.entries.write(), key, Entry::fresh(lease))
+    pub fn register(&self, addr: impl Into<PeerRemote>, lease: PeerLease) -> bool {
+        let addr = addr.into();
+        Self::register_locked(&mut self.entries.write(), addr, Entry::fresh(lease))
     }
 
     /// Register an unidentified (anonymous) inbound session. Anonymous
@@ -226,7 +204,7 @@ impl PeerTable {
     /// enable `p2p/test-seam` in their development dependencies.
     #[cfg(any(test, feature = "test-seam"))]
     pub fn register_unidentified(&self, lease: PeerLease) -> bool {
-        let key = SessionKey::Unidentified(lease.connection_id());
+        let key = PeerRemote::AnonymousTor(lease.connection_id());
         let entry = Entry {
             keyed_netgroup: self
                 .netgroup_key
@@ -236,7 +214,7 @@ impl PeerTable {
         Self::register_locked(&mut self.entries.write(), key, entry)
     }
 
-    fn register_locked(entries: &mut TableView, addr: SessionKey, entry: Entry) -> bool {
+    fn register_locked(entries: &mut TableView, addr: PeerRemote, entry: Entry) -> bool {
         match entries.get(&addr) {
             Some(current) if current.lease.same_connection(&entry.lease) => false,
             Some(_) => {
@@ -256,20 +234,23 @@ impl PeerTable {
 
     /// Register an outbound socket only while the service activity flag is enabled.
     /// Activity admission and connection replacement share the table write lock.
+    /// Inactive admission or a cancelled lease (including a revoked transport
+    /// epoch) returns `None` without changing the table.
     pub(crate) fn try_register_outbound(
         &self,
-        addr: PeerEndpoint,
+        addr: impl Into<PeerRemote>,
         lease: PeerLease,
         activity: &crate::NetworkActivity,
     ) -> Option<PeerLease> {
+        let addr = addr.into();
         debug_assert!(!lease.is_inbound(), "only outbound leases register here");
         let mut entries = self.entries.write();
-        if !activity.is_active() {
+        if !activity.is_active() || lease.is_cancelled() {
             return None;
         }
         Self::register_locked(
             &mut entries,
-            key_for(addr, &lease),
+            addr,
             Entry::fresh(lease.clone()),
         );
         Some(lease)
@@ -304,7 +285,8 @@ impl PeerTable {
     ///   [`crate::netgroup::NetGroups::group`], `max_inbound` is the resolved
     ///   automatic-connection remainder, and `best_block_depth` is
     ///   [`crate::listener::approximate_best_block_depth`].
-    /// POST: inactive admission returns `None` without mutation, even for an
+    /// POST: inactive admission or a cancelled lease (including a revoked
+    /// transport epoch) returns `None` without mutation, even for an
     ///   already registered lease. A lease at an address already holding a
     ///   LIVE inbound connection replaces and cancels it exactly as
     ///   [`Self::register`] does, which never grows the count. Any other
@@ -320,19 +302,20 @@ impl PeerTable {
     #[must_use]
     pub(crate) fn try_register_inbound(
         &self,
-        addr: PeerEndpoint,
+        addr: impl Into<PeerRemote>,
         lease: PeerLease,
         netgroup: &[u8],
         max_inbound: usize,
         best_block_depth: u64,
         activity: &crate::NetworkActivity,
     ) -> Option<PeerLease> {
+        let addr = addr.into();
         debug_assert!(lease.is_inbound(), "only inbound leases reserve here");
         let mut entries = self.entries.write();
-        if !activity.is_active() {
+        if !activity.is_active() || lease.is_cancelled() {
             return None;
         }
-        let key = key_for(addr, &lease);
+        let key = addr;
         let grows_count = match entries.get(&key) {
             Some(current) => {
                 if current.lease.same_connection(&lease) {
@@ -376,7 +359,7 @@ impl PeerTable {
         if !activity.is_active() {
             return None;
         }
-        let key = SessionKey::Unidentified(lease.connection_id());
+        let key = PeerRemote::AnonymousTor(lease.connection_id());
         if entries
             .get(&key)
             .is_some_and(|c| c.lease.same_connection(&lease))
@@ -404,7 +387,7 @@ impl PeerTable {
     /// Returns whether one was removed.
     fn evict_inbound_locked(
         entries: &mut TableView,
-        addr: SessionKey,
+        addr: PeerRemote,
         best_block_depth: u64,
     ) -> bool {
         // The newcomer would also replace a live outbound connection at its
@@ -422,10 +405,10 @@ impl PeerTable {
         let Some(victim_id) = crate::eviction::select_inbound_to_evict(candidates) else {
             return false;
         };
-        // Eviction names a connection; the private session key stays here.
+        // Eviction names a connection; the address key stays here.
         let Some(victim) = entries
             .iter()
-            .find(|(_, entry)| entry.lease.connection_id() == victim_id)
+            .find(|(key, _)| **key == victim_id)
             .map(|(key, _)| *key)
         else {
             return false;
@@ -441,7 +424,7 @@ impl PeerTable {
     /// The eviction view of a live inbound connection without `NoBan`, the set
     /// Core's `ProtectNoBanConnections` and `ProtectOutboundConnections` leave.
     fn eviction_candidate(
-        addr: SessionKey,
+        addr: PeerRemote,
         entry: &Entry,
         best_block_depth: u64,
     ) -> Option<crate::eviction::EvictionCandidate> {
@@ -451,7 +434,7 @@ impl PeerTable {
         }
         let info = entry.info.as_ref();
         Some(crate::eviction::EvictionCandidate {
-            key: lease.connection_id(),
+            addr,
             connected: lease.connected_at(),
             last_block: entry.announcement.useful_block_sequence,
             last_tx: entry.useful_tx_sequence,
@@ -465,7 +448,7 @@ impl PeerTable {
             keyed_netgroup: entry.keyed_netgroup,
             is_local: addr
                 .endpoint()
-                .is_some_and(crate::discouragement::is_local_endpoint),
+                .is_some_and(|endpoint| crate::discouragement::is_local(endpoint.address())),
         })
     }
 
@@ -483,16 +466,13 @@ impl PeerTable {
     }
 
     /// Publishes handshake metadata for the connection `lease` refers to.
-    pub fn publish_info(&self, addr: PeerEndpoint, lease: &PeerLease, info: PeerInfo) -> bool {
-        self.publish_info_key(key_for(addr, lease), lease, info)
-    }
-
-    /// Publish info for an unidentified session (accept-only anonymous path).
-    pub fn publish_info_unidentified(&self, lease: &PeerLease, info: PeerInfo) -> bool {
-        self.publish_info_key(SessionKey::Unidentified(lease.connection_id()), lease, info)
-    }
-
-    fn publish_info_key(&self, addr: SessionKey, lease: &PeerLease, info: PeerInfo) -> bool {
+    pub fn publish_info(
+        &self,
+        addr: impl Into<PeerRemote>,
+        lease: &PeerLease,
+        info: PeerInfo,
+    ) -> bool {
+        let addr = addr.into();
         let mut entries = self.entries.write();
         match entries.get_mut(&addr) {
             Some(entry) if entry.lease.same_connection(lease) => {
@@ -501,6 +481,15 @@ impl PeerTable {
             }
             _ => false,
         }
+    }
+
+    /// Publish info for an unidentified session (accept-only anonymous path).
+    pub fn publish_info_unidentified(&self, lease: &PeerLease, info: PeerInfo) -> bool {
+        self.publish_info(
+            PeerRemote::AnonymousTor(lease.connection_id()),
+            lease,
+            info,
+        )
     }
 
     /// Records that the live connection accepted `tip_hash` and raises its
@@ -513,7 +502,7 @@ impl PeerTable {
     ) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -540,7 +529,7 @@ impl PeerTable {
     pub(crate) fn set_demonstrated_tips(&self, source: PeerSource, tips: Vec<Hash256>) {
         let mut entries = self.entries.write();
         if let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source))
         {
             entry.demonstrated_tips = tips;
@@ -551,7 +540,7 @@ impl PeerTable {
     /// `docs/contracts/p2p-wire.md`.
     pub(crate) fn note_announced_height(&self, source: PeerSource, height: i32) -> bool {
         let mut entries = self.entries.write();
-        match entries.get_mut(&SessionKey::from_source(source)) {
+        match entries.get_mut(&PeerRemote::from(source)) {
             Some(entry) if entry.lease.is_current(source) && !entry.lease.is_cancelled() => {
                 let Some(info) = entry.info.as_mut() else {
                     return false;
@@ -583,7 +572,7 @@ impl PeerTable {
     pub(crate) fn note_headers_horizon(&self, source: PeerSource, height: u32) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -604,7 +593,7 @@ impl PeerTable {
     pub(crate) fn note_headers_progress(&self, source: PeerSource, height: u32) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -632,7 +621,7 @@ impl PeerTable {
     pub(crate) fn note_package_relay(&self, source: PeerSource, versions: u64) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -695,7 +684,7 @@ impl PeerTable {
     pub(crate) fn note_stale_tip_relay(&self, source: PeerSource, prefers_blocks: bool) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -708,7 +697,7 @@ impl PeerTable {
     /// connection accepted a post-verack `sendcmpct` with a known version.
     pub(crate) fn note_compact_relay(&self, source: PeerSource) -> bool {
         let mut entries = self.entries.write();
-        match entries.get_mut(&SessionKey::from_source(source)) {
+        match entries.get_mut(&PeerRemote::from(source)) {
             Some(entry) if entry.lease.is_current(source) && !entry.lease.is_cancelled() => {
                 let Some(info) = entry.info.as_mut() else {
                     return false;
@@ -732,7 +721,7 @@ impl PeerTable {
         };
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -747,7 +736,7 @@ impl PeerTable {
     pub(crate) fn note_announced_block(&self, source: PeerSource, hash: Hash256) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -762,7 +751,7 @@ impl PeerTable {
     pub(crate) fn note_useful_block(&self, source: PeerSource) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -780,7 +769,7 @@ impl PeerTable {
     pub fn note_useful_transaction(&self, source: PeerSource) -> bool {
         let mut entries = self.entries.write();
         let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return false;
@@ -799,7 +788,7 @@ impl PeerTable {
     pub(crate) fn note_high_bandwidth_selected(&self, source: PeerSource, selected: bool) {
         let mut entries = self.entries.write();
         if let Some(entry) = entries
-            .get_mut(&SessionKey::from_source(source))
+            .get_mut(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         {
             entry.announcement.selected_high_bandwidth = selected;
@@ -810,7 +799,7 @@ impl PeerTable {
     pub(crate) fn announcement_state(&self, source: PeerSource) -> Option<PeerAnnouncementState> {
         let entries = self.entries.read();
         entries
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .and_then(|entry| {
                 (entry.lease.is_current(source) && entry.info.is_some())
                     .then_some(entry.announcement)
@@ -819,11 +808,11 @@ impl PeerTable {
 
     /// Reports whether the live published connection at `addr` requested
     /// compact-block relay.
-    #[cfg(test)]
-    pub(crate) fn compact_relay_of(&self, addr: PeerEndpoint) -> bool {
+    pub(crate) fn compact_relay_of(&self, addr: impl Into<PeerRemote>) -> bool {
+        let addr = addr.into();
         let entries = self.entries.read();
         entries
-            .get(&SessionKey::Endpoint(addr))
+            .get(&addr)
             .is_some_and(|entry| {
                 entry
                     .info
@@ -838,7 +827,7 @@ impl PeerTable {
     pub(crate) fn compact_relay_of_source(&self, source: PeerSource) -> bool {
         let entries = self.entries.read();
         entries
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
             .is_some_and(|entry| {
                 entry
@@ -851,7 +840,7 @@ impl PeerTable {
     /// Records that the live connection at `source` negotiated BIP130 `sendheaders`.
     pub(crate) fn note_send_headers(&self, source: PeerSource) -> bool {
         let mut entries = self.entries.write();
-        match entries.get_mut(&SessionKey::from_source(source)) {
+        match entries.get_mut(&PeerRemote::from(source)) {
             Some(entry) if entry.lease.is_current(source) && !entry.lease.is_cancelled() => {
                 let Some(info) = entry.info.as_mut() else {
                     return false;
@@ -865,57 +854,43 @@ impl PeerTable {
 
     /// Removes and cancels the connection `lease` refers to. Returns `false`
     /// when a different connection is live at `addr`, leaving it untouched.
-    pub fn remove_current(&self, addr: PeerEndpoint, lease: &PeerLease) -> bool {
-        self.remove_if(key_for(addr, lease), |current| {
-            current.same_connection(lease)
-        })
+    pub fn remove_current(&self, addr: impl Into<PeerRemote>, lease: &PeerLease) -> bool {
+        let addr = addr.into();
+        self.remove_if(addr, |current| current.same_connection(lease))
     }
 
     /// Remove an unidentified session by its lease.
     pub fn remove_unidentified(&self, lease: &PeerLease) -> bool {
-        self.remove_if(SessionKey::Unidentified(lease.connection_id()), |current| {
-            current.same_connection(lease)
-        })
+        self.remove_if(
+            PeerRemote::AnonymousTor(lease.connection_id()),
+            |current| current.same_connection(lease),
+        )
     }
 
     /// Removes and cancels the connection that stamped `source`. Returns
     /// `false` when that connection is no longer live.
     pub(crate) fn disconnect_source(&self, source: PeerSource) -> bool {
-        self.remove_if(SessionKey::from_source(source), |current| {
+        self.remove_if(PeerRemote::from(source), |current| {
             current.is_current(source)
         })
     }
 
-    /// Removes and cancels whichever connection is live at `addr`, including
-    /// one still handshaking.
-    ///
-    /// This is address selection, not identity selection: the target is
-    /// whatever connection is live at `addr` at the moment of removal. An
-    /// operator-facing caller that works from `getpeerinfo` must use the
-    /// `disconnect_ready*` family instead.
-    pub fn disconnect(&self, addr: PeerEndpoint) -> bool {
-        self.remove_if(SessionKey::Endpoint(addr), |_| true)
+    /// Removes and cancels whichever connection is live at `addr`.
+    pub fn disconnect(&self, addr: impl Into<PeerRemote>) -> bool {
+        let addr = addr.into();
+        self.remove_if(addr, |_| true)
     }
 
     /// Removes and cancels the connection live at `addr` only when it has
     /// completed its handshake — the sessions `getpeerinfo` lists, which is
     /// what "connected nodes" means to an operator.
-    ///
-    /// The readiness check and the removal are one table write, so the
-    /// connection that was checked is the connection that is removed: a
-    /// same-address replacement that has not yet published its metadata is
-    /// left alone, exactly as a vacant address is.
-    ///
-    /// PRE: none.
-    /// POST: `false` with no mutation when `addr` is vacant or its session has
-    ///   published no [`PeerInfo`].
     pub fn disconnect_ready(&self, addr: PeerEndpoint) -> bool {
-        self.remove_entry_if(SessionKey::Endpoint(addr), |entry| entry.info.is_some())
+        self.remove_entry_if(addr.into(), |entry| entry.info.is_some())
     }
 
     /// Removes and cancels the live connection at `addr` only when its identity is `id`.
     pub(crate) fn disconnect_connection(&self, addr: PeerEndpoint, id: ConnectionId) -> bool {
-        self.remove_if(SessionKey::Endpoint(addr), |current| {
+        self.remove_if(addr.into(), |current| {
             current.connection_id() == id
         })
     }
@@ -965,18 +940,18 @@ impl PeerTable {
     ///   published no [`PeerInfo`], or it holds a connection with a different
     ///   node id.
     pub fn disconnect_ready_node_id_at(&self, addr: PeerEndpoint, node_id: u64) -> bool {
-        self.remove_entry_if(SessionKey::Endpoint(addr), |entry| {
+        self.remove_entry_if(addr.into(), |entry| {
             entry.info.is_some() && entry.lease.node_id() == node_id
         })
     }
 
-    fn remove_if(&self, addr: SessionKey, matches: impl FnOnce(&PeerLease) -> bool) -> bool {
+    fn remove_if(&self, addr: PeerRemote, matches: impl FnOnce(&PeerLease) -> bool) -> bool {
         self.remove_entry_if(addr, |entry| matches(&entry.lease))
     }
 
     /// Tests `matches` against the entry at `addr` and, on a match, removes and
     /// cancels it under the same write lock.
-    fn remove_entry_if(&self, addr: SessionKey, matches: impl FnOnce(&Entry) -> bool) -> bool {
+    fn remove_entry_if(&self, addr: PeerRemote, matches: impl FnOnce(&Entry) -> bool) -> bool {
         let mut entries = self.entries.write();
         if !entries.get(&addr).is_some_and(matches) {
             return false;
@@ -985,10 +960,32 @@ impl PeerTable {
         true
     }
 
+    /// Removes and cancels every connection accepted by `predicate`, returning
+    /// the affected addresses.
+    pub(crate) fn disconnect_matching(
+        &self,
+        predicate: impl Fn(&PeerRemote, &PeerLease) -> bool,
+    ) -> Vec<PeerRemote> {
+        let mut entries = self.entries.write();
+        let targets: Vec<PeerRemote> = entries
+            .iter()
+            .filter(|(addr, entry)| predicate(addr, &entry.lease))
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in &targets {
+            if let Some(removed) = entries.remove(addr) {
+                removed.lease.cancel();
+                Self::retire(&mut entries, &removed);
+            }
+        }
+        Self::settle_retired(&mut entries);
+        targets
+    }
+
     /// The one removal body, for callers already holding the write lock:
     /// removes the entry at `key`, cancels its lease, and retains its traffic
     /// counters so `traffic_totals` never decreases.
-    fn remove_locked(entries: &mut TableView, key: SessionKey) {
+    fn remove_locked(entries: &mut TableView, key: PeerRemote) {
         if let Some(removed) = entries.remove(&key) {
             removed.lease.cancel();
             Self::retain_traffic(entries, &removed);
@@ -1001,34 +998,11 @@ impl PeerTable {
     /// anonymous inbound connections from other epochs completely unaffected.
     pub(crate) fn disconnect_onion_epoch(&self, epoch: u64) -> Vec<ConnectionId> {
         let mut entries = self.entries.write();
-        let targets: Vec<(SessionKey, ConnectionId)> = entries
+        let targets: Vec<(PeerRemote, ConnectionId)> = entries
             .iter()
             .filter(|(addr, entry)| {
-                matches!(addr, SessionKey::Unidentified(_)) && entry.onion_epoch == Some(epoch)
+                matches!(addr, PeerRemote::AnonymousTor(_)) && entry.onion_epoch == Some(epoch)
             })
-            .map(|(addr, entry)| (*addr, entry.lease.connection_id()))
-            .collect();
-        for (addr, _) in &targets {
-            if let Some(removed) = entries.remove(addr) {
-                removed.lease.cancel();
-                Self::retire(&mut entries, &removed);
-            }
-        }
-        Self::settle_retired(&mut entries);
-        targets.into_iter().map(|(_, id)| id).collect()
-    }
-
-    /// Removes and cancels every connection accepted by `predicate`, returning
-    /// the affected connection ids. The private session key never leaves
-    /// the table; callers see only the endpoint and the lease.
-    pub(crate) fn disconnect_matching(
-        &self,
-        predicate: impl Fn(Option<PeerEndpoint>, &PeerLease) -> bool,
-    ) -> Vec<ConnectionId> {
-        let mut entries = self.entries.write();
-        let targets: Vec<(SessionKey, ConnectionId)> = entries
-            .iter()
-            .filter(|(addr, entry)| predicate(addr.endpoint(), &entry.lease))
             .map(|(addr, entry)| (*addr, entry.lease.connection_id()))
             .collect();
         for (addr, _) in &targets {
@@ -1111,10 +1085,9 @@ impl PeerTable {
 
     /// Returns whether any connection is live at `addr`.
     #[must_use]
-    pub fn is_connected(&self, addr: PeerEndpoint) -> bool {
-        self.entries
-            .read()
-            .contains_key(&SessionKey::Endpoint(addr))
+    pub fn is_connected(&self, addr: impl Into<PeerRemote>) -> bool {
+        let addr = addr.into();
+        self.entries.read().contains_key(&addr)
     }
 
     /// Returns whether the connection that stamped `source` is still live
@@ -1123,16 +1096,17 @@ impl PeerTable {
     pub fn is_current(&self, source: PeerSource) -> bool {
         self.entries
             .read()
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .is_some_and(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
     }
 
     /// Clones the lease of the live, uncancelled connection at `addr`.
     #[must_use]
-    pub fn lease(&self, addr: PeerEndpoint) -> Option<PeerLease> {
+    pub fn lease(&self, addr: impl Into<PeerRemote>) -> Option<PeerLease> {
+        let addr = addr.into();
         self.entries
             .read()
-            .get(&SessionKey::Endpoint(addr))
+            .get(&addr)
             .filter(|entry| !entry.lease.is_cancelled())
             .map(|entry| entry.lease.clone())
     }
@@ -1210,10 +1184,11 @@ impl PeerTable {
     /// Metadata of the one connection at `addr`, if it completed its handshake.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn info_of(&self, addr: PeerEndpoint) -> Option<PeerInfo> {
+    pub(crate) fn info_of(&self, addr: impl Into<PeerRemote>) -> Option<PeerInfo> {
+        let addr = addr.into();
         self.entries
             .read()
-            .get(&SessionKey::Endpoint(addr))
+            .get(&addr)
             .and_then(|entry| entry.info.clone())
     }
 
@@ -1224,7 +1199,7 @@ impl PeerTable {
     pub(crate) fn info_of_source(&self, source: PeerSource) -> Option<PeerInfo> {
         self.entries
             .read()
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
             .and_then(|entry| entry.info.clone())
     }
@@ -1286,14 +1261,15 @@ impl PeerTable {
     /// metadata, so a handshaking replacement cannot inherit an old scheduler
     /// decision.
     #[must_use]
-    pub fn ready_source(&self, addr: PeerEndpoint) -> Option<PeerSource> {
+    pub fn ready_source(&self, addr: impl Into<PeerRemote>) -> Option<PeerSource> {
+        let addr = addr.into();
         let entries = self.entries.read();
-        let entry = entries.get(&SessionKey::Endpoint(addr))?;
+        let entry = entries.get(&addr)?;
         entry.info.as_ref()?;
         if entry.lease.is_cancelled() {
             return None;
         }
-        Some(entry.lease.source(Some(addr)))
+        Some(entry.lease.source(addr.endpoint()))
     }
 
     /// Starts `operation` only for a current, uncancelled source. The table
@@ -1302,7 +1278,7 @@ impl PeerTable {
     pub(crate) fn with_current(&self, source: PeerSource, operation: impl FnOnce()) -> bool {
         let entries = self.entries.read();
         if !entries
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .is_some_and(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         {
             return false;
@@ -1315,7 +1291,7 @@ impl PeerTable {
     /// requests to it carry the witness flag, others do not.
     pub(crate) fn transaction_witness(&self, source: PeerSource) -> bool {
         let entries = self.entries.read();
-        let Some(entry) = entries.get(&SessionKey::from_source(source)) else {
+        let Some(entry) = entries.get(&PeerRemote::from(source)) else {
             return false;
         };
         !entry.lease.is_cancelled()
@@ -1332,7 +1308,7 @@ impl PeerTable {
     pub(crate) fn lease_source(&self, source: PeerSource) -> Option<PeerLease> {
         self.entries
             .read()
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
             .map(|entry| entry.lease.clone())
     }
@@ -1349,7 +1325,7 @@ impl PeerTable {
     pub fn send(&self, source: PeerSource, message: crate::Message) -> Result<(), OutboundRefusal> {
         let entries = self.entries.read();
         let Some(entry) = entries
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return Err(OutboundRefusal::Closed(message));
@@ -1370,7 +1346,7 @@ impl PeerTable {
     ) -> Result<(), OutboundRefusal> {
         let entries = self.entries.read();
         let Some(entry) = entries
-            .get(&SessionKey::from_source(source))
+            .get(&PeerRemote::from(source))
             .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
         else {
             return Err(OutboundRefusal::Closed(message));
@@ -1401,10 +1377,98 @@ impl PeerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retiring_an_epoch_wakes_its_leases_without_cancelling_a_replacement() {
+        let table = PeerTable::new();
+        let old_epoch = Arc::new(AtomicBool::new(true));
+        let new_epoch = Arc::new(AtomicBool::new(true));
+        let address = crate::PeerEndpoint::new(crate::PeerAddress::I2p([7; 32]), 8333);
+        let other = crate::PeerEndpoint::new(crate::PeerAddress::I2p([8; 32]), 8333);
+        let old = lease().with_transport_alive(Some(Arc::clone(&old_epoch)));
+        let remaining = lease().with_transport_alive(Some(Arc::clone(&old_epoch)));
+        table.register(address, old.clone());
+        table.register(other, remaining.clone());
+        let successor = lease().with_transport_alive(Some(new_epoch));
+        table.register(address, successor.clone());
+
+        // The SAM worker revokes admission before waking the old epoch's I/O.
+        old_epoch.store(false, Ordering::Release);
+        assert!(remaining.close_signal().try_recv().is_err());
+        table.cancel_transport_epoch(&old_epoch);
+        assert!(remaining.close_signal().try_recv().is_ok());
+        assert!(!successor.is_cancelled());
+        assert!(!table.remove_current(address, &old));
+        assert!(
+            table
+                .lease(address)
+                .is_some_and(|lease| lease.same_connection(&successor))
+        );
+        table.cancel_transport_epoch(&old_epoch);
+        assert!(!successor.is_cancelled());
+    }
+
+    #[test]
+    fn anonymous_sources_keep_independent_leases_and_roundtrip_mempool_attribution() {
+        let table = PeerTable::new();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let first = PeerLease::new_inbound(sender.clone());
+        let second = PeerLease::new_inbound(sender);
+        let first_remote = PeerRemote::AnonymousTor(first.connection_id());
+        let second_remote = PeerRemote::AnonymousTor(second.connection_id());
+        table.register(first_remote, first.clone());
+        table.register(second_remote, second.clone());
+        let source = first.source(first_remote);
+        let token = bitcoin_rs_mempool::PeerToken::from(source);
+        assert_eq!(token.addr, None);
+        assert_eq!(PeerSource::from(token), source);
+        assert_ne!(
+            token,
+            bitcoin_rs_mempool::PeerToken::from(second.source(second_remote))
+        );
+        assert_eq!(table.live_inbound_count(), 2);
+        assert!(table.remove_current(first_remote, &first));
+        assert!(!table.is_current(PeerSource::from(token)));
+        assert!(table.is_current(second.source(second_remote)));
+        assert_eq!(table.live_inbound_count(), 1);
+    }
+
+    #[test]
+    fn revoked_overlay_epoch_cannot_replace_a_successor_during_late_admission() {
+        let table = PeerTable::new();
+        let address = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+            crate::PeerAddress::I2p([7; 32]),
+            8333,
+        ));
+        let activity = crate::NetworkActivity::from_shared(Arc::new(AtomicBool::new(true)));
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let successor = PeerLease::new(sender.clone());
+        table.register(address, successor.clone());
+        let dead = Arc::new(AtomicBool::new(false));
+        let stale_outbound =
+            PeerLease::new(sender.clone()).with_transport_alive(Some(Arc::clone(&dead)));
+        assert!(
+            table
+                .try_register_outbound(address, stale_outbound, &activity)
+                .is_none()
+        );
+        let stale_inbound = PeerLease::new_inbound(sender).with_transport_alive(Some(dead));
+        assert!(
+            table
+                .try_register_inbound(address, stale_inbound, &[5, 7], 10, u64::MAX, &activity)
+                .is_none()
+        );
+        assert!(!successor.is_cancelled());
+        assert!(
+            table
+                .lease(address)
+                .is_some_and(|lease| lease.same_connection(&successor))
+        );
+    }
     use crate::test_support::QueuedMessages as _;
 
-    fn addr(port: u16) -> PeerEndpoint {
-        PeerEndpoint::Ip(SocketAddr::from(([127, 0, 0, 1], port)))
+    fn addr(port: u16) -> PeerRemote {
+        PeerRemote::from(([127, 0, 0, 1], port))
     }
 
     fn lease() -> PeerLease {
@@ -1412,7 +1476,7 @@ mod tests {
         PeerLease::new(tx)
     }
 
-    fn info(addr: PeerEndpoint, start_height: i32) -> PeerInfo {
+    fn info(addr: PeerRemote, start_height: i32) -> PeerInfo {
         info_with_counters(
             addr,
             start_height,
@@ -1421,13 +1485,14 @@ mod tests {
     }
 
     fn info_with_counters(
-        addr: PeerEndpoint,
+        addr: PeerRemote,
         start_height: i32,
         counters: std::sync::Arc<crate::counters::PeerCounters>,
     ) -> PeerInfo {
         PeerInfo {
-            endpoint: Some(addr),
-            network: addr.net(),
+            addr,
+            endpoint: addr.endpoint(),
+            network: addr.network().into(),
             version: 70016,
             wtxid_relay: false,
             relay_transactions: true,
@@ -1439,10 +1504,11 @@ mod tests {
             best_known_height: start_height,
             conn_time: 0,
             inbound: false,
-            addr_bind: crate::TransportRemote::new(match addr.as_ip() {
-                Some(ip) => ip,
-                None => panic!("ip test peer"),
-            }),
+            addr_bind: crate::TransportRemote::new(
+                addr.endpoint()
+                    .and_then(crate::PeerEndpoint::socket_addr)
+                    .unwrap_or_else(|| panic!("expected IP fixture")),
+            ),
             time_offset: 0,
             counters,
             transport: crate::TransportProtocol::V1,
@@ -1530,11 +1596,11 @@ mod tests {
         let entries = table.entries.read();
         let mut keyed = Vec::new();
         for lease in [&anon1, &anon2] {
-            let key = SessionKey::Unidentified(lease.connection_id());
+            let key = PeerRemote::AnonymousTor(lease.connection_id());
             let Some(candidate) = PeerTable::eviction_candidate(key, &entries[&key], 0) else {
                 panic!("anonymous inbound is an eviction candidate");
             };
-            assert_eq!(candidate.key, lease.connection_id());
+            assert_eq!(candidate.addr, key);
             assert_eq!(key.endpoint(), None);
             assert_eq!(
                 candidate.keyed_netgroup,
@@ -1852,26 +1918,27 @@ mod tests {
         );
     }
 
-    fn flooder(port: u16) -> PeerEndpoint {
-        PeerEndpoint::Ip(SocketAddr::from(([1, 2, 3, 4], port)))
+    fn flooder(port: u16) -> PeerRemote {
+        PeerRemote::from(([1, 2, 3, 4], port))
     }
 
-    fn newcomer() -> PeerEndpoint {
-        PeerEndpoint::Ip(SocketAddr::from(([5, 6, 7, 8], 8333)))
+    fn newcomer() -> PeerRemote {
+        PeerRemote::from(([5, 6, 7, 8], 8333))
     }
 
-    fn netgroup(addr: PeerEndpoint) -> Vec<u8> {
-        let Some(ip) = addr.as_ip() else {
-            panic!("ip test peer");
-        };
-        crate::netgroup::NetGroups::default().group(ip.ip())
+    fn netgroup(addr: PeerRemote) -> Vec<u8> {
+        crate::netgroup::NetGroups::default().group(
+            addr.endpoint()
+                .unwrap_or_else(|| panic!("known destination"))
+                .address(),
+        )
     }
 
     /// Offers an inbound `lease` from `addr` to a table capped at
     /// `max_inbound`.
     fn offer(
         table: &PeerTable,
-        addr: PeerEndpoint,
+        addr: PeerRemote,
         lease: PeerLease,
         max_inbound: usize,
     ) -> Option<PeerLease> {
@@ -2212,18 +2279,22 @@ mod tests {
         let ports: Vec<u16> = table
             .infos()
             .iter()
-            .map(|info| match info.endpoint.as_ref() {
-                Some(ep) => ep.port(),
-                None => panic!("endpoint"),
+            .map(|info| {
+                info.addr
+                    .endpoint()
+                    .unwrap_or_else(|| panic!("known destination"))
+                    .port()
             })
             .collect();
         assert_eq!(ports, vec![14, 13, 12, 11, 10]);
         let session_ports: Vec<u16> = table
             .sessions()
             .iter()
-            .map(|s| match s.endpoint.as_ref() {
-                Some(ep) => ep.port(),
-                None => panic!("endpoint"),
+            .map(|s| {
+                s.addr
+                    .endpoint()
+                    .unwrap_or_else(|| panic!("known destination"))
+                    .port()
             })
             .collect();
         assert_eq!(session_ports, ports);
@@ -2275,10 +2346,13 @@ mod tests {
         let b = lease();
         table.register(addr(1), a.clone());
         table.register(addr(2), b.clone());
-        let removed = table.disconnect_matching(|endpoint, _| {
-            endpoint.is_some_and(|endpoint| endpoint.port() == 2)
+        let removed = table.disconnect_matching(|addr, _| {
+            addr.endpoint()
+                .unwrap_or_else(|| panic!("known destination"))
+                .port()
+                == 2
         });
-        assert_eq!(removed, vec![b.connection_id()]);
+        assert_eq!(removed, vec![addr(2)]);
         assert!(b.is_cancelled());
         assert!(!a.is_cancelled());
         assert_eq!(table.len(), 1);
@@ -2489,10 +2563,13 @@ mod tests {
             info_with_counters(addr(2), 3, counters_third.clone()),
         );
         assert!(counted(&counters_third).write_all(&[0_u8; 7]).is_ok());
-        let removed = table.disconnect_matching(|endpoint, _| {
-            endpoint.is_some_and(|endpoint| endpoint.port() == 2)
+        let removed = table.disconnect_matching(|addr, _| {
+            addr.endpoint()
+                .unwrap_or_else(|| panic!("known destination"))
+                .port()
+                == 2
         });
-        assert_eq!(removed.len(), 1);
+        assert_eq!(removed, vec![addr(2)]);
         assert_eq!(table.traffic_totals(), (0, 42));
 
         drop(stream_second);

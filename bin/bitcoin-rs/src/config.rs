@@ -311,6 +311,18 @@ impl CoreValue for Option<Vec<bitcoin_rs_node::options::NetworkLabel>> {
         }
     }
 }
+impl CoreValue for Option<Vec<bitcoin_rs_node::options::PeerNetwork>> {
+    fn apply(value: &str, slot: &mut Self) {
+        let entries = slot.get_or_insert_with(Vec::new);
+        for item in value.split(',') {
+            if let Ok(network) = bitcoin_rs_node::options::parse_peer_network(item.trim()) {
+                if !entries.contains(&network) {
+                    entries.push(network);
+                }
+            }
+        }
+    }
+}
 /// Sets the one Core key that no table row can express: `listen` is a boolean
 /// switch over the bind list, not an address, and only its false value is an
 /// override. Returns whether it consumed `key`.
@@ -460,7 +472,6 @@ onion=127.0.0.1:9051
 dnsseed=0
 proxyrandomize=1
 torcontrol=127.0.0.1:9052
-torpassword=secret
 i2psam=127.0.0.1:7656
 i2pacceptincoming=1
 onlynet=onion,i2p
@@ -472,28 +483,24 @@ onlynet=onion,i2p
             Some(SocketAddr::from(([127, 0, 0, 1], 9050)))
         );
         assert_eq!(
-            conf_with_overlays.p2p.overlay.onion,
+            conf_with_overlays.p2p.overlay.onion_proxy,
             Some(SocketAddr::from(([127, 0, 0, 1], 9051)))
         );
-        assert!(conf_with_overlays.p2p.overlay.proxy_randomize_credentials);
+        assert!(conf_with_overlays.p2p.overlay.randomize_credentials);
         assert_eq!(
-            conf_with_overlays.p2p.overlay.tor_control.as_deref(),
-            Some("127.0.0.1:9052")
-        );
-        assert_eq!(
-            conf_with_overlays.p2p.overlay.tor_password.as_deref(),
-            Some("secret")
+            conf_with_overlays.p2p.overlay.tor_control,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9052)))
         );
         assert_eq!(
             conf_with_overlays.p2p.overlay.i2p_sam,
             Some(SocketAddr::from(([127, 0, 0, 1], 7656)))
         );
-        assert!(conf_with_overlays.p2p.overlay.i2p_accept_incoming);
+        assert!(conf_with_overlays.p2p.overlay.i2p_accept);
         assert_eq!(
             conf_with_overlays.p2p.overlay.onlynet,
             vec![
-                bitcoin_rs_node::options::NetworkLabel::Onion,
-                bitcoin_rs_node::options::NetworkLabel::I2p
+                bitcoin_rs_node::options::PeerNetwork::Onion,
+                bitcoin_rs_node::options::PeerNetwork::I2p
             ]
         );
         Ok(())

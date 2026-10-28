@@ -54,6 +54,7 @@ fn info(addr: SocketAddr) -> PeerInfo {
         compact_block_relay: false,
         endpoint: Some(bitcoin_rs_p2p::PeerEndpoint::Ip(addr)),
         network: bitcoin_rs_p2p::PeerEndpoint::Ip(addr).net(),
+        addr: addr.into(),
         send_headers: false,
         version: 70_016,
         services: 1,

@@ -3383,15 +3383,20 @@ fn owned_fetch_respects_window_capacity_and_frontier() {
 
 #[test]
 fn fanout_eligibility_requires_block_service_flags() {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use crate::PeerRemote;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use crate::{PeerCounters, PeerInfo};
 
     fn peer(services: u64, inbound: bool) -> PeerInfo {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+        let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8333,
+        ));
         PeerInfo {
-            endpoint: Some(crate::PeerEndpoint::Ip(addr)),
-            network: crate::PeerEndpoint::Ip(addr).net(),
+            addr,
+            endpoint: addr.endpoint(),
+            network: addr.network().into(),
             version: 70_016,
             wtxid_relay: false,
             relay_transactions: true,
@@ -3403,7 +3408,11 @@ fn fanout_eligibility_requires_block_service_flags() {
             best_known_height: 0,
             conn_time: 0,
             inbound,
-            addr_bind: crate::TransportRemote::new(addr),
+            addr_bind: crate::TransportRemote::new(
+                addr.endpoint()
+                    .and_then(crate::PeerEndpoint::socket_addr)
+                    .unwrap_or_else(|| panic!("expected IP fixture")),
+            ),
             time_offset: 0,
             counters: std::sync::Arc::new(PeerCounters::default()),
             transport: crate::TransportProtocol::V1,

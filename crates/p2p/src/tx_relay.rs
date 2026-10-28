@@ -453,7 +453,6 @@ mod tests {
     use bitcoin_rs_primitives::Hash256;
     use crossbeam_channel::bounded;
     use parking_lot::Mutex;
-    use std::net::SocketAddr;
     use std::sync::atomic::AtomicBool;
 
     /// A peer in the fake sink: a node id and a remaining send budget.
@@ -975,6 +974,7 @@ mod tests {
                         [127, 0, 0, 1],
                         8333,
                     )))),
+                    addr: Some(crate::PeerEndpoint::from(([127, 0, 0, 1], 8333))),
                     connection_id: 7,
                 }),
                 false,
@@ -1103,6 +1103,7 @@ mod tests {
                 [127, 0, 0, 1],
                 8333,
             )))),
+            addr: Some(crate::PeerEndpoint::from(([127, 0, 0, 1], 8333))),
             connection_id: 7,
         })
     }

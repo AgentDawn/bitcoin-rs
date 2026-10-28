@@ -1092,6 +1092,7 @@ mod tests {
 
     fn test_peer_info(addr: crate::PeerEndpoint, send_headers: bool) -> PeerInfo {
         PeerInfo {
+            addr: addr.into(),
             endpoint: Some(addr),
             network: addr.net(),
             version: 70016,

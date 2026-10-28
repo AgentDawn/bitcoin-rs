@@ -189,7 +189,7 @@ impl BlockSync {
     /// operations precede the scheduler lock to preserve the `PeerTable` ->
     /// scheduler ordering used elsewhere.
     fn discard_inadmissible_header_bodies(&self, invalid: &[(Hash256, Option<crate::PeerSource>)]) {
-        let blamed: Vec<_> = invalid
+        let blamed: Vec<crate::PeerSource> = invalid
             .iter()
             .filter_map(|(_, source)| *source)
             .filter(|source| {

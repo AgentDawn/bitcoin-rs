@@ -83,8 +83,8 @@ The decoder types exactly the commands in `crates/p2p/src/compat.rs::COMMANDS` (
 | `block` | sink | Forwarded to the node's block pipeline with the original wire bytes preserved. The shared inbound channel is bounded once for the node, and each connection's unsolicited share of it is bounded separately; a body the download window asked that connection for is always admitted (`docs/contracts/p2p-wire.md` `P2P-07`). |
 | `tx` | sink | Forwarded from a Ready peer into the node's bounded ingress channel, except while the node is in initial block download: unsolicited transaction bodies are then dropped before ingress, without a misbehavior score or disconnect (Core 31.1 `net_processing.cpp:4713-4716`). Mempool prepares and retries admission through its one gateway; node connects committed peer accepts to P2P's relay queue, which announces the negotiated inventory type excluding the exact delivering connection. P2P requests missing parents from that live connection using txid-typed `getdata`; mempool owns orphan retention and retry. A full ingress channel drops the body so the peer read loop can still service ping, headers, and blocks. No protocol response, no disconnect. |
 | `mempool` | ignored | BIP35 mempool snapshot request; Core answers with an `inv` of relay-pool transactions. Deviation: silent. |
-| `getaddr` | served | At most 32 retained IPv4/IPv6 addresses, once per full-relay connection; a peer that sent `sendaddrv2` gets `addrv2` rows from the same book, any other peer gets legacy `addr`. Book-disabled test/embedding connections remain silent. Core sends `addrv2` once negotiated (`net_processing.cpp:5803-5807`); non-IP networks are not relayed. |
-| `addr` / `addrv2` | consumed | Decoded with a 1,000-entry wire bound, then admitted to the shared address book behind a 32-entry connection allowance replenished one per 10 seconds. Source-group limits and routability apply before retention; unsupported non-IP transports are ignored. The same learned IPv4/IPv6 rows feed both `addr` and `addrv2` `getaddr` replies. |
+| `getaddr` | served | At most 32 retained IPv4/IPv6/Tor-v3/I2P addresses, once per full-relay connection; a peer that sent `sendaddrv2` gets `addrv2` rows from the same book, any other peer gets legacy `addr`. Book-disabled test/embedding connections remain silent. Core sends `addrv2` once negotiated (`net_processing.cpp:5803-5807`); legacy `addr` replies omit overlay endpoints. |
+| `addr` / `addrv2` | consumed | Decoded with a 1,000-entry wire bound, then admitted to the shared address book behind a 32-entry connection allowance replenished one per 10 seconds. Source-group limits and routability apply before retention; Tor v3 and I2P identities are retained and relayed as `addrv2`; Tor v2, CJDNS and unknown families are ignored. Legacy `addr` replies contain only the IP subset. Anonymous inbound Tor circuits do not supply a durable address-learning source. |
 | `feefilter` | applied | BIP133. Valid nonnegative thresholds through `MAX_MONEY` filter queued outbound transaction inventory for that connection; invalid values are ignored. The threshold never changes admission. Full-relay connections at protocol 70013+ receive rounded effective local floors on randomized refreshes. |
 | `sendcmpct` | negotiated | BIP152. Sent after `verack` in low-bandwidth mode (`send_compact=false`, version 2). Up to 3 peers are promoted to high-bandwidth mode (`sendcmpct(true, 2)`), demoting older peers (`sendcmpct(false, 2)`) when the cap is reached. Inbound `sendcmpct` establishes peer compact-relay version and high-bandwidth preference. Ready peers in high-bandwidth mode receive unsolicited `cmpctblock` announcements for new tips if the peer is known to hold the parent block (`prev_blockhash`); suppressed in `blocksonly` mode. A high-bandwidth `cmpctblock` may precede connect for a PoW-valid tip child (rules passed, commit intent, segwit active); a later connect failure is not retracted and sends nothing further. Inbound announcements also publish compact-fetch eligibility. |
 | `cmpctblock` / `blocktxn` | sink | BIP152 receive path. Like Core, a `cmpctblock` enters reconstruction only when its header earns the mempool scan. The header needs valid proof of work for the network, the block must not be marked invalid, and its parent must be a known block not marked invalid. The header must also pass the contextual checks header admission applies against that parent, including the required nBits, so a header mined at an easier target never earns the scan; as in admission, a header already in the tree is not rechecked. Finally it must either carry more work than the applied chain or answer a body fetch the same connection owns. Any other `cmpctblock` routes only its header to admission. A hash already attempted on that connection within the reconstruction deadline is not scanned again. Admitted, `cmpctblock` starts bounded per-peer reconstruction: the prefilled coinbase/transactions plus short-ID matches against the mempool and the bounded reconstruction extra pool under the identity profile we advertised (`COMPACT_BLOCK_VERSION`) — the extra pool holds at most 100 wtxid-keyed bodies (transactions removed as replaced, peer orphan-held bodies, and peer policy-only rejects below 100 000 serialized bytes; never a coinbase; hint-only, never admitted or relayed by retention; Core `DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN`) — BIP152 identity is directional: our advertised version fixes what a compliant peer sends us, and the peer's recorded version fixes what we serve; version 1 matches by txid and version 2 by wtxid; two witness variants of one txid stay distinct while a pool-resident identity duplicated in the extra pool is one claim, not a collision; missing transactions are requested with `getblocktxn` on the same connection; two distinct hint identities that collide on one short ID retire only that slot, which `getblocktxn` then carries; a duplicate declared short ID, a count mismatch, or a reconstruction that fails the bounds checks falls back to one full-block `getdata`; an entry whose deadline passes is dropped silently and the peer relies on the connection's separate stall/liveness handling — this module sends no deadline-driven `getdata`. `blocktxn` completes a pending reconstruction. Before delivery both completion paths re-verify the assembled body against the header's transaction-ID merkle root and reject a mutated transaction-ID tree (CVE-2012-2459 duplicate-final-transaction collision) and a body without a coinbase that holds a 64-byte transaction (CVE-2017-12842), so a short-ID misguess can never publish a wrong block; a failed check falls back the same way. A verified block enters the ordinary block pipeline like any `block` message — no validation bypass. |
@@ -361,7 +361,7 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
    timestamps before Add. Existing native port/routability admission is retained
    (`addrman.rs::routable`), including its narrower accepted IPv6 ranges and
    reserved IPv4 exclusions; exact group/hash vectors do not claim that every
-   Core-routable address is admitted. Only existing IP transports are supported.
+   Core-routable address is admitted. IP, Tor v3 and I2P destinations are supported.
    DNS remains
    bounded bootstrap input (64 results per seed pass), not a second address
    owner. Books with at least 64 records get 60 seconds to connect before a
@@ -372,13 +372,13 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
    Its shared at-most-32-entry sample stays byte-stable for 24 hours across
    reconnects and discoveries, then rotates and applies IsTerrible filtering.
    This differs from Core's randomized 21–27-hour cache and response sizing.
-   Non-IP addrv2 families are ignored; block-relay-only peers neither learn nor
+   Tor v3 and I2P addrv2 families are retained; other non-IP families are ignored; block-relay-only peers neither learn nor
    serve addresses. These boundaries are not a claim of complete Core peer
    lifecycle equivalence.
 
    The fixed indexes occupy 327,680 bytes; endpoint count is bounded at 81,920,
    with at most eight New bucket IDs each and at most 65,536 occupied New slots.
-   On the tested 64-bit target Candidate is 144 bytes and Source is 24 bytes,
+   On the tested 64-bit target Candidate is 184 bytes and Source is 40 bytes,
    excluding allocator/index/vector overhead. Fixed-width serialized fields
    have a conservative 512-byte/record bound (315-byte max-width fixture), so
    record separators plus bounded header/checksum remain below the 64 MiB file
@@ -392,60 +392,77 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
    Core ASN groups serialize as NET_IPV6 followed by little-endian ASN bytes,
    grouping IPv4/IPv6 together. ASN0 uses the corrected prefix/HE fallback;
    public linked-IPv4 forms use their embedded IPv4 without rewriting the dial
-   endpoint. Internal and legacy DNS sources retain their source namespaces.
+   endpoint. Internal DNS sources retain their source namespace.
    Startup logs the raw-file SHA256 identity. Invalid or unavailable configured
    maps permit memory-only prefix fallback but disable all book publication
-   and migration backup creation; restoring the map recovers the untouched
-   book. Intentionally omitting the map permits backed-up prefix migration.
+   and incompatible-file preservation; restoring the map recovers the untouched
+   book. Intentionally changing or omitting a map rebuckets the current format
+   through the existing placement owner, prioritizing proven/recent successes
+   and logging retained/demoted/dropped counts. Anchors are pruned only when
+   their endpoint is removed. Same-map restart retains every reference.
 
-   Schema v8 persists the secret, original source, health, map identity,
-   New membership and at most two anchors in one checksummed snapshot. Services
-   is a required field: JSON null means unknown DNS metadata, while numeric zero
-   means a known zero-bit claim. Null is valid only for an Internal/legacy-DNS
-   original source with no prior Good. Missing or invalid fields fail closed.
-   Same-map restart restores every reference; same-classifier v5/v6/v7-to-v8
-   upgrades preserve all references and anchors exactly. Known v1–v7 formats,
-   including genuine v3 files carrying anchors, are strict migration sources.
-   Their service fields must be numeric u64; old null or missing fields remain
-   invalid. Historical DNS zero/no-Good records cannot reveal whether zero was
-   actually observed. Decoding infers only that ambiguous case as unknown in
-   memory, where it may retry; its next accepted VERSION records the observation
-   precisely. Exact-byte backup gates publication of the upgraded file, not
-   in-memory discovery. If backup fails, the original file remains untouched and
-   the in-memory book runs with persistence disabled. IP zero and every
-   prior-Good zero stay known. No source, success or failure value is rewritten
-   to manufacture evidence.
-   The v1 reader retains its original 4,096-record/64-source/slot checks;
-   historical ASMap layouts validate source/record shape before re-bucketing.
-   The actual source bytes are copied to an exclusive content-named
-   `.v<schema>-<sha256>.bak` and file/directory-synced before replacement.
-   Schema-only upgrades do not discard corroboration. Changed classifiers or
-   old custom placement use deterministic original-source re-bucketing,
-   prioritizing proven/recent successes and logging retained/demoted/dropped
-   counts. Historic DNS u64 hashes retain a labelled legacy namespace; no
-   recovered seed name or Core hash is invented. Operational attempt/Good
-   times reset; advertised time, success and failures remain intact. A backup
-   failure allows memory discovery but disables writes. Unknown versions or
-   fields remain read-only. Retained anchors keep their original confirmation
-   time and remain a unique successful-record subset; regrouping prunes anchors
-   only when their endpoint is actually removed.
+   AddrMan reads and writes one canonical checksummed JSON snapshot, identified
+   by `format: "bitcoin-rs-addrman"` and `version: 1`. `SCHEMA_VERSION` MUST remain
+   `1` until the first official bitcoin-rs release. Before that release, edit
+   this definition directly; do not add compatibility readers or increment the
+   version. Only after release may a breaking change increment the version with
+   an explicit compatibility decision; release itself needs no increment.
 
-   Actual Core group/placement evidence includes 224 ASMap rows and official
-   Tried236/New795 anchors. Migration fixtures were emitted by the original
-   v1/v2/v3/v4/v5/v6/v7 writers; v5/v6/v7 fixtures pin all eight retained references. These
-   are specific algorithm/persistence checks, not full peer-lifecycle parity.
+   The canonical object has `format`, `version`, `magic` (four P2P magic bytes),
+   `secret` (32 bytes), `records`, `asmap_id` (null or 32 bytes), and `anchors`.
+   The trailing 32 bytes are SHA256 of the exact UTF-8 JSON payload. Endpoint
+   strings represent IP sockets, Tor-v3 host:port or I2P host:port; mapped IPv4
+   endpoints canonicalize to IPv4. Each record contains `addr`, `services`,
+   `source`, `last_seen`, `last_success`, `failures`, `tried`, `new_buckets`.
+   Source is exactly one of `{"ip": <IP string>}`, `{"overlay": <onion/I2P
+   address string>}`, or `{"internal": <10 SHA256 seed-hash bytes>}`. Overlay
+   sources cannot contain IP or ephemeral connection handles. Each anchor is
+   `{"addr": <endpoint string>, "confirmed_at": <Unix seconds>}` and must name
+   a unique successful record, with at most two anchors. Runtime attempt,
+   count-attempt, global-Good times and creation IDs are not persisted.
+
+   Services is required: JSON null means unknown DNS metadata, while numeric
+   zero means a known zero-bit claim. Null is valid only for an Internal source
+   with no prior Good. Unknown fields, invalid membership, unsafe endpoints,
+   malformed anchors, or excessive sizes fail closed. Tor/I2P endpoint hash
+   keys use BIP155 tags 4/5 followed by the 32 identity bytes and big-endian
+   port; netgroups are `[4, key[0] | 15]` / `[5, hash[0] | 15]`. Internal source
+   groups use tag 6 plus the ten seed-hash bytes. ASMap applies only to IP.
+   Both overlay branches must use these same identity, source and placement
+   rules when adopting this canonical definition; divergent development v9
+   layouts are not supported inputs for record import.
+
+   Unmarked pre-release v1-v9 files are never decoded or migrated. Only their
+   bounded JSON envelope, checksum and network identity are checked. Before
+   replacing one with an empty or freshly seeded canonical book, its exact bytes
+   are exclusively published and file/directory-synced to
+   `.pre-release-<sha256>.bak`. A pre-existing backup is reusable only if it is a
+   regular file with identical bytes and is flushed successfully. Preservation
+   failure disables replacement. The original stays at its source path until
+   atomic save succeeds; a crash before save can retry preservation safely.
+   No old peers, secrets, health or anchors are imported. Relearning uses the
+   existing discovery path. This discards development cache knowledge, not
+   authoritative chainstate, keys or operator configuration.
 
    Filenames remain scoped to actual P2P magic: `peers.dat` becomes
    `peers-<8 hexadecimal magic digits>.dat`, including custom/drynet magics.
-   A valid scoped book wins; same-magic legacy-base import retains the base,
-   and a valid foreign-magic base is left untouched. Corrupt/unknown/unreadable
-   files disable publication while in-memory discovery continues. Publication
+   A valid scoped book wins. A same-magic unscoped current book can be copied
+   into the scoped path without altering its source; an unmarked development
+   book there follows the same preservation-before-fresh-start rule. A valid
+   foreign-magic base is left untouched. Corrupt/unknown/unreadable files
+   disable publication while in-memory discovery continues. Publication
    retains exclusive random temporary creation with bounded collisions, file
    sync, atomic installation and the storage owner's directory-sync policy.
    First installation cannot overwrite a newly appeared destination. Saves
    retain the captured revision only after durable success, outside the state
    lock; concurrent later changes remain dirty. Periodic saves occur every
    15 minutes and shutdown/explicit barriers remain immediate.
+
+   Actual Core group/placement evidence includes 224 ASMap rows and official
+   Tried236/New795 anchors. Current-format tests retain IP/Tor/I2P round trips,
+   anchors, membership, services, map changes and atomic publication proofs.
+   These are specific algorithm/persistence checks, not full peer-lifecycle
+   parity. Historical upgrade fixtures are not a compatibility requirement.
 
    Restart anchors come only from automatic block-relay peers that supplied
    accepted chain evidence, with the existing seven-day age limit. On the first
@@ -473,7 +490,7 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
     - A block counts once applied. Core credits a peer whose block is newly stored (`net_processing.cpp:3429-3432`), side-branch blocks included. bitcoin-rs credits a block when it is applied to the active chain.
     - Wanted services are judged at eviction. Core fixes `fRelevantServices` when the peer's `version` arrives (`net_processing.cpp:3672`). bitcoin-rs evaluates `has_all_desirable_service_flags` against the tip depth at the newcomer's arrival, which differs only for a `NODE_NETWORK_LIMITED` peer whose standing crossed the 144-block threshold in between.
     - A newcomer at an address holding a live outbound connection is refused instead of evicting. The table keys one connection per address, so admitting it would replace the outbound connection too. Core keeps both.
-    - Core reserves part of the uptime protection for onion, I2P, CJDNS and localhost peers; only localhost exists as a transport here.
+    - Core reserves part of the uptime protection for onion, I2P, CJDNS and localhost peers; this implementation still reserves uptime protection only for localhost, even when overlay transports are enabled.
 
     Two Core steps never apply. BIP37 filters are ignored, so no peer has the bloom filter Core's transaction-time tie-break looks at. A discouraged address is refused at accept, where Core admits it while the inbound slots are not almost full and then evicts it first (`net.cpp:1811-1817`), so no candidate is discouraged.
 13. **Outbound service gate**: an outbound peer that does not advertise the desirable set is disconnected right after its `version`, before it is published as usable, exactly as Core's `HasAllDesirableServiceFlags` check does (`net_processing.cpp:1857-1872`, applied to an outbound connection at `:3864-3871`). The desirable set is `NETWORK | WITNESS`, or `NETWORK_LIMITED | WITNESS` while the local tip is younger than 144 blocks (`NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS`). Inbound peers are not service-checked, as in Core.
@@ -679,3 +696,95 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
 - Node-level reorg effects are coordinated in `crates/node/src/reorg.rs` (`switch_to_branch`, `invalidate_block`), which moves the applied tip off a losing branch; the node's P2P-chain adapter calls `switch_to_branch` when a higher-work header branch wins. The reorg fixture pins the peer-visible part of this at the `ChainQuery` seam — the exact surface `ActiveChainQuery` implements — via `reorg_switches_which_chain_a_peer_sees` (`crates/p2p/tests/core_compat.rs`).
 
 See also [docs/contracts/p2p-wire.md](../contracts/p2p-wire.md) for the contracts index and precedence rule.
+
+## Overlay transports
+
+`primitives::endpoint` owns logical IP, Tor v3 and I2P destination identities.
+Those identities key the existing peer table, connection sources, mempool
+attribution, address book, netgroups and relay. A loopback SOCKS/SAM hop is
+never the remote peer's identity. The existing listener owns Bitcoin framing,
+handshake, leases, counters, admission and message processing for all streams.
+
+`p2p::overlay` owns opt-in route selection and SOCKS5/SAM setup; its private
+Tor control and IVNP SAM workers participate in `P2pService` startup/shutdown.
+The service, transport and admission policy share one immutable routing
+configuration. The SAM session owns its local destination; RPC advertises it
+only while that session is live and inbound acceptance is enabled.
+Allowed-network policy is checked both during selection and final admission.
+The [configuration reference](../getting-started.md#tor-and-ivnp-i2p-networking)
+owns option spellings and defaults. Setup uses absolute deadlines and bounded
+cancellation polls for local overlay-service I/O. Direct IP dialing retains
+the existing single 10-second TCP connect timeout and does not poll cancellation
+during that call; the 100ms local-service reconnect helper is unsuitable for
+high-latency remote TCP establishment. SAM session preparation has a 120-second bound; onion
+circuit and I2P stream connection have a 60-second bound. Local service errors do not enter
+remote protocol discouragement or count as failed overlay peer attempts.
+Explicit SOCKS destination-unreachable/refused replies and SAM stream
+`CANT_REACH_PEER`/`TIMEOUT` replies, plus a SAM naming `KEY_NOT_FOUND` reply
+while dialing a destination, do update the existing address-book attempt
+and retry policy. Undocumented naming results (including `TIMEOUT`),
+authentication, malformed replies, local I/O and control
+session failures remain local errors.
+
+The existing outbound drain owns one retry policy for all `--connect` and
+persistent `addnode` destinations, including direct IP, SOCKS and SAM routes.
+The fixed-peer worker only resolves configured names and publishes desired
+destinations. It never schedules a connection. The drain canonicalizes pins,
+keeps at most one active dial per endpoint, and waits 1–60 seconds after
+completion or local admission refusal before retrying. Observing a ready
+connection resets its backoff; removing a pin removes its retry state.
+One-shot manual requests do not create retained retry state. Remote-vs-local
+failure attribution remains with the transport/listener and AddrMan owners
+described above; there is no overlay-specific peer retry loop.
+
+`run_sam` alone publishes/removes the SAM session record and starts replacement
+epochs. Each epoch has one irreversible liveness marker shared by its streams
+and leases. Control-session loss or `INVALID_ID` revokes only the observed
+marker; a late failure cannot revoke the replacement. Reads, including reads
+in the middle of a payload, use `PeerLease::is_cancelled`, which combines local
+connection cancellation with that same epoch marker. The SAM worker asks the
+peer table to wake only leases carrying its exact epoch marker. Ordinary
+identity-checked lease teardown and sync reconciliation handle revocation;
+there is no network-wide I2P cancellation sweep. The SAM worker restores the
+selected stable destination with bounded backoff, independently of remote-peer retries.
+
+Inbound Tor service identity is persistent but remote circuit identity is
+unknown. Opaque per-connection handles are usable for disconnecting a live
+connection; they are never persisted, learned as address-book sources, or
+advertised as destinations. Inbound I2P uses `STREAM ACCEPT` Destination and
+port metadata. Both paths use ordinary inbound capacity/eviction policy and
+have no localhost exemptions. Core's special onion/I2P uptime protection in
+eviction remains a deviation, as recorded above.
+
+Inbound transaction-inventory clocks use the remote network class and local
+bind endpoint. Tor circuits forwarded to one service share its bind clock.
+Accepted I2P SAM streams have ephemeral local bind ports, so their clocks are
+per stream rather than shared by application destination. This remains a
+deviation from Core's shared inbound clock policy.
+
+Routable `PeerAddress`/`PeerEndpoint` values contain only IP, Tor-v3 and I2P
+destinations. Anonymous Tor circuits live in the connection owner's
+`PeerRemote`, keyed by the lease's process-unique connection id. They share
+one unknown-origin admission group, receive no proxy-loopback protection, and
+have no destination to learn, persist, discourage or advertise through AddrMan.
+Their RPC connection handle remains `tor-inbound-N:0`; it is not accepted by
+destination configuration or dialing APIs.
+
+AddrMan endpoint/source persistence follows the canonical v1 definition in
+section 7. Invalid current source representations keep the original file
+untouched with persistence disabled.
+Application keys have a separate versioned,
+checksummed create-once format. A bad existing identity fails startup and is
+never replaced. IVNP router data and application identities have separate
+owners and directories.
+
+Local fixtures in `p2p::overlay` prove protocol transitions, refusal,
+malformed input, timeout/cancellation, service loss and key preservation.
+They do not prove privacy or external router interoperability. The manual
+[`overlay-interoperability`](../../.github/workflows/overlay-interop.yml)
+workflow runs `e2e/tests/overlay_connectivity.rs` through the existing process
+harness against external Tor and the IVNP revision owned by
+[`scripts/overlay-interop.py`](../../scripts/overlay-interop.py). Its artifacts
+record executable hashes, Bitcoin peer identity/counters, headers/block
+exchange and stable service-address restart observations. A failing or absent
+campaign is unavailable interoperability evidence, not an advertised pass.

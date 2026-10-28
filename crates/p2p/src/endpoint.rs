@@ -5,7 +5,6 @@
 
 use std::io;
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -259,85 +258,6 @@ pub fn overlay_netgroup(host: EndpointHost) -> Option<Vec<u8>> {
 pub fn anonymous_netgroup(connection_id: crate::ConnectionId) -> Vec<u8> {
     let digest = Sha256::digest(connection_id.get().to_le_bytes());
     vec![3, digest[0], digest[1]]
-}
-
-/// Resolved overlay configuration (node config → P2P service → dial
-/// routes). Defaults disable every overlay and preserve direct IP.
-#[derive(Clone, Default)]
-pub struct OverlayConfig {
-    /// General SOCKS5 proxy (`--proxy`), also used for IP when set.
-    pub proxy: Option<SocketAddr>,
-    /// SOCKS5 proxy for onion dials (`--onion`); falls back to `proxy`.
-    pub onion: Option<SocketAddr>,
-    /// Randomize SOCKS credentials per dial on the general proxy.
-    pub proxy_randomize_credentials: bool,
-    /// Tor control target (`--torcontrol`): `host:port` or a unix path.
-    pub tor_control: Option<String>,
-    /// Tor control password (`--torpassword`); SAFECOOKIE when absent.
-    pub tor_password: Option<String>,
-    /// Virtual port the onion service is published on.
-    pub tor_virtual_port: u16,
-    /// Persisted onion v3 service key blob path.
-    pub onion_key_path: Option<PathBuf>,
-    /// I2P SAM bridge (`--i2psam`).
-    pub i2p_sam: Option<SocketAddr>,
-    /// Accept inbound I2P streams (`--i2pacceptincoming`).
-    pub i2p_accept_incoming: bool,
-    /// Persisted I2P private destination path.
-    pub i2p_key_path: Option<PathBuf>,
-    /// Networks dials are restricted to (`--onlynet`); empty means all.
-    pub onlynet: Vec<NetworkLabel>,
-}
-
-impl core::fmt::Debug for OverlayConfig {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("OverlayConfig")
-            .field("proxy", &self.proxy)
-            .field("onion", &self.onion)
-            .field(
-                "proxy_randomize_credentials",
-                &self.proxy_randomize_credentials,
-            )
-            .field("tor_control", &self.tor_control)
-            .field(
-                "tor_password",
-                &self.tor_password.as_ref().map(|_| "<redacted>"),
-            )
-            .field("tor_virtual_port", &self.tor_virtual_port)
-            .field("onion_key_path", &self.onion_key_path)
-            .field("i2p_sam", &self.i2p_sam)
-            .field("i2p_accept_incoming", &self.i2p_accept_incoming)
-            .field("i2p_key_path", &self.i2p_key_path)
-            .field("onlynet", &self.onlynet)
-            .finish()
-    }
-}
-
-impl OverlayConfig {
-    /// Whether any Tor route or control surface is configured.
-    #[must_use]
-    pub fn tor_configured(&self) -> bool {
-        self.onion.is_some() || self.proxy.is_some() || self.tor_control.is_some()
-    }
-
-    /// Whether an I2P SAM bridge is configured.
-    #[must_use]
-    pub fn i2p_configured(&self) -> bool {
-        self.i2p_sam.is_some()
-    }
-
-    /// Build dial routes; the SAM session (if any) is attached by the
-    /// service once established.
-    #[must_use]
-    pub fn dial_routes(&self) -> DialRoutes {
-        DialRoutes {
-            proxy: self.proxy,
-            onion: self.onion,
-            proxy_randomize_credentials: self.proxy_randomize_credentials,
-            sam_session: None,
-            onlynet: self.onlynet.clone(),
-        }
-    }
 }
 
 /// Routing configuration for dials: which SOCKS proxy carries IP and
@@ -937,46 +857,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn overlay_config_debug_redacts_tor_password_and_preserves_other_fields()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = OverlayConfig {
-            proxy: Some("127.0.0.1:9050".parse()?),
-            onion: Some("127.0.0.1:9051".parse()?),
-            proxy_randomize_credentials: true,
-            tor_control: Some("127.0.0.1:9051".to_owned()),
-            tor_password: Some("super_secret_tor_password_123".to_owned()),
-            tor_virtual_port: 8333,
-            onion_key_path: Some(PathBuf::from("/path/to/onion_v3_private_key")),
-            i2p_sam: Some("127.0.0.1:7656".parse()?),
-            i2p_accept_incoming: true,
-            i2p_key_path: Some(PathBuf::from("/path/to/i2p_private_key")),
-            onlynet: vec![NetworkLabel::Onion, NetworkLabel::I2p],
-        };
-
-        let debug_str = format!("{config:?}");
-        assert!(
-            !debug_str.contains("super_secret_tor_password_123"),
-            "Debug output leaked secret tor_password"
-        );
-        assert!(
-            debug_str.contains("<redacted>"),
-            "Debug output missing <redacted>"
-        );
-        assert!(debug_str.contains("127.0.0.1:9050"));
-        assert!(debug_str.contains("127.0.0.1:7656"));
-
-        // When password is None, verify it formats as None without <redacted>
-        config.tor_password = None;
-        let debug_none = format!("{config:?}");
-        assert!(
-            !debug_none.contains("<redacted>"),
-            "Debug output must not contain <redacted> when password is None"
-        );
-        assert!(
-            debug_none.contains("tor_password: None"),
-            "Debug output missing tor_password: None"
-        );
-        Ok(())
-    }
 }

@@ -143,6 +143,8 @@ impl MutationResult {
 pub struct PeerToken {
     /// The peer's logical endpoint; `None` for unidentified sessions.
     pub endpoint: Option<PeerEndpoint>,
+    /// The peer's destination, absent for anonymous inbound connections.
+    pub addr: Option<bitcoin_rs_primitives::PeerEndpoint>,
     /// The node-local id of the connection the peer arrived on.
     pub connection_id: u64,
 }

@@ -448,6 +448,7 @@ name = "bitcoin-rs-p2p"
 version = "0.14.0"
 dependencies = [
  "arc-swap",
+ "base64 0.22.1",
  "bitcoin",
  "bitcoin-rs-chain",
  "bitcoin-rs-chainstate",
@@ -482,6 +483,7 @@ version = "0.14.0"
 dependencies = [
  "bytemuck",
  "ruint",
+ "serde",
  "serde_json",
  "sha2",
  "sha3",

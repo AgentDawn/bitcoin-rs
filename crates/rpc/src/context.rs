@@ -2361,6 +2361,7 @@ mod admission_chain_tests {
                 endpoint: Some(bitcoin_rs_primitives::PeerEndpoint::Ip(
                     std::net::SocketAddr::from(([127, 0, 0, 1], 18444)),
                 )),
+                addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 18444)).into()),
                 connection_id: 1,
             }),
             None,

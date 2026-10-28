@@ -1,9 +1,10 @@
 //! Deterministic Bitcoin Core 31.1 P2P compatibility contract tests.
 
 use std::collections::BTreeSet;
+use bitcoin_rs_primitives::PeerEndpoint;
 use std::error::Error;
 use std::io::Cursor;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -882,7 +883,11 @@ fn inbound_block_and_tx_messages_decode_and_leave_no_response() -> Result<(), Bo
 #[test]
 fn block_relay_only_dial_is_prohibited_from_transaction_relay() -> Result<(), Box<dyn Error>> {
     let magic = Magic::BITCOIN;
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let listener = TcpListener::bind(
+        PeerEndpoint::from((Ipv4Addr::LOCALHOST, 0))
+            .socket_addr()
+            .unwrap_or_else(|| panic!("expected IP fixture")),
+    )?;
     let addr = listener.local_addr()?;
     let (headers_tx, headers_rx) = crossbeam_channel::unbounded::<InboundHeaders>();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded::<InboundBlock>();
@@ -901,11 +906,7 @@ fn block_relay_only_dial_is_prohibited_from_transaction_relay() -> Result<(), Bo
         None,
         ListenerExtras::default(),
     );
-    let dial = spawn_outbound_connection(
-        bitcoin_rs_p2p::PeerEndpoint::Ip(addr),
-        shared,
-        PeerRole::BlockRelayOnly,
-    );
+    let dial = spawn_outbound_connection(addr.into(), shared, PeerRole::BlockRelayOnly);
 
     let (mut server, _) = listener.accept()?;
     server.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1254,7 +1255,11 @@ fn handshake_completes_over_tcp_for_every_network() -> Result<(), Box<dyn Error>
 }
 
 fn serve_and_handshake_over_tcp(network: Network, magic: Magic) -> Result<(), Box<dyn Error>> {
-    let listener = bind_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let listener = bind_listener(
+        PeerEndpoint::from((Ipv4Addr::LOCALHOST, 0))
+            .socket_addr()
+            .unwrap_or_else(|| panic!("expected IP fixture")),
+    )?;
     let addr = listener.local_addr()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1279,7 +1284,7 @@ fn serve_and_handshake_over_tcp(network: Network, magic: Magic) -> Result<(), Bo
 
     let handle = thread::spawn(move || serve(listener, listener_shutdown, shared));
 
-    let client = match connect_with_retry(addr) {
+    let client = match connect_with_retry(addr.into()) {
         Ok(client) => client,
         Err(error) => {
             shutdown.store(true, Ordering::Relaxed);
@@ -1294,10 +1299,15 @@ fn serve_and_handshake_over_tcp(network: Network, magic: Magic) -> Result<(), Bo
     outcome
 }
 
-fn connect_with_retry(addr: SocketAddr) -> Result<TcpStream, Box<dyn Error>> {
+fn connect_with_retry(addr: PeerEndpoint) -> Result<TcpStream, Box<dyn Error>> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        match TcpStream::connect_timeout(
+            &addr
+                .socket_addr()
+                .unwrap_or_else(|| panic!("expected IP fixture")),
+            Duration::from_millis(200),
+        ) {
             Ok(stream) => return Ok(stream),
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
@@ -1467,13 +1477,13 @@ fn outbound_peer_without_network_flag_disconnected() -> Result<(), Box<dyn Error
     let magic = Magic::BITCOIN;
     let peer_table = Arc::new(PeerTable::new());
     let shared = outbound_shared(Arc::clone(&peer_table), magic);
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let listener = TcpListener::bind(
+        PeerEndpoint::from((Ipv4Addr::LOCALHOST, 0))
+            .socket_addr()
+            .unwrap_or_else(|| panic!("expected IP fixture")),
+    )?;
     let addr = listener.local_addr()?;
-    let dial = spawn_outbound_connection(
-        bitcoin_rs_p2p::PeerEndpoint::Ip(addr),
-        shared,
-        PeerRole::FullRelay,
-    );
+    let dial = spawn_outbound_connection(addr.into(), shared, PeerRole::FullRelay);
 
     let (mut server, _) = listener.accept()?;
     server.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1512,13 +1522,13 @@ fn outbound_peer_with_network_and_witness_is_accepted() -> Result<(), Box<dyn Er
     let magic = Magic::BITCOIN;
     let peer_table = Arc::new(PeerTable::new());
     let shared = outbound_shared(Arc::clone(&peer_table), magic);
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let listener = TcpListener::bind(
+        PeerEndpoint::from((Ipv4Addr::LOCALHOST, 0))
+            .socket_addr()
+            .unwrap_or_else(|| panic!("expected IP fixture")),
+    )?;
     let addr = listener.local_addr()?;
-    let dial = spawn_outbound_connection(
-        bitcoin_rs_p2p::PeerEndpoint::Ip(addr),
-        shared,
-        PeerRole::FullRelay,
-    );
+    let dial = spawn_outbound_connection(addr.into(), shared, PeerRole::FullRelay);
 
     let (mut server, _) = listener.accept()?;
     server.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1566,13 +1576,13 @@ fn outbound_near_tip_limited_peer_is_accepted() -> Result<(), Box<dyn Error>> {
         ..genesis_block()?.header
     };
     shared.chain_query = Some(Arc::new(FakeChain::new(vec![recent], HashMap::new())));
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let listener = TcpListener::bind(
+        PeerEndpoint::from((Ipv4Addr::LOCALHOST, 0))
+            .socket_addr()
+            .unwrap_or_else(|| panic!("expected IP fixture")),
+    )?;
     let addr = listener.local_addr()?;
-    let dial = spawn_outbound_connection(
-        bitcoin_rs_p2p::PeerEndpoint::Ip(addr),
-        shared,
-        PeerRole::FullRelay,
-    );
+    let dial = spawn_outbound_connection(addr.into(), shared, PeerRole::FullRelay);
 
     let (mut server, _) = listener.accept()?;
     server.set_read_timeout(Some(Duration::from_secs(5)))?;

@@ -1330,6 +1330,10 @@ mod tests {
             endpoint: Some(bitcoin_rs_primitives::PeerEndpoint::Ip(
                 std::net::SocketAddr::from(([127, 0, 0, 1], 8333)),
             )),
+            addr: Some(bitcoin_rs_primitives::PeerEndpoint::from((
+                [127, 0, 0, 1],
+                8333,
+            ))),
             connection_id,
         }
     }

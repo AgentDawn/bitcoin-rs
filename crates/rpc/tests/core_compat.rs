@@ -209,6 +209,19 @@ fn network_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::
         "the one protocol version above Core 31.1's, and only that"
     );
     assert_eq!(network.connections, 0);
+    assert_eq!(
+        network
+            .networks
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ipv4", "ipv6", "onion", "i2p"]
+    );
+    for row in &network.networks[2..] {
+        assert!(row.limited);
+        assert!(!row.reachable);
+        assert_eq!(row.proxy, "");
+    }
     assert_eq!(network.warnings, Vec::<String>::new());
 
     let peers: corepc_types::v31::GetPeerInfo =

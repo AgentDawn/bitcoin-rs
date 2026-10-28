@@ -458,11 +458,10 @@ mod tests {
     }
 
     fn source() -> PeerToken {
+        let endpoint = PeerEndpoint::Ip(core::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
         PeerToken {
-            endpoint: Some(PeerEndpoint::Ip(core::net::SocketAddr::from((
-                [127, 0, 0, 1],
-                8333,
-            )))),
+            endpoint: Some(endpoint),
+            addr: Some(endpoint),
             connection_id: 7,
         }
     }

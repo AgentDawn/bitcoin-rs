@@ -1,8 +1,8 @@
 //! Header-presync admission gating over the real headers drain.
 
+use crate::PeerRemote;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
-use std::net::SocketAddr;
 use std::time::Instant;
 
 use super::settlement_faults::deliver_headers;
@@ -105,8 +105,11 @@ fn connect(
     peers: &Arc<PeerTable>,
     port: u16,
     start_height: i32,
-) -> (SocketAddr, PeerLease, crate::test_support::MessageReceiver) {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+) -> (PeerRemote, PeerLease, crate::test_support::MessageReceiver) {
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+    ));
     let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
     peers.register(crate::PeerEndpoint::Ip(addr), lease.clone());

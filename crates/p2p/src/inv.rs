@@ -142,7 +142,7 @@ pub(crate) const fn is_within_inventory_bound(items: &[Inventory]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use bitcoin_rs_primitives::PeerEndpoint;
 
     use bitcoin::hashes::Hash as _;
 
@@ -166,10 +166,10 @@ mod tests {
         let (sender, receiver) = crate::test_support::message_channel_bounded(2);
         let lease = PeerLease::new(sender);
         let source = source(&lease);
-        let endpoint = source
-            .endpoint
-            .ok_or_else(|| std::io::Error::other("identified peer endpoint"))?;
-        table.register(endpoint, lease.clone());
+        table.register(
+            source.addr.unwrap_or_else(|| panic!("known destination")),
+            lease.clone(),
+        );
 
         assert!(request_missing_parents(
             &table,
@@ -199,10 +199,10 @@ mod tests {
                 let (sender, receiver) = crate::test_support::message_channel_bounded(1);
                 let lease = PeerLease::new(sender);
                 let source = source(&lease);
-                let endpoint = source
-                    .endpoint
-                    .ok_or_else(|| std::io::Error::other("identified peer endpoint"))?;
-                table.register(endpoint, lease.clone());
+                table.register(
+                    source.addr.unwrap_or_else(|| panic!("known destination")),
+                    lease.clone(),
+                );
                 let mut version = crate::handshake::version_message(
                     1,
                     0,
@@ -215,15 +215,23 @@ mod tests {
                     ServiceFlags::NETWORK
                 };
                 let mut info = crate::PeerInfo::inbound_from_version(
-                    SocketAddr::from(([127, 0, 0, 1], 8333)),
-                    SocketAddr::from(([127, 0, 0, 1], 8333)),
+                    source.addr.unwrap_or_else(|| panic!("known destination")),
+                    source
+                        .addr
+                        .unwrap_or_else(|| panic!("known destination"))
+                        .socket_addr()
+                        .unwrap_or_else(|| panic!("expected IP fixture")),
                     &version,
                     0,
                     0,
                     Arc::new(crate::PeerCounters::default()),
                 );
                 info.wtxid_relay = wtxid_relay;
-                assert!(table.publish_info(endpoint, &lease, info));
+                assert!(table.publish_info(
+                    source.addr.unwrap_or_else(|| panic!("known destination")),
+                    &lease,
+                    info
+                ));
 
                 assert!(request_missing_parents(
                     &table,
@@ -279,13 +287,20 @@ mod tests {
         let (old_sender, old_receiver) = crate::test_support::message_channel_bounded(1);
         let old = PeerLease::new(old_sender);
         let stale_source = source(&old);
-        let endpoint = stale_source
-            .endpoint
-            .ok_or_else(|| std::io::Error::other("identified peer endpoint"))?;
-        table.register(endpoint, old);
+        table.register(
+            stale_source
+                .addr
+                .unwrap_or_else(|| panic!("known destination")),
+            old,
+        );
         let (new_sender, new_receiver) = crate::test_support::message_channel_bounded(1);
         let current = PeerLease::new(new_sender);
-        table.register(endpoint, current.clone());
+        table.register(
+            stale_source
+                .addr
+                .unwrap_or_else(|| panic!("known destination")),
+            current.clone(),
+        );
 
         assert!(current.send(Message::Ping(7)).is_ok());
         assert!(!request_missing_parents(&table, stale_source, &[parent(1)]));
@@ -310,10 +325,10 @@ mod tests {
         let lease = PeerLease::new(sender);
         let source = source(&lease);
         assert!(!request_missing_parents(&table, source, &[parent(1)]));
-        let endpoint = source
-            .endpoint
-            .ok_or_else(|| std::io::Error::other("identified peer endpoint"))?;
-        table.register(endpoint, lease.clone());
+        table.register(
+            source.addr.unwrap_or_else(|| panic!("known destination")),
+            lease.clone(),
+        );
         assert!(lease.send(Message::Ping(1)).is_ok());
 
         assert!(!request_missing_parents(&table, source, &[parent(1)]));
@@ -328,10 +343,10 @@ mod tests {
         let (sender, receiver) = crate::test_support::message_channel_bounded(1);
         let lease = PeerLease::new(sender);
         let source = source(&lease);
-        let endpoint = source
-            .endpoint
-            .ok_or_else(|| std::io::Error::other("identified peer endpoint"))?;
-        table.register(endpoint, lease.clone());
+        table.register(
+            source.addr.unwrap_or_else(|| panic!("known destination")),
+            lease.clone(),
+        );
         lease.cancel();
 
         assert!(!request_missing_parents(&table, source, &[parent(1)]));

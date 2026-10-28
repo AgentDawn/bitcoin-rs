@@ -1686,6 +1686,7 @@ mod stale_tip_routing_tests {
         let endpoint = crate::PeerEndpoint::Ip(addr);
         peers.register(endpoint, lease.clone());
         let info = crate::peer_info::PeerInfo {
+            addr: endpoint.into(),
             endpoint: Some(endpoint),
             network: endpoint.net(),
             version: 70016,

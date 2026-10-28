@@ -5,6 +5,7 @@
 //! to manage the in-flight window budget. `crate::BlockStager` owns the
 //! matching inbound staging set. The node sync coordinator drives these
 //! types; it does not own the policy.
+
 use std::time::{Duration, Instant};
 
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};

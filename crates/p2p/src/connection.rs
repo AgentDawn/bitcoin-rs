@@ -1,5 +1,6 @@
 //! Per-connection identity and cancellation.
 
+use bitcoin_rs_primitives::PeerEndpoint;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -10,7 +11,7 @@ use parking_lot::{Condvar, Mutex};
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Process-unique identity for one peer connection.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId(u64);
 
 impl ConnectionId {
@@ -46,6 +47,81 @@ impl ConnectionId {
     }
 }
 
+/// Remote identity of a live connection. Only destinations belong in `AddrMan`;
+/// an anonymous inbound circuit is identified by its own connection lease.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PeerRemote {
+    /// A routable Bitcoin peer destination.
+    Endpoint(PeerEndpoint),
+    /// An inbound Tor circuit whose remote destination is unknown.
+    AnonymousTor(ConnectionId),
+}
+
+impl PeerRemote {
+    /// Destination, when the connection reveals one.
+    pub const fn endpoint(self) -> Option<PeerEndpoint> {
+        match self {
+            Self::Endpoint(endpoint) => Some(endpoint),
+            Self::AnonymousTor(_) => None,
+        }
+    }
+
+    /// Network carrying this connection, independent of proxy sockets.
+    pub const fn network(self) -> crate::PeerNetwork {
+        match self {
+            Self::Endpoint(endpoint) => endpoint.address().network(),
+            Self::AnonymousTor(_) => crate::PeerNetwork::Onion,
+        }
+    }
+}
+
+impl From<PeerEndpoint> for PeerRemote {
+    fn from(endpoint: PeerEndpoint) -> Self {
+        Self::Endpoint(endpoint)
+    }
+}
+
+impl From<std::net::SocketAddr> for PeerRemote {
+    fn from(socket: std::net::SocketAddr) -> Self {
+        Self::Endpoint(socket.into())
+    }
+}
+
+impl<T> From<(T, u16)> for PeerRemote
+where
+    std::net::SocketAddr: From<(T, u16)>,
+{
+    fn from(value: (T, u16)) -> Self {
+        Self::from(std::net::SocketAddr::from(value))
+    }
+}
+
+impl std::fmt::Display for PeerRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Endpoint(endpoint) => endpoint.fmt(f),
+            Self::AnonymousTor(id) => write!(f, "tor-inbound-{}:0", id.get()),
+        }
+    }
+}
+
+impl std::str::FromStr for PeerRemote {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some(id) = value
+            .strip_prefix("tor-inbound-")
+            .and_then(|id| id.strip_suffix(":0"))
+        {
+            return id
+                .parse()
+                .map(|id| Self::AnonymousTor(ConnectionId(id)))
+                .map_err(|_| "invalid anonymous Tor connection handle");
+        }
+        value.parse().map(Self::Endpoint)
+    }
+}
+
 /// Attribution token for an event delivered by one connection.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PeerSource {
@@ -67,11 +143,21 @@ impl PeerSource {
         self.endpoint
     }
 
+    /// Remote identity for table keys: the endpoint when identified,
+    /// otherwise the anonymous connection.
+    #[must_use]
+    pub fn remote(&self) -> PeerRemote {
+        PeerRemote::from(*self)
+    }
+
     /// Mints a source with a fresh process-unique identity for tests.
     #[cfg(test)]
-    pub(crate) fn for_test(addr: SocketAddr) -> Self {
+    pub(crate) fn for_test(addr: impl Into<PeerRemote>) -> Self {
         Self {
-            endpoint: Some(crate::PeerEndpoint::Ip(addr)),
+            endpoint: {
+                let remote: PeerRemote = addr.into();
+                remote.endpoint()
+            },
             connection_id: ConnectionId::allocate(),
         }
     }
@@ -95,11 +181,30 @@ impl PeerSource {
     }
 }
 
+impl From<PeerSource> for PeerRemote {
+    fn from(source: PeerSource) -> Self {
+        source
+            .endpoint
+            .map_or(Self::AnonymousTor(source.connection_id), Self::Endpoint)
+    }
+}
+
 impl From<PeerSource> for bitcoin_rs_mempool::PeerToken {
     fn from(source: PeerSource) -> Self {
         Self {
             endpoint: source.endpoint,
+            addr: PeerRemote::from(source).endpoint(),
             connection_id: source.connection_id.get(),
+        }
+    }
+}
+
+impl From<bitcoin_rs_mempool::PeerToken> for PeerSource {
+    fn from(token: bitcoin_rs_mempool::PeerToken) -> Self {
+        let connection_id = ConnectionId(token.connection_id);
+        Self {
+            endpoint: token.endpoint,
+            connection_id,
         }
     }
 }
@@ -763,6 +868,10 @@ pub struct PeerLease {
     id: ConnectionId,
     outbound: Sender<QueuedFrame>,
     cancel: Arc<AtomicBool>,
+    /// Read-only reference to the transport owner's epoch marker. Local
+    /// connection cancellation and provider-epoch revocation are distinct;
+    /// `is_cancelled` is their single predicate for all connection consumers.
+    transport_alive: Option<Arc<AtomicBool>>,
     close_tx: Sender<()>,
     close_rx: Receiver<()>,
     budget: Arc<OutboundBudget>,
@@ -775,7 +884,7 @@ pub struct PeerLease {
     /// Whether the operator pinned this dial by hand (`--connect` or
     /// `addnode`). Core: `ConnectionType::MANUAL`.
     manual: bool,
-    /// Granted only from operator configuration using the actual socket IP.
+    /// Granted only when the logical remote IP matches operator configuration.
     no_ban: bool,
     /// Monotonic instant the connection was created.
     connected: Instant,
@@ -869,6 +978,7 @@ impl PeerLease {
             id: ConnectionId::allocate(),
             outbound,
             cancel: Arc::new(AtomicBool::new(false)),
+            transport_alive: None,
             close_tx,
             close_rx,
             budget: Arc::new(budget),
@@ -895,6 +1005,17 @@ impl PeerLease {
             false,
             budget,
         )
+    }
+
+    pub(crate) fn with_transport_alive(mut self, alive: Option<Arc<AtomicBool>>) -> Self {
+        self.transport_alive = alive;
+        self
+    }
+
+    pub(crate) fn belongs_to_transport_epoch(&self, epoch: &Arc<AtomicBool>) -> bool {
+        self.transport_alive
+            .as_ref()
+            .is_some_and(|alive| Arc::ptr_eq(alive, epoch))
     }
 
     pub(crate) fn with_no_ban(mut self, no_ban: bool) -> Self {
@@ -1195,11 +1316,10 @@ impl PeerLease {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
-    }
-
-    /// The flag [`Self::cancel`] sets, for a socket wrapper to observe.
-    pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
+            || self
+                .transport_alive
+                .as_ref()
+                .is_some_and(|alive| !alive.load(Ordering::Acquire))
     }
 }
 
@@ -1209,8 +1329,8 @@ mod tests {
         OutboundBudget, OutboundCredit, OutboundRefusal, PeerLease, QueuedFrame, Refusal,
         SharedOutboundBudget,
     };
+    use bitcoin_rs_primitives::PeerEndpoint;
     use crossbeam_channel::Receiver;
-    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1267,6 +1387,7 @@ mod tests {
             .as_ip()
             .ok_or_else(|| std::io::Error::other("ip test peer"))?;
         Ok(crate::PeerInfo {
+            addr: addr.into(),
             endpoint: Some(addr),
             network: addr.net(),
             version: 70_016,
@@ -1333,7 +1454,7 @@ mod tests {
     fn stale_connection_cannot_publish_over_replacement() -> Result<(), Box<dyn std::error::Error>>
     {
         let table = crate::PeerTable::new();
-        let addr: crate::PeerEndpoint = SocketAddr::from(([127, 0, 0, 1], 18_450)).into();
+        let addr = PeerEndpoint::from(([127, 0, 0, 1], 18_450));
         let (old_tx, _old_rx) = crossbeam_channel::unbounded();
         let old = PeerLease::new(old_tx);
         assert!(!table.register(addr, old.clone()));
@@ -1365,7 +1486,7 @@ mod tests {
     #[test]
     fn stale_disconnect_source_preserves_replacement() -> Result<(), Box<dyn std::error::Error>> {
         let table = crate::PeerTable::new();
-        let addr: crate::PeerEndpoint = SocketAddr::from(([127, 0, 0, 1], 18_451)).into();
+        let addr = PeerEndpoint::from(([127, 0, 0, 1], 18_451));
         let (old_tx, _old_rx) = crossbeam_channel::unbounded();
         let old = PeerLease::new(old_tx);
         table.register(addr, old.clone());
@@ -1392,7 +1513,7 @@ mod tests {
     fn ready_snapshot_keeps_identity_across_same_address_replacement()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = crate::PeerTable::new();
-        let addr: crate::PeerEndpoint = SocketAddr::from(([127, 0, 0, 1], 18_452)).into();
+        let addr = PeerEndpoint::from(([127, 0, 0, 1], 18_452));
         let (old_tx, _old_rx) = crossbeam_channel::unbounded();
         let old = PeerLease::new(old_tx);
         table.register(addr, old.clone());

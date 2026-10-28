@@ -40,6 +40,9 @@ pub mod inv;
 /// Inbound accept loop, outbound dial, and their shared start-epoch wiring.
 pub mod listener;
 pub(crate) mod netgroup;
+/// Opt-in Tor and IVNP I2P transport configuration.
+pub mod overlay;
+pub use overlay::{OverlayConfig, OverlayNetworkState};
 
 /// Bitcoin Core `net:*` tracepoint payload mapping.
 mod net_trace;
@@ -67,8 +70,6 @@ pub mod staletip;
 pub mod subnet;
 /// Block-download executor driving the applied-chain [`sync::SyncChain`] seam.
 pub mod sync;
-/// External Tor control-port client for the onion hidden service.
-pub(crate) mod tor_control;
 /// A connection's v1 or BIP324 v2 transport and its negotiation.
 pub(crate) mod transport;
 /// Connection-bound transaction request and relay policy.
@@ -81,7 +82,7 @@ pub mod wire;
 #[cfg(test)]
 mod test_support;
 
-pub use bitcoin_rs_primitives::{EndpointHost, NetworkLabel, PeerEndpoint};
+pub use bitcoin_rs_primitives::{EndpointHost, NetworkLabel};
 pub use block_announce::{
     BlockAnnounceConfig, BlockAnnounceQueue, BlockAnnounceReceiver, BlockAnnouncer,
     MAX_BLOCKS_TO_ANNOUNCE, MAX_HIGH_BANDWIDTH_PEERS, spawn_block_announce_worker,
@@ -90,15 +91,17 @@ pub(crate) use block_stager::BlockStager;
 pub use chain_query::{ActiveChainQuery, RecentBlockSlot};
 pub use compact_blocks::{CompactBlockHints, Reconstruction};
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, PINNED_CORE_VERSION};
-pub use connection::{ConnectionId, OutboundRefusal, PeerLease, PeerSource, QueuedFrame};
+pub use connection::{
+    ConnectionId, OutboundRefusal, PeerLease, PeerRemote, PeerSource, QueuedFrame,
+};
 pub use counters::{CountingStream, PeerCounters};
 pub use dispatch::{
     ChainQuery, FilterRequest, FilterServing, InventoryServing, StaleTipHeaders, TxInventory,
 };
 pub use endpoint::{
-    DialFailure, DialRoutes, OverlayConfig, RouteDenial, RouteTable, TransportRemote,
-    accepted_ip_identity, addrv2_gossip_enabled, connect_peer_stream, dialed_ip_identity,
-    endpoint_from_addrv2, endpoint_to_addrv2, format_endpoint, parse_endpoint,
+    DialFailure, DialRoutes, RouteDenial, RouteTable, TransportRemote, accepted_ip_identity,
+    addrv2_gossip_enabled, connect_peer_stream, dialed_ip_identity, endpoint_from_addrv2,
+    endpoint_to_addrv2, format_endpoint, parse_endpoint,
 };
 pub use feature::{
     FEATURE_COMMAND, FEATURE_V2_SHORT_ID, FEATURE_VERSION, FeatureAnnouncement, FeatureError,
@@ -117,7 +120,6 @@ pub use service::{
     P2pServiceError,
 };
 pub use subnet::{BannedSubnet, IpSubnet, SubnetParseError};
-pub use tor_control::TorControlTarget;
 pub use transport::{TransportFailure, TransportProtocol};
 pub use tx_policy::{
     InboundBody, InboundPackage, MAX_DECODED_PACKAGES_PER_PEER, OpenedPackage, PackageCapacity,
@@ -135,3 +137,5 @@ pub use sync::StaleTipRetainer;
 
 /// Bounded automatic reconnect avoidance; manual bans retain their owner.
 pub mod discouragement;
+
+pub use bitcoin_rs_primitives::{PeerAddress, PeerEndpoint, PeerNetwork};

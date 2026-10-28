@@ -818,6 +818,7 @@ fn network_peer_methods_read_shared_peer_table() -> Result<(), Box<dyn std::erro
             8333,
         ))),
         network: bitcoin_rs_p2p::NetworkLabel::Ipv4,
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333).into(),
         version: 70016,
         services: 0,
         user_agent: "/bitcoin-rs:0.1.0/".to_string(),
