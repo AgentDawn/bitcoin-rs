@@ -3329,6 +3329,7 @@ mod finalizepsbt_tests {
         assert!(optional_max_feerate(&json!([1.0]), 0).is_err());
         assert!(optional_max_feerate(&json!(["1.0"]), 0).is_err());
         assert!(optional_max_feerate(&json!([-0.1]), 0).is_err());
+        assert!(optional_max_feerate(&json!([-1]), 0).is_err());
         assert!(optional_max_feerate(&json!(["-1"]), 0).is_err());
     }
 }

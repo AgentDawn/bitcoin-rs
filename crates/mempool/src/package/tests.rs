@@ -20,9 +20,6 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 struct Seen(parking_lot::Mutex<Vec<crate::MutationEnvelope>>);
 
 impl crate::MempoolObserver for Seen {
-    fn wants_accepted_transactions(&self) -> bool {
-        false
-    }
     fn on_mutation(&self, envelope: &crate::MutationEnvelope) {
         self.0.lock().push(envelope.clone());
     }
@@ -35,7 +32,7 @@ fn native_package_aggregates_cpfp_atomically_and_ignores_input_order() -> TestRe
         Arc::new(parking_lot::RwLock::new(Mempool::new(
             MempoolLimits::default(),
         ))),
-        Some(seen.clone()),
+        Some((seen.clone(), crate::BodyInterest::Metadata)),
         ValidationEngine::Native,
         None,
     );
@@ -819,7 +816,7 @@ fn gateway_observed(observer: Option<Arc<dyn crate::MempoolObserver>>) -> Mempoo
             min_relay_fee_sat_per_kvb: 0,
             ..MempoolLimits::default()
         }))),
-        observer,
+        observer.map(|leg| (leg, crate::BodyInterest::Metadata)),
         ValidationEngine::Native,
         None,
     )
