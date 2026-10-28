@@ -6,7 +6,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin_rs_chain::LatchReader;
 use bitcoin_rs_chainstate::{
@@ -29,6 +30,27 @@ use crate::chain_effects::ChainFollowers;
 
 /// Bytes buffered between the encoder and the output file.
 const EXPORT_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Process-wide counter distinguishing staged exports within one process.
+static EXPORT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Builds a per-attempt staged file name.
+///
+/// The name embeds the process id, a wall-clock timestamp and a process-wide
+/// counter, so a SIGKILL orphan (`*.incomplete`) can never collide with a
+/// later export even after PID reuse. Creation still uses `create_new`, and no
+/// caller unlinks another process's staged file.
+fn staged_temp_name(name: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let counter = EXPORT_TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!(
+        "{name}.{pid}.{nanos:x}-{counter:x}.incomplete",
+        pid = std::process::id()
+    )
+}
 
 /// The import budget and activation effects shared by embedding and RPC.
 pub(crate) struct SnapshotControl {
@@ -117,16 +139,16 @@ struct ExportTarget {
 /// interruption and panic path leaves no partial snapshot behind.
 struct StagedFile<'a> {
     dir: &'a cap_std::fs::Dir,
-    name: &'a str,
+    name: String,
     published: bool,
 }
 
 impl<'a> StagedFile<'a> {
     fn create(
         dir: &'a cap_std::fs::Dir,
-        name: &'a str,
+        name: String,
     ) -> std::io::Result<(Self, cap_std::fs::File)> {
-        let file = create_file(dir, name)?;
+        let file = create_file(dir, &name)?;
         Ok((
             Self {
                 dir,
@@ -145,10 +167,10 @@ impl<'a> StagedFile<'a> {
 impl Drop for StagedFile<'_> {
     fn drop(&mut self) {
         if !self.published
-            && let Err(error) = self.dir.remove_file(self.name)
+            && let Err(error) = self.dir.remove_file(&self.name)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(file = self.name, %error, "could not remove unpublished snapshot export");
+            tracing::warn!(file = &self.name, %error, "could not remove unpublished snapshot export");
         }
     }
 }
@@ -291,12 +313,27 @@ impl SnapshotControl {
             .export
             .try_lock()
             .ok_or(SnapshotExportError::ExportInProgress)?;
-        let target = self.resolve_output(output)?;
+        let mut target = self.resolve_output(output)?;
         if stop() {
             return Err(SnapshotExportError::Interrupted);
         }
-        let (staged, file) =
-            StagedFile::create(&target.dir, &target.temp).map_err(SnapshotExportError::Output)?;
+        let (staged, file) = {
+            let mut attempts = 0_u32;
+            let mut temp = target.temp.clone();
+            loop {
+                match StagedFile::create(&target.dir, temp.clone()) {
+                    Ok(staged) => break staged,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 32 =>
+                    {
+                        attempts += 1;
+                        temp = staged_temp_name(&target.name);
+                    }
+                    Err(error) => return Err(SnapshotExportError::Output(error)),
+                }
+            }
+        };
+        target.temp = staged.name.clone();
         let mut sink = BufWriter::with_capacity(EXPORT_BUFFER_BYTES, file);
         let encoded = self.encode_at_applied_tip(&mut sink, stop)?;
         sink.flush().map_err(SnapshotExportError::Write)?;
@@ -379,7 +416,7 @@ impl SnapshotControl {
             Err(error) => return Err(SnapshotExportError::Output(error)),
         }
         Ok(ExportTarget {
-            temp: format!("{name}.{}.incomplete", std::process::id()),
+            temp: staged_temp_name(&name),
             dir,
             name,
             path,
@@ -1135,6 +1172,50 @@ mod tests {
             Err(SnapshotExportError::Interrupted)
         ));
         assert_eq!(entry_names(&out)?, ["interrupted.dat"]);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_same_pid_temp_does_not_block_a_new_export() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (state, core_path, _native_path) = snapshot_inputs(dir.path())?;
+        state.snapshots.import(&core_path)?;
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out)?;
+        // A SIGKILL orphan from the previous fixed-pattern name with our pid.
+        // It must be left alone (never unlinked) yet never block the retry.
+        let stale = out.join(format!("export.dat.{}.incomplete", std::process::id()));
+        std::fs::write(&stale, b"stale")?;
+        let output = out.join("export.dat");
+
+        let exported = state
+            .snapshots
+            .export(&output, &LatchReader::fixture_never())?;
+        assert_eq!(
+            exported.path,
+            output.canonicalize()?.to_string_lossy().into_owned()
+        );
+        assert_eq!(std::fs::read(&stale)?, b"stale");
+        assert!(output.is_file());
+        let names = entry_names(&out)?;
+        assert!(names.contains(&"export.dat".to_string()));
+        assert!(
+            names.contains(
+                &stale
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("stale file name"))?
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.ends_with(".incomplete"))
+                .count(),
+            1,
+            "the new export publishes without leaving its own staged file"
+        );
         Ok(())
     }
 
