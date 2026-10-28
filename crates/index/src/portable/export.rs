@@ -25,15 +25,16 @@ use super::{
     BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, MAX_RESTORE_POSITIONS, io_error,
     sync_dir,
 };
-use crate::types::{HashPrefixRow, TxPosition, TxPositionValue};
-use crate::{
-    IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexScanRow,
-};
+use crate::types::{HASH_PREFIX_ROW_SIZE, HashPrefixRow, TxPosition, TxPositionValue};
+use crate::{IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily};
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use zerocopy::IntoBytes;
 
 /// Rows per export page. Export streams the family through bounded pages,
 /// each read through a short-lived snapshot, so export memory stays flat in
@@ -360,23 +361,238 @@ struct RowExporter<'a> {
     path: &'a Path,
 }
 
-/// One page row resolved against its block, held for stored-order emission.
-struct StagedRow {
-    height: u32,
-    /// `(txid, position)` pairs sorted by id then position.
-    located: Vec<([u8; 32], TxPosition)>,
+/// Sort key of one staged row entry: `height` big-endian then `sequence`
+/// big-endian, so byte order is numeric order.
+const STAGED_SORT_KEY_LEN: usize = 4 + 8;
+/// Sort key of one resolved entry: `sequence` big-endian.
+const RESOLVED_SORT_KEY_LEN: usize = 8;
+/// Staged payload of one row: the fixed-width stored key, the value length,
+/// then the value.
+const STAGED_KEY_LEN: usize = HASH_PREFIX_ROW_SIZE;
+/// Bytes accumulated per external-sort run. Runs are cut by bytes rather than
+/// by entries so one run never exceeds a constant even when single rows carry
+/// unusually large position lists.
+const SORT_RUN_BYTES: usize = 4 << 20;
+/// Sorted runs merged at once. The merge holds one decoded head entry plus
+/// one open file per run, so descriptors and memory stay bounded no matter
+/// how many runs a family needs.
+const SORT_MERGE_FAN_IN: usize = 32;
+
+/// One framed external-sort record: `sort_key || payload_len (u64 LE) ||
+/// payload`. Merge passes compare only the fixed-width sort key, so one
+/// implementation sorts both the staged file (keyed by height) and the
+/// resolved file (keyed by sequence).
+fn write_framed(out: &mut impl Write, key: &[u8], payload: &[u8]) -> io::Result<()> {
+    out.write_all(key)?;
+    out.write_all(&(payload.len() as u64).to_le_bytes())?;
+    out.write_all(payload)
+}
+
+/// Reads one framed record, or `None` at a clean record boundary. A file
+/// that ends inside a key, length, or payload is corruption, never a clean
+/// end.
+fn read_framed(
+    reader: &mut impl Read,
+    key_len: usize,
+) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let mut key = vec![0_u8; key_len];
+    match reader.read_exact(&mut key) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut len = [0_u8; 8];
+    reader.read_exact(&mut len)?;
+    let len = u64::from_le_bytes(len);
+    let len = usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sort record too large"))?;
+    let mut payload = vec![0_u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok(Some((key, payload)))
+}
+
+/// Sorts every framed record of `file` by its sort key, using bounded memory.
+///
+/// The file is split into sorted runs of at most [`SORT_RUN_BYTES`], then the
+/// runs merge [`SORT_MERGE_FAN_IN`] at a time until one sorted file remains;
+/// the file is rewritten in place and left at its start. Anonymous temp files
+/// back the runs, so cancelling or failing the export removes every staging
+/// byte with the file handles.
+fn external_sort(file: &mut File, key_len: usize, path: &Path) -> Result<(), IndexBundleError> {
+    let failed = move |error: io::Error| io_error(path, error);
+    file.seek(SeekFrom::Start(0)).map_err(failed)?;
+    let mut runs: Vec<File> = Vec::new();
+    let mut at_end = false;
+    while !at_end {
+        let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut chunk_bytes = 0_usize;
+        while chunk_bytes < SORT_RUN_BYTES {
+            match read_framed(file, key_len).map_err(failed)? {
+                None => {
+                    at_end = true;
+                    break;
+                }
+                Some((key, payload)) => {
+                    chunk_bytes = chunk_bytes
+                        .saturating_add(key.len())
+                        .saturating_add(8)
+                        .saturating_add(payload.len());
+                    chunk.push((key, payload));
+                }
+            }
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        chunk.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut run = tempfile::tempfile().map_err(failed)?;
+        for (key, payload) in &chunk {
+            write_framed(&mut run, key, payload).map_err(failed)?;
+        }
+        run.seek(SeekFrom::Start(0)).map_err(failed)?;
+        runs.push(run);
+    }
+    while runs.len() > 1 {
+        let mut merged: Vec<File> = Vec::with_capacity(runs.len().div_ceil(SORT_MERGE_FAN_IN));
+        for group in runs.chunks_mut(SORT_MERGE_FAN_IN) {
+            let mut out = tempfile::tempfile().map_err(failed)?;
+            merge_runs(group, &mut out, key_len, path)?;
+            out.seek(SeekFrom::Start(0)).map_err(failed)?;
+            merged.push(out);
+        }
+        runs = merged;
+    }
+    file.seek(SeekFrom::Start(0)).map_err(failed)?;
+    file.set_len(0).map_err(failed)?;
+    if let Some(mut run) = runs.pop() {
+        run.seek(SeekFrom::Start(0)).map_err(failed)?;
+        io::copy(&mut run, &mut *file).map_err(failed)?;
+    }
+    file.seek(SeekFrom::Start(0)).map_err(failed)?;
+    Ok(())
+}
+
+/// Merges one group of sorted runs into `out`, holding one head entry and
+/// one open file per run.
+fn merge_runs(
+    runs: &mut [File],
+    out: &mut File,
+    key_len: usize,
+    path: &Path,
+) -> Result<(), IndexBundleError> {
+    let failed = move |error: io::Error| io_error(path, error);
+    let mut readers: Vec<BufReader<&mut File>> = runs.iter_mut().map(BufReader::new).collect();
+    let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> = Vec::with_capacity(readers.len());
+    for reader in readers.iter_mut() {
+        heads.push(read_framed(reader, key_len).map_err(failed)?);
+    }
+    let mut heap: BinaryHeap<Reverse<(Vec<u8>, usize)>> = BinaryHeap::new();
+    for (index, head) in heads.iter().enumerate() {
+        if let Some((key, _)) = head {
+            heap.push(Reverse((key.clone(), index)));
+        }
+    }
+    while let Some(Reverse((key, index))) = heap.pop() {
+        let Some((_, payload)) = heads[index].take() else {
+            return Err(IndexError::from(StorageError::InvalidOperation(
+                "sort merge lost its head entry",
+            ))
+            .into());
+        };
+        write_framed(out, &key, &payload).map_err(failed)?;
+        if let Some(next) = read_framed(&mut readers[index], key_len).map_err(failed)? {
+            heap.push(Reverse((next.0.clone(), index)));
+            heads[index] = Some(next);
+        }
+    }
+    Ok(())
+}
+
+/// Staged payload of one stored row: the fixed-width stored key, the value
+/// length, then the value.
+fn encode_staged(key: &[u8; STAGED_KEY_LEN], value: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(STAGED_KEY_LEN + 8 + value.len());
+    payload.extend_from_slice(key);
+    payload.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    payload.extend_from_slice(value);
+    payload
+}
+
+/// Splits one staged payload back into its stored key and value.
+fn decode_staged(payload: &[u8]) -> Option<([u8; STAGED_KEY_LEN], &[u8])> {
+    let key: [u8; STAGED_KEY_LEN] = payload.get(..STAGED_KEY_LEN)?.try_into().ok()?;
+    let rest = payload.get(STAGED_KEY_LEN..)?;
+    let len = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+    let len = usize::try_from(len).ok()?;
+    let value = rest.get(8..)?;
+    if value.len() != len {
+        return None;
+    }
+    Some((key, value))
+}
+
+/// Resolved payload of one row: the height, the entry count, then one
+/// `txid || position` pair per entry, with positions in [`TxPosition`]'s
+/// little-endian 6-byte layout.
+fn encode_resolved(height: u32, located: &[([u8; 32], TxPosition)]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + located.len() * (32 + 6));
+    payload.extend_from_slice(&height.to_le_bytes());
+    payload.extend_from_slice(&(located.len() as u64).to_le_bytes());
+    for (txid, position) in located {
+        payload.extend_from_slice(txid);
+        payload.extend_from_slice(position.as_bytes());
+    }
+    payload
+}
+
+/// Splits one resolved payload back into its height and located pairs.
+fn decode_resolved(payload: &[u8]) -> Option<(u32, Vec<([u8; 32], TxPosition)>)> {
+    if payload.len() < 12 {
+        return None;
+    }
+    let height = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+    let count = u64::from_le_bytes(payload.get(4..12)?.try_into().ok()?);
+    let count = usize::try_from(count).ok()?;
+    let mut rest = payload.get(12..)?;
+    if rest.len() != count.checked_mul(32 + 6)? {
+        return None;
+    }
+    let mut located = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (txid, tail) = rest.split_at(32);
+        let (raw, next) = tail.split_at(6);
+        let offset = u32::from_le_bytes([raw[0], raw[1], raw[2], 0]);
+        let len = u32::from_le_bytes([raw[3], raw[4], raw[5], 0]);
+        located.push((txid.try_into().ok()?, TxPosition::new(offset, len)));
+        rest = next;
+    }
+    Some((height, located))
 }
 
 impl RowExporter<'_> {
     /// Streams every row once, in stored-key order, and returns
     /// `(records, payload bytes)`.
     ///
+    /// Stored order is transaction-id order while bodies are keyed by block,
+    /// so resolving in stored order reloads and reparses one body per row,
+    /// and grouping only within each page still reloads one body per page a
+    /// block touches. The export instead stages every row into an anonymous
+    /// temp file, sorts the staging file by `(height, sequence)`, resolves
+    /// the height-ordered rows so each covered body is read and parsed once,
+    /// then re-sorts the resolved rows by sequence and emits them in stored
+    /// order. The artifact keeps its strictly ascending record order while
+    /// body I/O stays height-local.
+    ///
     /// Each page is read through a short-lived snapshot that must still show
-    /// `base` at `self.floor`; the snapshot is dropped before any body I/O,
-    /// so a long export never pins one key-value snapshot across the whole
-    /// family. Rows stream through bounded pages, so no family-sized copy is
-    /// made on any backend. Cancellation is polled every
-    /// [`CANCEL_POLL_RECORDS`] resolved rows.
+    /// `base` at `self.floor`; snapshots are dropped before any body I/O, so
+    /// a long export never pins one key-value snapshot across the whole
+    /// family. Rows stream through bounded pages, sorts spill through bounded
+    /// runs, and only one row is resolved or emitted at a time, so export
+    /// memory stays flat in family size on every backend. Cancellation is
+    /// polled every [`CANCEL_POLL_RECORDS`] scanned, resolved, or emitted
+    /// rows. The writer's end-to-end fence, checked after the stream, covers
+    /// the whole external pass: any watermark movement aborts and removes
+    /// the output.
     fn stream(
         &mut self,
         base: IndexWatermark,
@@ -385,10 +601,38 @@ impl RowExporter<'_> {
         // `host` is itself a shared reference, so copying the cancellation
         // probe out ends the borrow of `self` immediately.
         let cancelled = self.host.cancelled;
+        let (mut staged, rows) = self.enumerate(base, cancelled)?;
+        if rows == 0 {
+            return Ok((0, 0));
+        }
+        external_sort(&mut staged, STAGED_SORT_KEY_LEN, self.path)?;
+        let mut resolved = self.resolve(&mut staged, rows, cancelled)?;
+        external_sort(&mut resolved, RESOLVED_SORT_KEY_LEN, self.path)?;
+        self.emit(&mut resolved, rows, out, cancelled)
+    }
+
+    /// Streams every stored row once, in stored-key order, into an anonymous
+    /// staging file keyed by `(height, sequence)`.
+    ///
+    /// Each page is read through a short-lived snapshot that must still show
+    /// `base` at `self.floor`; the snapshot is dropped before the next page,
+    /// so a long export never pins one key-value snapshot across the whole
+    /// family. No body I/O happens here: bodies are read once the staging
+    /// file is sorted by height. Cancellation is polled every
+    /// [`CANCEL_POLL_RECORDS`] scanned rows. Returns the staging file, left
+    /// at its start, and the stored-order row count.
+    fn enumerate(
+        &self,
+        base: IndexWatermark,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(File, u64), IndexBundleError> {
+        let path = self.path;
+        let failed = move |error: io::Error| io_error(path, error);
         let limit = export_page_limit();
         let mut start_after: Option<Vec<u8>> = None;
-        let mut visited = 0_u64;
-        let mut totals = (0_u64, 0_u64);
+        let mut staged = tempfile::tempfile().map_err(failed)?;
+        let mut seq = 0_u64;
+        let mut scanned = 0_u64;
         loop {
             let page = {
                 let snapshot = self.host.reader.snapshot()?;
@@ -404,11 +648,21 @@ impl RowExporter<'_> {
                     limit,
                 )?
             };
-            let (records, bytes) = self.export_page(&page.rows, out, &mut visited, cancelled)?;
-            totals.0 += records;
-            totals.1 += bytes;
+            for row in &page.rows {
+                scanned = scanned.saturating_add(1);
+                if scanned.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
+                    return Err(IndexBundleError::Cancelled);
+                }
+                let key = row.row.to_db_row();
+                let mut sort_key = [0_u8; STAGED_SORT_KEY_LEN];
+                sort_key[..4].copy_from_slice(&row.row.height().to_be_bytes());
+                sort_key[4..].copy_from_slice(&seq.to_be_bytes());
+                write_framed(&mut staged, &sort_key, &encode_staged(&key, &row.value))
+                    .map_err(failed)?;
+                seq = seq.saturating_add(1);
+            }
             if page.complete {
-                return Ok(totals);
+                break;
             }
             let Some(last) = page.rows.last() else {
                 // A conforming page scan always returns its first row while
@@ -425,50 +679,167 @@ impl RowExporter<'_> {
             next.push(0);
             start_after = Some(next);
         }
+        staged.seek(SeekFrom::Start(0)).map_err(failed)?;
+        Ok((staged, seq))
     }
 
-    /// Resolves one page grouped by block, then emits records in the page's
-    /// stored order.
+    /// Resolves the height-sorted staging file into a sequence-keyed resolved
+    /// file, reading and parsing each covered body once.
     ///
-    /// Export visits rows in transaction-id order while bodies are keyed by
-    /// block, so resolving in stored order reloads and reparses one body per
-    /// row. Resolving each bounded page in height order instead keeps
-    /// same-block rows adjacent in the body's bounded LRU window;
-    /// emission still follows stored order, so the artifact keeps its
-    /// strictly ascending record order.
-    fn export_page(
+    /// `staged` must already sort by `(height, sequence)`, so consecutive
+    /// rows for one block resolve against one cached body no matter how the
+    /// stored order scattered them across pages. One row is resolved and
+    /// filed at a time; the body stays resident across its consecutive rows
+    /// through the bounded LRU, and a block never recurs once its rows are
+    /// filed. Every position still must equal a real top-level transaction
+    /// span whose id carries the row's prefix, exactly as direct resolution
+    /// enforces, and positions stop at the shared restore bound before the
+    /// resolved file can outgrow an importable bundle. Cancellation is polled
+    /// every [`CANCEL_POLL_RECORDS`] resolved rows. Returns the resolved
+    /// file, left at its start, holding `rows` entries in height order.
+    fn resolve(
         &mut self,
-        rows: &[TxIndexScanRow],
-        out: &mut impl Write,
-        visited: &mut u64,
+        staged: &mut File,
+        rows: u64,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<(u64, u64), IndexBundleError> {
-        let mut order: Vec<usize> = (0..rows.len()).collect();
-        order.sort_by_key(|&index| rows[index].row.height());
-        let mut staged: Vec<(usize, StagedRow)> = Vec::with_capacity(rows.len());
-        for index in order {
-            *visited += 1;
+    ) -> Result<File, IndexBundleError> {
+        let path = self.path;
+        let failed = move |error: io::Error| io_error(path, error);
+        let mut resolved = tempfile::tempfile().map_err(failed)?;
+        let mut seen = 0_u64;
+        let mut visited = 0_u64;
+        let mut positions = 0_u64;
+        while seen < rows {
+            let Some((sort_key, payload)) =
+                read_framed(staged, STAGED_SORT_KEY_LEN).map_err(failed)?
+            else {
+                return Err(IndexError::from(StorageError::InvalidOperation(
+                    "export staging ended before every stored row resolved",
+                ))
+                .into());
+            };
+            seen = seen.saturating_add(1);
+            let sequence_bytes: [u8; 8] = sort_key.get(4..12).and_then(|bytes| bytes.try_into().ok()).ok_or_else(
+                || {
+                    IndexError::from(StorageError::InvalidOperation(
+                        "export staging carries a malformed sort key",
+                    ))
+                },
+            )?;
+            let sequence = u64::from_be_bytes(sequence_bytes);
+            let (key, value) = decode_staged(&payload).ok_or_else(|| {
+                IndexError::from(StorageError::InvalidOperation(
+                    "export staging carries a malformed row",
+                ))
+            })?;
+            let mut prefix = [0_u8; 8];
+            prefix.copy_from_slice(&key[..8]);
+            let mut encoded = [0_u8; 4];
+            encoded.copy_from_slice(&key[8..12]);
+            let row = HashPrefixRow {
+                prefix,
+                height: encoded,
+            };
+            visited = visited.saturating_add(1);
             if visited.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
                 return Err(IndexBundleError::Cancelled);
             }
-            let scan_row = &rows[index];
-            self.locate(scan_row.row, &scan_row.value)?;
-            staged.push((
-                index,
-                StagedRow {
-                    height: scan_row.row.height(),
-                    located: std::mem::take(&mut self.located),
-                },
-            ));
+            self.locate(row, value)?;
+            positions = positions.saturating_add(self.located.len() as u64);
+            if positions > u64::try_from(MAX_RESTORE_POSITIONS).unwrap_or(u64::MAX) {
+                return Err(IndexBundleError::ExportTooLarge {
+                    limit_positions: MAX_RESTORE_POSITIONS,
+                });
+            }
+            let mut sequence_key = [0_u8; RESOLVED_SORT_KEY_LEN];
+            sequence_key.copy_from_slice(&sequence.to_be_bytes());
+            write_framed(
+                &mut resolved,
+                &sequence_key,
+                &encode_resolved(row.height(), &self.located),
+            )
+            .map_err(failed)?;
         }
-        staged.sort_by_key(|(index, _)| *index);
-        let (mut records, mut bytes) = (0_u64, 0_u64);
-        for (_, staged) in &staged {
-            let (row_records, row_bytes) = self.emit_row(staged.height, &staged.located, out)?;
-            records += row_records;
-            bytes += row_bytes;
+        if read_framed(staged, STAGED_SORT_KEY_LEN)
+            .map_err(failed)?
+            .is_some()
+        {
+            return Err(IndexError::from(StorageError::InvalidOperation(
+                "export staging holds more rows than the stored stream",
+            ))
+            .into());
         }
-        Ok((records, bytes))
+        resolved.seek(SeekFrom::Start(0)).map_err(failed)?;
+        Ok(resolved)
+    }
+
+    /// Emits the sequence-sorted resolved file into the artifact in stored
+    /// order, returning `(records, payload bytes)`.
+    ///
+    /// `resolved` must already sort by sequence, so emission follows the page
+    /// stream's stored order exactly and the artifact keeps its strictly
+    /// ascending record order. One row is held at a time; the position budget
+    /// is re-checked while writing, exactly as direct emission does.
+    /// Cancellation is polled every [`CANCEL_POLL_RECORDS`] emitted rows.
+    fn emit(
+        &mut self,
+        resolved: &mut File,
+        rows: u64,
+        out: &mut impl Write,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(u64, u64), IndexBundleError> {
+        let path = self.path;
+        let failed = move |error: io::Error| io_error(path, error);
+        let mut totals = (0_u64, 0_u64);
+        let mut expected = 0_u64;
+        while expected < rows {
+            let Some((sort_key, payload)) =
+                read_framed(resolved, RESOLVED_SORT_KEY_LEN).map_err(failed)?
+            else {
+                return Err(IndexError::from(StorageError::InvalidOperation(
+                    "export staging ended before every stored row emitted",
+                ))
+                .into());
+            };
+            let sequence_bytes: [u8; RESOLVED_SORT_KEY_LEN] =
+                sort_key.try_into().map_err(|_| {
+                    IndexError::from(StorageError::InvalidOperation(
+                        "export staging carries a malformed sort key",
+                    ))
+                })?;
+            let sequence = u64::from_be_bytes(sequence_bytes);
+            if sequence != expected {
+                let height = decode_resolved(&payload)
+                    .map(|(height, _)| height)
+                    .unwrap_or(u32::MAX);
+                return Err(IndexBundleError::SourceRow {
+                    height,
+                    reason: "resolved rows lost their stored order",
+                });
+            }
+            let (height, located) = decode_resolved(&payload).ok_or_else(|| {
+                IndexError::from(StorageError::InvalidOperation(
+                    "export staging carries a malformed resolved row",
+                ))
+            })?;
+            let (records, bytes) = self.emit_row(height, &located, out)?;
+            totals.0 = totals.0.saturating_add(records);
+            totals.1 = totals.1.saturating_add(bytes);
+            expected = expected.saturating_add(1);
+            if expected.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
+                return Err(IndexBundleError::Cancelled);
+            }
+        }
+        if read_framed(resolved, RESOLVED_SORT_KEY_LEN)
+            .map_err(failed)?
+            .is_some()
+        {
+            return Err(IndexError::from(StorageError::InvalidOperation(
+                "export staging holds more rows than the stored stream",
+            ))
+            .into());
+        }
+        Ok(totals)
     }
 
     /// Writes one record per distinct transaction id in `located`, which must
