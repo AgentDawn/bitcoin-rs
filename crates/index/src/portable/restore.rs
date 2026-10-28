@@ -78,7 +78,7 @@ pub(super) fn restore(
     let (chain, count_withheld) = identity?;
     fresh?;
     // Without the receiver's count at the base the identity is unproven, so
-    // the locator outcome above is a placeholder and nothing activates.
+    // the locator outcome above is unchecked and nothing activates.
     if let Some(withheld) = count_withheld {
         return Ok(BundleOutcome::RestoreWithheld(withheld));
     }
@@ -86,6 +86,14 @@ pub(super) fn restore(
         LocatorOutcome::Verified => {}
         LocatorOutcome::Mismatch { height } => return Err(IndexBundleError::Locator { height }),
         LocatorOutcome::Withheld(withheld) => return Ok(BundleOutcome::RestoreWithheld(withheld)),
+        // Unreachable while the gates above run first: verification is only
+        // skipped when identity or freshness already refused. Fails closed so
+        // a future reorder can never activate an unchecked bundle.
+        LocatorOutcome::NotChecked => {
+            return Err(IndexBundleError::Identity(
+                "locator verification was skipped".to_owned(),
+            ));
+        }
     }
 
     let plan = ImportPlan {
@@ -222,6 +230,9 @@ enum LocatorOutcome {
     Mismatch { height: u32 },
     /// A body is unavailable, so the bundle cannot be proven here.
     Withheld(Withheld),
+    /// Verification was skipped: no chain was proven, so no outcome exists.
+    /// Never trusted; the gates in [`restore`] refuse before it is read.
+    NotChecked,
 }
 
 /// Locator verification that rides the validating pass. The first terminal
@@ -320,7 +331,10 @@ fn validate_artifact(
     let outcome = match (chain, locators) {
         (Some(_), Some(check)) => check.outcome,
         (Some(_), None) => LocatorOutcome::Withheld(Withheld::NoBodySource),
-        (None, _) => LocatorOutcome::Verified,
+        // No proven chain rode this pass, so there is no outcome to report;
+        // the caller refuses on identity, freshness, or count before reading
+        // it. Never `Verified`: correctness must not depend on that ordering.
+        (None, _) => LocatorOutcome::NotChecked,
     };
     Ok((header, outcome))
 }
@@ -485,6 +499,27 @@ impl ImportPlan<'_> {
         rows.flush(&mut |row, value| emit(PortableImportRow::TxLookup { row, value }))?;
         if into_digest(hashed) != self.manifest.tx_lookup.sha256 {
             return Err(IndexBundleError::ArtifactHash { name });
+        }
+        // The chain may have reorged during the long stream: refuse to stamp
+        // a watermark for a base that left the active chain. A tip advance
+        // past the base is fine — restore supports an above-base tip and
+        // backfill continues above it — so only the base identity is
+        // rechecked. Un-watermarked rows are cleared by the existing reset
+        // path, so a retry starts clean.
+        let tip = self.host.applied_tip.load_full().ok_or_else(|| {
+            IndexBundleError::Identity("the receiver has no applied tip".to_owned())
+        })?;
+        let base_height = self.manifest.identity.base_height;
+        let still_active = {
+            let tree = self.host.block_tree.read();
+            tree.node_at_height_from(tip.tip_id, base_height)
+                .and_then(|id| tree.node(id).ok())
+                .is_some_and(|node| node.hash.to_le_bytes() == self.manifest.identity.base_hash)
+        };
+        if !still_active {
+            return Err(IndexBundleError::Identity(
+                "the bundle base is not on the receiver's active chain".to_owned(),
+            ));
         }
         Ok(())
     }
