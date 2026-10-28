@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use binary_sv2::{B064K, B0255, Decodable, Encodable, GetSize, Seq0255, Str0255, U256};
 use bitcoin_rs_chain::compact_is_met_by;
@@ -1920,6 +1920,54 @@ fn unconfirmed_shares_are_bounded_and_a_busy_refusal_is_not_recorded() {
         3,
         job.id().get(),
         second,
+        job.ntime(),
+        version,
+    );
+    accepted(wire.events());
+}
+
+#[test]
+fn expired_tickets_unburn_for_retry() {
+    // A zero deadline expires at the next poll, deterministically.
+    let mut config = server_config();
+    config.limits = Limits {
+        pending_ack_timeout: Duration::ZERO,
+        ..Limits::DEFAULT
+    };
+    let mut wire = Wire::with(WHOLE, config, BIP320_VERSION_MASK);
+    let installed = wire
+        .book
+        .install(candidate(100, 0xab, 2), Vec::new())
+        .unwrap_or_else(|error| panic!("install: {error:?}"));
+    wire.setup_mining(0);
+    let mut frames = wire.open_standard(1, "expiry", ALL_ONES);
+    let opened = read_open_standard(&mut frames);
+    wire.events();
+    let job = installed.job;
+    let version = job.version();
+    let nonce = share_nonce(&job, &opened.prefix, version);
+    wire.submit_standard(
+        opened.channel_id,
+        1,
+        job.id().get(),
+        nonce,
+        job.ntime(),
+        version,
+    );
+    let share = accepted(wire.events());
+    let expired = wire
+        .conn
+        .session_mut()
+        .expire_tickets(&mut wire.book, Instant::now());
+    assert_eq!(expired, vec![share.ticket]);
+    assert_eq!(wire.conn.session().pending_acks(), 0);
+    // The retry validates fresh instead of sticking at Duplicate, even
+    // though the first validation burned the key and nothing recorded it.
+    wire.submit_standard(
+        opened.channel_id,
+        2,
+        job.id().get(),
+        nonce,
         job.ntime(),
         version,
     );

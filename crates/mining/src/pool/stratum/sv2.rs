@@ -683,6 +683,11 @@ impl Connection {
         &self.session
     }
 
+    /// The protocol session, for host-owned acknowledgement and expiry.
+    pub fn session_mut(&mut self) -> &mut ProtocolSession {
+        &mut self.session
+    }
+
     /// True once the connection must be flushed and closed (a refused
     /// `SetupConnection`, a failure, or [`Connection::release`]).
     #[must_use]

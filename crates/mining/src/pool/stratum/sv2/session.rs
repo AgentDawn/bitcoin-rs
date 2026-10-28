@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use binary_sv2::{B032, B064K, Decodable, Encodable, GetSize, Seq0255, Str0255, Sv2Option, U256};
 use crate::{MiningControl, MiningControlError};
@@ -147,6 +148,11 @@ pub struct Limits {
     pub max_jobs_per_channel: usize,
     /// Accepted shares awaiting [`ProtocolSession::confirm_share`].
     pub max_pending_acks: usize,
+    /// How long an unacknowledged share ticket lives before
+    /// [`ProtocolSession::expire_tickets`] drops it and releases its burned
+    /// duplicate key. Zero expires at the next poll. Monotonic: wall-clock
+    /// jumps never fast-forward or stall expiry.
+    pub pending_ack_timeout: Duration,
     /// Plaintext frames queued for the transport.
     pub max_outbound_frames: usize,
     /// Events queued for the host.
@@ -162,6 +168,7 @@ impl Limits {
         max_channels: 64,
         max_jobs_per_channel: 64,
         max_pending_acks: 1024,
+        pending_ack_timeout: Duration::from_secs(300),
         max_outbound_frames: 4096,
         max_pending_events: 4096,
         max_outbound_bytes: 4 * 1024 * 1024,
@@ -578,6 +585,9 @@ struct Pending {
     /// [`JobBook::unburn`] when the ticket is dropped without a durable
     /// record (channel close, connection teardown, expiry, or host refusal).
     hash: [u8; 32],
+    /// Monotonic arrival time; [`ProtocolSession::expire_tickets`] drops the
+    /// ticket past `limits.pending_ack_timeout`.
+    submitted_at: Instant,
     kind: PendingKind,
 }
 
@@ -967,6 +977,32 @@ impl ProtocolSession {
     #[must_use]
     pub fn pending_acks(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Drops unacknowledged tickets older than `limits.pending_ack_timeout`
+    /// and releases their burned duplicate keys, so a stuck host or a silent
+    /// miner cannot pin the bounded [`Limits::max_pending_acks`] budget and
+    /// head-of-line-block every later share. Returns the dropped tickets for
+    /// host observability. Confirmed and buffered shares are unaffected: only
+    /// tickets still awaiting host acknowledgement can expire, and the
+    /// idempotent ledger stays the convergence point for any retry.
+    /// Monotonic: age is measured with [`Instant`], never wall clock.
+    pub fn expire_tickets(&mut self, book: &mut JobBook, now: Instant) -> Vec<ShareTicket> {
+        let timeout = self.config.limits.pending_ack_timeout;
+        let mut expired = Vec::new();
+        let mut hashes = Vec::new();
+        self.pending.retain(|ticket, pending| {
+            if now.duration_since(pending.submitted_at) < timeout {
+                return true;
+            }
+            expired.push(ShareTicket(*ticket));
+            hashes.push(pending.hash);
+            false
+        });
+        for hash in &hashes {
+            unburn_hash(book, hash);
+        }
+        expired
     }
 
     /// The group channel id, once a channel was opened.
@@ -1789,6 +1825,7 @@ impl ProtocolSession {
                                 difficulty,
                                 block_hash: None,
                                 hash: *accepted.hash.as_bytes(),
+                                submitted_at: Instant::now(),
                                 kind: PendingKind::Share,
                             },
                         );
@@ -1808,6 +1845,7 @@ impl ProtocolSession {
                                 difficulty,
                                 block_hash: Some(*found.share.hash.as_bytes()),
                                 hash: *found.share.hash.as_bytes(),
+                                submitted_at: Instant::now(),
                                 kind: PendingKind::Block,
                             },
                         );

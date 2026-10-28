@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow};
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_primitives::BlockHash;
-use bitcoin_rs_mining::pool::ledger as pool_ledger;
 use bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter;
 use bitcoin_rs_mining::pool::stratum::sv2::{
     AdmitError, AuthorityKeypair, BlockSubmission, Connection, ERROR_CODE_SHARE_NOT_RECORDED,
@@ -162,6 +161,7 @@ pub(crate) fn start(
                             max_channels: 8,
                             max_jobs_per_channel: 16,
                             max_pending_acks: 16,
+                            pending_ack_timeout: Limits::DEFAULT.pending_ack_timeout,
                             max_outbound_frames: 256,
                             max_pending_events: 32,
                             max_outbound_bytes: 1_048_576,
@@ -313,10 +313,23 @@ fn serve_connection(
                 &mut block_permit,
                 &mut deferred,
             )?;
+            // Shed tickets the host never acknowledged: a stuck ledger or a
+            // silent miner must not pin the bounded pending-ack budget and
+            // head-of-line-block later shares. Expiry releases the burned
+            // duplicate keys, so a retry validates fresh; the idempotent
+            // ledger stays the convergence point.
+            let expired = core.with_job_book(|book| {
+                connection
+                    .session_mut()
+                    .expire_tickets(book, Instant::now())
+            });
+            if !expired.is_empty() {
+                tracing::debug!(count = expired.len(), "SV2 pending tickets expired");
+            }
             // Any consumed event or newly queued reply is progress: an idle
             // miner that keeps submitting (or being announced to) never trips
             // the idle deadline on a quiet socket alone.
-            if events_before != connection.session().pending_acks() {
+            if events_before != connection.session().pending_acks() || !expired.is_empty() {
                 last_progress = Instant::now();
             }
             transmit.fill(&mut connection);
@@ -396,7 +409,7 @@ fn handle_events(
                     // refusal failure leaves the ticket in place, so no
                     // release happens on `Err`.
                     core.with_job_book(|book| {
-                        book.unburn(&event.outcome.hash);
+                        let _ = book.unburn(&event.outcome.hash);
                     });
                 }
             }
@@ -735,6 +748,7 @@ mod tests {
             max_channels: 8,
             max_jobs_per_channel: 16,
             max_pending_acks: 16,
+            pending_ack_timeout: Limits::DEFAULT.pending_ack_timeout,
             max_outbound_frames: 256,
             max_pending_events: 32,
             max_outbound_bytes: 1_048_576,
