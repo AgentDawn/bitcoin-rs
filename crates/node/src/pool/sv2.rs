@@ -244,6 +244,19 @@ fn serve_connection(
             if last_progress.elapsed() >= IDLE_TIMEOUT {
                 return Err(anyhow!("SV2 connection idle timed out"));
             }
+            // Confirm blocks whose retained records became durable even when
+            // the miner sends no more bytes; a silent socket must not delay
+            // `SubmitShares.Success` until the next frame.
+            let deferred_before = deferred.len();
+            deferred.retain(|(hash, submission)| {
+                if !matches!(ledger.found_block_recorded(*hash), Ok(true)) {
+                    return true;
+                }
+                connection.confirm_block(submission).is_err()
+            });
+            if deferred.len() != deferred_before {
+                last_progress = Instant::now();
+            }
             announce_current_job(&mut connection, core)?;
             transmit.fill(&mut connection);
             let pending_bytes = transmit.remaining();
@@ -252,6 +265,15 @@ fn serve_connection(
                 last_progress = Instant::now();
             }
 
+            // A block-record reservation is only consumed by a `BlockFound`
+            // event. Wait for capacity instead of feeding a solved block with
+            // no permit: dropping the event would close the connection without
+            // submitting or retaining the block.
+            let Some(block_permit) = ledger.try_reserve_block_slot() else {
+                thread::sleep(SOCKET_POLL_INTERVAL);
+                continue;
+            };
+            let mut block_permit = Some(block_permit);
             if buffered_input.is_none() {
                 let read_len = connection.read_hint().clamp(1, MAX_FEED_LEN);
                 match stream.read(&mut input[..read_len]) {
@@ -275,12 +297,6 @@ fn serve_connection(
                 }
             }
 
-            // A block-record reservation is only consumed by a `BlockFound`
-            // event. When the pending-block queue is full there is no permit,
-            // but shares and channel messages on the buffered frame must still
-            // be handled; the `BlockFound` arm errors if its event actually
-            // needs a missing permit.
-            let mut block_permit = ledger.try_reserve_block_slot();
             let length = buffered_input
                 .take()
                 .ok_or_else(|| anyhow!("SV2 buffered input length is missing"))?;
@@ -295,15 +311,6 @@ fn serve_connection(
                 &mut block_permit,
                 &mut deferred,
             )?;
-            // Confirm blocks whose retained records became durable while this
-            // feed was handled. A closed channel settles its entry; a session
-            // fault is retried next iteration and surfaces on socket progress.
-            deferred.retain(|(hash, submission)| {
-                if !matches!(ledger.found_block_recorded(*hash), Ok(true)) {
-                    return true;
-                }
-                connection.confirm_block(submission).is_err()
-            });
             // Any consumed event or newly queued reply is progress: an idle
             // miner that keeps submitting (or being announced to) never trips
             // the idle deadline on a quiet socket alone.
