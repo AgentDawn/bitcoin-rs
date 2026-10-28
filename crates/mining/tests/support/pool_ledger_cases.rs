@@ -1164,6 +1164,23 @@ fn pruning_streams_bounded_batches() {
 }
 
 #[test]
+fn share_count_comes_from_sequence_metadata_not_a_table_scan() {
+    let (_dir, ledger) = plain_ledger(5);
+    assert_eq!(ledger.share_count().fixture("empty"), 0);
+    for nonce in 0..10u32 {
+        ledger.record_share(&share(1, 1, nonce, 1)).fixture("share");
+    }
+    assert_eq!(ledger.share_count().fixture("ten"), 10);
+    // Retiring the job bounds the secondary index but keeps the shares.
+    assert_eq!(ledger.retire_job(1).fixture("retire"), 10);
+    assert_eq!(ledger.share_count().fixture("retire keeps shares"), 10);
+    // Pruning advances the floor; the count is the live suffix.
+    assert_eq!(ledger.prune_shares(5).fixture("prune"), 5);
+    assert_eq!(ledger.share_count().fixture("five left"), 5);
+    ledger.check_invariants().fixture("invariants");
+}
+
+#[test]
 fn short_history_uses_all_work_and_pruning_protects_old_windows() {
     let (_dir, ledger) = plain_ledger(100);
     for account in 1..=6 {

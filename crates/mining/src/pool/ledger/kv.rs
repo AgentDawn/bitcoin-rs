@@ -464,14 +464,4 @@ impl<K: Value, V: Value> Table<'_, K, V> {
         })
         .transpose()
     }
-    pub(crate) fn len(&self) -> Result<u64, LedgerError> {
-        let mut count = 0u64;
-        for row in self.rows_iter()? {
-            row?;
-            count = count
-                .checked_add(1)
-                .ok_or(LedgerError::Overflow("table length"))?;
-        }
-        Ok(count)
-    }
 }

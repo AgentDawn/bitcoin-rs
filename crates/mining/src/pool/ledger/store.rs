@@ -586,11 +586,22 @@ impl Ledger {
 
     /// Number of shares currently stored (pruned shares are not counted).
     ///
+    /// Derived in O(1) from the share sequence and pruned-prefix metadata
+    /// (`next_share_seq - pruned_below_seq`): share seqs are contiguous from
+    /// zero with only a pruned prefix removed, so no table scan is needed.
+    /// Snapshot isolation: both counters come from one read snapshot.
+    ///
     /// # Errors
-    /// Returns a storage error.
+    /// Returns a storage error or [`LedgerError::Invariant`] when the pruned
+    /// prefix runs past the allocated sequence.
     pub fn share_count(&self) -> Result<u64, LedgerError> {
         let read = self.db.begin_read()?;
-        read.open_table(SHARES)?.len()
+        let meta = read.open_table(META_U64)?;
+        let next = meta_u64(&meta, M_NEXT_SHARE)?;
+        let pruned = meta_u64(&meta, M_PRUNED_BELOW)?;
+        next.checked_sub(pruned).ok_or_else(|| {
+            LedgerError::Invariant("pruned share prefix runs past the sequence".into())
+        })
     }
 
     // -----------------------------------------------------------------------------------------
