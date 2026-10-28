@@ -343,6 +343,7 @@ dependencies = [
  "compact_str",
  "crossbeam-channel",
  "hashbrown 0.17.1",
+ "metrics",
  "parking_lot",
  "proptest",
  "rayon",
@@ -350,6 +351,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sonic-rs",
  "tempfile",
  "thiserror",
  "tracing",
@@ -482,6 +484,7 @@ name = "bitcoin-rs-primitives"
 version = "0.14.0"
 dependencies = [
  "bytemuck",
+ "bytes",
  "ruint",
  "serde",
  "serde_json",
@@ -512,6 +515,7 @@ dependencies = [
  "bitcoin-rs-rpc",
  "bitcoin-rs-script",
  "bitcoin-rs-utxo",
+ "bytes",
  "cap-fs-ext",
  "cap-std",
  "compact_str",

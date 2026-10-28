@@ -68,6 +68,10 @@ state (`crates/mempool/src/orphan.rs`).
   `publish_fee_delta_generation()`.
   `node` attaches that mining observer at gateway construction and the ZMQ
   sequence observer as an extra named leg on the gateway's `CompositeObserver`.
+- Whether a leg wants accepted transaction bodies is a registration-time
+  fact (`BodyInterest`): `commit` loads the composite's atomic before
+  taking the pool write lock, so no observer code runs under any gateway
+  lock — neither to answer interest nor, per the clause above, at delivery.
 - Proof: `gateway::tests::concurrent_mutations_publish_in_sequence_order`
   in `crates/mempool/src/gateway.rs` publishes 1,500 commit cycles from
   parallel callers and checks the observed stream is gap-free commit order;

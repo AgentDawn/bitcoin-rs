@@ -515,7 +515,8 @@ fn is_ipv6_tcp_endpoint(endpoint: &str) -> bool {
     host.contains(':') && tail.starts_with(':') && tail.len() > 1
 }
 
-/// Publishes committed admissions as `rawtx` and Core `sequence` `A`/`R` events.
+/// Publishes committed admissions as `hashtx`, `rawtx`, and Core `sequence`
+/// `A` events, and removals as `sequence` `R` events.
 ///
 /// Install on the [`bitcoin_rs_mempool::MempoolGateway`] observer slot when
 /// ZMQ notifications are configured. Raw bodies are retained only for `rawtx`.
@@ -541,7 +542,7 @@ impl MempoolSequenceObserver {
 
 impl bitcoin_rs_mempool::MempoolObserver for MempoolSequenceObserver {
     fn on_mutation(&self, envelope: &bitcoin_rs_mempool::MutationEnvelope) {
-        use bitcoin_rs_primitives::encode::ConsensusEncode;
+        use bitcoin_rs_primitives::encode::consensus_bytes;
         let result = &envelope.result;
         for (offset, change) in result.changes.iter().enumerate() {
             let Some(sequence) = result.sequence_of(offset) else {
@@ -550,16 +551,16 @@ impl bitcoin_rs_mempool::MempoolObserver for MempoolSequenceObserver {
             let txid = Txid(change.txid);
             match change.outcome {
                 bitcoin_rs_mempool::MutationOutcome::Accepted => {
-                    publish_admitted_hashtx(self.publisher.as_ref(), core::iter::once(txid));
+                    // Core's `TransactionAddedToMempool` notifies `hashtx`
+                    // and `rawtx` for every admission, then `sequence` `A`.
+                    self.publisher.publish_hashtx(txid);
                     if self.publisher.wants_rawtx()
                         && let Some((_, tx)) = envelope
                             .accepted_transactions
                             .iter()
                             .find(|(index, _)| *index == offset)
                     {
-                        let mut bytes = Vec::with_capacity(tx.total_size());
-                        tx.consensus_encode(&mut bytes);
-                        self.publisher.publish_rawtx(&bytes);
+                        self.publisher.publish_rawtx(&consensus_bytes(tx.as_ref()));
                     }
                     self.publisher
                         .publish_sequence(SequenceEvent::Added(txid, sequence));
@@ -1129,6 +1130,10 @@ mod manifest_tests {
         let raw = subscriber.recv_multipart(0)?;
         assert_eq!(raw[0].as_slice(), b"rawtx");
         assert_eq!(raw[1], expected);
+        // Per-topic transport counters (`ZmqTopic::index`): the warm-up loop above
+        // publishes `SequenceEvent::Connected`, which advances only the `Sequence`
+        // counter (index 4). This is the first `rawtx` publish, so the `RawTx`
+        // counter (index 3) is still 0 here.
         assert_eq!(raw[2], 0_u32.to_le_bytes());
         let added = subscriber.recv_multipart(0)?;
         assert_eq!(added[0].as_slice(), b"sequence");
@@ -1252,7 +1257,7 @@ mod manifest_tests {
         assert_eq!(
             *publisher.hashtx.lock(),
             vec![first.txid(), second.txid()],
-            "hashtx fires once per Accepted change in commit order"
+            "every admission notifies hashtx, as Core does"
         );
         assert_eq!(
             *publisher.sequence_bodies.lock(),

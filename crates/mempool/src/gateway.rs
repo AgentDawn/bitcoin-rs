@@ -467,6 +467,11 @@ use crate::rbf::{LimitEnforcement, RbfError};
 /// Callbacks run without gateway locks and may re-enter the gateway. Nested
 /// commits enqueue behind the current callback and may return before publication.
 /// Observer panics are contained after the pool mutation has committed.
+///
+/// Whether an observer wants accepted transaction bodies is a
+/// registration-time fact ([`BodyInterest`]), never a callback: `commit`
+/// loads the composite's atomic before taking the pool write lock, so no
+/// observer code ever runs under any gateway lock.
 pub trait MempoolObserver: Send + Sync {
     /// Called once per committed, non-empty [`MutationEnvelope`].
     fn on_mutation(&self, envelope: &MutationEnvelope);

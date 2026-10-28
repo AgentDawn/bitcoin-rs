@@ -668,3 +668,117 @@ p2p_noban = ["192.0.2.99/24", "::1"]
     );
     Ok(())
 }
+
+/// Resolves one environment entry as its own layer.
+fn environment(key: &str, value: &str) -> Result<UserConfig> {
+    let mut layer = UserConfig::default();
+    layer.apply_env(key, std::ffi::OsStr::new(value))?;
+    Ok(layer)
+}
+
+fn refusal(layers: &[&UserConfig]) -> String {
+    match resolve(layers) {
+        Ok(_) => panic!("configuration must be refused"),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[test]
+fn index_bundle_is_an_explicit_one_shot_request() -> Result<()> {
+    let indexes = resolve(&[])?.indexes;
+    assert_eq!((indexes.bundle_import, indexes.bundle_export), (None, None));
+
+    let txindex: UserConfig = toml::from_str("txindex = true")?;
+    let import: UserConfig = toml::from_str("index_bundle_import = \"/srv/bundle\"")?;
+    let indexes = resolve(&[&txindex, &import])?.indexes;
+    assert_eq!(
+        indexes.bundle_import.as_deref(),
+        Some(std::path::Path::new("/srv/bundle"))
+    );
+    assert_eq!(indexes.bundle_export, None);
+
+    // The same key from a higher layer replaces the path; the directory is
+    // never opened while the configuration resolves.
+    let elsewhere = environment("BITCOIN_RS_INDEX_BUNDLE_IMPORT", "/nonexistent/elsewhere")?;
+    let indexes = resolve(&[&txindex, &import, &elsewhere])?.indexes;
+    assert_eq!(
+        indexes.bundle_import.as_deref(),
+        Some(std::path::Path::new("/nonexistent/elsewhere"))
+    );
+
+    let export = environment("BITCOIN_RS_INDEX_BUNDLE_EXPORT", "relative/out")?;
+    let indexes = resolve(&[&txindex, &export])?.indexes;
+    assert_eq!(indexes.bundle_import, None);
+    assert_eq!(
+        indexes.bundle_export.as_deref(),
+        Some(std::path::Path::new("relative/out"))
+    );
+    Ok(())
+}
+
+#[test]
+fn index_bundle_import_and_export_never_resolve_by_precedence() -> Result<()> {
+    let txindex: UserConfig = toml::from_str("txindex = true")?;
+    let import: UserConfig = toml::from_str("index_bundle_import = \"/srv/in\"")?;
+    let export = environment("BITCOIN_RS_INDEX_BUNDLE_EXPORT", "/srv/out")?;
+    for layers in [[&txindex, &import, &export], [&txindex, &export, &import]] {
+        assert!(refusal(&layers).contains("mutually exclusive"));
+    }
+    let both: UserConfig =
+        toml::from_str("index_bundle_import = \"/srv/in\"\nindex_bundle_export = \"/srv/out\"")?;
+    assert!(refusal(&[&txindex, &both]).contains("mutually exclusive"));
+    Ok(())
+}
+
+#[test]
+fn index_bundle_requires_the_transaction_index_it_moves() -> Result<()> {
+    let import: UserConfig = toml::from_str("index_bundle_import = \"/srv/in\"")?;
+    assert!(refusal(&[&import]).contains("--index-bundle-import requires --txindex"));
+    let export = environment("BITCOIN_RS_INDEX_BUNDLE_EXPORT", "/srv/out")?;
+    assert!(refusal(&[&export]).contains("--index-bundle-export requires --txindex"));
+
+    // A higher layer that disables txindex strands a lower layer's request.
+    let txindex: UserConfig = toml::from_str("txindex = true")?;
+    let no_txindex = environment("BITCOIN_RS_TXINDEX", "false")?;
+    assert!(refusal(&[&txindex, &import, &no_txindex]).contains("requires --txindex"));
+    Ok(())
+}
+
+#[test]
+fn index_bundle_rejects_empty_and_unusable_directories_on_every_surface() {
+    for key in ["index_bundle_import", "index_bundle_export"] {
+        for value in ["", "   ", "a\u{0}b"] {
+            let text = format!("{key} = \"{value}\"");
+            assert!(
+                toml::from_str::<UserConfig>(&text).is_err(),
+                "TOML accepted {text}"
+            );
+        }
+    }
+    for key in [
+        "BITCOIN_RS_INDEX_BUNDLE_IMPORT",
+        "BITCOIN_RS_INDEX_BUNDLE_EXPORT",
+    ] {
+        for value in ["", "\t", "a\0b"] {
+            assert!(
+                environment(key, value).is_err(),
+                "environment accepted {key}={value:?}"
+            );
+        }
+    }
+
+    // A programmatic caller bypassing the parser still meets identical
+    // validation for empty, whitespace-only, and NUL-bearing paths.
+    for unusable in ["", "   ", "\t\n", "foo\0bar"] {
+        let mut config = NodeConfig::default_for_network(Network::Regtest);
+        config.indexes.txindex = true;
+        config.indexes.bundle_import = Some(std::path::PathBuf::from(unusable));
+        let error = config.validate().err().map(|error| error.to_string());
+        assert!(
+            error.is_some_and(|error| {
+                error.contains("must not be empty") || error.contains("must not contain a NUL")
+            }),
+            "validate accepted {unusable:?}"
+        );
+    }
+}

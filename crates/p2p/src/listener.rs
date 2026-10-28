@@ -420,8 +420,7 @@ impl ConnectionShared {
         &self,
         lease: &crate::PeerLease,
         peer_addr: impl Into<crate::PeerRemote>,
-        block: bitcoin_rs_primitives::Block,
-        serialized: bytes::Bytes,
+        payload: bitcoin_rs_primitives::BlockPayload,
     ) {
         let peer_addr = peer_addr.into();
         let source = lease.source(peer_addr);
@@ -442,7 +441,7 @@ impl ConnectionShared {
         // same tick would schedule a duplicate fetch for it. Queueing the
         // body first means the tick that admits the header always marks the
         // body received first.
-        let header = block.header;
+        let header = payload.block().header;
         let hash = bitcoin_rs_primitives::Hash256::from(header.compute_hash());
         let requested = self
             .block_sync
@@ -455,7 +454,7 @@ impl ConnectionShared {
             metrics::counter!("node.sync.dropped_unsolicited_blocks").increment(1);
             return;
         };
-        if self.forward_block(block, serialized, source, Some(credit)) {
+        if self.forward_block(payload, source, Some(credit)) {
             self.send_headers(source, vec![header], false);
         }
     }
@@ -472,17 +471,11 @@ impl ConnectionShared {
     ///   the credit is released when sync drops the body it holds.
     fn forward_block(
         &self,
-        block: bitcoin_rs_primitives::Block,
-        serialized: bytes::Bytes,
+        payload: bitcoin_rs_primitives::BlockPayload,
         source: crate::PeerSource,
         forward_credit: Option<crate::connection::BlockForwardCredit>,
     ) -> bool {
-        let mut inbound = crate::InboundBlock {
-            block,
-            serialized,
-            source: Some(source),
-            forward_credit,
-        };
+        let mut inbound = crate::InboundBlock::new(payload, Some(source), forward_credit);
         loop {
             if self.is_session_cancelled() {
                 tracing::debug!(
@@ -2239,7 +2232,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             }
         }
 
-        let (message, raw, reply) = if let Some((message, reply)) = resumed {
+        let (message, _raw, reply) = if let Some((message, reply)) = resumed {
             // Already read, role-checked and counted as received; no body of
             // its own, so there are no wire bytes to carry.
             (message, bytes::Bytes::new(), reply)
@@ -2472,8 +2465,8 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             crate::Message::NotFound(items) => {
                 shared.block_not_found(lease.source(peer_addr), &items);
             }
-            crate::Message::Block(block) => {
-                shared.send_block(lease, peer_addr, block, raw);
+            crate::Message::Block(payload) => {
+                shared.send_block(lease, peer_addr, payload);
             }
             crate::Message::Tx(tx) => forward_tx_if_relay_open(
                 shared,
@@ -2875,9 +2868,12 @@ fn handle_compact_outcome(
     let lease = sink.lease;
     match outcome {
         crate::compact_blocks::Outcome::Complete(block) => {
-            let serialized = bitcoin_rs_primitives::consensus_bytes(&block);
             tracing::info!(peer_addr = %peer_addr, hash = %block.block_hash(), "p2p compact block reconstructed");
-            shared.send_block(lease, peer_addr, block, serialized.into());
+            shared.send_block(
+                lease,
+                peer_addr,
+                bitcoin_rs_primitives::BlockPayload::from_local(block),
+            );
             None
         }
         crate::compact_blocks::Outcome::RequestMissing(request) => {
@@ -3780,19 +3776,18 @@ mod writer_shutdown_tests {
         let lease = crate::PeerLease::new(tx);
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
-        let block =
-            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
-                .map_err(|_| std::io::Error::other("genesis block must decode"))?;
         let serialized = bytes::Bytes::from(block_bytes);
+        let payload = bitcoin_rs_primitives::BlockPayload::from_raw(serialized.clone())
+            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
         let source = lease.source(addr);
 
         shared.send_headers(source, Vec::new(), true);
-        shared.send_block(&lease, addr, block, serialized.clone());
+        shared.send_block(&lease, addr, payload);
 
         assert_eq!(headers_rx.try_recv()?.source, Some(source));
         let received = blocks_rx.try_recv()?;
         assert_eq!(received.source, Some(source));
-        assert_eq!(received.serialized, serialized);
+        assert_eq!(received.payload().bytes(), &serialized);
         Ok(())
     }
 
@@ -3809,13 +3804,13 @@ mod writer_shutdown_tests {
         let lease = crate::PeerLease::new(tx);
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
-        let block =
-            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
+        let payload =
+            bitcoin_rs_primitives::BlockPayload::from_raw(bytes::Bytes::from(block_bytes))
                 .map_err(|_| std::io::Error::other("genesis block must decode"))?;
-        let header = block.header;
+        let header = payload.block().header;
         let source = lease.source(addr);
 
-        shared.send_block(&lease, addr, block, bytes::Bytes::from(block_bytes));
+        shared.send_block(&lease, addr, payload);
 
         let forwarded = headers_rx.try_recv()?;
         assert_eq!(forwarded.source, Some(source));
@@ -3838,17 +3833,15 @@ mod writer_shutdown_tests {
         let lease = crate::PeerLease::new(tx);
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let first_bytes = bitcoin::consensus::encode::serialize(&genesis);
-        let first =
-            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&first_bytes)
-                .map_err(|_| std::io::Error::other("genesis block must decode"))?;
-        let second_bytes = first_bytes.clone();
-        let second =
-            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&second_bytes)
-                .map_err(|_| std::io::Error::other("genesis block must decode"))?;
-        shared.send_block(&lease, addr, first, bytes::Bytes::from(first_bytes));
+        let first = bitcoin_rs_primitives::BlockPayload::from_raw(bytes::Bytes::from(first_bytes))
+            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        let second_bytes = first.bytes().clone();
+        let second = bitcoin_rs_primitives::BlockPayload::from_raw(second_bytes)
+            .map_err(|_| std::io::Error::other("genesis block must decode"))?;
+        shared.send_block(&lease, addr, first);
 
         let blocked = std::thread::spawn(move || {
-            shared.send_block(&lease, addr, second, bytes::Bytes::from(second_bytes));
+            shared.send_block(&lease, addr, second);
         });
         let started = std::time::Instant::now();
         while !blocked.is_finished() && started.elapsed() < Duration::from_millis(250) {
@@ -4714,7 +4707,9 @@ mod writer_shutdown_tests {
         let (lease, rx) = queued(&[
             crate::Message::Ping(0),
             crate::Message::Pong(1),
-            crate::Message::Block(bitcoin_rs_primitives::Block::default()),
+            crate::Message::Block(bitcoin_rs_primitives::BlockPayload::from_local(
+                bitcoin_rs_primitives::Block::default(),
+            )),
             crate::Message::Ping(2),
         ]);
         let first = rx.try_recv().expect("the first queued frame");
@@ -4750,7 +4745,9 @@ mod writer_shutdown_tests {
     #[test]
     fn collect_write_burst_emits_a_bulk_payload_alone() {
         let (_lease, rx) = queued(&[
-            crate::Message::Block(bitcoin_rs_primitives::Block::default()),
+            crate::Message::Block(bitcoin_rs_primitives::BlockPayload::from_local(
+                bitcoin_rs_primitives::Block::default(),
+            )),
             crate::Message::Ping(1),
         ]);
         let first = rx.try_recv().expect("the bulk frame");
@@ -4993,7 +4990,7 @@ mod block_forward_tests {
             sync_blocks_rx,
             crate::sync::syncing_ibd_latch(),
         ));
-        sync_blocks_tx.send(crate::InboundBlock::from_decoded(blocks[0].clone()))?;
+        sync_blocks_tx.send(crate::InboundBlock::from_local(blocks[0].clone()))?;
         sync.tick();
 
         let flooded = test_addr(9780, 0)?;
@@ -5024,10 +5021,13 @@ mod block_forward_tests {
             .lease(flooded)
             .ok_or("flood connection must be registered")?;
         let unrelated = genesis_body();
-        let unrelated_bytes = bytes::Bytes::from(consensus_bytes(&unrelated));
 
         for _ in 0..=MAX_UNSOLICITED_BLOCK_FORWARDS {
-            shared.send_block(&lease, flooded, unrelated.clone(), unrelated_bytes.clone());
+            shared.send_block(
+                &lease,
+                flooded,
+                bitcoin_rs_primitives::BlockPayload::from_local(unrelated.clone()),
+            );
         }
         assert_eq!(
             blocks_rx.len(),
@@ -5038,8 +5038,7 @@ mod block_forward_tests {
         shared.send_block(
             &lease,
             flooded,
-            block2.clone(),
-            bytes::Bytes::from(consensus_bytes(&block2)),
+            bitcoin_rs_primitives::BlockPayload::from_local(block2),
         );
         assert_eq!(
             blocks_rx.len(),
@@ -5055,8 +5054,7 @@ mod block_forward_tests {
         shared.send_block(
             &other_lease,
             other,
-            unrelated.clone(),
-            unrelated_bytes.clone(),
+            bitcoin_rs_primitives::BlockPayload::from_local(unrelated.clone()),
         );
         assert_eq!(
             blocks_rx.len(),
@@ -5065,7 +5063,11 @@ mod block_forward_tests {
         );
 
         while blocks_rx.try_recv().is_ok() {}
-        shared.send_block(&lease, flooded, unrelated, unrelated_bytes);
+        shared.send_block(
+            &lease,
+            flooded,
+            bitcoin_rs_primitives::BlockPayload::from_local(unrelated),
+        );
         assert_eq!(
             blocks_rx.len(),
             1,
