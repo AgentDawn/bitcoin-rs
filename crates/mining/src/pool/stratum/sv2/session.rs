@@ -568,6 +568,12 @@ struct Channel {
     target: ShareTarget,
     last_sequence: Option<u32>,
     jobs: BTreeMap<u32, ChannelJob>,
+    /// Parent hash of the last `SetNewPrevHash` that landed on this channel.
+    /// `None` until the first parent arrives. A new job whose parent differs
+    /// forces `Delivery::Future` plus `SetNewPrevHash` for this channel, even
+    /// when the connection-wide delivery is `Active` (for example a channel
+    /// that missed the parent announce).
+    last_prev_hash: Option<BlockHash>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1358,6 +1364,7 @@ impl ProtocolSession {
                 target,
                 last_sequence: None,
                 jobs: BTreeMap::new(),
+                last_prev_hash: None,
             },
         );
         self.push_event(Event::ChannelOpened {
@@ -1417,6 +1424,12 @@ impl ProtocolSession {
 
     fn distribute(&mut self, job: &Job, delivery: Delivery) -> Result<(), SessionError> {
         let job_id = job.id().get();
+        let parent = job.previous_block_hash();
+        // Per-channel parent enforcement lives in `send_to_channel`: a channel
+        // whose last parent differs (including `None` for a channel that never
+        // got `SetNewPrevHash`) gets `Future` plus the parent even when the
+        // connection-wide delivery is `Active`. This covers a channel that
+        // missed the parent announce on an otherwise unchanged parent.
         let missing: Vec<u32> = self
             .channels
             .iter()
@@ -1441,8 +1454,21 @@ impl ProtocolSession {
         if missing.is_empty() && needs_parent.is_empty() {
             return Ok(());
         }
+        // Group-addressed delivery shares one `Delivery` for every channel, so
+        // it is only safe when every channel agrees on the parent. An `Active`
+        // group job would otherwise activate a channel that never got the
+        // parent; fall back to per-channel delivery (which upgrades stale
+        // channels to `Future` in `send_to_channel`) when parents disagree.
         let group = match self.group_id {
-            Some(group) if !self.requires_standard_jobs && missing.len() == self.channels.len() => {
+            Some(group)
+                if !self.requires_standard_jobs
+                    && missing.len() == self.channels.len()
+                    && (delivery == Delivery::Future
+                        || self
+                            .channels
+                            .values()
+                            .all(|channel| channel.last_prev_hash == Some(parent))) =>
+            {
                 Some(group)
             }
             _ => None,
@@ -1463,6 +1489,7 @@ impl ProtocolSession {
                 self.push_frame(frame)?;
                 for channel in self.channels.values_mut() {
                     activate_job(channel, job_id);
+                    channel.last_prev_hash = Some(parent);
                 }
                 self.parent_delivered = true;
             }
@@ -1501,6 +1528,7 @@ impl ProtocolSession {
         self.push_frame(frame)?;
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             activate_job(channel, job_id);
+            channel.last_prev_hash = Some(job.previous_block_hash());
         }
         self.parent_delivered = true;
         Ok(())
@@ -1514,6 +1542,18 @@ impl ProtocolSession {
         job: &Job,
         delivery: Delivery,
     ) -> Result<(), SessionError> {
+        // Enforce the per-channel parent invariant at the lowest level: a
+        // channel whose last parent differs gets `Future` plus
+        // `SetNewPrevHash`, even if the caller asked for `Active`.
+        let mut delivery = delivery;
+        if delivery == Delivery::Active
+            && self
+                .channels
+                .get(&channel_id)
+                .is_some_and(|channel| channel.last_prev_hash != Some(job.previous_block_hash()))
+        {
+            delivery = Delivery::Future;
+        }
         let (kind, session_prefix, rolled, target) = match self.channels.get(&channel_id) {
             Some(channel) => (
                 channel.kind,
@@ -1548,6 +1588,7 @@ impl ProtocolSession {
             self.push_frame(frame)?;
             if let Some(channel) = self.channels.get_mut(&channel_id) {
                 activate_job(channel, job_id);
+                channel.last_prev_hash = Some(job.previous_block_hash());
             }
             self.parent_delivered = true;
         }

@@ -2736,6 +2736,136 @@ fn full_event_queue_fails_before_share_validation_without_orphan_ticket() {
 }
 
 #[test]
+fn active_refresh_upgrades_a_channel_that_missed_its_parent_to_future() {
+    // A channel that missed its `SetNewPrevHash` (job frame landed while the
+    // prev-hash frame hit a full outbound queue) keeps a stale parent.
+    // A later refresh on the same parent is `Active` connection-wide, but that
+    // stale channel must still get `Future` plus `SetNewPrevHash`.
+    use bitcoin_rs_mining::pool::stratum::sv2::{Frame, ProtocolSession};
+    fn setup_frame(msg_type: u8, channel_msg: bool, payload: Vec<u8>) -> Frame {
+        Frame {
+            extension_type: 0,
+            msg_type,
+            channel_msg,
+            payload,
+        }
+    }
+    let mut book = JobBook::new(book_config(BIP320_VERSION_MASK))
+        .unwrap_or_else(|error| panic!("book: {error:?}"));
+    let mut cfg = server_config();
+    cfg.limits.max_outbound_frames = 3;
+    let mut session = ProtocolSession::new(cfg, &book)
+        .unwrap_or_else(|error| panic!("session: {error:?}"));
+    let setup = SetupConnection {
+        protocol: Protocol::MiningProtocol,
+        min_version: 2,
+        max_version: 2,
+        flags: FLAG_REQUIRES_STANDARD_JOBS,
+        endpoint_host: Str0255::try_from("pool.invalid").unwrap(),
+        endpoint_port: 3333,
+        vendor: Str0255::try_from("test-miner").unwrap(),
+        hardware_version: Str0255::try_from("sim-1").unwrap(),
+        firmware: Str0255::try_from("fw-0").unwrap(),
+        device_id: Str0255::try_from("").unwrap(),
+    };
+    let payload = binary_sv2::to_bytes(setup).unwrap_or_else(|error| panic!("encode: {error:?}"));
+    session
+        .handle(
+            &mut book,
+            setup_frame(MESSAGE_TYPE_SETUP_CONNECTION, false, payload),
+        )
+        .unwrap_or_else(|error| panic!("setup: {error:?}"));
+    assert!(session.is_open());
+    session.take_frames();
+    let open = |session: &mut ProtocolSession, book: &mut JobBook, id: u32, user: &str| {
+        let msg = OpenStandardMiningChannel {
+            request_id: id,
+            user_identity: Str0255::try_from(user).unwrap(),
+            nominal_hash_rate: 1.0e12,
+            max_target: U256::from(&ALL_ONES),
+        };
+        let payload = binary_sv2::to_bytes(msg).unwrap();
+        session
+            .handle(
+                book,
+                setup_frame(MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL, false, payload),
+            )
+            .unwrap_or_else(|error| panic!("open: {error:?}"));
+        let mut out = session.take_frames();
+        let mut received: Vec<Received> = out
+            .drain(..)
+            .map(|frame| Received {
+                msg_type: frame.msg_type,
+                channel_msg: frame.channel_msg,
+                payload: frame.payload,
+            })
+            .collect();
+        read_open_standard(&mut received)
+    };
+    let opened_a = open(&mut session, &mut book, 7, "alice.rig1");
+    let opened_b = open(&mut session, &mut book, 8, "bob.rig1");
+    // First parent: the second channel's prev-hash frame does not fit, so it
+    // holds the job inactive without a parent while the first is active.
+    let first = book
+        .install(candidate(100, 0xab, 2), Vec::new())
+        .unwrap_or_else(|error| panic!("install: {error:?}"));
+    assert!(session.announce(&first).is_err());
+    let missed = session.take_frames();
+    assert_eq!(missed.len(), 3);
+    // Same parent refresh: connection-wide `Active`, but the stale channel
+    // must converge via `Future` plus its missing parent.
+    let second = book
+        .install(candidate(100, 0xab, 3), Vec::new())
+        .unwrap_or_else(|error| panic!("install: {error:?}"));
+    assert!(!second.clean_jobs);
+    assert!(
+        second.job.id().get() != first.job.id().get(),
+        "second install must be a new job"
+    );
+    session
+        .announce(&second)
+        .unwrap_or_else(|error| panic!("announce: {error:?}"));
+    let announced = session.take_frames();
+    let detail: Vec<(u8, Vec<u8>)> = announced
+        .iter()
+        .map(|frame| (frame.msg_type, frame.payload.clone()))
+        .collect();
+    assert_eq!(announced.len(), 3, "second announce frames: {:?}", detail);
+    let mut received: Vec<Received> = announced
+        .into_iter()
+        .map(|frame| Received {
+            msg_type: frame.msg_type,
+            channel_msg: frame.channel_msg,
+            payload: frame.payload,
+        })
+        .collect();
+    let mut jobs = Vec::new();
+    while received
+        .iter()
+        .any(|frame| frame.msg_type == MESSAGE_TYPE_NEW_MINING_JOB)
+    {
+        jobs.push(read_std_job(&mut received));
+    }
+    assert_eq!(jobs.len(), 2);
+    let prev = read_prev_hash(&mut received);
+    assert!(received.is_empty());
+    let active = jobs
+        .iter()
+        .find(|job| job.min_ntime.is_some())
+        .unwrap_or_else(|| panic!("one channel gets Active"));
+    let future = jobs
+        .iter()
+        .find(|job| job.min_ntime.is_none())
+        .unwrap_or_else(|| panic!("stale channel gets Future"));
+    assert_eq!(active.job_id, second.job.id().get());
+    assert_eq!(future.job_id, second.job.id().get());
+    assert_eq!(prev.job_id, second.job.id().get());
+    assert_eq!(future.channel_id, opened_b.channel_id);
+    assert_eq!(prev.channel_id, opened_b.channel_id);
+    assert_eq!(active.channel_id, opened_a.channel_id);
+}
+
+#[test]
 fn announce_without_fresh_still_delivers_a_missing_job_and_parent() {
     // `announce` is driven by per-connection delivery state, not the owner's
     // `fresh` flag: a channel opened before the install still converges on
