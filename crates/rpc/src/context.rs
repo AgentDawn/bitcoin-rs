@@ -12,7 +12,7 @@ use bitcoin_rs_mempool::{
 use bitcoin_rs_mempool::{Mempool, MempoolLimits, MempoolObserver};
 use bitcoin_rs_mining::MiningControl;
 use bitcoin_rs_primitives::{
-    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
+    BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
     layout::ParsedBlock, unix_time_secs,
 };
 
@@ -930,6 +930,30 @@ struct RetainedBody {
     tx_bytes: usize,
 }
 
+/// Conservative accounting for a materialized transaction's owned
+/// allocations, including one vector entry per witness item.
+fn retained_tx_bytes(txs: &[Tx]) -> usize {
+    txs.iter()
+        .map(|tx| {
+            core::mem::size_of::<Tx>()
+                + tx.inputs.len() * core::mem::size_of::<TxIn>()
+                + tx.outputs.len() * core::mem::size_of::<TxOut>()
+                + tx.inputs
+                    .iter()
+                    .map(|input| {
+                        input.script_sig.len()
+                            + input.witness.len() * core::mem::size_of::<Vec<u8>>()
+                            + input.witness.iter().map(Vec::len).sum::<usize>()
+                    })
+                    .sum::<usize>()
+                + tx.outputs
+                    .iter()
+                    .map(|output| output.script_pubkey.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
 /// Production [`PrevoutResolver`] for the BIP337 codec.
 ///
 /// Consistency: snapshot isolation. Handlers construct and run the
@@ -1034,10 +1058,6 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
                 crate::compressed_tx::Limit::IndexBytes,
             ));
         }
-        // The materialized transactions hold the same consensus bytes as
-        // the body minus framing, so the body length is a sound estimate
-        // of their retained size.
-        let tx_bytes = bytes.len();
         let (rows, txs) = {
             let parsed =
                 ParsedBlock::parse_exact(&bytes).map_err(|_| LookupError::CorruptBody(height))?;
@@ -1060,6 +1080,9 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
             }
             (rows, txs)
         };
+        // Charge the owned allocations, not just the wire length: a witness
+        // item needs a vector entry even when its payload is one byte.
+        let tx_bytes = retained_tx_bytes(&txs);
         while self.bodies.len() >= MAX_RETAINED_BODIES
             || self.retained_tx_bytes + tx_bytes > MAX_RETAINED_BODY_BYTES
             || self.retained_index_bytes + index_bytes > MAX_RETAINED_INDEX_BYTES
