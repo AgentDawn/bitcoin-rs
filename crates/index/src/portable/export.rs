@@ -742,6 +742,28 @@ impl RowExporter<'_> {
         self.emit(&mut resolved, rows, out, cancelled)
     }
 
+    /// Validates one stored row value and charges its positions against the
+    /// running total, returning the new total. Invalid rows fail here with
+    /// `SourceRow` before any staging write, matching the later resolve
+    /// check. Totals past the shared restore bound fail with
+    /// `ExportTooLarge` before the row is written or sorted, so an
+    /// unimportable family never pays staging or sort I/O.
+    fn charge_row(value: &[u8], height: u32, total: u64) -> Result<u64, IndexBundleError> {
+        let positions = TxPositionValue::decode(value)
+            .filter(|found| positions_are_valid(found))
+            .ok_or_else(|| IndexBundleError::SourceRow {
+                height,
+                reason: "row carries no valid position list",
+            })?;
+        let total = total.saturating_add(u64::try_from(positions.len()).unwrap_or(u64::MAX));
+        if total > u64::try_from(MAX_RESTORE_POSITIONS).unwrap_or(u64::MAX) {
+            return Err(IndexBundleError::ExportTooLarge {
+                limit_positions: MAX_RESTORE_POSITIONS,
+            });
+        }
+        Ok(total)
+    }
+
     /// Streams every stored row once, in stored-key order, into an anonymous
     /// staging file keyed by `(height, sequence)`.
     ///
@@ -749,7 +771,11 @@ impl RowExporter<'_> {
     /// `base` at `self.floor`; the snapshot is dropped before the next page,
     /// so a long export never pins one key-value snapshot across the whole
     /// family. No body I/O happens here: bodies are read once the staging
-    /// file is sorted by height. Cancellation is polled every
+    /// file is sorted by height. Positions are decoded, validated, and
+    /// counted against the shared restore bound before staging: over-limit
+    /// families fail with `ExportTooLarge` before any write or sort, while
+    /// corrupt rows fail with `SourceRow`. The later resolve and emit checks
+    /// remain as defense. Cancellation is polled every
     /// [`CANCEL_POLL_RECORDS`] scanned rows. Returns the staging file, left
     /// at its start, and the stored-order row count.
     fn enumerate(
@@ -764,6 +790,7 @@ impl RowExporter<'_> {
         let mut staged = tempfile::tempfile().map_err(failed)?;
         let mut seq = 0_u64;
         let mut scanned = 0_u64;
+        let mut positions_total = 0_u64;
         loop {
             let page = {
                 let snapshot = self.host.reader.snapshot()?;
@@ -784,6 +811,7 @@ impl RowExporter<'_> {
                 if scanned.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
                     return Err(IndexBundleError::Cancelled);
                 }
+                positions_total = Self::charge_row(&row.value, row.row.height(), positions_total)?;
                 let key = row.row.to_db_row();
                 let mut sort_key = [0_u8; STAGED_SORT_KEY_LEN];
                 sort_key[..4].copy_from_slice(&row.row.height().to_be_bytes());
@@ -1226,6 +1254,41 @@ mod tests {
         assert!(
             matches!(result, Err(IndexBundleError::Cancelled)),
             "a cancelled sort must abort instead of running to completion"
+        );
+        Ok(())
+    }
+
+    /// Enumeration charges positions before staging: over-limit totals fail
+    /// with `ExportTooLarge` before any write or sort, while corrupt values
+    /// fail with `SourceRow` exactly as the later resolve check would.
+    #[test]
+    fn enumeration_charges_positions_before_staging() -> TestResult {
+        let valid = TxPositionValue::encode(&[TxPosition::new(0, 1), TxPosition::new(1, 1)]);
+        let ceiling = u64::try_from(MAX_RESTORE_POSITIONS).unwrap_or(u64::MAX);
+        let almost_full = ceiling.saturating_sub(1);
+        assert!(
+            matches!(
+                RowExporter::charge_row(&valid, 7, almost_full),
+                Err(IndexBundleError::ExportTooLarge { .. })
+            ),
+            "over-limit positions must fail before staging"
+        );
+        let charged = RowExporter::charge_row(&valid, 7, 0)?;
+        assert_eq!(charged, 2, "valid positions charge their exact count");
+        assert!(
+            matches!(
+                RowExporter::charge_row(&[], 7, 0),
+                Err(IndexBundleError::SourceRow { .. })
+            ),
+            "empty values must fail validation before staging"
+        );
+        let zero_len = TxPositionValue::encode(&[TxPosition::new(0, 0)]);
+        assert!(
+            matches!(
+                RowExporter::charge_row(&zero_len, 7, 0),
+                Err(IndexBundleError::SourceRow { .. })
+            ),
+            "zero-length positions must fail validation before staging"
         );
         Ok(())
     }
