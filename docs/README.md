@@ -23,7 +23,6 @@
 | Mine regtest blocks and inspect templates | [Solo-mining generate path](contracts/external-api.md#api-05-solo-mining-generate-path) and [template extras](contracts/external-api.md#api-11-bip22bip23-template-extras) |
 | Inspect a Core snapshot file without starting a node | [Snapshot inspector](../tools/snapshot/README.md) |
 | Watch a running node for stalls | [Runtime stall watchdog](operations/runtime-stall.md) |
-| Review unselected index-design options (historical) | [Index ideation record](ideation/better-tasting-and-efficient-index-design-and-abstractions.md): brainstorm only, not a plan |
 
 The contract index owns the clause/proof map; this page does not maintain a
 second inventory. Contracts take precedence over local source comments,
