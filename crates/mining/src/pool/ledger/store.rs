@@ -597,9 +597,16 @@ impl Ledger {
     // Found blocks and rounds
     // -----------------------------------------------------------------------------------------
 
-    /// Record a found block: credit its share and snapshot the PPLNS window, in one transaction.
+    /// Record a found block: credit its share, snapshot the PPLNS window, and open the round.
     /// The round starts Pending; no money exists until [`Ledger::reconcile_rounds`] observes the
     /// block on the active chain. Idempotent on the block hash.
+    ///
+    /// The window walk runs on a read snapshot, never under the writer lock:
+    /// phase one credits the share in one short write transaction, phase two
+    /// walks the window with no lock held, and phase three opens the round in
+    /// a second short write. A concurrent record for the same block converges
+    /// on the same idempotent verdict, and a crash between phases replays to
+    /// the same round through the share's idempotent identity.
     ///
     /// # Errors
     /// Returns [`LedgerError::BlockConflict`] if the block is already recorded with a different
@@ -607,19 +614,15 @@ impl Ledger {
     pub fn record_found_block(&self, found: &BlockFound) -> Result<BlockRecorded, LedgerError> {
         found.share.validate()?;
         let block_hash = found.share.header_hash;
-        let txn = self.db.begin_write()?;
-        let (recorded, newly) = {
+        // Phase one: idempotent credit in one short write transaction.
+        let (solving_seq, share_receipt) = {
+            let txn = self.db.begin_write()?;
             let tables = Tables::open(&txn)?;
-            let existing = round_id_for_block(&tables.round_by_block, &block_hash)?;
-            if let Some(id) = existing {
-                let round = load_round(&tables.rounds, id)?
-                    .ok_or_else(|| LedgerError::Corrupt("round index points at no round".into()))?;
-                if round.height != found.height
-                    || round.coinbase_txid != found.coinbase_txid
-                    || round.claimed_coinbase_value_sat != found.claimed_coinbase_value_sat
-                {
-                    return Err(LedgerError::BlockConflict);
-                }
+            if let Some(id) = round_id_for_block(&tables.round_by_block, &block_hash)? {
+                let round = load_round(&tables.rounds, id)?.ok_or_else(|| {
+                    LedgerError::Corrupt("round index points at no round".into())
+                })?;
+                Self::check_round_claim(&round, found)?;
                 let seq = round.solving_seq;
                 return Ok(BlockRecorded {
                     round,
@@ -628,16 +631,52 @@ impl Ledger {
                 });
             }
             let share_receipt = credit_share(&tables, &found.share)?;
-            let solving_seq = share_receipt.seq();
+            if matches!(share_receipt, ShareReceipt::Credited { .. }) {
+                self.commit(txn, OP_RECORD_BLOCK)?;
+            }
+            (share_receipt.seq(), share_receipt)
+        };
+        // Phase two: walk the window on a read snapshot. No writer lock is
+        // held across the unbounded share walk; sequence numbers only grow,
+        // so the solving sequence from phase one stays valid.
+        let (window_total, weights) = {
+            let read = self.db.begin_read()?;
+            let tables = Tables::open(&read)?;
             let pruned_below = meta_u64(&tables.meta_u64, M_PRUNED_BELOW)?;
+            if solving_seq < pruned_below {
+                return Err(LedgerError::WindowPruned);
+            }
             let window = collect_window(
                 &tables.shares,
                 pruned_below,
                 solving_seq,
                 self.config.window_work,
             )?;
-            let window_total = window.total();
-            let weights = window.into_weights();
+            (window.total(), window.into_weights())
+        };
+        // Phase three: open the round in a second short write transaction. A
+        // concurrent record may have opened it first, and a concurrent prune
+        // may have retired the solving share; both re-checks fail closed with
+        // the same verdicts as the single-transaction path.
+        let txn = self.db.begin_write()?;
+        let recorded = {
+            let tables = Tables::open(&txn)?;
+            if let Some(id) = round_id_for_block(&tables.round_by_block, &block_hash)? {
+                let round = load_round(&tables.rounds, id)?.ok_or_else(|| {
+                    LedgerError::Corrupt("round index points at no round".into())
+                })?;
+                Self::check_round_claim(&round, found)?;
+                let seq = round.solving_seq;
+                return Ok(BlockRecorded {
+                    round,
+                    share: ShareReceipt::Duplicate { seq },
+                    newly_recorded: false,
+                });
+            }
+            let pruned_below = meta_u64(&tables.meta_u64, M_PRUNED_BELOW)?;
+            if solving_seq < pruned_below {
+                return Err(LedgerError::WindowPruned);
+            }
             let id = bump(&tables.meta_u64, M_NEXT_ROUND, 1)?;
             let round = Round {
                 id,
@@ -669,19 +708,27 @@ impl Ledger {
                 &ZERO_HASH,
                 [u64::from(found.height), low64(window_total), solving_seq],
             )?;
-            (
-                BlockRecorded {
-                    round,
-                    share: share_receipt,
-                    newly_recorded: true,
-                },
-                true,
-            )
+            BlockRecorded {
+                round,
+                share: share_receipt,
+                newly_recorded: true,
+            }
         };
-        if newly {
-            self.commit(txn, OP_RECORD_BLOCK)?;
-        }
+        self.commit(txn, OP_RECORD_BLOCK)?;
         Ok(recorded)
+    }
+
+    /// The [`LedgerError::BlockConflict`] check shared by the idempotent
+    /// re-record paths: a known block hash with a different claim is a
+    /// conflicting block, never a second round.
+    fn check_round_claim(round: &Round, found: &BlockFound) -> Result<(), LedgerError> {
+        if round.height != found.height
+            || round.coinbase_txid != found.coinbase_txid
+            || round.claimed_coinbase_value_sat != found.claimed_coinbase_value_sat
+        {
+            return Err(LedgerError::BlockConflict);
+        }
+        Ok(())
     }
 
     /// Advance every monitored round from authoritative chain observations: fix the reward from
