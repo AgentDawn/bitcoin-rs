@@ -1,4 +1,4 @@
-//! Smoke tests for every required Task 16 RPC handler.
+//! RPC handlers report the fixture chain, mempool, index, and network facts.
 // A mis-sequenced fixture is a test failure; panicking reports it at the call
 // site, so expect() is deliberate throughout.
 #![allow(clippy::expect_used)]
