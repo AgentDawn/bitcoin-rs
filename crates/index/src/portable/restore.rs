@@ -234,11 +234,6 @@ enum LocatorOutcome {
     Withheld(Withheld),
 }
 
-/// Conservative per-position charge for the grouped locator pass.
-const LOCATOR_POSITION_BYTES: usize = 64;
-/// Memory ceiling for the grouped locator pass.
-const MAX_LOCATOR_PENDING_BYTES: usize = 256 * 1024 * 1024;
-
 /// Locator verification that rides the validating pass. The first terminal
 /// outcome sticks; later records are not looked up.
 ///
@@ -263,8 +258,8 @@ struct LocatorCheck<'a> {
     /// arrive in txid-prefix order, so every block's transactions scatter
     /// across the whole stream.
     pending: HashMap<u32, Vec<(TxPosition, [u8; 32])>>,
-    /// Bytes charged against [`MAX_LOCATOR_PENDING_BYTES`].
-    pending_bytes: usize,
+    /// Positions charged against [`MAX_RESTORE_POSITIONS`].
+    pending_positions: usize,
     /// Positions the bundle carries per height, for the completeness check.
     counts: HashMap<u32, u64>,
     outcome: LocatorOutcome,
@@ -288,10 +283,14 @@ impl LocatorCheck<'_> {
                 "the receiver chain has no block at a record height".to_owned(),
             )
         })?;
-        let added = record.positions.len().saturating_mul(LOCATOR_POSITION_BYTES);
-        if self.pending_bytes.saturating_add(added) > MAX_LOCATOR_PENDING_BYTES {
+        let added = record.positions.len();
+        if self
+            .pending_positions
+            .saturating_add(added)
+            > super::MAX_RESTORE_POSITIONS
+        {
             return Err(IndexBundleError::RestoreTooLarge {
-                limit_bytes: MAX_LOCATOR_PENDING_BYTES,
+                limit_positions: super::MAX_RESTORE_POSITIONS,
             });
         }
         self.pending.entry(height).or_default().extend(
@@ -300,7 +299,7 @@ impl LocatorCheck<'_> {
                 .iter()
                 .map(|&position| (position, record.txid)),
         );
-        self.pending_bytes += added;
+        self.pending_positions += added;
         Ok(())
     }
 
@@ -428,9 +427,7 @@ impl LocatorCheck<'_> {
         hash: Hash256,
     ) -> Result<Option<u64>, IndexBundleError> {
         if let Some(positions) = self.pending.remove(&height) {
-            self.pending_bytes = self
-                .pending_bytes
-                .saturating_sub(positions.len().saturating_mul(LOCATOR_POSITION_BYTES));
+            self.pending_positions = self.pending_positions.saturating_sub(positions.len());
             self.verify_height_positions(height, hash, &positions)
         } else if let Some(count) = self.block_tx_count(height, hash)? {
             Ok(Some(count))
@@ -531,7 +528,7 @@ fn validate_artifact(
             tree: host.block_tree,
             source,
             pending: HashMap::new(),
-            pending_bytes: 0,
+            pending_positions: 0,
             counts: HashMap::new(),
             outcome: LocatorOutcome::Verified,
         }),
