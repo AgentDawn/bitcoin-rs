@@ -10,7 +10,7 @@ use super::telemetry::metric_count;
 use crate::Message;
 use crate::connection::PeerSource;
 use crate::download_window::BlockDownloadPolicy;
-use crate::download_window::PeerRequest;
+use crate::download_window::RefusalFilter;
 use crate::download_window::SyncPeer;
 use crate::download_window::statically_fanout_eligible;
 use crate::download_window::{peer_can_serve_height, servable_floor, serves_requested_height};
@@ -98,13 +98,16 @@ impl UnavailableBodies {
             .is_some_and(|answered_at| Self::live(*answered_at, now))
     }
 
-    /// Whether any entry of `request` names a body its owner answered
-    /// `notfound` for. One hash probe per entry.
-    pub(super) fn refuses_request(&self, request: &PeerRequest, now: Instant) -> bool {
-        !self.answered.is_empty()
-            && request
-                .entries()
-                .any(|(_, hash)| self.refuses(request.owner(), hash, now))
+    /// Live hashes `source` answered `notfound` for within
+    /// [`BODY_UNAVAILABLE_RETRY`] of `now`, for lanes that consult the
+    /// ledger without nesting the scheduler lock inside their own.
+    pub(super) fn refused_hashes(&self, source: PeerSource, now: Instant) -> Vec<Hash256> {
+        self.answered
+            .iter()
+            .filter_map(|((owner, hash), answered_at)| {
+                (*owner == source && Self::live(*answered_at, now)).then_some(*hash)
+            })
+            .collect()
     }
 
     /// Forgets `source`'s answer for `hash`: it delivered the body, so the
@@ -417,11 +420,12 @@ impl BlockSync {
         }
         let servable_floor = servable_floor(&info, &policy);
         let tree = self.chain.block_tree();
-        // A plan that names a body `source` already answered `notfound` for
-        // is dropped whole: nothing was marked, so the ordinary scheduler
-        // plans the same blocks again, for the next peer this tick or for
-        // `source` once the retry interval has passed. Nothing waits on the
-        // refused peer and no message goes out, so a peer that lacks a body
+        // Bodies `source` already answered `notfound` for are excluded while
+        // the batch is built, never by dropping it: the scan plans around
+        // them and pins the cursor at the lowest refused height, so the next
+        // peer this tick — or `source` once the retry interval has passed —
+        // can still be offered the bodies it holds. Nothing was marked for a
+        // refused body, and no message names one, so a peer that lacks a body
         // is never polled for it at wake-up pace.
         let request = {
             let mut scheduler = self.scheduler.lock();
@@ -431,19 +435,20 @@ impl BlockSync {
                 body_unavailable,
                 ..
             } = &mut *scheduler;
-            window
-                .next_peer_request(
-                    stager,
-                    source,
-                    allow_expired_retry_from_peer,
-                    chain_tip,
-                    required.height,
-                    peer_best_height,
-                    servable_floor,
-                    &tree,
-                    now,
-                )
-                .filter(|request| !body_unavailable.refuses_request(request, now))
+            let is_refused = |hash| body_unavailable.refuses(source, hash, now);
+            let mut refusals = RefusalFilter::new(&is_refused);
+            window.next_peer_request(
+                stager,
+                source,
+                allow_expired_retry_from_peer,
+                chain_tip,
+                required.height,
+                peer_best_height,
+                servable_floor,
+                &tree,
+                now,
+                &mut refusals,
+            )
         };
         drop(tree);
         let Some(request) = request else {

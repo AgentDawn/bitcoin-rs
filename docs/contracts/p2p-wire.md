@@ -1,4 +1,4 @@
-# P2P wire contract (pointer)
+# P2P wire contract
 
 This page assigns ownership and cites proof under the
 [contracts precedence rule](README.md).
@@ -38,16 +38,30 @@ This page assigns ownership and cites proof under the
   `ActiveChainQuery::headers_after` resolves the locator order, stop hash,
   and height walk against the validated applied tip, never the header-best
   tip; the empty-locator single-header direct lookup stays on the header-best
-  chain. The decoder
-  still types inbound `block` as `Message::Block`.
-- Proof: `crates/p2p/src/chain_query.rs` tests
-  `getheaders_after_locator_stops_at_stop_hash`,
-  `applied_prefix_when_headers_lead`, `applied_fork_off_best_serves_own_ancestry`,
+  chain. The wire decoder types inbound `block` as
+  `Message::Block(BlockPayload)`, constructed once via
+  `BlockPayload::from_raw` on the frame bytes with no second decode; the
+  serving `Message::BlockPayload(Bytes)` envelope stays raw-only with no
+  decoded field. `InboundBlock` owns the one payload while peer/source and
+  `forward_credit` stay outer; `check_body_binding` runs on the decoded
+  block and credit is released at the existing handoff.
+- Proof: applied-tip `headers_after` in `crates/p2p/src/chain_query.rs`
+  (`applied_prefix_when_headers_lead` proves only the servable applied
+  prefix replies while headers lead and a header-best-only locator is not
+  an applied ancestor; `applied_fork_off_best_serves_own_ancestry`,
   `best_only_locator_does_not_skip_applied_fork`, and
-  `stop_hash_bounds_applied_response` pin applied-chain locator behavior;
-  `crates/p2p/src/wire.rs::block_payload_writes_the_same_frame_as_decoded_block`
-  and `chain_query.rs::getdata_decodes_active_body_from_source_and_reports_missing_inventory`
-  pin exact payload encoding and single-decode serving.
+  `stop_hash_bounds_applied_response` prove off-best ancestry, locator
+  fallback, and applied-stop bounding);
+  `committed_tip_reads_applied_tip_when_headers_are_ahead` and
+  `serving_depth_uses_applied_tip_when_headers_are_ahead` prove the
+  committed tip and serving depth follow the applied tip while headers
+  lead. Single `BlockPayload::from_raw` decode:
+  `crates/primitives/src/block.rs`
+  `payload_from_raw_retains_exact_fixture_bytes` and
+  `payload_from_raw_rejects_trailing_bytes` plus
+  `crates/p2p/src/wire.rs`
+  `block_message_roundtrip_preserves_wire_payload` (one decode carries the
+  frame; raw bytes preserved end to end).
 
 ### `P2P-02`: Connection lifecycle and peer lease ownership
 
@@ -265,7 +279,8 @@ branch-plan, attribution, timeout and bounded-staging suites remain required.
   one release it earns is the recovery path above: a body-carried header that
   cannot attach frees its owner's gate, so the ancestry request that delivery
   motivates reaches the wire with it (P2P-05).
-- The staged retry carries the delivering connection
+- The stager MUST hold one `BlockPayload` per entry (`insert(payload)`). The
+  staged retry carries the delivering connection
   (`ReceivedBlock::source`): a retry that admits credits that peer exactly
   as the headers drain would (`note_announced_tip`), and a peer-fault
   rejection drops the staged body (`stager.discard`, never re-queued;

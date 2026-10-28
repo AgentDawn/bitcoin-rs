@@ -81,6 +81,43 @@ impl PeerRequest {
     }
 }
 
+/// Per-peer availability view for one request build.
+///
+/// `is_refused` names the bodies this peer answered `notfound` for; the scan
+/// records the lowest such height so the batch pins the cursor there instead
+/// of dropping the whole batch. Grouping the predicate with its pin keeps the
+/// scan helpers to one added parameter.
+pub(crate) struct RefusalFilter<'a> {
+    is_refused: &'a dyn Fn(Hash256) -> bool,
+    min_refused: Option<u32>,
+}
+
+impl<'a> RefusalFilter<'a> {
+    pub(crate) fn new(is_refused: &'a dyn Fn(Hash256) -> bool) -> Self {
+        Self {
+            is_refused,
+            min_refused: None,
+        }
+    }
+
+    /// Whether `hash` stays in this peer's batch. A refused body is dropped
+    /// and its height contends for the cursor pin.
+    pub(crate) fn keep(&mut self, hash: Hash256, height: u32) -> bool {
+        if (self.is_refused)(hash) {
+            self.min_refused = Some(self.min_refused.map_or(height, |floor| {
+                floor.min(height)
+            }));
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn min_refused(&self) -> Option<u32> {
+        self.min_refused
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PeerRequestEntry {
     hash: Hash256,
@@ -1641,9 +1678,11 @@ impl DownloadWindow {
     /// no blocks are available to request.
     ///
     /// PRE: `stager` is the coupled staging set; expiry has run this tick.
-    /// POST: a request whose entries are unowned, on the request branch, and
-    ///      inside every pending/staging budget; `next_request_height` covers
-    ///      every height the scan offered.
+    /// POST: a request whose entries are unowned, on the request branch,
+    ///      inside every pending/staging budget, and free of bodies
+    ///      `is_refused` names for `source`; `next_request_height` covers
+    ///      every height the scan offered except the lowest refused one,
+    ///      which pins the cursor so another peer can plan it this tick.
     /// INVARIANT: staged membership, count, and bytes are read from `stager`.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn next_peer_request(
@@ -1657,6 +1696,7 @@ impl DownloadWindow {
         servable_floor: u32,
         tree: &BlockTree,
         now: Instant,
+        refusals: &mut RefusalFilter,
     ) -> Option<PeerRequest> {
         self.retarget_request_branch(stager, chain_tip, request_start_height, tree, now);
         if self.staged_bytes_exhausted(stager) {
@@ -1694,12 +1734,16 @@ impl DownloadWindow {
             return None;
         }
 
+        // Bodies `source` already answered `notfound` for are excluded per
+        // entry, never by dropping the batch: the lowest refused height pins
+        // the cursor so a peer that holds it is still planned below.
         let mut entries = self.expired_request_entries(
             stager,
             expired,
             batch_limit,
             servable_floor,
             &mut byte_capacity,
+            refusals,
         );
         let selected_hashes = SelectedHashes::from_entries(&entries);
 
@@ -1741,8 +1785,14 @@ impl DownloadWindow {
                 next_request_height,
             };
             if entries.is_empty()
-                && let Some(request) =
-                    self.clean_contiguous_peer_request(stager, source, chain_tip, tree, scan)
+                && let Some(request) = self.clean_contiguous_peer_request(
+                    stager,
+                    source,
+                    chain_tip,
+                    tree,
+                    scan,
+                    refusals,
+                )
             {
                 return Some(request);
             }
@@ -1754,7 +1804,15 @@ impl DownloadWindow {
                 scan,
                 selected_hashes.as_ref(),
                 &mut entries,
+                refusals,
             );
+        }
+        if let Some(refused_height) = refusals.min_refused() {
+            // The pin only holds the cursor back, never rewinds it: every
+            // refused height the scan saw sits at or above where it started.
+            next_request_height = next_request_height
+                .min(refused_height)
+                .max(self.next_request_height);
         }
         non_empty_request(source, entries, next_request_height)
     }
@@ -1824,6 +1882,7 @@ impl DownloadWindow {
         scan: RequestScan,
         selected_hashes: Option<&SelectedHashes>,
         entries: &mut Vec<PeerRequestEntry>,
+        refusals: &mut RefusalFilter,
     ) -> u32 {
         if scan.remaining_limit == 0 {
             return scan.next_request_height;
@@ -1853,10 +1912,12 @@ impl DownloadWindow {
                 && !stager.contains(&node.hash)
                 && selected_hashes.is_none_or(|hashes| !hashes.contains(&node.hash))
             {
-                candidates.push(PeerRequestEntry {
-                    hash: node.hash,
-                    height: node.height,
-                });
+                if refusals.keep(node.hash, node.height) {
+                    candidates.push(PeerRequestEntry {
+                        hash: node.hash,
+                        height: node.height,
+                    });
+                }
             }
             let Some(parent) = node.parent else {
                 break;
@@ -1883,11 +1944,15 @@ impl DownloadWindow {
         batch_limit: usize,
         servable_floor: u32,
         byte_capacity: &mut usize,
+        refusals: &mut RefusalFilter,
     ) -> Vec<PeerRequestEntry> {
         let mut entries = Vec::with_capacity(batch_limit);
         for entry in expired {
             if entries.len() >= batch_limit || *byte_capacity < self.ewma_block_bytes {
                 break;
+            }
+            if !refusals.keep(entry.hash, entry.height) {
+                continue;
             }
             if entry.height < servable_floor
                 || stager.contains(&entry.hash)
@@ -1908,6 +1973,7 @@ impl DownloadWindow {
         chain_tip: &TipSnapshot,
         tree: &BlockTree,
         scan: RequestScan,
+        refusals: &mut RefusalFilter,
     ) -> Option<PeerRequest> {
         if !self.pending.is_empty() || stager.received_len() > 0 {
             return None;
@@ -1919,6 +1985,17 @@ impl DownloadWindow {
             .min(scan.request_tip_height);
         let entries =
             contiguous_request_entries(tree, chain_tip.tip_id, scan.height, request_end_height)?;
+        // A refused body inside the range falls through to the reverse scan,
+        // which excludes it per entry and pins the cursor at its height. The
+        // loop never short-circuits: every refused height contends for the
+        // pin even though the range is rebuilt below.
+        let mut has_refused = false;
+        for entry in &entries {
+            has_refused |= !refusals.keep(entry.hash, entry.height);
+        }
+        if has_refused {
+            return None;
+        }
         let next_request_height = scan
             .next_request_height
             .max(request_end_height.saturating_add(1));

@@ -22,8 +22,6 @@ use bitcoin_rs_index::runtime::REDB_BATCH_LIMITS;
 use bitcoin_rs_index::runtime::open_derived_index_store_on_worker;
 #[cfg(any(test, feature = "test-seam"))]
 use bitcoin_rs_mempool::Mempool;
-#[cfg(any(test, feature = "test-seam"))]
-use bitcoin_rs_primitives::Block;
 use bitcoin_rs_rpc::context::PruneService;
 use bitcoin_rs_storage::KvStore;
 use bitcoin_rs_storage::StorageBackend;
@@ -375,17 +373,18 @@ impl NodeState {
         self.followers.clone()
     }
 
-    /// Synthetically applies `block` as the next tip after consensus checks.
+    /// Synthetically applies `payload` as the next tip after consensus checks.
     ///
     /// Holds the chain transition through follower dispatch (`ARCH-07`).
     /// A post-commit settlement failure remains distinguishable in
     /// [`crate::ConnectMutationError`] and retains the authoritative outcome.
+    /// Exactness is owned by the [`BlockPayload`] constructor; no re-encode.
     #[cfg(any(test, feature = "test-seam"))]
     pub fn apply_block(
         &self,
-        block: &Block,
+        payload: &bitcoin_rs_primitives::BlockPayload,
     ) -> core::result::Result<TipSnapshot, crate::chain_effects::ConnectMutationError> {
-        let outcome = self.followers.apply_connect(&self.chainstate, block)?;
+        let outcome = self.followers.apply_connect(&self.chainstate, payload)?;
         Ok(outcome.tip)
     }
 
@@ -445,6 +444,18 @@ impl NodeState {
             let q: Arc<dyn bitcoin_rs_rpc::context::DerivedIndexQuery> = adapter.clone();
             q
         })
+    }
+
+    /// Returns the node-owned historical query adapter when any index capability is enabled.
+    ///
+    /// Capability selection stays with the engine: a tx-only node serves
+    /// historical transactions while script calls fail closed with the typed
+    /// disabled cause. A node with no index capability returns `None` so the
+    /// caller maps to the per-call disabled cause.
+    pub(crate) fn historical_index_adapter(
+        &self,
+    ) -> Option<Arc<bitcoin_rs_index::runtime::DerivedIndexQueryAdapter>> {
+        self.derived_index.adapter().cloned()
     }
 
     /// Returns the optional compact-filter query owner for RPC and P2P.
@@ -517,6 +528,7 @@ fn build_derived_index_open_spec(
     txindex_cache_bytes: u64,
     epoch: u64,
     guard: &bitcoin_rs_storage::StoreGuard,
+    seed_slot: Option<bitcoin_rs_utxo::SeedOfferCell>,
 ) -> Result<Option<bitcoin_rs_index::runtime::DerivedIndexOpenSpec>> {
     let enabled = derived_index_capabilities(config);
     if enabled.is_empty() {
@@ -553,7 +565,31 @@ fn build_derived_index_open_spec(
         }),
         utxo: None,
         chain_transition: None,
+        bundle: index_bundle_directive(config)?,
+        seed_slot,
     }))
+}
+
+/// The portable-bundle action the operator asked for, or `None`.
+///
+/// Configuration validation already rejects both directories together; a
+/// caller that bypassed it is refused here rather than guessing which wins.
+fn index_bundle_directive(
+    config: &NodeConfig,
+) -> Result<bitcoin_rs_index::portable::IndexBundleDirective> {
+    use bitcoin_rs_index::portable::{IndexBundleDirective, IndexBundleRequest};
+    let request = |dir: &std::path::PathBuf| IndexBundleRequest {
+        dir: dir.clone(),
+        network: config.network,
+    };
+    match (&config.indexes.bundle_import, &config.indexes.bundle_export) {
+        (None, None) => Ok(IndexBundleDirective::None),
+        (Some(dir), None) => Ok(IndexBundleDirective::Restore(request(dir))),
+        (None, Some(dir)) => Ok(IndexBundleDirective::Export(request(dir))),
+        (Some(_), Some(_)) => {
+            bail!("--index-bundle-import and --index-bundle-export are mutually exclusive")
+        }
+    }
 }
 
 struct DerivedIndexComposer {

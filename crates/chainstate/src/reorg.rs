@@ -4,7 +4,7 @@ use crate::{
     ApplyError, ChainTransition, Chainstate, ConnectOutcome, DisconnectError, DisconnectOutcome,
 };
 use bitcoin_rs_chain::{InvalidationOutcome, NodeId, ReorgPlan, plan_reorg};
-use bitcoin_rs_primitives::{Block, DecodeError, Hash256, deserialize};
+use bitcoin_rs_primitives::{Block, BlockPayload, DecodeError, Hash256};
 use bitcoin_rs_storage::StorageError;
 
 /// Maximum number of disconnect-side block bodies held in memory at once
@@ -477,7 +477,7 @@ fn prepare_branches<F>(
     staged_body: &mut F,
 ) -> core::result::Result<PreparedBranches, ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
 {
     let Some(plan) = plan else {
         return Ok(PreparedBranches {
@@ -523,7 +523,7 @@ pub fn switch_to_branch<F, O, S>(
     mut settle: S,
 ) -> core::result::Result<(), ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
     O: ReorgObserver + ?Sized,
     S: FnMut(&mut O, core::result::Result<(), ReorgError>) -> core::result::Result<(), ReorgError>,
 {
@@ -643,8 +643,7 @@ struct LoadedPlanProgress {
 
 struct LoadedBranchBody {
     hash: Hash256,
-    block: Block,
-    serialized: bytes::Bytes,
+    payload: BlockPayload,
     height: u32,
 }
 
@@ -657,7 +656,7 @@ fn load_available_branch_prefix<F>(
     staged_body: &mut F,
 ) -> core::result::Result<LoadedBranchPrefix, ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
 {
     let window = &nodes[..nodes.len().min(CONNECT_STREAM_WINDOW)];
     let mut loaded = Vec::with_capacity(window.len());
@@ -693,10 +692,10 @@ fn load_branch_body<F>(
     staged_body: &mut F,
 ) -> core::result::Result<LoadedBranchBody, ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
 {
-    if let Some((block, serialized)) = staged_body(hash) {
-        return validate_branch_body(hash, height, block, serialized);
+    if let Some(payload) = staged_body(hash) {
+        return validate_branch_body(hash, height, payload);
     }
     if let Some(store) = handles.block_body_store()
         && let Some(body) =
@@ -718,22 +717,20 @@ fn decode_branch_body(
     height: u32,
     serialized: bytes::Bytes,
 ) -> core::result::Result<LoadedBranchBody, ReorgError> {
-    let block =
-        deserialize::<Block>(serialized.as_ref()).map_err(|source| ReorgError::BodyDecode {
-            hash,
-            height,
-            source,
-        })?;
-    validate_branch_body(hash, height, block, serialized)
+    let payload = BlockPayload::from_raw(serialized).map_err(|source| ReorgError::BodyDecode {
+        hash,
+        height,
+        source,
+    })?;
+    validate_branch_body(hash, height, payload)
 }
 
 fn validate_branch_body(
     expected: Hash256,
     height: u32,
-    block: Block,
-    serialized: bytes::Bytes,
+    payload: BlockPayload,
 ) -> core::result::Result<LoadedBranchBody, ReorgError> {
-    let actual = block.block_hash().0;
+    let actual = payload.block().block_hash().0;
     if actual != expected {
         return Err(ReorgError::BodyHashMismatch {
             expected,
@@ -741,7 +738,7 @@ fn validate_branch_body(
             height,
         });
     }
-    if !crate::bytes_are_block(serialized.as_ref(), &block) {
+    if !crate::bytes_are_block(payload.bytes().as_ref(), payload.block()) {
         return Err(ReorgError::BodyBytesMismatch {
             hash: expected,
             height,
@@ -749,8 +746,7 @@ fn validate_branch_body(
     }
     Ok(LoadedBranchBody {
         hash: expected,
-        block,
-        serialized,
+        payload,
         height,
     })
 }
@@ -763,7 +759,7 @@ fn preflight_disconnect_bodies<F>(
     staged_body: &mut F,
 ) -> core::result::Result<(), ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
 {
     for (hash, height) in nodes {
         load_branch_body(handles, *hash, *height, staged_body)?;
@@ -788,14 +784,14 @@ fn restore_disconnected_branch<F, O>(
     staged_body: &mut F,
 ) -> core::result::Result<(), ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
     O: ReorgObserver + ?Sized,
 {
     let handles = transition.chainstate();
     for (connected, &(hash, height)) in disconnected.iter().rev().enumerate() {
         let body = load_branch_body(handles, hash, height, staged_body)?;
-        match transition.connect(&body.block, Some(body.serialized)) {
-            Ok(outcome) => observer.connected(&body.block, &outcome),
+        match transition.connect(&body.payload) {
+            Ok(outcome) => observer.connected(body.payload.block(), &outcome),
             Err(source) => {
                 return Err(ReorgError::ConnectFailed {
                     disconnected: disconnected.len(),
@@ -822,7 +818,7 @@ fn execute_streamed_plan<F, O>(
     staged_body: &mut F,
 ) -> (LoadedPlanProgress, core::result::Result<(), ReorgError>)
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
     O: ReorgObserver + ?Sized,
 {
     let handles = transition.chainstate();
@@ -853,7 +849,7 @@ where
             }
         }
         for body in bodies {
-            match transition.disconnect(&body.block) {
+            match transition.disconnect(body.payload.block()) {
                 Ok(outcome) => {
                     observer.disconnected(&outcome);
                     progress.disconnected += 1;
@@ -897,7 +893,7 @@ fn execute_connect_stream<F, O>(
     progress: &mut LoadedPlanProgress,
 ) -> core::result::Result<(), ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
     O: ReorgObserver + ?Sized,
 {
     let handles = transition.chainstate();
@@ -935,9 +931,9 @@ fn connect_loaded_body<O>(
 where
     O: ReorgObserver + ?Sized,
 {
-    match transition.connect(&body.block, Some(body.serialized.clone())) {
+    match transition.connect(&body.payload) {
         Ok(outcome) => {
-            observer.connected(&body.block, &outcome);
+            observer.connected(body.payload.block(), &outcome);
             progress.connected += 1;
             Ok(())
         }
@@ -1002,12 +998,12 @@ fn revisit_disconnected_blocks<F, O>(
     staged_body: &mut F,
 ) -> core::result::Result<(), ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<bitcoin_rs_primitives::BlockPayload>,
     O: ReorgObserver + ?Sized,
 {
     for (hash, block_height) in disconnect_nodes[..disconnected_count].iter().rev() {
         let body = load_branch_body(handles, *hash, *block_height, staged_body)?;
-        observer.reconsider_disconnected(&body.block);
+        observer.reconsider_disconnected(body.payload.block());
     }
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Smoke tests for every required Task 16 RPC handler.
+//! RPC handlers report the fixture chain, mempool, index, and network facts.
 // A mis-sequenced fixture is a test failure; panicking reports it at the call
 // site, so expect() is deliberate throughout.
 #![allow(clippy::expect_used)]
@@ -394,6 +394,20 @@ impl ChainControl for RecordingChainControl {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
+    }
+
+    // No snapshot exporter is wired into this fixture.
+    fn dump_txoutset(
+        &self,
+        _path: &std::path::Path,
+        _cancellation: &bitcoin_rs_chain::LatchReader,
+    ) -> Result<
+        bitcoin_rs_rpc::context::SnapshotExport,
+        bitcoin_rs_rpc::context::SnapshotControlError,
+    > {
+        Err(bitcoin_rs_rpc::context::SnapshotControlError::Unavailable(
+            "snapshot export is not attached to this fixture".to_owned(),
+        ))
     }
 
     // No block verifier is wired, so the chain cannot be declared verified.
