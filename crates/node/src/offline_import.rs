@@ -132,6 +132,9 @@ struct CertifiedState {
 
 const HEADER_LEN: usize = 80;
 const MAX_PAYLOAD: usize = 4_000_000;
+/// Byte bound on the manifest, enforced while reading so an oversized or
+/// unbounded path (a device, a huge file) is refused without buffering it.
+const MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Runs the foreground offline import and writes the certified state.
 ///
@@ -347,17 +350,28 @@ fn connect_batch(
 }
 
 fn read_manifest(path: &Path) -> Result<Manifest> {
-    let raw =
-        std::fs::read(path).with_context(|| format!("cannot read manifest {}", path.display()))?;
-    if raw.len() > 512 * 1024 * 1024 {
-        bail!("manifest exceeds its byte bound");
-    }
+    let raw = read_bounded(path, MAX_MANIFEST_BYTES)?;
     // No duplicate-key `Value` is used here: the manifest is decoded into
     // typed structs with contiguous-height and packed-offset checks, so a
     // duplicated key cannot smuggle a second chain view.
     let raw_doc: RawManifest = sonic_rs::from_slice(&raw)
         .with_context(|| format!("manifest {} is not valid JSON", path.display()))?;
     raw_doc.normalize()
+}
+
+/// Reads at most `limit` bytes, refusing a longer input before buffering
+/// more than one byte past the bound.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let file =
+        File::open(path).with_context(|| format!("cannot read manifest {}", path.display()))?;
+    let mut raw = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut raw)
+        .with_context(|| format!("cannot read manifest {}", path.display()))?;
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > limit {
+        bail!("manifest exceeds its byte bound");
+    }
+    Ok(raw)
 }
 
 impl RawManifest {
@@ -502,7 +516,7 @@ fn namespace_has_content(path: &Path) -> bool {
 }
 
 fn parse_magic_hex(text: &str) -> Result<[u8; 4]> {
-    if text.len() != 8 {
+    if text.len() != 8 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("network magic must be 8 hex characters");
     }
     let mut out = [0u8; 4];
@@ -953,5 +967,29 @@ mod tests {
         // Start-at-zero behavior is unchanged.
         assert_eq!(block_index_for_height(0, 1).expect("index"), 1);
         assert_eq!(block_index_for_height(0, 2).expect("skip"), 2);
+    }
+
+    #[test]
+    fn network_magic_refuses_non_hex_without_panicking() {
+        assert_eq!(
+            parse_magic_hex("f9beb4d9").expect("hex"),
+            [0xf9, 0xbe, 0xb4, 0xd9]
+        );
+        // Eight bytes but multibyte UTF-8: refused, not sliced off a char
+        // boundary.
+        assert!(parse_magic_hex("\u{e9}\u{e9}f9be").is_err());
+        // Sign prefixes `from_str_radix` would accept are not hex digits.
+        assert!(parse_magic_hex("+fbeb4d9").is_err());
+        assert!(parse_magic_hex("f9beb4d").is_err());
+    }
+
+    #[test]
+    fn manifest_read_refuses_oversized_input_without_buffering_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, [b' '; 17]).expect("manifest");
+        assert_eq!(read_bounded(&path, 17).expect("at bound").len(), 17);
+        let error = read_bounded(&path, 16).expect_err("oversized manifest");
+        assert!(error.to_string().contains("byte bound"), "{error}");
     }
 }
