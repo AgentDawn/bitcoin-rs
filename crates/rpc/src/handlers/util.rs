@@ -509,17 +509,159 @@ fn bound_derivation_work(begin: u32, end: u32) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// One public, fixed scan descriptor and its Core-specialized attribution.
+/// One scan script and its Core-specialized attribution.
 pub(crate) struct ScanScript {
     pub(crate) script_pubkey: Vec<u8>,
     pub(crate) desc: String,
 }
 
-/// Extracts one public scan script and its Core-specialized attribution at the given derived descriptor.
-pub(crate) fn scan_script_at(
+/// Parsed scan input, retained until the whole request's derivation budget
+/// has been checked. Parsing performs no public-key derivation.
+pub(crate) enum ScanDescriptor {
+    Fixed(ScanScript),
+    Keys {
+        descriptor: Box<MiniscriptDescriptor<DescriptorPublicKey>>,
+        kind: &'static str,
+        range: (u32, u32),
+    },
+}
+
+impl ScanDescriptor {
+    /// Counts work before deduplication, including every multipath branch.
+    pub(crate) fn script_count(&self) -> usize {
+        match self {
+            Self::Fixed(_) => 1,
+            Self::Keys {
+                descriptor,
+                range: (begin, end),
+                ..
+            } => {
+                // Supported key descriptors have exactly one key.
+                let mut paths = 1;
+                descriptor.for_each_key(|key| {
+                    if let DescriptorPublicKey::MultiXPub(key) = key {
+                        paths = key.derivation_paths.paths().len();
+                    }
+                    true
+                });
+                paths.saturating_mul(usize::try_from(end - begin + 1).unwrap_or(usize::MAX))
+            }
+        }
+    }
+
+    pub(crate) fn expand(
+        self,
+        cancelled: &impl Fn() -> Result<bool, RpcError>,
+        mut insert: impl FnMut(ScanScript) -> Result<(), RpcError>,
+    ) -> Result<(), RpcError> {
+        if cancelled()? {
+            return Ok(());
+        }
+        let (descriptor, kind, (begin, end)) = match self {
+            Self::Fixed(script) => return insert(script),
+            Self::Keys {
+                descriptor,
+                kind,
+                range,
+            } => (descriptor, kind, range),
+        };
+        let paths = descriptor
+            .into_single_descriptors()
+            .map_err(|error| RpcError::InvalidAddressOrKey(error.to_string()))?;
+        // Core expands indexes first, then paths. Keep deterministic first
+        // attribution when different derivations produce the same script.
+        for index in begin..=end {
+            for path in &paths {
+                if cancelled()? {
+                    return Ok(());
+                }
+                let derived = path
+                    .at_derivation_index(index)
+                    .map_err(|error| RpcError::InvalidAddressOrKey(error.to_string()))?;
+                insert(scan_key_script(&derived, kind)?)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Existing checksum, network and public-key rules stay in this owner.
+pub(crate) fn scan_descriptor(
+    text: &str,
+    range: Option<(u32, u32)>,
+    network: Network,
+) -> Result<ScanDescriptor, RpcError> {
+    let (payload, _) = checked_checksum(text, ChecksumRequirement::Optional)?;
+    let chain = convert::bitcoin_network(network);
+    if let Some(raw) = parse_unspendable(payload) {
+        let script = match raw.map_err(descriptor_error)? {
+            Unspendable::Address(address) => address
+                .require_network(chain)
+                .map_err(|_| RpcError::InvalidAddressOrKey("Address is not valid".into()))?
+                .script_pubkey(),
+            Unspendable::Raw(script) => script,
+        };
+        return Ok(ScanDescriptor::Fixed(ScanScript {
+            desc: crate::tx_render::script_descriptor(script.as_bytes(), network),
+            script_pubkey: script.into_bytes(),
+        }));
+    }
+    // Parsing public keys directly rejects WIF/xprv without converting or
+    // deriving secrets. Other descriptor endpoints retain their own contract.
+    let descriptor = MiniscriptDescriptor::<DescriptorPublicKey>::from_str(payload)
+        .map_err(|error| RpcError::InvalidAddressOrKey(error.to_string()))?;
+    ensure_keys_match_network(&descriptor, chain).map_err(descriptor_error)?;
+    if descriptor_needs_private_keys(&descriptor) {
+        return Err(RpcError::InvalidAddressOrKey(
+            GENERATEBLOCK_NEEDS_PRIVATE_KEYS.into(),
+        ));
+    }
+    let kind =
+        match &descriptor {
+            MiniscriptDescriptor::Pkh(_) => "pkh",
+            MiniscriptDescriptor::Wpkh(_) => "wpkh",
+            MiniscriptDescriptor::Sh(sh)
+                if matches!(sh.as_inner(), miniscript::descriptor::ShInner::Wpkh(_)) =>
+            {
+                "sh(wpkh"
+            }
+            MiniscriptDescriptor::Tr(tr) if tr.tap_tree().is_none() => "tr",
+            _ => return Err(RpcError::InvalidParameter(
+                "Supported scan descriptors are addr, raw, pkh, wpkh, sh(wpkh), and key-only tr"
+                    .into(),
+            )),
+        };
+    // Miniscript accepts repeated alternatives; Core rejects them. Inspect
+    // the parsed paths rather than introducing a second descriptor parser.
+    if let Some(DescriptorPublicKey::MultiXPub(key)) = descriptor.iter_pk().next() {
+        let mut seen = std::collections::BTreeSet::new();
+        if key
+            .derivation_paths
+            .paths()
+            .iter()
+            .any(|path| !seen.insert(path))
+        {
+            return Err(RpcError::InvalidAddressOrKey(
+                "Duplicate multipath derivation paths are not supported".into(),
+            ));
+        }
+    }
+    let range = if descriptor.has_wildcard() {
+        // Core's scan default is inclusive: 0 through 1000.
+        range.unwrap_or((0, 1000))
+    } else {
+        (0, 0)
+    };
+    Ok(ScanDescriptor::Keys {
+        descriptor: Box::new(descriptor),
+        kind,
+        range,
+    })
+}
+
+fn scan_key_script(
     derived: &MiniscriptDescriptor<DefiniteDescriptorKey>,
-    kind: &'static str,
-    _network: Network,
+    kind: &str,
 ) -> Result<ScanScript, RpcError> {
     let key = derived
         .iter_pk()
@@ -560,22 +702,6 @@ pub(crate) fn scan_script_at(
         script_pubkey: derived.script_pubkey().into_bytes(),
         desc: with_checksum(&format!("{kind}({origin}{public}{suffix}")),
     })
-}
-
-/// Evaluates the explicitly supported, non-ranged scan descriptor forms.
-/// Existing checksum/network/derivation rules stay in this descriptor owner.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "descriptor scanner interface retained for callers and tests"
-    )
-)]
-pub(crate) fn scan_descriptor(text: &str, network: Network) -> Result<ScanScript, RpcError> {
-    let mut scripts = scan_descriptor_range(text, network, None, || Ok(false))?;
-    scripts
-        .pop()
-        .ok_or_else(|| RpcError::InvalidParameter("Descriptor produced no scripts".into()))
 }
 
 /// Expands a scan descriptor over an optional derivation range, bounded by script and byte budgets.
@@ -716,7 +842,7 @@ pub(crate) fn scan_descriptor_range_budgeted(
             let derived = path
                 .at_derivation_index(index)
                 .map_err(|error| RpcError::InvalidAddressOrKey(error.to_string()))?;
-            let script = scan_script_at(&derived, kind, network)?;
+            let script = scan_key_script(&derived, kind)?;
             scripts.push(script);
         }
     }
