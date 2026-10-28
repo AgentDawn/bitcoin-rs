@@ -576,13 +576,18 @@ impl NodeState {
             tracing::info!(status = "disabled", "mempool snapshot persistence disabled");
         }
         if zmq_publisher.wants_notifications() {
+            let interest = if zmq_publisher.wants_rawtx() {
+                BodyInterest::Bodies
+            } else {
+                BodyInterest::Metadata
+            };
             mempool_gateway
                 .attach_observer_leg(
                     "sequence",
                     Arc::new(bitcoin_rs_rpc::zmq::MempoolSequenceObserver::new(
                         Arc::clone(&zmq_publisher),
                     )),
-                    BodyInterest::Bodies,
+                    interest,
                 )
                 .map_err(anyhow::Error::msg)?;
         } else if let Some(observer) = mempool_observer.cloned() {
