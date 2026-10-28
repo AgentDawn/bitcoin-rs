@@ -995,15 +995,20 @@ impl CallResponse {
 
     const fn http_status(&self) -> u16 {
         match self {
-            Self::Reply {
-                envelope_error: true,
-                ..
-            } => 400,
+            // The dialect code mapping is the single owner of every reply
+            // that carries a code, including envelope refusals: Core's
+            // outer error path maps the post-classification `-32600` to
+            // 400 through this arm in either dialect. The generic envelope
+            // arm below only covers the codeless case.
             Self::Reply {
                 version,
                 error_code: Some(code),
                 ..
             } => version.error_status_for_code(*code),
+            Self::Reply {
+                envelope_error: true,
+                ..
+            } => 400,
             Self::Reply { .. } | Self::Notification => 200,
         }
     }
@@ -1023,25 +1028,29 @@ fn handle_json(handler: &Handler, body: &[u8]) -> JsonResponse {
         }
     };
 
-    let close = request.as_array().map_or_else(
-        || crate::registry::blocking_request(&request),
-        |requests| requests.iter().any(crate::registry::blocking_request),
-    );
-    let mut response = handle_decoded_json(handler, &request);
-    // A rejected long call must not retain the reserved ordinary slot through
-    // keep-alive. Batch/notification classification uses the same registry.
-    response.close = close;
-    response
+    // The close decision is owned by `handle_decoded_json`, which sees the
+    // decoded envelope. Undecodable bodies name no method, so they never
+    // close; every decodable shape carries the flag computed below.
+    handle_decoded_json(handler, &request)
 }
 
 fn handle_decoded_json(handler: &Handler, request: &Value) -> JsonResponse {
+    // Single owner of the close decision: a rejected long call must not
+    // retain the reserved ordinary slot through keep-alive.
+    // Batch/notification classification uses the same registry, and every
+    // return below carries this flag, so no caller overwrites it and a
+    // future `true` cannot be silently discarded.
+    let close = request.as_array().map_or_else(
+        || crate::registry::blocking_request(request),
+        |requests| requests.iter().any(crate::registry::blocking_request),
+    );
     if let Some(requests) = request.as_array() {
         if requests.is_empty() {
             // Core: an empty batch still answers HTTP 200 with an empty
             // result array (`httprpc.cpp` runs the batch reply path, which
             // produces `[]` for no members).
             return JsonResponse {
-                close: false,
+                close,
                 status: 200,
                 reason: reason_for_status(200),
                 body: Some(json!([])),
@@ -1055,13 +1064,17 @@ fn handle_decoded_json(handler: &Handler, request: &Value) -> JsonResponse {
             }
         }
         if responses.is_empty() {
-            return no_content_response();
+            return if close {
+                closing_no_content_response()
+            } else {
+                no_content_response()
+            };
         }
         // Core: "Batches never throw HTTP errors, they are always just
         // included in HTTP OK responses" (`httprpc.cpp:200-201`). A
         // per-member envelope or dispatch error stays inside the 200 batch.
         return JsonResponse {
-            close: false,
+            close,
             status: 200,
             reason: reason_for_status(200),
             body: Some(json!(responses)),
@@ -1083,12 +1096,18 @@ fn handle_decoded_json(handler: &Handler, request: &Value) -> JsonResponse {
     let status = response.http_status();
     match response {
         CallResponse::Reply { body, .. } => JsonResponse {
-            close: false,
+            close,
             status,
             reason: reason_for_status(status),
             body: Some(body),
         },
-        CallResponse::Notification => no_content_response(),
+        CallResponse::Notification => {
+            if close {
+                closing_no_content_response()
+            } else {
+                no_content_response()
+            }
+        }
     }
 }
 
@@ -1171,6 +1190,9 @@ fn legacy_error_response(error: &RpcError, id: &Value) -> JsonResponse {
     let version = JsonRpcVersion::Legacy;
     let status = version.error_status_for(error);
     JsonResponse {
+        // Undecodable bodies and top-level scalars name no method, so they
+        // never close; the flag stays here only because there is no decoded
+        // envelope for `handle_decoded_json` to classify.
         close: false,
         status,
         reason: reason_for_status(status),
@@ -1188,9 +1210,21 @@ const fn reason_for_status(status: u16) -> &'static str {
     }
 }
 
+/// A 204 drain that keeps the connection: the drained batch (or
+/// notification) named no blocking method.
 const fn no_content_response() -> JsonResponse {
+    no_content_response_inner(false)
+}
+
+/// A 204 drain that also closes: the drained batch (or notification) named
+/// a blocking method, so the reserved slot must not survive keep-alive.
+const fn closing_no_content_response() -> JsonResponse {
+    no_content_response_inner(true)
+}
+
+const fn no_content_response_inner(close: bool) -> JsonResponse {
     JsonResponse {
-        close: false,
+        close,
         status: 204,
         reason: "No Content",
         body: None,

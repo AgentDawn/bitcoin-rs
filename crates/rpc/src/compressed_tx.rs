@@ -728,7 +728,11 @@ fn ecdsa_compressed(sig_item: &[u8]) -> Option<CompressedSig> {
 fn compressed_signature(input: &TxIn, kind: &PrevoutKind) -> Option<CompressedSig> {
     match kind {
         PrevoutKind::P2tr => {
-            if input.witness.len() != 1 {
+            // Decompression rebuilds an empty scriptSig (see the P2tr fill
+            // in `decompress_finalize`), so only inputs that already carry
+            // the exact key-path shape compress; anything else, including a
+            // non-empty scriptSig, falls back to the uncompressed envelope.
+            if !input.script_sig.is_empty() || input.witness.len() != 1 {
                 return None;
             }
             let item = input.witness.first()?;

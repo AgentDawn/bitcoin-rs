@@ -753,6 +753,49 @@ fn roundtrip_taproot_script_path_uses_uncompressed_envelope() {
 }
 
 #[test]
+fn taproot_nonempty_scriptsig_falls_back_to_uncompressed_envelope() {
+    // Decompression rebuilds an empty scriptSig for P2TR, so a key-path
+    // witness paired with a non-empty scriptSig must not take the
+    // compressed path: it has no round trip. It falls back to the
+    // uncompressed envelope and survives the round trip byte-for-byte.
+    let mut script = vec![0x51, 0x20];
+    script.extend_from_slice(&[9_u8; 32]);
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: Script::from_bytes(script),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let kind = super::prevout_kind(prevout.script_pubkey.as_bytes());
+    // Positive control: the exact key-path shape still compresses.
+    let canonical = spend_of(
+        &prev_tx,
+        Script::new(),
+        Witness::from_stack(vec![vec![7_u8; 64]]),
+    );
+    assert!(
+        super::compressed_signature(&canonical.inputs[0], &kind).is_some(),
+        "empty-scriptSig key-path witness must take the compressed path"
+    );
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 0);
+    roundtrip(&canonical, &mut resolver, true);
+
+    // The same witness with a non-empty scriptSig falls back instead.
+    let tx = spend_of(
+        &prev_tx,
+        Script::from_bytes(vec![0x51]),
+        Witness::from_stack(vec![vec![7_u8; 64]]),
+    );
+    assert!(
+        super::compressed_signature(&tx.inputs[0], &kind).is_none(),
+        "P2TR input with a non-empty scriptSig must fall back to the uncompressed envelope"
+    );
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 0);
+    roundtrip(&tx, &mut resolver, true);
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one table of output shapes exercised in a single round trip"

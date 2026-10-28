@@ -912,12 +912,20 @@ struct FlatRow {
     output_count: u32,
 }
 
-/// One retained block body plus its flat-output prefix rows.
+/// One retained block body: its flat-output prefix rows plus the
+/// transactions materialized while building them.
+///
+/// The raw bytes are parsed once in [`RpcPrevoutResolver::ensure_body`]
+/// and then dropped; only the materialized transactions are retained.
+/// They share the body's lifetime and are dropped with it on eviction,
+/// so per-input lookups never reparse and retention costs one body-sized
+/// copy, not two.
 struct RetainedBody {
     height: u32,
-    bytes: Vec<u8>,
     rows: Vec<FlatRow>,
+    txs: Vec<Tx>,
     index_bytes: usize,
+    tx_bytes: usize,
 }
 
 /// Production [`PrevoutResolver`] for the BIP337 codec.
@@ -927,11 +935,14 @@ struct RetainedBody {
 /// captured `applied_view()`, UTXO entries, txindex heights, and bodies
 /// all come from one transition-excluded chainstate read; a tip that
 /// moves mid-call cancels the call instead of mixing branches. It holds one
-/// block-render permit for the whole call, retains body bytes plus
-/// cumulative-output prefix rows per height, and parses each retained
-/// body in a scope that drops the parsed block before the next body is
-/// read. Missing, corrupt, and unreadable bodies stay distinct
-/// ([`LookupError`]) because the codec degrades them differently.
+/// block-render permit for the whole call, retains materialized
+/// transactions plus cumulative-output prefix rows per height, and parses
+/// each retained body once in a scope that drops the parsed block before
+/// the next body is read. Retained materialized transactions are charged
+/// against the body and combined budgets and evicted with their body, so
+/// the cache lifetime stays bounded. Missing, corrupt, and unreadable
+/// bodies stay distinct ([`LookupError`]) because the codec degrades them
+/// differently.
 pub(crate) struct RpcPrevoutResolver<'ctx> {
     ctx: &'ctx Context,
     view: AppliedView,
@@ -939,7 +950,7 @@ pub(crate) struct RpcPrevoutResolver<'ctx> {
     _permit: BlockRenderPermit,
     cancellation: LatchReader,
     bodies: Vec<RetainedBody>,
-    retained_body_bytes: usize,
+    retained_tx_bytes: usize,
     retained_index_bytes: usize,
     memo: HashMap<OutPoint, Option<ResolvedPrevout>>,
     state_bytes: usize,
@@ -961,7 +972,7 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
             _permit: permit,
             cancellation,
             bodies: Vec::new(),
-            retained_body_bytes: 0,
+            retained_tx_bytes: 0,
             retained_index_bytes: 0,
             memo: HashMap::new(),
             state_bytes: 0,
@@ -1021,10 +1032,15 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
                 crate::compressed_tx::Limit::IndexBytes,
             ));
         }
-        let rows = {
+        // The materialized transactions hold the same consensus bytes as
+        // the body minus framing, so the body length is a sound estimate
+        // of their retained size.
+        let tx_bytes = bytes.len();
+        let (rows, txs) = {
             let parsed =
                 ParsedBlock::parse_exact(&bytes).map_err(|_| LookupError::CorruptBody(height))?;
             let mut rows = Vec::with_capacity(parsed.transactions().len());
+            let mut txs = Vec::with_capacity(parsed.transactions().len());
             let mut flat = 0_u32;
             for parsed_tx in parsed.transactions() {
                 let tx = parsed_tx.materialize();
@@ -1038,13 +1054,14 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
                 flat = flat
                     .checked_add(output_count)
                     .ok_or(LookupError::CorruptBody(height))?;
+                txs.push(tx);
             }
-            rows
+            (rows, txs)
         };
         while self.bodies.len() >= MAX_RETAINED_BODIES
-            || self.retained_body_bytes + bytes.len() > MAX_RETAINED_BODY_BYTES
+            || self.retained_tx_bytes + tx_bytes > MAX_RETAINED_BODY_BYTES
             || self.retained_index_bytes + index_bytes > MAX_RETAINED_INDEX_BYTES
-            || self.retained_body_bytes + self.retained_index_bytes + bytes.len() + index_bytes
+            || self.retained_tx_bytes + self.retained_index_bytes + tx_bytes + index_bytes
                 > MAX_RETAINED_BYTES_TOTAL
         {
             let Some(evicted) = (!self.bodies.is_empty()).then(|| self.bodies.remove(0)) else {
@@ -1052,33 +1069,32 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
                     crate::compressed_tx::Limit::Bodies,
                 ));
             };
-            self.retained_body_bytes -= evicted.bytes.len();
+            self.retained_tx_bytes -= evicted.tx_bytes;
             self.retained_index_bytes -= evicted.index_bytes;
         }
-        self.retained_body_bytes += bytes.len();
+        self.retained_tx_bytes += tx_bytes;
         self.retained_index_bytes += index_bytes;
         self.bodies.push(RetainedBody {
             height,
-            bytes,
             rows,
+            txs,
             index_bytes,
+            tx_bytes,
         });
         Ok(())
     }
 
-    /// Materializes the transaction `txid` inside the retained body at
-    /// `height`; the parsed block is dropped before this returns.
+    /// Returns a clone of the transaction `txid` cached with the retained
+    /// body at `height`; the body is parsed once at retain time, so this
+    /// lookup scans cached transactions without reparsing.
     fn body_tx(&mut self, height: u32, txid: &Txid) -> Result<Option<Tx>, LookupError> {
         self.ensure_body(height)?;
         let Some(body) = self.bodies.iter().find(|body| body.height == height) else {
             return Err(LookupError::BodyMissing(height));
         };
-        let parsed =
-            ParsedBlock::parse_exact(&body.bytes).map_err(|_| LookupError::CorruptBody(height))?;
-        for parsed_tx in parsed.transactions() {
-            let tx = parsed_tx.materialize();
-            if tx.txid() == *txid {
-                return Ok(Some(tx));
+        for (row, tx) in body.rows.iter().zip(body.txs.iter()) {
+            if row.txid == *txid {
+                return Ok(Some(tx.clone()));
             }
         }
         Ok(None)
