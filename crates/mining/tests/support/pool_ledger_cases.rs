@@ -3075,6 +3075,82 @@ fn the_audit_chain_is_deterministic_and_detects_tampering() {
 }
 
 #[test]
+fn bounded_reconcile_units_are_bounded_and_generation_guarded() {
+    // Rounds: one open round fits in limit 1 but not limit 0, proving the work
+    // is bounded per commit.
+    let fund = staged(0, 1_000_001);
+    let second = found(share(1, 4, 1, 20), 101, 1_000_001);
+    fund.ledger.record_found_block(&second).fixture("second block");
+    fund.chain.set_block(101, second.share.header_hash);
+    fund.chain
+        .set_coinbase(second.share.header_hash, coinbase_for(&second, 1_000_001));
+    let (empty, more_empty) = fund
+        .ledger
+        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 0, 0)
+        .fixture("rounds limit 0");
+    assert!(empty.transitions.is_empty() && empty.anomalies.is_empty());
+    assert!(more_empty, "limit 0 must report more open rounds");
+    let (_, more_first) = fund
+        .ledger
+        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 1, 0)
+        .fixture("rounds first page");
+    assert!(more_first, "two open rounds need a second page");
+    let (_, more_second) = fund
+        .ledger
+        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 1, 1)
+        .fixture("rounds second page");
+    assert!(!more_second, "offset reaches the tail");
+
+    // Rounds: a generation change aborts instead of applying a torn view.
+    fund.chain.set_tip(100);
+    let (aborted, _) = fund
+        .ledger
+        .reconcile_rounds_checked_limit(&fund.chain, &|| true, 10, 0)
+        .fixture("rounds aborted");
+    assert!(aborted.transitions.is_empty() && aborted.anomalies.is_empty());
+    let pending = fund
+        .ledger
+        .round_for_block(&fund.block.share.header_hash)
+        .fixture("round")
+        .fixture("exists");
+    assert_eq!(pending.state, RoundState::Pending);
+
+    // Payouts: one observable batch fits in limit 1 but not limit 0.
+    let fund = funded(0, 1_000_001);
+    let batch = prepared(&fund);
+    let tx = pay_tx(&batch, &[outpoint(0xA1, 0)], Some(50_000));
+    fund.ledger
+        .record_signed(&receipt(&batch, &tx))
+        .fixture("signed");
+    let (none, more_none) = fund
+        .ledger
+        .reconcile_payouts_checked_limit(&fund.chain, &|| false, 0, 0)
+        .fixture("payouts limit 0");
+    assert!(none.is_empty());
+    assert!(more_none, "limit 0 must report more observable batches");
+    let (_, more_one) = fund
+        .ledger
+        .reconcile_payouts_checked_limit(&fund.chain, &|| false, 1, 0)
+        .fixture("payouts limit 1");
+    assert!(!more_one, "single observable batch fits in limit 1");
+
+    // Payouts: a generation change aborts a confirming commit.
+    fund.chain.set_tx(tx.txid, TxStatus::InMempool);
+    fund.ledger
+        .record_broadcast(&batch.id, &tx.txid, &fund.chain)
+        .fixture("broadcast");
+    confirm_tx(&fund, tx.txid, 0xB1, 102, 102);
+    fund.chain.set_tip(103);
+    let (held, _) = fund
+        .ledger
+        .reconcile_payouts_checked_limit(&fund.chain, &|| true, 10, 0)
+        .fixture("payouts aborted");
+    assert!(held.is_empty());
+    let still = fund.ledger.batch(&batch.id).fixture("batch").fixture("exists");
+    assert_eq!(still.state, BatchState::Broadcast);
+}
+
+#[test]
 fn payout_lifecycle_events_are_audited_in_order() {
     let fund = funded(0, 1_000_001);
     let batch = prepared(&fund);

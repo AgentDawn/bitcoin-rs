@@ -31,6 +31,14 @@ use super::{
 
 /// Most signed transactions (RBF replacements) recorded for one batch.
 pub const MAX_SIGNED_TXS_PER_BATCH: usize = 32;
+/// Maximum rounds observed per bounded reconcile commit. Each round can fetch
+/// a block body and decode it, so an unbounded scan would stall chain
+/// transitions that need the same stores.
+pub const RECONCILE_ROUND_BATCH_LIMIT: usize = 32;
+/// Maximum payout batches observed per bounded reconcile commit. Each batch
+/// scans signed transactions and script indexes, so the work per commit stays
+/// bounded while the generation check keeps every financial commit coherent.
+pub const RECONCILE_PAYOUT_BATCH_LIMIT: usize = 16;
 const MAX_INPUTS_PER_TX: usize = 100_000;
 const SCHEMA_VERSION: u64 = 1;
 const AUDIT_DOMAIN: &[u8] = b"btcrs.pool.audit.v1";
@@ -820,6 +828,96 @@ impl Ledger {
         Ok(report)
     }
 
+    /// Bounded variant of [`Self::reconcile_rounds_checked`]: observes at most
+    /// `limit` open rounds per commit, returning whether more remain. Each
+    /// commit still evaluates `abort` inside its write transaction, so a
+    /// generation change aborts the financial commit instead of applying a
+    /// torn view.
+    pub fn reconcile_rounds_checked_limit(
+        &self,
+        chain: &dyn ChainView,
+        abort: &dyn Fn() -> bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(RoundReconcileReport, bool), LedgerError> {
+        let (open, more) = {
+            let read = self.db.begin_read()?;
+            let open_tbl = read.open_table(OPEN_ROUNDS)?;
+            let rounds_tbl = read.open_table(ROUNDS)?;
+            let mut list = Vec::new();
+            let mut more = false;
+            let mut skipped = 0usize;
+            for item in open_tbl.rows_iter()? {
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                if list.len() >= limit {
+                    more = true;
+                    break;
+                }
+                let (key, _) = item?;
+                if let Some(round) = load_round(&rounds_tbl, key.value())? {
+                    list.push(round);
+                }
+            }
+            (list, more)
+        };
+        if open.is_empty() {
+            return Ok((RoundReconcileReport::default(), more));
+        }
+        let mut report = RoundReconcileReport::default();
+        let tip = chain.tip_height()?;
+        let mut observations = Vec::with_capacity(open.len());
+        for round in open {
+            let canon = match chain.block_location(&round.block_hash, round.height)? {
+                super::BlockLocation::Canonical { height } if height == round.height => {
+                    Canon::Canonical
+                }
+                super::BlockLocation::Canonical { .. } | super::BlockLocation::Side => {
+                    Canon::Displaced
+                }
+                super::BlockLocation::Unknown => Canon::Unknown,
+            };
+            let coinbase = if canon == Canon::Canonical && !round.reward_fixed {
+                chain.coinbase_of(&round.block_hash)?
+            } else {
+                None
+            };
+            observations.push(RoundObservation {
+                id: round.id,
+                block_hash: round.block_hash,
+                canon,
+                coinbase,
+            });
+        }
+        let txn = self.db.begin_write()?;
+        if abort() {
+            return Ok((RoundReconcileReport::default(), more));
+        }
+        let mut dirty = false;
+        {
+            let tables = Tables::open(&txn)?;
+            for observation in &observations {
+                let outcome = apply_round_observation(&tables, &self.config, observation, tip)?;
+                dirty |= outcome.dirty;
+                if let Some(transition) = outcome.transition {
+                    report.transitions.push(transition);
+                }
+                if let Some(reason) = outcome.anomaly {
+                    report.anomalies.push(RoundAnomaly {
+                        round: observation.id,
+                        reason,
+                    });
+                }
+            }
+        }
+        if dirty {
+            self.commit(txn, OP_RECONCILE_ROUNDS)?;
+        }
+        Ok((report, more))
+    }
+
     fn open_round_list(&self) -> Result<Vec<Round>, LedgerError> {
         let read = self.db.begin_read()?;
         let open = read.open_table(OPEN_ROUNDS)?;
@@ -1423,6 +1521,103 @@ impl Ledger {
             self.commit(txn, OP_RECONCILE_PAYOUTS)?;
         }
         Ok(transitions)
+    }
+
+    /// Bounded variant of [`Self::reconcile_payouts_checked`]: observes at most
+    /// `limit` observable batches per commit, returning whether more remain.
+    /// Each commit still evaluates `abort` inside its write transaction, so a
+    /// generation change aborts the financial commit instead of failing a
+    /// payout on a torn view.
+    pub fn reconcile_payouts_checked_limit(
+        &self,
+        chain: &dyn ChainView,
+        abort: &dyn Fn() -> bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<BatchTransition>, bool), LedgerError> {
+        let (observable, more) = {
+            let read = self.db.begin_read()?;
+            let active_tbl = read.open_table(ACTIVE_BATCHES)?;
+            let batches_tbl = read.open_table(BATCHES)?;
+            let mut list = Vec::new();
+            let mut more = false;
+            let mut skipped = 0usize;
+            for item in active_tbl.rows_iter()? {
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                if list.len() >= limit {
+                    more = true;
+                    break;
+                }
+                let (_, value) = item?;
+                let id = hash_from(value.value())?;
+                let Some(batch) = load_batch(&batches_tbl, &id)? else {
+                    continue;
+                };
+                if !batch.state_is_observable() {
+                    continue;
+                }
+                list.push(batch);
+            }
+            (list, more)
+        };
+        if observable.is_empty() {
+            return Ok((Vec::new(), more));
+        }
+        let mut observations = Vec::with_capacity(observable.len());
+        let mut tip: Option<u32> = None;
+        for batch in &observable {
+            let tip_height = if let Some(height) = tip {
+                height
+            } else {
+                let height = chain.tip_height()?;
+                tip = Some(height);
+                height
+            };
+            observations.push(observe_batch(chain, &self.config, batch, tip_height)?);
+        }
+        let mut transitions = Vec::new();
+        if observations.is_empty() {
+            return Ok((transitions, more));
+        }
+        let tip = tip.unwrap_or(0);
+        let txn = self.db.begin_write()?;
+        if abort() {
+            return Ok((Vec::new(), more));
+        }
+        let mut dirty = false;
+        {
+            let tables = Tables::open(&txn)?;
+            for observation in &observations {
+                let Some(mut batch) = load_batch(&tables.batches, &observation.id)? else {
+                    continue;
+                };
+                if batch.rev != observation.rev {
+                    continue;
+                }
+                dirty |= apply_batch_decision(
+                    &tables,
+                    &mut batch,
+                    observation,
+                    &self.config,
+                    &mut transitions,
+                )?;
+                if batch.state == BatchState::Confirmed
+                    && let Some(confirmation) = batch.confirmation
+                    && u64::from(tip)
+                        >= u64::from(confirmation.height) + u64::from(self.config.reorg_watch_depth)
+                {
+                    tables.active_batches.remove(batch.seq)?;
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            self.commit(txn, OP_RECONCILE_PAYOUTS)?;
+        }
+        Ok((transitions, more))
     }
 
     // -----------------------------------------------------------------------------------------

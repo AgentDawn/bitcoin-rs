@@ -546,45 +546,65 @@ impl LedgerHost {
                 Err(error) => break Some(error),
             }
         };
-        // One stable snapshot across observe and commit: holding `StableRead`
-        // excludes authoritative transitions while `RawChainView` (lock-free,
-        // never re-locks `StableRead`) observes and while the ledger write
-        // transactions commit, so a reorg cannot slip between validation and
-        // commit to permanently fail a payout. The checked reconciles still
-        // validate the generation inside their write transactions as
-        // defense-in-depth for callers without the guard. Snapshot isolation:
-        // a commit only applies observations taken under one generation.
-        // Linearizability of the ledger itself comes from its write
-        // serialization; callers stay idempotent, so a deferred reconcile is
-        // retried.
-        let _stable = chain.stable.lock();
+        // Bounded reconciliation units without a chain-transition fence: each
+        // financial commit observes at most `RECONCILE_*_BATCH_LIMIT` items
+        // lock-free via `RawChainView` (never re-locks `StableRead`) and
+        // validates the generation inside its write transaction, so a reorg
+        // cannot slip between validation and commit to permanently fail a
+        // payout. No `StableRead` is held across observations, signed-transaction
+        // scans, body decodes, or durable writes, so a growing payout or round
+        // history cannot stall block application. Batches loop with an offset
+        // until no more remains, so the tail converges instead of starving
+        // behind the head; a moving tip retries once and otherwise converges
+        // on the next tick. Snapshot
+        // isolation holds per commit: a commit only applies observations taken
+        // under one generation. Callers stay idempotent, so a deferred
+        // reconcile is retried.
+        let mut round_offset = 0usize;
+        let mut payout_offset = 0usize;
         let mut attempts = 0;
         let reconcile_result = loop {
             let before = chain.tip_generation();
             let observation = RawChainView(chain);
             let aborted = || !tip_unchanged(&before, &chain.tip_generation());
-            let result: Result<(), pool_ledger::LedgerError> = (|| {
-                self.ledger
-                    .reconcile_rounds_checked(&observation, &aborted)?;
-                self.ledger
-                    .reconcile_payouts_checked(&observation, &aborted)?;
-                Ok(())
+            let result: Result<(bool, bool), pool_ledger::LedgerError> = (|| {
+                let (_, round_more) =
+                    self.ledger.reconcile_rounds_checked_limit(
+                        &observation,
+                        &aborted,
+                        pool_ledger::RECONCILE_ROUND_BATCH_LIMIT,
+                        round_offset,
+                    )?;
+                let (_, payout_more) =
+                    self.ledger.reconcile_payouts_checked_limit(
+                        &observation,
+                        &aborted,
+                        pool_ledger::RECONCILE_PAYOUT_BATCH_LIMIT,
+                        payout_offset,
+                    )?;
+                Ok((round_more, payout_more))
             })();
             let after = chain.tip_generation();
             match result {
-                Ok(()) if tip_unchanged(&before, &after) => break Ok(()),
-                Ok(()) => {
+                Ok((false, false)) if tip_unchanged(&before, &after) => break Ok(()),
+                Ok((round_more, payout_more)) if tip_unchanged(&before, &after) => {
+                    if round_more {
+                        round_offset += pool_ledger::RECONCILE_ROUND_BATCH_LIMIT;
+                    }
+                    if payout_more {
+                        payout_offset += pool_ledger::RECONCILE_PAYOUT_BATCH_LIMIT;
+                    }
+                    if !round_more && !payout_more {
+                        break Ok(());
+                    }
+                }
+                Ok(_) => {
                     attempts += 1;
                     if attempts >= 2 {
-                        // A continuously moving tip still made progress: the
-                        // last pass committed idempotent transitions and the
-                        // next scheduled reconcile converges.
                         break Ok(());
                     }
                 }
                 Err(error) => {
-                    // A chain-observation error may be a torn view from a
-                    // concurrent transition; retry once against the new tip.
                     attempts += 1;
                     if attempts >= 2 || tip_unchanged(&before, &after) {
                         break Err(error);
