@@ -42,24 +42,21 @@ fn asmap_placement_matches_224_actual_core_vectors() {
         let groups = &classifiers[row["map"].as_str().expect("map")];
         let secret =
             <[u8; 32]>::from_hex(row["secret_raw_hex"].as_str().expect("secret")).expect("key");
-        let addr = canonical(
-            SocketAddr::new(
-                row["address"]
-                    .as_str()
-                    .expect("address")
-                    .parse()
-                    .expect("IP"),
-                u16::try_from(row["port"].as_u64().expect("port")).expect("port"),
-            )
-            .into(),
-        );
+        let addr = canonical(PeerEndpoint::new(
+            row["address"]
+                .as_str()
+                .expect("address")
+                .parse::<IpAddr>()
+                .expect("IP"),
+            u16::try_from(row["port"].as_u64().expect("port")).expect("port"),
+        ));
         let origin = row["source"].as_str().expect("source");
         let source = origin.strip_prefix("internal:").map_or_else(
             || Source::Ip(origin.parse().expect("source IP")),
             Source::dns,
         );
         assert_eq!(
-            groups.group(ip(addr)).to_lower_hex_string(),
+            groups.group(addr.address()).to_lower_hex_string(),
             row["address_group_hex"].as_str().expect("group"),
             "{row}"
         );
@@ -107,14 +104,14 @@ fn incoming_source_asn_controls_corroboration_without_rewriting_primary_source()
         <[u8; 32]>::from_hex("41f758f2e5cc078d3795b4fc0cb60c2d735fa92cc020572bdc982dd2d564d11b")
             .expect("Core secret");
     manager.rng = StdRng::seed_from_u64(17);
-    let addr = crate::parse_endpoint("4.4.4.4:8333").expect("peer");
-    let primary = Source::Ip("8.8.0.1".parse().expect("source"));
+    let addr = "4.4.4.4:8333".parse::<PeerEndpoint>().expect("peer");
+    let primary = Source::Ip("8.8.0.1".parse::<std::net::IpAddr>().expect("source"));
     add_ref(&mut manager, addr, &primary, EPOCH - 1);
     for _ in 0..512 {
         assert!(!manager.learn(
             addr,
             Some(9),
-            Source::Ip("9.9.0.1".parse().expect("same ASN")),
+            Source::Ip("9.9.0.1".parse::<std::net::IpAddr>().expect("same ASN")),
             EPOCH,
             EPOCH,
             0
@@ -123,7 +120,11 @@ fn incoming_source_asn_controls_corroboration_without_rewriting_primary_source()
     add_ref(
         &mut manager,
         addr,
-        &Source::Ip("8.8.1.1".parse().expect("different ASN")),
+        &Source::Ip(
+            "8.8.1.1"
+                .parse::<std::net::IpAddr>()
+                .expect("different ASN"),
+        ),
         EPOCH,
     );
     let entry = &manager.stored.records[manager.by_addr[&addr]];
@@ -228,7 +229,10 @@ fn asmap_change_rebuckets_without_backup_and_restart_keeps_refs() {
     assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
     assert_indexes(&again.state.lock());
     let prefix = AddressBook::open(Some(base), [1; 4], false, None);
-    assert!(prefix.state.lock().writable);
+    assert!(
+        prefix.state.lock().writable,
+        "intentional map omission permits current-format rebucketing"
+    );
     assert_eq!(prefix.state.lock().stored.asmap_id, None);
     assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
     assert_indexes(&prefix.state.lock());

@@ -5,6 +5,7 @@ use anyhow::Result;
 use bitcoin_rs_chainstate::{ChainstateJournalConfig, ValidationMode};
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_index::IndexCapabilities;
+use bitcoin_rs_p2p::PeerNetwork;
 use bitcoin_rs_p2p::endpoint::{ClassifiedEndpoint, classify_endpoint};
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_storage::StorageBackend;
@@ -136,6 +137,8 @@ pub struct StorageConfig {
 /// Resolved P2P configuration.
 #[derive(Clone, Debug)]
 pub struct P2pConfig {
+    /// Opt-in Tor and IVNP I2P routing.
+    pub overlay: bitcoin_rs_p2p::overlay::OverlayConfig,
     /// P2P message-start bytes.
     pub magic: [u8; 4],
     /// P2P listener bind addresses.
@@ -154,9 +157,6 @@ pub struct P2pConfig {
     /// `NODE_P2P_V2` is advertised. On by default, as Core's `-v2transport` is;
     /// off keeps every connection on v1.
     pub v2_transport: bool,
-    /// Overlay transport configuration (Tor/I2P). Defaults disable every
-    /// overlay and preserve direct IP behavior.
-    pub overlay: bitcoin_rs_p2p::OverlayConfig,
 }
 
 /// Resolved RPC configuration.
@@ -253,40 +253,6 @@ impl NodeConfig {
         Self::materialize(&UserConfig::default(), NetworkSelection::from(network))
     }
 
-    /// Resolves the overlay transport configuration with one owner for the
-    /// Bitcoin service port.
-    ///
-    /// Core advertises a single P2P service port on every transport: the same
-    /// port answers on clearnet, on the onion hidden service's virtual port,
-    /// and on the I2P destination (local endpoint and inbound `TO_PORT`
-    /// fallback). `OverlayConfig::tor_virtual_port` carries that shared port
-    /// (named for its first consumer; the field lives in the endpoint lane
-    /// and is not renamed here). This function is the only place that sets
-    /// it, from the winning network's default P2P port, so Tor and I2P can
-    /// never diverge onto separate ports.
-    fn materialize_overlay(
-        settings: &UserConfig,
-        selection: NetworkSelection,
-        data_dir: &Path,
-    ) -> bitcoin_rs_p2p::OverlayConfig {
-        // Single owner for the shared Bitcoin service port advertised on all
-        // transports (clearnet `listen`, onion virtual port, I2P endpoint).
-        let service_port = selection.consensus_network().default_p2p_port();
-        bitcoin_rs_p2p::OverlayConfig {
-            proxy: settings.p2p.proxy,
-            onion: settings.p2p.onion,
-            proxy_randomize_credentials: settings.p2p.proxy_randomize_credentials.unwrap_or(true),
-            tor_control: settings.p2p.torcontrol.clone(),
-            tor_password: settings.p2p.torpassword.clone(),
-            tor_virtual_port: service_port,
-            onion_key_path: Some(data_dir.join("onion_v3_private_key")),
-            i2p_sam: settings.p2p.i2psam,
-            i2p_accept_incoming: settings.p2p.i2pacceptincoming.unwrap_or(false),
-            i2p_key_path: Some(data_dir.join("i2p_private_key")),
-            onlynet: settings.p2p.onlynet.clone().unwrap_or_default(),
-        }
-    }
-
     /// Materializes the resolved settings from one folded layer.
     ///
     /// PRE: `settings` is the overlay of every source layer and `selection`
@@ -310,7 +276,6 @@ impl NodeConfig {
             .data_dir
             .clone()
             .unwrap_or_else(|| PathBuf::from(".bitcoin-rs"));
-        let overlay = Self::materialize_overlay(settings, selection, &data_dir);
         Self {
             network: selection.consensus_network(),
             persist_mempool: settings.persist_mempool.unwrap_or(true),
@@ -323,6 +288,24 @@ impl NodeConfig {
                 prune_target_mb: settings.storage.prune_target_mb.unwrap_or(0),
             },
             p2p: P2pConfig {
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
+                    proxy: settings.p2p.proxy,
+                    onion_proxy: settings.p2p.onion_proxy,
+                    onlynet: settings.p2p.onlynet.clone().unwrap_or_default(),
+                    randomize_credentials: settings.p2p.proxy_randomize_credentials.unwrap_or(true),
+                    i2p_sam: settings.p2p.i2p_sam,
+                    i2p_accept: settings.p2p.i2p_accept.unwrap_or(false),
+                    tor_control: settings.p2p.tor_control,
+                    tor_cookie: settings.p2p.tor_cookie.clone(),
+                    identity_dir: PathBuf::from(format!(
+                        "overlay-{:08x}",
+                        u32::from_be_bytes(settings.p2p.magic.unwrap_or(profile.magic))
+                    )),
+                    port: settings
+                        .p2p
+                        .overlay_port
+                        .unwrap_or_else(|| selection.consensus_network().default_p2p_port()),
+                },
                 magic: settings.p2p.magic.unwrap_or(profile.magic),
                 listen: settings.p2p.listen.clone().unwrap_or(profile.listen),
                 dns_seeds_enabled: settings.p2p.dns_seeds.unwrap_or(profile.dns_seeds),
@@ -331,7 +314,6 @@ impl NodeConfig {
                 connect: settings.p2p.connect.clone().unwrap_or(profile.connect),
                 fast_sync: settings.p2p.fast_sync.unwrap_or(false),
                 v2_transport: settings.p2p.v2_transport.unwrap_or(true),
-                overlay,
             },
             rpc: RpcConfig {
                 bind: settings.rpc.bind.unwrap_or(profile.rpc_bind),
@@ -383,6 +365,10 @@ impl NodeConfig {
     /// This is the fail-early gate for engine selection: an engine this build
     /// cannot execute is rejected here — before the data directory opens,
     /// chainstate exists, or any worker starts.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep resolved cross-field checks in one ordered fail-early gate before startup"
+    )]
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.mempool_snapshot_max_bytes >= 1024 * 1024
@@ -527,7 +513,7 @@ impl NodeConfig {
     /// privacy; typed IP, Tor, and I2P endpoints stay supported.
     fn validate_overlay(&self) -> Result<()> {
         let overlay = &self.p2p.overlay;
-        let onion_route = overlay.onion.is_some() || overlay.proxy.is_some();
+        let onion_route = overlay.onion_proxy.is_some() || overlay.proxy.is_some();
         let privacy_route = onion_route || overlay.i2p_sam.is_some();
         anyhow::ensure!(
             !privacy_route || !self.p2p.dns_seeds_enabled,
@@ -536,20 +522,20 @@ impl NodeConfig {
         anyhow::ensure!(
             !overlay
                 .onlynet
-                .contains(&bitcoin_rs_primitives::NetworkLabel::Onion)
+                .contains(&PeerNetwork::Onion)
                 || onion_route,
-            "--onlynet=onion requires an onion route (--onion or --proxy)"
+            "--onlynet=onion requires an onion route (--onion-proxy or --proxy)"
         );
         anyhow::ensure!(
             !overlay
                 .onlynet
-                .contains(&bitcoin_rs_primitives::NetworkLabel::I2p)
+                .contains(&PeerNetwork::I2p)
                 || overlay.i2p_sam.is_some(),
-            "--onlynet=i2p requires an I2P SAM bridge (--i2psam)"
+            "--onlynet=i2p requires an I2P SAM bridge (--i2p-sam)"
         );
         anyhow::ensure!(
-            !overlay.i2p_accept_incoming || overlay.i2p_sam.is_some(),
-            "--i2pacceptincoming requires an I2P SAM bridge (--i2psam)"
+            !overlay.i2p_accept || overlay.i2p_sam.is_some(),
+            "--i2p-accept requires an I2P SAM bridge (--i2p-sam)"
         );
         for target in &self.p2p.connect {
             match classify_endpoint(target) {
@@ -561,13 +547,13 @@ impl NodeConfig {
                 }) => {
                     anyhow::ensure!(
                         onion_route,
-                        "--connect onion target requires an onion route (--onion or --proxy)"
+                        "--connect onion target requires an onion route (--onion-proxy or --proxy)"
                     );
                 }
                 ClassifiedEndpoint::Valid(bitcoin_rs_primitives::PeerEndpoint::I2p { .. }) => {
                     anyhow::ensure!(
                         overlay.i2p_sam.is_some(),
-                        "--connect I2P target requires an I2P SAM bridge (--i2psam)"
+                        "--connect I2P target requires an I2P SAM bridge (--i2p-sam)"
                     );
                 }
                 ClassifiedEndpoint::Valid(bitcoin_rs_primitives::PeerEndpoint::Ip(..)) => {}
@@ -922,13 +908,9 @@ mod shared_service_port_tests {
             NetworkSelection::Regtest,
             NetworkSelection::Drynet4,
         ] {
-            let overlay = NodeConfig::materialize_overlay(
-                &UserConfig::default(),
-                selection,
-                Path::new("test-data-dir"),
-            );
+            let config = NodeConfig::default_for_network(selection.consensus_network());
             assert_eq!(
-                overlay.tor_virtual_port,
+                config.p2p.overlay.port,
                 selection.consensus_network().default_p2p_port(),
                 "shared Bitcoin service port must follow {selection:?}",
             );

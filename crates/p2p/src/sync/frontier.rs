@@ -312,19 +312,19 @@ impl SyncFrontier {
     fn probe_pick(&self) -> Option<PeerSource> {
         let required = ServiceFlags::NETWORK.to_u64() | ServiceFlags::WITNESS.to_u64();
         let eligible = |peer: &&UsablePeer| peer.info.services & required == required;
-        let pending_addr = self.header_request.map(|request| request.source.endpoint);
+        let pending_addr = self.header_request.map(|request| request.source.addr);
         self.usable_peers
             .iter()
             .filter(|peer| {
-                eligible(peer) && pending_addr.is_none_or(|addr| peer.source.endpoint > addr)
+                eligible(peer) && pending_addr.is_none_or(|addr| peer.source.addr > addr)
             })
-            .min_by_key(|peer| peer.source.endpoint)
+            .min_by_key(|peer| peer.source.addr)
             .map(|peer| peer.source)
             .or_else(|| {
                 self.usable_peers
                     .iter()
                     .filter(|peer| eligible(peer))
-                    .min_by_key(|peer| peer.source.endpoint)
+                    .min_by_key(|peer| peer.source.addr)
                     .map(|peer| peer.source)
             })
     }

@@ -451,8 +451,8 @@ fn registered_inbound(
 ) -> (PeerSource, crate::test_support::MessageReceiver) {
     let (sender, receiver) = crate::test_support::message_channel_bounded(32);
     let lease = crate::PeerLease::new_inbound(sender);
-    let addr = ([127, 0, 0, 1], port).into();
-    table.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+    let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
+    table.register(addr, lease.clone());
     let version = crate::handshake::version_message(
         1,
         0,
@@ -460,18 +460,19 @@ fn registered_inbound(
         bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
     );
     table.publish_info(
-        crate::PeerEndpoint::Ip(addr),
+        addr,
         &lease,
         crate::PeerInfo::inbound_from_version(
             addr,
-            addr,
+            addr.socket_addr()
+                .unwrap_or_else(|| panic!("expected IP fixture")),
             &version,
             0,
             0,
             Arc::new(crate::PeerCounters::default()),
         ),
     );
-    (lease.source_ip(addr), receiver)
+    (lease.source(addr), receiver)
 }
 
 #[test]

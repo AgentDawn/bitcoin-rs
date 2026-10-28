@@ -145,7 +145,7 @@ impl BlockSync {
                                 .lock()
                                 .window
                                 .mark_peer_unresponsive(source, Instant::now());
-                            blamed_peer = Some(source.endpoint);
+                            blamed_peer = Some(source.addr);
                         }
                     }
                     if let Some(peer_addr) = blamed_peer {
@@ -462,7 +462,7 @@ impl BlockSync {
         for source in expired {
             self.peer_table.disconnect_source(source);
             self.clear_headers_sync_for(source);
-            tracing::debug!(peer_addr = ?source.endpoint, "block sync: header sync request timed out");
+            tracing::debug!(peer_addr = ?source.addr, "block sync: header sync request timed out");
         }
     }
 
@@ -611,7 +611,7 @@ impl BlockSync {
             .peer_table
             .sessions()
             .iter()
-            .find(|session| session.endpoint == source.endpoint)
+            .find(|session| session.addr == source.addr)
             .map_or(i32::MAX, |session| {
                 headers_target_height(session.headers_horizon, session.info.as_ref())
             });
@@ -633,8 +633,8 @@ impl BlockSync {
                         .as_ref()
                         .is_some_and(|info| info.services & required == required)
             })
-            .min_by_key(|session| session.endpoint)
-            .map(|session| session.lease.source(session.endpoint));
+            .min_by_key(|session| session.addr)
+            .map(|session| session.lease.source(session.addr));
         self.request_headers_from(source);
     }
 
@@ -707,7 +707,7 @@ impl BlockSync {
                             .is_some_and(|info| *height > info.best_known_height)
                     });
                     (needs_prune || credit.is_some())
-                        .then(|| (session.lease.source(session.endpoint), credit, keep))
+                        .then(|| (session.lease.source(session.addr), credit, keep))
                 })
                 .collect()
         };
@@ -799,7 +799,7 @@ impl BlockSync {
         let outcome = self.send_getheaders(source, our_height, target_height, locator);
         if outcome == GetheadersOutcome::Sent {
             tracing::debug!(
-                peer_addr = ?source.endpoint,
+                peer_addr = ?source.addr,
                 "block sync: sent idle-frontier capability probe"
             );
         }
@@ -857,7 +857,7 @@ impl BlockSync {
         );
         if outcome == GetheadersOutcome::Sent {
             tracing::debug!(
-                peer_addr = ?source.endpoint,
+                peer_addr = ?source.addr,
                 "block sync: sent chain-sync eviction probe"
             );
         }
@@ -916,7 +916,7 @@ impl BlockSync {
         let now = Instant::now();
         if self.has_pending_getheaders(source, locator_tip_hash, target_height, now) {
             tracing::trace!(
-                peer_addr = ?source.endpoint,
+                peer_addr = ?source.addr,
                 our_height,
                 target_height,
                 "block sync: getheaders already pending",
@@ -975,14 +975,14 @@ impl BlockSync {
                 // then-current locator. The peer stays connected and keeps
                 // its sync state.
                 tracing::debug!(
-                    peer_addr = ?source.endpoint,
+                    peer_addr = ?source.addr,
                     "block sync: getheaders deferred; node outbound budget is full"
                 );
                 return GetheadersOutcome::Failed;
             }
             Err(crate::OutboundRefusal::Closed(_)) => {
                 tracing::warn!(
-                    peer_addr = ?source.endpoint,
+                    peer_addr = ?source.addr,
                     "block sync: outbound channel disconnected"
                 );
                 // The send failure means this connection is gone: evict it so
@@ -997,7 +997,7 @@ impl BlockSync {
             }
         }
         tracing::debug!(
-            peer_addr = ?source.endpoint,
+            peer_addr = ?source.addr,
             our_height,
             target_height,
             protocol_version = PROTOCOL_VERSION,
@@ -1353,7 +1353,7 @@ impl BlockSync {
             .peer_table
             .sessions()
             .iter()
-            .find(|session| session.endpoint == source.endpoint)
+            .find(|session| session.addr == source.addr)
             .map_or(i32::MAX, |session| {
                 headers_target_height(session.headers_horizon, session.info.as_ref())
             });
@@ -1372,7 +1372,7 @@ impl BlockSync {
     fn settle_presync_fault(&self, source: PeerSource, error: HeaderSyncError) {
         if !error.is_peer_fault() {
             tracing::debug!(
-                peer_addr = ?source.endpoint,
+                peer_addr = ?source.addr,
                 %error,
                 "block sync: header presync gave up on a possibly reorged continuation",
             );
@@ -1387,7 +1387,7 @@ impl BlockSync {
                 .mark_peer_unresponsive(source, Instant::now());
         }
         tracing::warn!(
-            peer_addr = ?source.endpoint,
+            peer_addr = ?source.addr,
             %error,
             "block sync: peer failed header presync validation; disconnecting",
         );

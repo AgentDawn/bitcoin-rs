@@ -1,3 +1,4 @@
+use crate::PeerRemote;
 pub(crate) use crate::test_support::{OrFail, TestResult};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -558,7 +559,10 @@ fn tick_allows_demoted_peer_when_it_is_the_only_eligible_peer() -> TestResult {
         }
         .with_pending_timeout_override(Duration::ZERO),
     );
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
     sync.tick();
@@ -653,7 +657,10 @@ fn getdata_uses_compact_flavor_only_for_relaying_peers_near_tip() -> TestResult 
 
     let (sync, peers, _block_tree, _applied, _expected) = sync_with_header_chain(4)?;
     install_budget(&sync, super::default_sync_budget(Network::Regtest));
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_101);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        9_101,
+    ));
     let mut relaying = synthetic_peer(addr, 100);
     relaying.compact_block_relay = true;
     let rx = connect_peer(&peers, relaying);
@@ -662,7 +669,10 @@ fn getdata_uses_compact_flavor_only_for_relaying_peers_near_tip() -> TestResult 
 
     let (sync, peers, _block_tree, _applied, _expected) = sync_with_header_chain(4)?;
     install_budget(&sync, super::default_sync_budget(Network::Regtest));
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_102);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        9_102,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
     sync.tick();
     assert_flavor(&first_getdata(&rx), false);
@@ -677,7 +687,10 @@ fn getdata_uses_compact_flavor_only_for_relaying_peers_near_tip() -> TestResult 
             ..super::default_sync_budget(Network::Regtest)
         },
     );
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_103);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        9_103,
+    ));
     let mut relaying = synthetic_peer(addr, 100);
     relaying.compact_block_relay = true;
     let rx = connect_peer(&peers, relaying);
@@ -723,7 +736,10 @@ fn unsolicited_stale_block_retries_from_resolved_header_height() -> TestResult {
             ..super::default_sync_budget(Network::Regtest)
         },
     );
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
     sync.tick();
@@ -787,7 +803,10 @@ fn inv_delivered_block_admits_carried_header_and_applies() -> TestResult {
         inbound_headers_tx: _inbound_headers_tx,
     } = SyncHarness::new(tree);
     install_budget(&sync, super::default_sync_budget(Network::Regtest));
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 0));
 
     sync.tick();
@@ -815,7 +834,7 @@ fn inv_delivered_block_admits_carried_header_and_applies() -> TestResult {
     let best_known = peers
         .sessions()
         .iter()
-        .find(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(addr)))
+        .find(|session| session.addr == addr)
         .and_then(|session| session.info.as_ref())
         .map(|info| info.best_known_height)
         .ok_or_else(|| std::io::Error::other("missing peer info"))?;
@@ -856,7 +875,10 @@ fn out_of_order_delivered_blocks_admit_and_apply() -> TestResult {
         inbound_headers_tx: _inbound_headers_tx,
     } = SyncHarness::new(tree);
     install_budget(&sync, super::default_sync_budget(Network::Regtest));
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 0));
     let source = current_source(&peers, addr);
 
@@ -916,7 +938,10 @@ fn missing_parent_block_delivery_recovers_with_getheaders() -> TestResult {
         inbound_headers_tx,
     } = SyncHarness::new(tree);
     install_budget(&sync, super::default_sync_budget(Network::Regtest));
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 0));
     let source = current_source(&peers, addr);
 
@@ -1118,7 +1143,7 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
         assert_eq!(scheduler.window.pending_len(), 2);
         assert_eq!(
             scheduler.window.stalling_peer().map(|(addr, _)| addr),
-            Some(Some(crate::PeerEndpoint::Ip(staller))),
+            Some(staller),
             "the front-stripe owner must be the observed staller"
         );
     }
@@ -1127,7 +1152,7 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
     sync.tick();
 
     assert!(
-        !peers.is_connected(crate::PeerEndpoint::Ip(staller)),
+        !peers.is_connected(staller),
         "staller's outbound lease must be revoked"
     );
     assert!(
@@ -1179,7 +1204,10 @@ fn clean_fast_path_caps_request_at_peer_height() -> TestResult {
             ..super::default_sync_budget(Network::Regtest)
         },
     );
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 2));
 
     sync.tick();
@@ -1252,8 +1280,14 @@ fn staging_exhaustion_fixture() -> Result<ExhaustionFixture, Box<dyn std::error:
         }
         .with_pending_timeout_override(Duration::ZERO),
     );
-    let stalled_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-    let healthy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
+    let stalled_addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
+    let healthy_addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8334,
+    ));
     let stalled_rx = connect_peer(&peers, synthetic_peer(stalled_addr, 100));
 
     sync.tick();
@@ -1328,7 +1362,10 @@ fn deterministic_proxy_fixture() -> Result<DeterministicProxyFixture, Box<dyn st
         },
     );
 
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let outbound_rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
     Ok(DeterministicProxyFixture {
@@ -1872,7 +1909,7 @@ fn historical_delivery_retries_corruption_and_does_not_rewind_foreground() -> Te
             .historical
             .lock()
             .window
-            .peer_in_staller_cooldown(crate::PeerSource::for_test(addr), Instant::now())
+            .peer_in_staller_cooldown(source, Instant::now())
     );
     let retry_addr = test_addr(28001, 0)?;
     let retry_rx = connect_peer(&harness.peers, synthetic_peer(retry_addr, 3));
@@ -2377,10 +2414,10 @@ fn assert_applied_genesis(
     Ok(())
 }
 
-pub(crate) fn current_source(peer_table: &Arc<PeerTable>, addr: SocketAddr) -> PeerSource {
-    peer_table.lease(crate::PeerEndpoint::Ip(addr)).map_or_else(
+pub(crate) fn current_source(peer_table: &Arc<PeerTable>, addr: PeerRemote) -> PeerSource {
+    peer_table.lease(addr).map_or_else(
         || panic!("test peer {addr} must be connected"),
-        |lease| lease.source_ip(addr),
+        |lease| lease.source(addr),
     )
 }
 
@@ -2392,18 +2429,14 @@ fn test_frontier(sync: &BlockSync) -> super::ChainFrontier {
 fn register_info(peer_table: &Arc<PeerTable>, info: PeerInfo) {
     let (tx, _rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    let Some(endpoint) = info.endpoint else {
-        panic!("identified peer endpoint");
-    };
-    peer_table.register(endpoint, lease.clone());
-    peer_table.publish_info(endpoint, &lease, info);
+    peer_table.register(info.addr, lease.clone());
+    peer_table.publish_info(info.addr, &lease, info);
 }
 /// The canonical sync-test peer: outbound, and advertising `NODE_NETWORK` plus
 /// `NODE_WITNESS`, so it may serve block bodies at any height.
-pub(crate) fn synthetic_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
+pub(crate) fn synthetic_peer(addr: PeerRemote, start_height: i32) -> PeerInfo {
     PeerInfo {
-        endpoint: Some(crate::PeerEndpoint::Ip(addr)),
-        network: crate::PeerEndpoint::Ip(addr).net(),
+        addr,
         version: 70_016,
         wtxid_relay: false,
         relay_transactions: true,
@@ -2416,7 +2449,10 @@ pub(crate) fn synthetic_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
         best_known_height: start_height,
         conn_time: 0,
         inbound: false,
-        addr_bind: crate::TransportRemote::new(addr),
+        addr_bind: addr
+            .endpoint()
+            .and_then(crate::PeerEndpoint::socket_addr)
+            .unwrap_or_else(|| panic!("expected IP fixture")),
         time_offset: 0,
         counters: std::sync::Arc::new(crate::PeerCounters::default()),
         transport: crate::TransportProtocol::V1,
@@ -2425,7 +2461,7 @@ pub(crate) fn synthetic_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
 
 /// A peer that may not serve block bodies at all: inbound (attacker-chosen)
 /// and advertising no services.
-pub(crate) fn ineligible_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
+pub(crate) fn ineligible_peer(addr: PeerRemote, start_height: i32) -> PeerInfo {
     PeerInfo {
         services: 0,
         inbound: true,
@@ -2436,11 +2472,11 @@ pub(crate) fn ineligible_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
 pub(crate) fn test_addr(
     base_port: usize,
     idx: usize,
-) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    Ok(SocketAddr::new(
+) -> Result<PeerRemote, Box<dyn std::error::Error>> {
+    Ok(PeerRemote::Endpoint(crate::PeerEndpoint::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         u16::try_from(base_port + idx)?,
-    ))
+    )))
 }
 
 pub(crate) fn connect_peer(
@@ -2449,16 +2485,13 @@ pub(crate) fn connect_peer(
 ) -> crate::test_support::MessageReceiver {
     let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    let Some(endpoint) = info.endpoint else {
-        panic!("identified peer endpoint");
-    };
-    peer_table.register(endpoint, lease.clone());
-    peer_table.publish_info(endpoint, &lease, info);
+    peer_table.register(info.addr, lease.clone());
+    peer_table.publish_info(info.addr, &lease, info);
     rx
 }
 
-/// The canonical sync-test anonymous peer: inbound Tor (`endpoint: None`,
-/// `network = Onion`), mirroring what the listener publishes for an
+/// The canonical sync-test anonymous peer: an inbound Tor circuit with no
+/// routable destination, mirroring what the listener publishes for an
 /// unidentified session. Anonymous sessions schedule by exact connection
 /// identity, never by endpoint.
 pub(crate) fn connect_anonymous_peer(
@@ -2467,11 +2500,10 @@ pub(crate) fn connect_anonymous_peer(
 ) -> crate::test_support::MessageReceiver {
     let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    info.endpoint = None;
-    info.network = crate::NetworkLabel::Onion;
+    info.addr = crate::PeerRemote::AnonymousTor(lease.connection_id());
     info.inbound = true;
-    peer_table.register_unidentified(lease.clone());
-    assert!(peer_table.publish_info_unidentified(&lease, info));
+    peer_table.register(info.addr, lease.clone());
+    assert!(peer_table.publish_info(info.addr, &lease, info));
     rx
 }
 
@@ -2605,12 +2637,9 @@ fn cold_front_hedge_skips_a_saturated_candidate_without_cancelling_it() -> TestR
     let saturated_addr = test_addr(18_910, 1)?;
     let (saturated_tx, saturated_rx) = crate::test_support::message_channel();
     let saturated_lease = PeerLease::new(saturated_tx).with_shared_budget(&aggregate);
-    peers.register(
-        crate::PeerEndpoint::Ip(saturated_addr),
-        saturated_lease.clone(),
-    );
+    peers.register(saturated_addr, saturated_lease.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(saturated_addr),
+        saturated_addr,
         &saturated_lease,
         synthetic_peer(saturated_addr, 300),
     );
@@ -2625,7 +2654,7 @@ fn cold_front_hedge_skips_a_saturated_candidate_without_cancelling_it() -> TestR
         !saturated_lease.is_cancelled(),
         "a full aggregate never cancels a healthy candidate"
     );
-    assert!(peers.is_connected(crate::PeerEndpoint::Ip(saturated_addr)));
+    assert!(peers.is_connected(saturated_addr));
 
     // Whichever order the candidates are tried in, the request reaches the
     // healthy one and the saturated one stays untouched and connected.
@@ -2639,7 +2668,7 @@ fn cold_front_hedge_skips_a_saturated_candidate_without_cancelling_it() -> TestR
     assert!(matches!(healthy_rx.try_recv()?, Message::GetData(_)));
     assert!(saturated_rx.is_empty());
     assert!(!saturated_lease.is_cancelled());
-    assert!(peers.is_connected(crate::PeerEndpoint::Ip(saturated_addr)));
+    assert!(peers.is_connected(saturated_addr));
     drop(hold);
     Ok(())
 }
@@ -2870,9 +2899,9 @@ struct NotFoundFixture {
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     blocks: Vec<Block>,
     blocks_tx: InboundBlockSender,
-    owner: SocketAddr,
+    owner: PeerRemote,
     owner_rx: crate::test_support::MessageReceiver,
-    alternate: SocketAddr,
+    alternate: PeerRemote,
     alternate_rx: Option<crate::test_support::MessageReceiver>,
 }
 
@@ -3010,7 +3039,7 @@ fn notfound_from_owner_replans_the_body_to_the_alternate_once_with_one_request_p
     assert!(
         fixture
             .peers
-            .is_connected(bitcoin_rs_primitives::PeerEndpoint::Ip(fixture.owner)),
+            .is_connected(fixture.owner),
         "a peer that lacks a body is not punished"
     );
 
@@ -3211,7 +3240,7 @@ fn notfound_only_peer_is_retried_after_the_interval_and_not_starved_or_polled() 
     assert!(
         fixture
             .peers
-            .is_connected(bitcoin_rs_primitives::PeerEndpoint::Ip(fixture.owner)),
+            .is_connected(fixture.owner),
         "a peer that lacks a body is not disconnected"
     );
 

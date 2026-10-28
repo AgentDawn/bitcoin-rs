@@ -373,6 +373,7 @@ impl NodeState {
         };
         let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
             bitcoin_rs_p2p::P2pServiceConfig {
+                overlay: Arc::new(config.p2p.overlay.clone()),
                 listen_addrs: config.p2p.listen.clone(),
                 address_book_path: Some(config.data_dir.join("peers.dat")),
                 asmap_path: config.p2p.asmap.clone(),
@@ -412,7 +413,6 @@ impl NodeState {
                     }
                 },
                 v2_transport: config.p2p.v2_transport,
-                overlay: config.p2p.overlay.clone(),
                 ..bitcoin_rs_p2p::P2pServiceConfig::default()
             },
             chainstate.shutdown_reader(),

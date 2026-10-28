@@ -71,7 +71,7 @@ impl BlockSync {
             .mark_peer_unresponsive(source, Instant::now());
         metrics::counter!("node.sync.invalid_block_disconnects").increment(1);
         tracing::warn!(
-            peer_addr = ?source.endpoint,
+            peer_addr = ?source.addr,
             %hash,
             "block sync: disconnected the connection that delivered a consensus-invalid block"
         );

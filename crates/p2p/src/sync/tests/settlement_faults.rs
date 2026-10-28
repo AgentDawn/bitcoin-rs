@@ -188,7 +188,10 @@ fn apply_cache_horizon_capped_by_pending_budget() -> TestResult {
 #[test]
 fn on_peer_ready_sweeps_dead_predecessor_header_request() -> TestResult {
     let HeaderSyncFixture { sync, .. } = header_sync_with_genesis()?;
-    let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let peer_addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let source = crate::PeerSource::for_test(peer_addr);
     {
         let mut scheduler = sync.scheduler.lock();
@@ -217,11 +220,14 @@ fn on_peer_ready_sweeps_dead_predecessor_header_request() -> TestResult {
 #[test]
 fn on_peer_ready_sweep_releases_dead_owned_requests_only() -> TestResult {
     let HeaderSyncFixture { sync, .. } = header_sync_with_genesis()?;
-    let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
+    let peer_addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8334,
+    ));
     let (stale_tx, _stale_rx) = crate::test_support::message_channel();
     let stale = PeerLease::new(stale_tx);
     sync.peer_table
-        .register(crate::PeerEndpoint::Ip(peer_addr), stale.clone());
+        .register(peer_addr, stale.clone());
     register_info(&sync.peer_table, synthetic_peer(peer_addr, 2));
     let replacement = current_source(&sync.peer_table, peer_addr);
     {
@@ -240,7 +246,7 @@ fn on_peer_ready_sweep_releases_dead_owned_requests_only() -> TestResult {
         });
         scheduler.header_request_owner = Some(replacement);
     }
-    sync.on_peer_ready(stale.source_ip(peer_addr));
+    sync.on_peer_ready(stale.source(peer_addr));
     sync.on_peer_ready(replacement);
     assert!(
         sync.scheduler
@@ -260,12 +266,15 @@ fn far_future_matching_peer_retries_without_peer_blame() -> TestResult {
         inbound_headers_tx,
         peers,
     } = header_sync_with_genesis()?;
-    let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let peer_addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    peers.register(crate::PeerEndpoint::Ip(peer_addr), lease.clone());
+    peers.register(peer_addr, lease.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(peer_addr),
+        peer_addr,
         &lease,
         synthetic_peer(peer_addr, 8),
     );
@@ -291,8 +300,8 @@ fn far_future_matching_peer_retries_without_peer_blame() -> TestResult {
         !lease.is_cancelled(),
         "local-clock rejection must not cancel the peer lease"
     );
-    assert!(peers.is_connected(crate::PeerEndpoint::Ip(peer_addr)));
-    assert!(peers.is_connected(crate::PeerEndpoint::Ip(peer_addr)));
+    assert!(peers.is_connected(peer_addr));
+    assert!(peers.is_connected(peer_addr));
     assert!(
         !sync
             .scheduler
@@ -341,9 +350,9 @@ fn same_address_registration_clears_getheaders_gate_and_routes_replacement() -> 
 
     let (new_tx, new_rx) = crate::test_support::message_channel();
     let new_lease = PeerLease::new(new_tx);
-    peers.register(crate::PeerEndpoint::Ip(addr), new_lease.clone());
+    peers.register(addr, new_lease.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(addr),
+        addr,
         &new_lease,
         synthetic_peer(addr, 8),
     );

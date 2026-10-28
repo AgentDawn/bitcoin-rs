@@ -71,7 +71,7 @@ fn unknown_dns_zero_version_is_durable_metadata_without_good() {
     assert_eq!(book.state.lock().stored.records[0].services, Some(0));
     book.save();
     assert_eq!(stored_value(&path)["format"], "bitcoin-rs-addrman");
-    assert_eq!(stored_value(&path)["version"], 1);
+    assert_eq!(stored_value(&path)["version"], SCHEMA_VERSION);
     assert_eq!(stored_value(&path)["records"][0]["services"], 0);
     let restored = AddressBook::open(Some(base), [1; 4], false, None);
     assert_eq!(restored.state.lock().stored.records[0].services, Some(0));
@@ -87,15 +87,15 @@ fn incoming_known_gossip_and_unknown_dns_merge_without_losing_observation() {
     let book = book();
     book.learn_dns("seed", &[target()], EPOCH);
     let revision = book.state.lock().revision;
-    book.learn_peer(ip(addr(2)), &[(target(), 0, EPOCH)], EPOCH);
+    book.learn_peer(addr(2).address(), &[(target(), 0, EPOCH)], EPOCH);
     assert_eq!(book.state.lock().stored.records[0].services, None);
     assert_eq!(
         book.state.lock().revision,
         revision,
         "zero-bit gossip and same-time ref refusal add no new information"
     );
-    book.learn_peer(ip(addr(3)), &[(target(), 1, EPOCH)], EPOCH);
-    book.learn_peer(ip(addr(4)), &[(target(), 8, EPOCH)], EPOCH);
+    book.learn_peer(addr(3).address(), &[(target(), 1, EPOCH)], EPOCH);
+    book.learn_peer(addr(4).address(), &[(target(), 8, EPOCH)], EPOCH);
     assert_eq!(book.state.lock().stored.records[0].services, Some(9));
     book.learn_dns("seed", &[target()], EPOCH + 7200);
     assert_eq!(book.state.lock().stored.records[0].services, Some(9));
@@ -108,13 +108,21 @@ fn incoming_known_gossip_and_unknown_dns_merge_without_losing_observation() {
         "unknown incoming advertisement still refreshes known peer time"
     );
     let ip_origin = addr(5);
-    book.learn_peer(ip(addr(6)), &[(ip_origin, 9, EPOCH)], EPOCH);
+    book.learn_peer(addr(6).address(), &[(ip_origin, 9, EPOCH)], EPOCH);
     book.succeeded(ip_origin, 9, EPOCH + 1);
     book.learn_dns("seed", &[ip_origin], EPOCH + 14_400);
     let manager = book.state.lock();
     let entry = &manager.stored.records[manager.by_addr[&ip_origin]];
     assert_eq!(entry.services, Some(9));
-    assert_eq!(entry.source, Source::Ip(ip(addr(6))));
+    assert_eq!(
+        entry.source,
+        Source::Ip(
+            addr(6)
+                .address()
+                .ip()
+                .unwrap_or_else(|| panic!("expected IP fixture"))
+        )
+    );
     assert_eq!(entry.last_seen, EPOCH + 14_400);
 }
 
@@ -190,7 +198,7 @@ fn zero_gossip_preserves_unknown_dns_bootstrap_but_version_zero_is_known() {
     book.state.lock().stored.secret = [1; 32];
     book.learn_dns("seed", &[target()], EPOCH);
     let revision = book.state.lock().revision;
-    book.learn_peer(ip(addr(2)), &[(target(), 0, EPOCH)], EPOCH);
+    book.learn_peer(addr(2).address(), &[(target(), 0, EPOCH)], EPOCH);
     assert_eq!(book.state.lock().stored.records[0].services, None);
     assert_eq!(book.state.lock().revision, revision);
     assert_eq!(
@@ -204,14 +212,22 @@ fn zero_gossip_preserves_unknown_dns_bootstrap_but_version_zero_is_known() {
     );
     let restored = AddressBook::open(Some(base.clone()), [1; 4], false, None);
     restored.learn_dns("seed", &[target()], EPOCH + 7200);
-    restored.learn_peer(ip(addr(3)), &[(target(), 0, EPOCH + 7200)], EPOCH + 7200);
+    restored.learn_peer(
+        addr(3).address(),
+        &[(target(), 0, EPOCH + 7200)],
+        EPOCH + 7200,
+    );
     restored.save();
     let restored = AddressBook::open(Some(base.clone()), [1; 4], false, None);
     assert!(restored.ordinary_services_eligible(target(), u64::MAX));
     let revision = restored.state.lock().revision;
     restored.set_services(target(), 0);
     assert_eq!(restored.state.lock().revision, revision + 1);
-    restored.learn_peer(ip(addr(3)), &[(target(), 0, EPOCH + 7200)], EPOCH + 7200);
+    restored.learn_peer(
+        addr(3).address(),
+        &[(target(), 0, EPOCH + 7200)],
+        EPOCH + 7200,
+    );
     restored.learn_dns("seed", &[target()], EPOCH + 14_400);
     assert_eq!(restored.state.lock().stored.records[0].services, Some(0));
     assert!(!restored.ordinary_services_eligible(target(), u64::MAX));
@@ -220,7 +236,11 @@ fn zero_gossip_preserves_unknown_dns_bootstrap_but_version_zero_is_known() {
     let restored = AddressBook::open(Some(base), [1; 4], false, None);
     assert!(!restored.ordinary_services_eligible(target(), u64::MAX));
     let fresh = addr(9);
-    restored.learn_peer(ip(addr(7)), &[(fresh, 0, EPOCH + 14_400)], EPOCH + 14_400);
+    restored.learn_peer(
+        addr(7).address(),
+        &[(fresh, 0, EPOCH + 14_400)],
+        EPOCH + 14_400,
+    );
     let manager = restored.state.lock();
     assert_eq!(
         manager.stored.records[manager.by_addr[&fresh]].services,

@@ -1,7 +1,7 @@
 use super::*;
 
 fn challenger() -> PeerEndpoint {
-    crate::parse_endpoint("8.8.8.8:412").expect("actual Core collision")
+    "8.8.8.8:412".parse().expect("actual Core collision")
 }
 fn collision_book() -> Arc<AddressBook> {
     let book = oracle_book();
@@ -20,9 +20,9 @@ fn collision_book() -> Arc<AddressBook> {
     }
     book
 }
-fn state(book: &AddressBook, endpoint: PeerEndpoint) -> Candidate {
+fn state(book: &AddressBook, addr: PeerEndpoint) -> Candidate {
     let manager = book.state.lock();
-    manager.stored.records[manager.by_addr[&endpoint]].clone()
+    manager.stored.records[manager.by_addr[&addr]].clone()
 }
 
 #[test]
@@ -60,8 +60,7 @@ fn collision_pending_active_policy_and_callback_bounds_recheck_current_state() {
 fn make_tried_clears_all_refs_demotes_and_removes_only_colliding_new_reference() {
     for victim_refs in [1, 2] {
         let book = collision_book();
-        let victim: PeerEndpoint =
-            crate::parse_endpoint("8.8.9.89:8333").expect("actual Core New collider");
+        let victim: PeerEndpoint = "8.8.9.89:8333".parse().expect("actual Core New collider");
         {
             let mut manager = book.state.lock();
             for n in 2..=8 {
@@ -96,7 +95,7 @@ fn make_tried_clears_all_refs_demotes_and_removes_only_colliding_new_reference()
 #[test]
 fn pending_final_demotion_victim_defers_all_membership_and_good_health() {
     let book = collision_book();
-    let victim: PeerEndpoint = crate::parse_endpoint("8.8.9.89:8333").expect("collider");
+    let victim: PeerEndpoint = "8.8.9.89:8333".parse().expect("collider");
     {
         let mut manager = book.state.lock();
         manager.learn(victim, Some(9), source(1), EPOCH - 1000, EPOCH, 0);
@@ -122,7 +121,7 @@ fn pending_final_demotion_victim_defers_all_membership_and_good_health() {
 #[test]
 fn feeler_connected_incumbent_gets_good_but_pending_attempt_does_not() {
     let book = collision_book();
-    let mapped: PeerEndpoint = crate::parse_endpoint("[::ffff:8.8.8.8]:8333").expect("alias");
+    let mapped: PeerEndpoint = "[::ffff:8.8.8.8]:8333".parse().expect("alias");
     assert_eq!(
         book.feeler(&[mapped], &[mapped], EPOCH, |_| true),
         Some(challenger())
@@ -151,13 +150,11 @@ fn feeler_connected_incumbent_gets_good_but_pending_attempt_does_not() {
 #[test]
 fn connected_collision_good_uses_ip_not_port_but_not_linked_ipv6_group() {
     let book = collision_book();
-    let other_port: PeerEndpoint =
-        crate::parse_endpoint("[::ffff:8.8.8.8]:18444").expect("TCP alias");
+    let other_port: PeerEndpoint = "[::ffff:8.8.8.8]:18444".parse().expect("TCP alias");
     book.feeler(&[other_port], &[other_port], EPOCH, |_| true);
     assert_eq!(state(&book, target()).last_success, EPOCH);
     let book = collision_book();
-    let linked: PeerEndpoint =
-        crate::parse_endpoint("[2002:808:808::1]:8333").expect("linked IPv6");
+    let linked: PeerEndpoint = "[2002:808:808::1]:8333".parse().expect("linked IPv6");
     assert_eq!(
         book.feeler(&[linked], &[linked], EPOCH, |_| true),
         Some(target())
@@ -633,8 +630,7 @@ fn anchor_reservation_precedes_publication_and_failed_commit_rolls_it_back() {
 #[test]
 fn collision_resolution_uses_creation_order_not_reversed_good_order() {
     let book = oracle_book();
-    let second: PeerEndpoint =
-        crate::parse_endpoint("8.8.8.8:1343").expect("second actual Core collider");
+    let second: PeerEndpoint = "8.8.8.8:1343".parse().expect("second actual Core collider");
     let mut manager = book.state.lock();
     manager.learn(target(), Some(9), source(1), EPOCH - 1000, EPOCH, 0);
     manager.good(target(), true, EPOCH - 20_000);
@@ -672,7 +668,7 @@ fn feelers_use_advertised_address_database_services_without_inventing_dns_bits()
         book.select(&[], &[], EPOCH, u64::MAX, |_| true),
         Some(target())
     );
-    book.learn_peer(ip(addr(2)), &[(target(), 1, EPOCH)], EPOCH);
+    book.learn_peer(addr(2).address(), &[(target(), 1, EPOCH)], EPOCH);
     assert_eq!(book.feeler(&[], &[], EPOCH, |_| true), Some(target()));
     book.state.lock().stored.records[0].services = Some(1024);
     assert_eq!(book.feeler(&[], &[], EPOCH, |_| true), Some(target()));
@@ -683,7 +679,7 @@ fn feelers_use_advertised_address_database_services_without_inventing_dns_bits()
 #[test]
 fn regular_queue_admission_never_takes_probe_or_anchor_claims() {
     let book = book();
-    let alias: PeerEndpoint = crate::parse_endpoint("[::ffff:8.8.8.8]:8333").expect("alias");
+    let alias: PeerEndpoint = "[::ffff:8.8.8.8]:8333".parse().expect("alias");
     assert!(book.queued_feeler(target()));
     assert!(!book.queued(alias));
     assert!(book.is_feeler(target()));
@@ -714,8 +710,8 @@ fn returned_anchor_releases_same_as_group_and_rejection_preserves_other_purposes
     .expect("Core map");
     let book = AddressBook::open(None, [1; 4], false, Some(&map));
     book.state.lock().stored.secret = [1; 32];
-    let anchor: PeerEndpoint = crate::parse_endpoint("8.8.0.1:8333").expect("anchor");
-    let other: PeerEndpoint = crate::parse_endpoint("9.9.0.1:8333").expect("same Core ASN");
+    let anchor: PeerEndpoint = "8.8.0.1:8333".parse().expect("anchor");
+    let other: PeerEndpoint = "9.9.0.1:8333".parse().expect("same Core ASN");
     book.learn_dns("seed", &[anchor, other], EPOCH);
     assert_eq!(book.len(), 2);
     book.succeeded(anchor, 9, EPOCH);

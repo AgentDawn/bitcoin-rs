@@ -784,9 +784,7 @@ mod tests {
         let available = orphan_child(OutPoint::new(parent, 0));
         let missing = orphan_child(OutPoint::new(Hash256::from_le_bytes(&[43; 32]).into(), 0));
         let source = PeerToken {
-            endpoint: Some(bitcoin_rs_primitives::PeerEndpoint::Ip(
-                std::net::SocketAddr::from(([127, 0, 0, 1], 18444)),
-            )),
+            addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 18444)).into()),
             connection_id: 7,
         };
         let replacement = PeerToken {
@@ -794,9 +792,7 @@ mod tests {
             ..source
         };
         let missing_source = PeerToken {
-            endpoint: Some(bitcoin_rs_primitives::PeerEndpoint::Ip(
-                std::net::SocketAddr::from(([127, 0, 0, 1], 18445)),
-            )),
+            addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 18445)).into()),
             connection_id: 9,
         };
         let chain = AdmissionCoins::default();
@@ -887,9 +883,7 @@ mod tests {
         let outpoint = OutPoint::new(parent, 0);
         let child = orphan_child(outpoint);
         let source = PeerToken {
-            endpoint: Some(bitcoin_rs_primitives::PeerEndpoint::Ip(
-                std::net::SocketAddr::from(([127, 0, 0, 1], 18444)),
-            )),
+            addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 18444)).into()),
             connection_id: 7,
         };
         let chain = AdmissionCoins::default();

@@ -24,7 +24,10 @@ fn tick_sends_getdata_for_headers_above_applied_tip() -> TestResult {
         inbound_headers_tx: _inbound_headers_tx,
         inbound_blocks_tx: _inbound_blocks_tx,
     } = SyncHarness::new(tree);
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 100));
 
     sync.tick();
@@ -100,7 +103,10 @@ fn tick_fetches_new_tip_headers_from_at_tip_peers() -> TestResult {
     applied_tip.store(Some(Arc::new(applied)));
     // The peer's handshake height equals the applied height: it connected
     // while the node was at the tip, before the new block existed.
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 2));
 
     // The peer announces the new tip header; drain accepts it and must
@@ -188,7 +194,10 @@ fn tick_fetches_reorg_fork_announced_by_at_tip_peer() -> TestResult {
     // The peer's handshake height equals the applied height: it
     // connected at the losing tip, and only the fork announcement it
     // delivers demonstrates anything beyond that.
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let rx = connect_peer(&peers, synthetic_peer(addr, 2));
 
     inbound_headers_tx.send(InboundHeaders {
@@ -287,7 +296,7 @@ fn losing_fork_credit_survives_winner_disconnect() -> TestResult {
         peers
             .infos()
             .into_iter()
-            .find(|info| info.endpoint == Some(crate::PeerEndpoint::Ip(peer_a)))
+            .find(|info| info.addr == peer_a)
             .ok_or("peer A info missing")?
             .best_known_height,
         0,
@@ -305,7 +314,7 @@ fn losing_fork_credit_survives_winner_disconnect() -> TestResult {
         peers
             .infos()
             .into_iter()
-            .find(|info| info.endpoint == Some(crate::PeerEndpoint::Ip(peer_a)))
+            .find(|info| info.addr == peer_a)
             .ok_or("peer A info missing after reorg")?
             .best_known_height,
         2,

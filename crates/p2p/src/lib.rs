@@ -38,6 +38,9 @@ pub mod inv;
 /// Inbound accept loop, outbound dial, and their shared start-epoch wiring.
 pub mod listener;
 pub(crate) mod netgroup;
+/// Opt-in Tor and IVNP I2P transport configuration.
+pub mod overlay;
+pub use overlay::OverlayNetworkState;
 
 /// Bitcoin Core `net:*` tracepoint payload mapping.
 mod net_trace;
@@ -74,7 +77,9 @@ pub mod wire;
 #[cfg(test)]
 mod test_support;
 
-pub use bitcoin_rs_primitives::{EndpointHost, NetworkLabel, PeerEndpoint};
+pub use bitcoin_rs_primitives::{
+    EndpointHost, NetworkLabel, PeerAddress, PeerEndpoint, PeerNetwork,
+};
 pub use block_announce::{
     BlockAnnounceConfig, BlockAnnounceQueue, BlockAnnounceReceiver, BlockAnnouncer,
     MAX_BLOCKS_TO_ANNOUNCE, MAX_HIGH_BANDWIDTH_PEERS, spawn_block_announce_worker,
@@ -83,7 +88,9 @@ pub(crate) use block_stager::BlockStager;
 pub use chain_query::{ActiveChainQuery, RecentBlockSlot};
 pub use compact_blocks::{CompactBlockHints, Reconstruction};
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, PINNED_CORE_VERSION};
-pub use connection::{ConnectionId, OutboundRefusal, PeerLease, PeerSource, QueuedFrame};
+pub use connection::{
+    ConnectionId, OutboundRefusal, PeerLease, PeerRemote, PeerSource, QueuedFrame,
+};
 pub use counters::{CountingStream, PeerCounters};
 pub use dispatch::{ChainQuery, FilterRequest, FilterServing, InventoryServing, TxInventory};
 pub use endpoint::{

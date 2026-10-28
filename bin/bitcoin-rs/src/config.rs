@@ -322,11 +322,11 @@ impl CoreValue for Option<SocketAddr> {
     }
 }
 
-impl CoreValue for Option<Vec<bitcoin_rs_node::options::NetworkLabel>> {
+impl CoreValue for Option<Vec<bitcoin_rs_node::options::PeerNetwork>> {
     fn apply(key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
         let mut parsed = Vec::new();
         for item in value.split(',') {
-            match bitcoin_rs_node::options::parse_network_label(item.trim()) {
+            match bitcoin_rs_node::options::parse_peer_network(item.trim()) {
                 Ok(label) => {
                     if !parsed.contains(&label) {
                         parsed.push(label);
@@ -510,28 +510,28 @@ onlynet=onion,i2p
             Some(SocketAddr::from(([127, 0, 0, 1], 9050)))
         );
         assert_eq!(
-            conf_with_overlays.p2p.overlay.onion,
+            conf_with_overlays.p2p.overlay.onion_proxy,
             Some(SocketAddr::from(([127, 0, 0, 1], 9051)))
         );
-        assert!(conf_with_overlays.p2p.overlay.proxy_randomize_credentials);
+        assert!(conf_with_overlays.p2p.overlay.randomize_credentials);
         assert_eq!(
-            conf_with_overlays.p2p.overlay.tor_control.as_deref(),
-            Some("127.0.0.1:9052")
+            conf_with_overlays.p2p.overlay.tor_control,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9052)))
         );
         assert_eq!(
-            conf_with_overlays.p2p.overlay.tor_password.as_deref(),
-            Some("secret")
+            conf_with_overlays.p2p.overlay.tor_cookie.as_deref(),
+            Some(std::path::Path::new("secret"))
         );
         assert_eq!(
             conf_with_overlays.p2p.overlay.i2p_sam,
             Some(SocketAddr::from(([127, 0, 0, 1], 7656)))
         );
-        assert!(conf_with_overlays.p2p.overlay.i2p_accept_incoming);
+        assert!(conf_with_overlays.p2p.overlay.i2p_accept);
         assert_eq!(
             conf_with_overlays.p2p.overlay.onlynet,
             vec![
-                bitcoin_rs_node::options::NetworkLabel::Onion,
-                bitcoin_rs_node::options::NetworkLabel::I2p
+                bitcoin_rs_node::options::PeerNetwork::Onion,
+                bitcoin_rs_node::options::PeerNetwork::I2p
             ]
         );
         Ok(())

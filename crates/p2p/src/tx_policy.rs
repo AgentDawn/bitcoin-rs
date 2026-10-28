@@ -679,7 +679,7 @@ impl PeerTable {
             let live: HashSet<_> = self
                 .usable_peers()
                 .iter()
-                .map(|peer| peer.lease.source(peer.endpoint))
+                .map(|peer| peer.lease.source(peer.addr))
                 .collect();
             let gone: Vec<_> = policy
                 .counts
@@ -782,7 +782,7 @@ mod tests {
     }
 
     pub(super) fn source(port: u16) -> PeerSource {
-        PeerSource::for_test(([127, 0, 0, 1], port).into())
+        PeerSource::for_test(([127, 0, 0, 1], port))
     }
     pub(super) fn item(n: u32) -> Inventory {
         let mut hash = [0; 32];
@@ -1017,8 +1017,8 @@ mod tests {
         let table = Arc::new(PeerTable::new());
         let (sender, receiver) = crate::test_support::message_channel_bounded(4);
         let lease = crate::PeerLease::new(sender);
-        let addr = ([127, 0, 0, 1], 8333).into();
-        table.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+        let addr: crate::PeerEndpoint = ([127, 0, 0, 1], 8333).into();
+        table.register(addr, lease.clone());
         let version = crate::handshake::version_message(
             1,
             0,
@@ -1026,11 +1026,12 @@ mod tests {
             bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
         );
         table.publish_info(
-            crate::PeerEndpoint::Ip(addr),
+            addr,
             &lease,
             crate::PeerInfo::outbound_from_version(
                 addr,
-                addr,
+                addr.socket_addr()
+                    .unwrap_or_else(|| panic!("expected IP fixture")),
                 &version,
                 0,
                 0,
@@ -1039,7 +1040,7 @@ mod tests {
         );
         let mut poll_now = Instant::now() + Duration::from_secs(1);
         let inventory = InventoryView(AtomicBool::new(false));
-        table.announce_transactions(lease.source_ip(addr), &[item(1)]);
+        table.announce_transactions(lease.source(addr), &[item(1)]);
         table.poll_transaction_requests_at(&inventory, poll_now);
         assert!(matches!(receiver.try_recv(), Ok(Message::GetData(_))));
         inventory.0.store(true, Ordering::Relaxed);
@@ -1048,7 +1049,7 @@ mod tests {
         assert!(table.tx_policy.lock().requests.is_empty());
         assert!(receiver.try_recv().is_err());
         inventory.0.store(false, Ordering::Relaxed);
-        table.announce_transactions(lease.source_ip(addr), &[item(1)]);
+        table.announce_transactions(lease.source(addr), &[item(1)]);
         let Some(Identity::Wtxid(hash)) = Identity::from_inventory(item(1)) else {
             panic!("wtx fixture")
         };
@@ -1060,25 +1061,27 @@ mod tests {
         let pending_table = Arc::clone(&table);
         let (new_sender, new_receiver) = crate::test_support::message_channel_bounded(4);
         let new_lease = crate::PeerLease::new(new_sender);
-        let new_addr = ([127, 0, 0, 1], 8334).into();
+        let new_addr: crate::PeerEndpoint = ([127, 0, 0, 1], 8334).into();
         POLL_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 // A new ready connection and its announcement both appear
                 // after poll entered but before policy reconciliation.
-                pending_table.register(crate::PeerEndpoint::Ip(new_addr), new_lease.clone());
+                pending_table.register(new_addr, new_lease.clone());
                 pending_table.publish_info(
-                    crate::PeerEndpoint::Ip(new_addr),
+                    new_addr,
                     &new_lease,
                     crate::PeerInfo::outbound_from_version(
                         new_addr,
-                        new_addr,
+                        new_addr
+                            .socket_addr()
+                            .unwrap_or_else(|| panic!("expected IP fixture")),
                         &version,
                         0,
                         0,
                         Arc::new(crate::PeerCounters::default()),
                     ),
                 );
-                pending_table.announce_transactions(new_lease.source_ip(new_addr), &[item(2)]);
+                pending_table.announce_transactions(new_lease.source(new_addr), &[item(2)]);
             }));
         });
         poll_now += REQUEST_POLL_INTERVAL;
@@ -1107,8 +1110,8 @@ mod tests {
         port: u16,
         lease: &crate::PeerLease,
     ) -> PeerSource {
-        let addr = ([127, 0, 0, 1], port).into();
-        table.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+        let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
+        table.register(addr, lease.clone());
         let version = crate::handshake::version_message(
             1,
             0,
@@ -1116,18 +1119,19 @@ mod tests {
             bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
         );
         table.publish_info(
-            crate::PeerEndpoint::Ip(addr),
+            addr,
             lease,
             crate::PeerInfo::outbound_from_version(
                 addr,
-                addr,
+                addr.socket_addr()
+                    .unwrap_or_else(|| panic!("expected IP fixture")),
                 &version,
                 0,
                 0,
                 std::sync::Arc::new(crate::PeerCounters::default()),
             ),
         );
-        lease.source_ip(addr)
+        lease.source(addr)
     }
 
     #[derive(Default)]

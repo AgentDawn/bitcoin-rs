@@ -217,7 +217,7 @@ impl BlockSync {
             metrics::counter!("node.sync.body_not_found_releases")
                 .increment(u64::try_from(released).unwrap_or(u64::MAX));
             tracing::debug!(
-                peer_addr = ?source.endpoint,
+                peer_addr = ?source.addr,
                 released,
                 "block sync: peer answered notfound for requested blocks; released for replan"
             );
@@ -312,7 +312,7 @@ impl BlockSync {
             .window
             .confirm_prefix_probe(owner, hashes, &successful, now);
         tracing::info!(
-            owner = ?owner.endpoint,
+            owner = ?owner.addr,
             alternates = successful.len(),
             blocks = block_count,
             "block sync: started common-prefix peer probe"
@@ -443,12 +443,12 @@ impl BlockSync {
             // plans the request again from the window's then-current state.
             if refusal.is_saturated() {
                 tracing::debug!(
-                    peer_addr = ?source.endpoint,
+                    peer_addr = ?source.addr,
                     "block sync: getdata deferred; node outbound budget is full"
                 );
             } else {
                 tracing::warn!(
-                    peer_addr = ?source.endpoint,
+                    peer_addr = ?source.addr,
                     "block sync: outbound channel disconnected (getdata)"
                 );
             }
@@ -457,13 +457,13 @@ impl BlockSync {
         metrics::histogram!("node.sync.getdata_batch_size").record(metric_count(count));
         if compact_fetch {
             tracing::info!(
-                peer_addr = ?source.endpoint,
+                peer_addr = ?source.addr,
                 count,
                 "block sync: requested compact blocks near tip"
             );
         }
         tracing::debug!(
-            peer_addr = ?source.endpoint,
+            peer_addr = ?source.addr,
             count,
             compact = compact_fetch,
             applied_height = applied_tip.height,
@@ -502,7 +502,7 @@ impl BlockSync {
             let Some(peer) = session.info else {
                 continue;
             };
-            let source = session.lease.source(session.endpoint);
+            let source = session.lease.source(session.addr);
             // One capability rule for every path that asks for a body: the
             // same `body_capability` the frontier's usable-peer view
             // precomputes, so the hedge and the scheduler can never disagree
@@ -542,8 +542,8 @@ impl BlockSync {
             match self.peer_table.send(source, message) {
                 Ok(()) => {
                     tracing::info!(
-                        owner = ?owner.endpoint,
-                        hedge_peer = ?source.endpoint,
+                        owner = ?owner.addr,
+                        hedge_peer = ?source.addr,
                         %front_hash,
                         front_height,
                         "block sync: hedged cold-start stalled front"

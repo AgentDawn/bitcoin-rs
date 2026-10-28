@@ -1,7 +1,9 @@
 //! Fee-aware queued inventory, contained in the transaction policy owner.
+#[cfg(test)]
+use bitcoin_rs_primitives::PeerEndpoint;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use bitcoin::hashes::Hash as _;
@@ -24,6 +26,8 @@ const INVENTORY_TARGET: usize = 70;
 /// Core v31.1 net.cpp builds `m_network_key` from remote `GetNetClass` plus
 /// bound address bytes and port. Socket scope/flow and the remote address/port
 /// are not part of this identity.
+/// Accepted I2P SAM streams use their ephemeral local bind endpoint, so their
+/// clocks are per stream; they do not share a destination-wide inbound clock.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct InboundClockKey {
     network: NetworkClass,
@@ -32,9 +36,11 @@ pub(super) struct InboundClockKey {
 }
 
 impl InboundClockKey {
-    fn new(remote: IpAddr, bind: SocketAddr) -> Self {
+    fn new(remote: crate::PeerRemote, bind: std::net::SocketAddr) -> Self {
         Self {
-            network: network_class(remote),
+            network: remote.endpoint().map_or(NetworkClass::Onion, |endpoint| {
+                network_class(endpoint.address())
+            }),
             bind_ip: canonical_ip(bind.ip()),
             bind_port: bind.port(),
         }
@@ -201,20 +207,12 @@ impl PeerTable {
             let inbound = session
                 .lease
                 .is_inbound()
-                .then(|| {
-                    session
-                        .endpoint
-                        .and_then(crate::PeerEndpoint::as_ip)
-                        .map(|socket| {
-                            InboundClockKey::new(socket.ip(), info.addr_bind.socket_addr())
-                        })
-                })
-                .flatten();
+                .then(|| InboundClockKey::new(session.addr, info.addr_bind));
             let TxPolicy {
                 relay, inbound_inv, ..
             } = &mut *policy;
             let peer = relay
-                .entry(session.lease.source(session.endpoint))
+                .entry(session.lease.source(session.addr))
                 .or_insert_with(|| RelayPeer::new(now, inbound, inbound_inv, rng));
             if request.source == Some(session.lease.node_id()) {
                 peer.note_known(Identity::Txid(request.txid.0));
@@ -266,13 +264,7 @@ impl PeerTable {
         let inbound = session
             .lease
             .is_inbound()
-            .then(|| {
-                session
-                    .endpoint
-                    .and_then(crate::PeerEndpoint::as_ip)
-                    .map(|socket| InboundClockKey::new(socket.ip(), info.addr_bind.socket_addr()))
-            })
-            .flatten();
+            .then(|| InboundClockKey::new(session.addr, info.addr_bind));
         {
             let mut policy = self.tx_policy.lock();
             if let Some(peer) = policy.relay.get_mut(&source) {
@@ -317,13 +309,7 @@ impl PeerTable {
         let inbound = session
             .lease
             .is_inbound()
-            .then(|| {
-                session
-                    .endpoint
-                    .and_then(crate::PeerEndpoint::as_ip)
-                    .map(|socket| InboundClockKey::new(socket.ip(), info.addr_bind.socket_addr()))
-            })
-            .flatten();
+            .then(|| InboundClockKey::new(session.addr, info.addr_bind));
         {
             let mut policy = self.tx_policy.lock();
             if let Some(peer) = policy.relay.get_mut(&source) {
@@ -368,7 +354,7 @@ impl PeerTable {
             let sessions = self.usable_peers();
             let live: HashSet<_> = sessions
                 .iter()
-                .map(|session| session.lease.source(session.endpoint))
+                .map(|session| session.lease.source(session.addr))
                 .collect();
             policy.relay.retain(|source, _| live.contains(source));
             sessions
@@ -378,19 +364,11 @@ impl PeerTable {
             if !session.lease.role().relays_transactions() {
                 continue;
             }
-            let source = session.lease.source(session.endpoint);
+            let source = session.lease.source(session.addr);
             let inbound = session
                 .lease
                 .is_inbound()
-                .then(|| {
-                    session
-                        .endpoint
-                        .and_then(crate::PeerEndpoint::as_ip)
-                        .map(|socket| {
-                            InboundClockKey::new(socket.ip(), info.addr_bind.socket_addr())
-                        })
-                })
-                .flatten();
+                .then(|| InboundClockKey::new(session.addr, info.addr_bind));
             let requests = {
                 let mut policy = self.tx_policy.lock();
                 let TxPolicy {
@@ -554,7 +532,7 @@ impl PeerTable {
                 }
             }
             Err(crate::OutboundRefusal::Closed(_)) => {
-                tracing::debug!(peer_addr = ?source.endpoint, "relay inventory queue closed; connection cancelled");
+                tracing::debug!(peer_addr = ?source.addr, "relay inventory queue closed; connection cancelled");
             }
         }
     }
@@ -676,14 +654,14 @@ mod tests {
         role: crate::PeerRole,
         ready: bool,
     ) -> (PeerSource, MessageReceiver) {
-        let addr = ([127, 0, 0, 1], port).into();
+        let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
         connect_at(table, addr, addr, inbound, wtxid, role, ready)
     }
 
     fn connect_at(
         table: &PeerTable,
-        addr: SocketAddr,
-        bind: SocketAddr,
+        addr: PeerEndpoint,
+        bind: PeerEndpoint,
         inbound: bool,
         wtxid: bool,
         role: crate::PeerRole,
@@ -697,8 +675,8 @@ mod tests {
         } else {
             crate::PeerLease::new(sender)
         };
-        let source = lease.source_ip(addr);
-        table.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+        let source = lease.source(addr);
+        table.register(addr, lease.clone());
         if ready {
             let version = crate::handshake::version_message(
                 1,
@@ -708,14 +686,15 @@ mod tests {
             );
             let mut info = crate::PeerInfo::outbound_from_version(
                 addr,
-                bind,
+                bind.socket_addr()
+                    .unwrap_or_else(|| panic!("expected IP fixture")),
                 &version,
                 0,
                 0,
                 Arc::new(crate::PeerCounters::default()),
             );
             info.wtxid_relay = wtxid;
-            table.publish_info(crate::PeerEndpoint::Ip(addr), &lease, info);
+            table.publish_info(addr, &lease, info);
         }
         (source, receiver)
     }
@@ -790,7 +769,8 @@ mod tests {
         );
         let source = connected.0;
         let endpoint = source
-            .endpoint
+            .addr
+            .endpoint()
             .ok_or_else(|| std::io::Error::other("clock fixture endpoint"))?;
         let lease = table
             .lease(endpoint)
@@ -833,9 +813,10 @@ mod tests {
         // GetPort. IPv4 mapped bind bytes are identical; scope/flow are absent.
         let key = |remote: &str, bind: &str| {
             InboundClockKey::new(
-                remote
-                    .parse()
-                    .unwrap_or_else(|error| panic!("remote: {error}")),
+                remote.parse::<crate::PeerAddress>().map_or_else(
+                    |error| panic!("remote: {error}"),
+                    |address| crate::PeerEndpoint::new(address, 0).into(),
+                ),
                 bind.parse().unwrap_or_else(|error| panic!("bind: {error}")),
             )
         };
@@ -850,10 +831,10 @@ mod tests {
         let plain: std::net::Ipv6Addr = "fe80::1"
             .parse()
             .unwrap_or_else(|error| panic!("IPv6: {error}"));
-        let bind = SocketAddr::V6(std::net::SocketAddrV6::new(plain, 8333, 123, 456));
+        let bind = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(plain, 8333, 123, 456));
         assert_eq!(
             key("8.8.8.8", "[fe80::1]:8333"),
-            InboundClockKey::new(([8, 8, 8, 8]).into(), bind),
+            InboundClockKey::new(crate::PeerRemote::from(([8, 8, 8, 8], 0)), bind),
         );
     }
 
@@ -1085,11 +1066,11 @@ mod tests {
         port: u16,
         aggregate: &Arc<crate::connection::SharedOutboundBudget>,
     ) -> (PeerSource, MessageReceiver) {
-        let addr = ([127, 0, 0, 1], port).into();
+        let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
         let (sender, receiver) = message_channel_bounded(1024);
         let lease = crate::PeerLease::new(sender).with_shared_budget(aggregate);
-        let source = lease.source_ip(addr);
-        table.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+        let source = lease.source(addr);
+        table.register(addr, lease.clone());
         let version = crate::handshake::version_message(
             1,
             0,
@@ -1098,14 +1079,15 @@ mod tests {
         );
         let mut info = crate::PeerInfo::outbound_from_version(
             addr,
-            addr,
+            addr.socket_addr()
+                .unwrap_or_else(|| panic!("expected IP fixture")),
             &version,
             0,
             0,
             Arc::new(crate::PeerCounters::default()),
         );
         info.wtxid_relay = true;
-        table.publish_info(crate::PeerEndpoint::Ip(addr), &lease, info);
+        table.publish_info(addr, &lease, info);
         (source, receiver)
     }
 
@@ -1397,7 +1379,8 @@ mod tests {
         let (known, known_rx) = connect(&table, 2, false, true, crate::PeerRole::FullRelay, true);
         let (_, other_rx) = connect(&table, 3, false, true, crate::PeerRole::FullRelay, true);
         let endpoint = optout
-            .endpoint
+            .addr
+            .endpoint()
             .ok_or_else(|| std::io::Error::other("identified fixture"))?;
         let Some(lease) = table.lease(endpoint) else {
             return Err(std::io::Error::other("live fixture lease").into());

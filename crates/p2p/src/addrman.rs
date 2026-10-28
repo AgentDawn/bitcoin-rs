@@ -1,16 +1,16 @@
 //! P2P's single bounded AddrMan owner, following Core31.1 placement and selection.
 //! Membership is persisted with each endpoint; lookup tables are derived indexes.
+use bitcoin_rs_primitives::PeerEndpoint;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::netgroup::NetGroups;
 use bitcoin::secp256k1::rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
-use bitcoin_rs_primitives::{EndpointHost, PeerEndpoint};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -69,7 +69,7 @@ fn endpoint_ip(endpoint: PeerEndpoint) -> Option<IpAddr> {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Source {
     Ip(IpAddr),
-    Overlay(EndpointHost),
+    Overlay(crate::PeerAddress),
     Internal([u8; 10]),
 }
 impl Source {
@@ -82,9 +82,7 @@ impl Source {
     fn group(&self, groups: &NetGroups) -> Vec<u8> {
         match self {
             Self::Ip(ip) => groups.group(*ip),
-            Self::Overlay(host) => {
-                crate::endpoint::overlay_netgroup(*host).unwrap_or_else(|| vec![0])
-            }
+            Self::Overlay(address) => groups.group(*address),
             Self::Internal(bytes) => {
                 let mut group = vec![6];
                 group.extend_from_slice(bytes);
@@ -253,23 +251,11 @@ fn cheap_hash(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(first)
 }
 fn endpoint_key(addr: PeerEndpoint) -> Vec<u8> {
-    // IP keys keep their historical byte form (v4 mapped to 16 bytes);
-    // overlay keys use their BIP155 network id (4 TorV3, 5 I2P).
-    let mut bytes = match addr {
-        PeerEndpoint::Ip(socket) => match socket.ip() {
-            IpAddr::V4(ip) => ip.to_ipv6_mapped().octets().to_vec(),
-            IpAddr::V6(ip) => ip.octets().to_vec(),
-        },
-        PeerEndpoint::TorV3 { key, .. } => {
-            let mut bytes = vec![4u8];
-            bytes.extend_from_slice(&key);
-            bytes
-        }
-        PeerEndpoint::I2p { hash, .. } => {
-            let mut bytes = vec![5u8];
-            bytes.extend_from_slice(&hash);
-            bytes
-        }
+    let mut bytes = match addr.address() {
+        crate::PeerAddress::Ip(IpAddr::V4(ip)) => ip.to_ipv6_mapped().octets().to_vec(),
+        crate::PeerAddress::Ip(IpAddr::V6(ip)) => ip.octets().to_vec(),
+        crate::PeerAddress::Onion(key) => [vec![4], key.to_vec()].concat(),
+        crate::PeerAddress::I2p(key) => [vec![5], key.to_vec()].concat(),
     };
     bytes.extend_from_slice(&addr.port().to_be_bytes());
     bytes
@@ -281,7 +267,7 @@ fn new_bucket(
     groups: &NetGroups,
 ) -> usize {
     let mut bytes = secret.to_vec();
-    vector(&endpoint_group(groups, addr), &mut bytes);
+    vector(&groups.group(addr.address()), &mut bytes);
     vector(source_group, &mut bytes);
     let first = cheap_hash(&bytes) % 64;
     let mut bytes = secret.to_vec();
@@ -294,7 +280,7 @@ fn tried_bucket(secret: &[u8; 32], addr: PeerEndpoint, groups: &NetGroups) -> us
     vector(&endpoint_key(addr), &mut bytes);
     let first = cheap_hash(&bytes) % 8;
     let mut bytes = secret.to_vec();
-    vector(&endpoint_group(groups, addr), &mut bytes);
+    vector(&groups.group(addr.address()), &mut bytes);
     bytes.extend_from_slice(&first.to_le_bytes());
     usize::try_from(cheap_hash(&bytes) % 256).unwrap_or_default()
 }
@@ -617,8 +603,8 @@ impl Manager {
             return false;
         }
         let self_source = match &source {
-            Source::Ip(ip) => Some(crate::netgroup::canonical_ip(*ip)) == endpoint_ip(addr),
-            Source::Overlay(host) => *host == addr.host(),
+            Source::Ip(ip) => Some(crate::netgroup::canonical_ip(*ip)) == addr.address().ip(),
+            Source::Overlay(address) => *address == addr.address(),
             Source::Internal(_) => false,
         };
         let time_penalty = if self_source { 0 } else { time_penalty };
@@ -782,33 +768,16 @@ impl Manager {
 }
 
 pub(crate) fn canonical(addr: PeerEndpoint) -> PeerEndpoint {
-    match addr {
-        PeerEndpoint::Ip(socket) => match socket.ip() {
-            IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(addr, |ip| {
-                PeerEndpoint::Ip(SocketAddr::new(ip.into(), socket.port()))
-            }),
-            IpAddr::V4(_) => addr,
-        },
-        PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => addr,
-    }
+    addr.to_canonical()
 }
 
 fn routable(addr: PeerEndpoint, allow_local: bool) -> bool {
-    // Core-compatible: I2P port `0` is an explicit unspecified service and
-    // stays routable; IP and TorV3 port `0` remain unroutable.
-    if addr.port() == 0 && !matches!(addr, PeerEndpoint::I2p { .. }) {
+    if addr.port() == 0 && !matches!(addr.address(), crate::PeerAddress::I2p(_)) || addr.address().is_unspecified() || addr.address().is_multicast() {
         return false;
     }
-    // Overlay endpoints are never local and have no IP routability test.
-    let socket = match addr {
-        PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => return true,
-        PeerEndpoint::Ip(socket) => socket,
-    };
-    if socket.ip().is_unspecified() || socket.ip().is_multicast() {
-        return false;
-    }
-    match socket.ip() {
-        IpAddr::V4(ip) => {
+    match addr.address() {
+        crate::PeerAddress::Onion(_) | crate::PeerAddress::I2p(_) => true,
+        crate::PeerAddress::Ip(IpAddr::V4(ip)) => {
             let octets = ip.octets();
             if ip.is_broadcast() || octets[0] == 0 || octets[0] >= 240 {
                 return false;
@@ -824,12 +793,9 @@ fn routable(addr: PeerEndpoint, allow_local: bool) -> bool {
                 || octets[0] == 198 && (18..=19).contains(&octets[1])
                 || octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
         }
-        IpAddr::V6(ip) => {
+        crate::PeerAddress::Ip(IpAddr::V6(ip)) => {
             if let Some(ip) = ip.to_ipv4_mapped() {
-                return routable(
-                    PeerEndpoint::Ip(SocketAddr::new(ip.into(), socket.port())),
-                    allow_local,
-                );
+                return routable(PeerEndpoint::new(IpAddr::V4(ip), addr.port()), allow_local);
             }
             if allow_local {
                 return true;
@@ -1000,16 +966,20 @@ impl AddressBook {
     }
     pub(crate) fn learn_peer(
         &self,
-        source: IpAddr,
+        source: impl Into<crate::PeerAddress>,
         addresses: &[(PeerEndpoint, u64, u64)],
         now: u64,
     ) {
+        let source = source.into();
         let mut manager = self.state.lock();
         for &(addr, services, seen) in addresses.iter().take(MAX_GOSSIP) {
             manager.learn(
                 addr,
                 Some(services),
-                Source::Ip(source),
+                match source {
+                    crate::PeerAddress::Ip(ip) => Source::Ip(ip),
+                    address => Source::Overlay(address),
+                },
                 seen,
                 now,
                 2 * 60 * 60,
@@ -1051,7 +1021,7 @@ impl AddressBook {
                     .iter()
                     .filter_map(|(addr, claim)| (*claim != PendingClaim::Feeler).then_some(addr)),
             )
-            .map(|addr| endpoint_group(&manager.groups, *addr))
+            .map(|addr| manager.groups.group(addr.address()))
             .collect();
         let eligible: Vec<_> = manager
             .stored
@@ -1062,7 +1032,7 @@ impl AddressBook {
                     && allowed.contains(&entry.endpoint)
                     && !connected.contains(&entry.endpoint)
                     && !manager.pending.contains_key(&entry.endpoint)
-                    && !groups.contains(&endpoint_group(&manager.groups, entry.endpoint))
+                    && !groups.contains(&manager.groups.group(entry.endpoint.address()))
             })
             .collect();
         manager.select(&eligible, now)
@@ -1103,7 +1073,7 @@ impl AddressBook {
         let manager = self.state.lock();
         let mut groups = HashSet::new();
         for address in outbound {
-            groups.insert(endpoint_group(&manager.groups, *address));
+            groups.insert(manager.groups.group(address.address()));
             if groups.len() >= threshold {
                 return true;
             }
@@ -1195,8 +1165,8 @@ impl AddressBook {
                 )
                 && !active.iter().any(|other| {
                     canonical(*other) == addr
-                        || endpoint_group(&manager.groups, *other)
-                            == endpoint_group(&manager.groups, addr)
+                        || manager.groups.group(other.address())
+                            == manager.groups.group(addr.address())
                 })
         })
     }
@@ -1250,7 +1220,7 @@ impl AddressBook {
         self.state.lock().set_services(canonical(addr), services);
     }
     /// The netgroup of `ip` under this book's classifier, `ASMap` or IP prefix.
-    pub(crate) fn netgroup(&self, ip: IpAddr) -> Vec<u8> {
+    pub(crate) fn netgroup(&self, ip: impl Into<crate::PeerAddress>) -> Vec<u8> {
         self.state.lock().groups.group(ip)
     }
     pub(crate) fn succeeded(&self, addr: PeerEndpoint, services: u64, now: u64) {
@@ -1300,7 +1270,7 @@ impl AddressBook {
         // same canonical IP is sufficient even at a different port.
         let connected: HashSet<_> = connected
             .iter()
-            .filter_map(|addr| endpoint_ip(canonical(*addr)))
+            .map(|addr| canonical(*addr).address())
             .collect();
         let active: HashSet<_> = active.iter().copied().map(canonical).collect();
         let addresses: Vec<_> = {
@@ -1336,7 +1306,7 @@ impl AddressBook {
             if incumbent != EMPTY_SLOT {
                 let addr =
                     manager.stored.records[usize::try_from(incumbent).unwrap_or_default()].endpoint;
-                if endpoint_ip(addr).is_some_and(|ip| connected.contains(&ip)) {
+                if connected.contains(&addr.address()) {
                     manager.good(addr, true, now);
                 } else if manager.stored.records[usize::try_from(incumbent).unwrap_or_default()]
                     .services
@@ -1509,22 +1479,19 @@ impl AddressBook {
         self.save();
     }
 
-    pub(crate) fn gossip(&self, now: u64) -> Vec<(u32, bitcoin::p2p::address::Address)> {
+    pub(crate) fn gossip(&self, now: u64) -> Vec<bitcoin::p2p::address::AddrV2Message> {
         self.gossip_at(now, Instant::now())
     }
-    fn gossip_at(&self, now: u64, tick: Instant) -> Vec<(u32, bitcoin::p2p::address::Address)> {
+    fn gossip_at(&self, now: u64, tick: Instant) -> Vec<bitcoin::p2p::address::AddrV2Message> {
         let mut manager = self.state.lock();
         Self::shared_rows(&mut manager, now, tick)
             .into_iter()
-            .filter_map(|row| {
-                let socket = row.endpoint.as_ip()?;
-                Some((
+            .map(|row| {
+                crate::endpoint::endpoint_to_addrv2(
+                    row.endpoint,
                     row.last_seen,
-                    bitcoin::p2p::address::Address::new(
-                        &socket,
-                        bitcoin::p2p::ServiceFlags::from(row.services),
-                    ),
-                ))
+                    bitcoin::p2p::ServiceFlags::from(row.services),
+                )
             })
             .collect()
     }
@@ -1737,8 +1704,8 @@ fn validate_current(
     for entry in &stored.records {
         if !routable(entry.endpoint, allow_local)
             || canonical(entry.endpoint) != entry.endpoint
-            || matches!(&entry.source, Source::Overlay(host)
-                if !matches!(host, EndpointHost::TorV3 { .. } | EndpointHost::I2p { .. }))
+            || matches!(&entry.source, Source::Overlay(address)
+                if !matches!(address, crate::PeerAddress::Onion(_) | crate::PeerAddress::I2p(_)))
             || !endpoints.insert(entry.endpoint)
             || entry.services.is_none() && !entry.allows_unknown_services()
             || entry.new_buckets.len() > MAX_NEW_REFS
@@ -1832,6 +1799,7 @@ fn read_book(
     if magic.is_some_and(|magic| magic != header.magic) {
         return Err(invalid("address book network"));
     }
+
     if header.format.as_deref() != Some(FORMAT) || header.version != SCHEMA_VERSION {
         return Err(invalid("unsupported address book format/version"));
     }
@@ -1852,6 +1820,7 @@ fn read_book(
         bytes,
     }))
 }
+
 // Preserve rejected bytes before allowing replacement. Exclusive atomic
 // publication cannot clobber an existing backup, including an unsafe file type.
 // An interrupted first save can reuse only a byte-identical, flushed backup.
@@ -1869,8 +1838,6 @@ fn preserve_incompatible(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
             {
                 return Err(invalid("address book backup size/type"));
             }
-            // Read, revalidate and flush the same handle. Windows requires
-            // GENERIC_WRITE for FlushFileBuffers even when bytes are unchanged.
             let mut file = OpenOptions::new().read(true).write(true).open(&backup)?;
             let mut existing = Vec::new();
             (&mut file)

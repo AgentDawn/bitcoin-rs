@@ -847,7 +847,7 @@ impl BlockSync {
                     })
                 };
                 usable_peers.push(UsablePeer {
-                    source: session.lease.source(session.endpoint),
+                    source: session.lease.source(session.addr),
                     info,
                     demonstrated_tips,
                     active_height,

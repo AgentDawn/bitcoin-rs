@@ -97,83 +97,6 @@ fn optional_u64(params: &Value, index: usize, default: u64) -> Result<u64, RpcEr
         .ok_or_else(|| RpcError::InvalidParameter("value is out of range".to_owned()))
 }
 
-/// Reports the configured reachability of each network.
-///
-/// Reachability is *outbound* reachability: Core reports `reachable` for a
-/// network we can dial, and `limited` when we cannot. For onion that means the
-/// SOCKS route an onion dial goes through — `--onion`, or `--proxy` as its
-/// documented fallback (`DialRoutes::onion`) — and nothing else.
-///
-/// A Tor control connection is deliberately not enough. `tor_control` only
-/// publishes an inbound onion service and retires stale inbound streams; it
-/// carries no dial capability, so a node configured with control alone cannot
-/// originate a single onion connection. Reporting it as reachable would tell
-/// an operator their node can reach the onion network when every outbound
-/// onion dial fails with "no onion proxy route is configured". Inbound
-/// service publication is already reported where it belongs: the endpoint
-/// appears in `localaddresses`.
-fn configured_networks(overlay: &bitcoin_rs_p2p::OverlayConfig) -> Vec<GetNetworkInfoNetwork> {
-    let onlynet = &overlay.onlynet;
-    let allowed =
-        |label: bitcoin_rs_primitives::NetworkLabel| onlynet.is_empty() || onlynet.contains(&label);
-    let onion_proxy = overlay.onion.or(overlay.proxy);
-    let ipv4_reachable = allowed(bitcoin_rs_primitives::NetworkLabel::Ipv4);
-    let ipv6_reachable = allowed(bitcoin_rs_primitives::NetworkLabel::Ipv6);
-    let onion_reachable =
-        allowed(bitcoin_rs_primitives::NetworkLabel::Onion) && onion_proxy.is_some();
-    let i2p_reachable =
-        allowed(bitcoin_rs_primitives::NetworkLabel::I2p) && overlay.i2p_sam.is_some();
-    [
-        (
-            "ipv4",
-            !ipv4_reachable,
-            ipv4_reachable,
-            overlay
-                .proxy
-                .map(|addr| addr.to_string())
-                .unwrap_or_default(),
-            overlay.proxy.is_some() && overlay.proxy_randomize_credentials,
-        ),
-        (
-            "ipv6",
-            !ipv6_reachable,
-            ipv6_reachable,
-            overlay
-                .proxy
-                .map(|addr| addr.to_string())
-                .unwrap_or_default(),
-            overlay.proxy.is_some() && overlay.proxy_randomize_credentials,
-        ),
-        (
-            "onion",
-            !onion_reachable,
-            onion_reachable,
-            onion_proxy.map(|addr| addr.to_string()).unwrap_or_default(),
-            onion_proxy.is_some(),
-        ),
-        (
-            "i2p",
-            !i2p_reachable,
-            i2p_reachable,
-            overlay
-                .i2p_sam
-                .map(|addr| addr.to_string())
-                .unwrap_or_default(),
-            false,
-        ),
-    ]
-    .into_iter()
-    .map(
-        |(name, limited, reachable, proxy, randomize)| GetNetworkInfoNetwork {
-            name: name.to_owned(),
-            limited,
-            reachable,
-            proxy,
-            proxy_randomize_credentials: randomize,
-        },
-    )
-    .collect()
-}
 
 pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
@@ -182,19 +105,28 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let inbound = peers.iter().filter(|p| p.inbound).count();
     let outbound = total.saturating_sub(inbound);
     let network_active = ctx.network.p2p.network_active();
-    // Reachability and proxy strings are *configured*, never probed:
-    // they state what the operator configured, exactly as Core reports
-    // its configured proxies without testing them.
-    let networks = configured_networks(&ctx.network.overlay);
-    let local_addresses = ctx
-        .network
-        .p2p
-        .overlay_addresses()
-        .into_iter()
-        .map(|endpoint| v31::GetNetworkInfoAddress {
-            address: endpoint.host().to_string(),
-            port: endpoint.port(),
-            score: 0,
+    let states = ctx.network.p2p.network_states();
+    let networks = states
+        .iter()
+        .map(|state| GetNetworkInfoNetwork {
+            name: state.network.name().to_owned(),
+            limited: !state.allowed,
+            reachable: state.allowed
+                && network_active
+                && match state.network {
+                    bitcoin_rs_p2p::PeerNetwork::Ipv4 | bitcoin_rs_p2p::PeerNetwork::Ipv6 => {
+                        state.proxy.is_none() || state.operational
+                    }
+                    bitcoin_rs_p2p::PeerNetwork::Onion | bitcoin_rs_p2p::PeerNetwork::I2p => {
+                        state.proxy.is_some()
+                    }
+                },
+            proxy: state
+                .proxy
+                .map_or_else(String::new, |socket| socket.to_string()),
+            proxy_randomize_credentials: state.proxy.is_some()
+                && state.network != bitcoin_rs_p2p::PeerNetwork::I2p
+                && ctx.network.p2p.proxy_randomize_credentials(),
         })
         .collect::<Vec<_>>();
     let mut local_services =
@@ -225,7 +157,36 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         networks,
         relay_fee: DEFAULT_RELAY_FEE_BTC_PER_KVB,
         incremental_fee: DEFAULT_INCREMENTAL_FEE_BTC_PER_KVB,
-        local_addresses,
+        local_addresses: {
+            let mut seen: HashSet<bitcoin_rs_p2p::PeerEndpoint> = HashSet::new();
+            let mut addresses: Vec<corepc_types::v17::GetNetworkInfoAddress> = states
+                .iter()
+                .filter_map(|state| state.local_address)
+                .map(|endpoint| {
+                    seen.insert(endpoint);
+                    corepc_types::v17::GetNetworkInfoAddress {
+                        address: endpoint.address().to_string(),
+                        port: endpoint.port(),
+                        score: 1,
+                    }
+                })
+                .collect();
+            for endpoint in ctx.network.p2p.overlay_addresses() {
+                if !matches!(
+                    endpoint.address().network(),
+                    bitcoin_rs_p2p::PeerNetwork::Onion | bitcoin_rs_p2p::PeerNetwork::I2p
+                ) || !seen.insert(endpoint)
+                {
+                    continue;
+                }
+                addresses.push(corepc_types::v17::GetNetworkInfoAddress {
+                    address: endpoint.host().to_string(),
+                    port: endpoint.port(),
+                    score: 0,
+                });
+            }
+            addresses
+        },
         warnings: Vec::new(),
     })
 }
@@ -313,7 +274,7 @@ pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
             let fee_filter = sat_to_btc(
                 ctx.network
                     .peer_table
-                    .transaction_fee_filter(session.lease.source(session.endpoint)),
+                    .transaction_fee_filter(session.lease.source(session.addr)),
             );
             Some(peer_info_wire(session, peer, fee_filter))
         })
@@ -413,11 +374,12 @@ fn peer_info_wire(
     PeerInfoWire {
         id: session.lease.node_id(),
         address: peer
-            .endpoint
+            .addr
+            .endpoint()
             .map_or_else(|| "unknown".to_owned(), |endpoint| endpoint.to_string()),
         address_bind: Some(peer.addr_bind.to_string()),
         address_local: None,
-        network: peer.network.as_str().to_owned(),
+        network: peer.addr.network().name().to_owned(),
         mapped_as: None,
         services: format!("{:016x}", peer.services),
         services_names: peer
@@ -588,12 +550,38 @@ pub(crate) fn ping(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcErro
     Ok(Value::new_null())
 }
 
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "The lowercased I2P DNS suffix selects a transport, not a filesystem extension"
+)]
 pub(crate) fn addnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let node = required_str(params, 0, "node is required")?;
     let command = required_str(params, 1, "command is required")?;
-    let addr = bitcoin_rs_p2p::parse_endpoint(node).ok_or(RpcError::InvalidParams(
-        "node must be a valid host:port address",
-    ))?;
+    if !matches!(command, "add" | "onetry" | "remove") {
+        return Err(RpcError::InvalidParams(
+            "command must be one of: add, remove, onetry",
+        ));
+    }
+    let addr = if let Ok(endpoint) = bitcoin_rs_p2p::PeerEndpoint::from_str(node) {
+        endpoint
+    } else if command != "remove"
+        && node
+            .to_ascii_lowercase()
+            .rsplit_once(':')
+            .is_some_and(|(host, _)| host.ends_with(".i2p"))
+    {
+        ctx.network
+            .p2p
+            .resolve_peer(node)
+            .map_err(|_| RpcError::InvalidParams("I2P name resolution failed"))?
+            .into_iter()
+            .next()
+            .ok_or(RpcError::InvalidParams("I2P name has no destination"))?
+    } else {
+        return Err(RpcError::InvalidParams(
+            "node must be a valid host:port address",
+        ));
+    };
     match command {
         "add" => {
             ctx.network
@@ -621,6 +609,9 @@ pub(crate) fn addnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcEr
 
 fn control_error_to_rpc_error(error: bitcoin_rs_p2p::P2pControlError) -> RpcError {
     match error {
+        bitcoin_rs_p2p::P2pControlError::NetworkDisabled => {
+            RpcError::InvalidParams("destination network disabled")
+        }
         bitcoin_rs_p2p::P2pControlError::Banned => RpcError::InvalidParams("node is banned"),
         bitcoin_rs_p2p::P2pControlError::QueueFull => {
             RpcError::Internal("p2p outbound queue full".to_owned())
@@ -752,7 +743,7 @@ pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Val
     // Live peers carry real service flags and handshake times. Unidentified
     // peers have no known address to report.
     for peer in ctx.network.peer_table.infos() {
-        let Some(endpoint) = peer.endpoint else {
+        let Some(endpoint) = peer.addr.endpoint() else {
             continue;
         };
         if !seen.insert(endpoint) {
@@ -761,9 +752,9 @@ pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Val
         entries.push(v31::NodeAddress {
             time: peer.conn_time,
             services: peer.services,
-            address: endpoint.host().to_string(),
+            address: endpoint.address().to_string(),
             port: endpoint.port(),
-            network: endpoint.net().as_str().to_owned(),
+            network: peer.addr.network().name().to_owned(),
         });
     }
 
@@ -775,9 +766,9 @@ pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Val
         entries.push(v31::NodeAddress {
             time: now,
             services: 1,
-            address: addr.host().to_string(),
+            address: addr.address().to_string(),
             port: addr.port(),
-            network: addr.net().as_str().to_owned(),
+            network: addr.address().network().name().to_owned(),
         });
     }
 
@@ -797,6 +788,57 @@ mod tests {
     use super::*;
     use alloc::sync::Arc;
     use sonic_rs::{JsonContainerTrait, JsonValueTrait, json};
+
+    #[test]
+    fn configured_overlay_route_is_reported_without_claiming_an_operational_peer() {
+        let mut ctx = Context::new();
+        let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+            bitcoin_rs_p2p::P2pServiceConfig {
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
+                    onion_proxy: Some(
+                        "127.0.0.1:9050"
+                            .parse()
+                            .unwrap_or_else(|error| panic!("proxy: {error}")),
+                    ),
+                    onlynet: vec![bitcoin_rs_p2p::PeerNetwork::Onion],
+                    ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
+                }
+                .into(),
+                ..bitcoin_rs_p2p::P2pServiceConfig::default()
+            },
+            bitcoin_rs_chain::LatchReader::fixture_never(),
+        ));
+        ctx.network.peer_table = p2p.table();
+        ctx.network.p2p = p2p;
+        let ctx = Arc::new(ctx);
+        let result =
+            getnetworkinfo(&ctx, &json!([])).unwrap_or_else(|error| panic!("RPC: {error}"));
+        let networks = result
+            .get("networks")
+            .and_then(|value| value.as_array())
+            .unwrap_or_else(|| panic!("networks"));
+        for row in networks {
+            let name = row
+                .get("name")
+                .and_then(JsonValueTrait::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                row.get("reachable").and_then(JsonValueTrait::as_bool),
+                Some(name == "onion")
+            );
+            assert_eq!(
+                row.get("limited").and_then(JsonValueTrait::as_bool),
+                Some(name != "onion")
+            );
+            if name == "onion" {
+                assert_eq!(
+                    row.get("proxy").and_then(JsonValueTrait::as_str),
+                    Some("127.0.0.1:9050")
+                );
+            }
+        }
+        assert!(addnode(&ctx, &json!(["127.0.0.1:8333", "onetry"])).is_err());
+    }
 
     #[test]
     fn getnetworkinfo_reports_zero_connections_on_fresh_context() {
@@ -822,12 +864,21 @@ mod tests {
         let mut ctx = Context::new();
         // Dead proxy/SAM addresses on purpose: reporting must reflect
         // configuration, never a live probe.
-        ctx.network.overlay = bitcoin_rs_p2p::OverlayConfig {
-            onion: Some("127.0.0.1:1".parse()?),
-            i2p_sam: Some("127.0.0.1:2".parse()?),
-            proxy_randomize_credentials: true,
-            ..bitcoin_rs_p2p::OverlayConfig::default()
-        };
+        let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+            bitcoin_rs_p2p::P2pServiceConfig {
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
+                    onion_proxy: Some("127.0.0.1:1".parse()?),
+                    i2p_sam: Some("127.0.0.1:2".parse()?),
+                    randomize_credentials: true,
+                    ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
+                }
+                .into(),
+                ..bitcoin_rs_p2p::P2pServiceConfig::default()
+            },
+            bitcoin_rs_chain::LatchReader::fixture_never(),
+        ));
+        ctx.network.peer_table = p2p.table();
+        ctx.network.p2p = p2p;
         let ctx = Arc::new(ctx);
         let result = getnetworkinfo(&ctx, &json!(null))?;
         let Some(networks) = result
@@ -892,12 +943,19 @@ mod tests {
     fn getnetworkinfo_does_not_call_onion_reachable_with_control_only()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut ctx = Context::new();
-        ctx.network.overlay = bitcoin_rs_p2p::OverlayConfig {
-            tor_control: Some("127.0.0.1:9051".to_owned()),
-            onion_key_path: Some(std::path::PathBuf::from("/tmp/onion_v3_private_key")),
-            tor_virtual_port: 8333,
-            ..bitcoin_rs_p2p::OverlayConfig::default()
-        };
+        let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+            bitcoin_rs_p2p::P2pServiceConfig {
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
+                    tor_control: Some("127.0.0.1:9051".parse()?),
+                    ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
+                }
+                .into(),
+                ..bitcoin_rs_p2p::P2pServiceConfig::default()
+            },
+            bitcoin_rs_chain::LatchReader::fixture_never(),
+        ));
+        ctx.network.peer_table = p2p.table();
+        ctx.network.p2p = p2p;
         let ctx = Arc::new(ctx);
 
         let result = getnetworkinfo(&ctx, &json!(null))?;
@@ -944,29 +1002,41 @@ mod tests {
         Ok(())
     }
 
-    /// The dial route the onion network actually uses — `--onion`, or
-    /// `--proxy` as its documented fallback — is what makes it reachable.
+    /// The dial route the onion network actually uses — `onion_proxy` — is what
+    /// makes it reachable. The general `proxy` alone does not route onion
+    /// (`OverlayConfig::connect` requires `onion_proxy`; it is never inherited
+    /// from `proxy`), so it leaves onion unreachable and reports no onion proxy.
     #[test]
     fn getnetworkinfo_calls_onion_reachable_with_an_outbound_socks_route()
     -> Result<(), Box<dyn std::error::Error>> {
-        for (label, overlay) in [
+        for (label, overlay, expect_reachable) in [
             (
                 "onion route",
-                bitcoin_rs_p2p::OverlayConfig {
-                    onion: Some("127.0.0.1:9050".parse()?),
-                    ..bitcoin_rs_p2p::OverlayConfig::default()
+                bitcoin_rs_p2p::overlay::OverlayConfig {
+                    onion_proxy: Some("127.0.0.1:9050".parse()?),
+                    ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
                 },
+                true,
             ),
             (
-                "general proxy fallback",
-                bitcoin_rs_p2p::OverlayConfig {
+                "general proxy alone",
+                bitcoin_rs_p2p::overlay::OverlayConfig {
                     proxy: Some("127.0.0.1:9050".parse()?),
-                    ..bitcoin_rs_p2p::OverlayConfig::default()
+                    ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
                 },
+                false,
             ),
         ] {
             let mut ctx = Context::new();
-            ctx.network.overlay = overlay;
+            let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+                bitcoin_rs_p2p::P2pServiceConfig {
+                    overlay: overlay.into(),
+                    ..bitcoin_rs_p2p::P2pServiceConfig::default()
+                },
+                bitcoin_rs_chain::LatchReader::fixture_never(),
+            ));
+            ctx.network.peer_table = p2p.table();
+            ctx.network.p2p = p2p;
             let ctx = Arc::new(ctx);
             let result = getnetworkinfo(&ctx, &json!(null))?;
             let Some(networks) = result
@@ -983,17 +1053,21 @@ mod tests {
             };
             assert_eq!(
                 onion.get("reachable").and_then(JsonValueTrait::as_bool),
-                Some(true),
-                "{label} must make onion reachable"
+                Some(expect_reachable),
+                "{label} onion reachability"
             );
             assert_eq!(
                 onion.get("limited").and_then(JsonValueTrait::as_bool),
-                Some(false),
-                "{label} must not mark onion limited"
+                Some(!expect_reachable),
+                "{label} onion limited"
             );
             assert_eq!(
                 onion.get("proxy").and_then(JsonValueTrait::as_str),
-                Some("127.0.0.1:9050"),
+                if expect_reachable {
+                    Some("127.0.0.1:9050")
+                } else {
+                    Some("")
+                },
                 "{label} must report the SOCKS endpoint it dials"
             );
         }
@@ -1061,15 +1135,23 @@ mod tests {
     #[test]
     fn getnetworkinfo_reports_onlynet_and_credential_isolation()
     -> Result<(), Box<dyn std::error::Error>> {
-        use bitcoin_rs_primitives::NetworkLabel;
-
         let mut ctx = Context::new();
-        ctx.network.overlay = bitcoin_rs_p2p::OverlayConfig {
-            proxy: Some("127.0.0.1:9050".parse()?),
-            proxy_randomize_credentials: false,
-            onlynet: vec![NetworkLabel::Onion],
-            ..bitcoin_rs_p2p::OverlayConfig::default()
-        };
+        let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
+            bitcoin_rs_p2p::P2pServiceConfig {
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
+                    proxy: Some("127.0.0.1:9050".parse()?),
+                    onion_proxy: Some("127.0.0.1:9050".parse()?),
+                    randomize_credentials: false,
+                    onlynet: vec![bitcoin_rs_p2p::PeerNetwork::Onion],
+                    ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
+                }
+                .into(),
+                ..bitcoin_rs_p2p::P2pServiceConfig::default()
+            },
+            bitcoin_rs_chain::LatchReader::fixture_never(),
+        ));
+        ctx.network.peer_table = p2p.table();
+        ctx.network.p2p = p2p;
         let ctx = Arc::new(ctx);
         let result = getnetworkinfo(&ctx, &json!(null))?;
         let Some(networks) = result
@@ -1117,14 +1199,13 @@ mod tests {
             onion.get("proxy").and_then(JsonValueTrait::as_str),
             Some("127.0.0.1:9050")
         );
-        // Tor transport in endpoint.rs enforces mandatory per-dial credential
-        // isolation regardless of general IP proxy settings; reports true
-        // whenever an onion proxy route is configured.
+        // Credential isolation follows `randomize_credentials`; I2P never
+        // randomizes. With the flag off, the onion route reports false.
         assert_eq!(
             onion
                 .get("proxy_randomize_credentials")
                 .and_then(JsonValueTrait::as_bool),
-            Some(true)
+            Some(false)
         );
 
         let i2p = by_name("i2p")?;
@@ -1231,7 +1312,10 @@ mod addnode_validation_tests {
         let persisted = bitcoin_rs_p2p::PeerEndpoint::Ip(SocketAddr::from(([127, 0, 0, 1], 8333)));
         let result = addnode(&ctx, &json!(["127.0.0.1:8333", "add"]));
         assert!(result.is_ok());
-        assert_eq!(ctx.network.p2p.added_nodes().as_slice(), &[persisted]);
+        assert_eq!(
+            ctx.network.p2p.added_nodes().as_slice(),
+            &[persisted.into()]
+        );
 
         ctx.network.p2p.set_network_active(true);
         let result = addnode(&ctx, &json!(["127.0.0.2:8333", "onetry"]));
@@ -1247,10 +1331,7 @@ mod addnode_validation_tests {
         assert!(result.is_null());
         assert_eq!(
             ctx.network.p2p.added_nodes().as_slice(),
-            &[bitcoin_rs_p2p::PeerEndpoint::Ip(SocketAddr::from((
-                [127, 0, 0, 1],
-                8333
-            )))]
+            &[bitcoin_rs_p2p::PeerEndpoint::from(([127, 0, 0, 1], 8333))]
         );
     }
 
@@ -1263,11 +1344,8 @@ mod addnode_validation_tests {
             },
             bitcoin_rs_chain::LatchReader::fixture_never(),
         ));
-        p2p.add_node(
-            bitcoin_rs_p2p::PeerEndpoint::Ip(SocketAddr::from(([127, 0, 0, 1], 8333))),
-            false,
-        )
-        .unwrap_or_else(|err| panic!("failed to fill outbound queue: {err}"));
+        p2p.add_node(SocketAddr::from(([127, 0, 0, 1], 8333)).into(), false)
+            .unwrap_or_else(|err| panic!("failed to fill outbound queue: {err}"));
         let mut ctx = Context::new();
         ctx.network.p2p = Arc::clone(&p2p);
         let ctx = Arc::new(ctx);
@@ -1289,11 +1367,8 @@ mod addnode_validation_tests {
             },
             bitcoin_rs_chain::LatchReader::fixture_never(),
         ));
-        p2p.add_node(
-            bitcoin_rs_p2p::PeerEndpoint::Ip(SocketAddr::from(([127, 0, 0, 1], 8333))),
-            false,
-        )
-        .unwrap_or_else(|err| panic!("failed to fill outbound queue: {err}"));
+        p2p.add_node(SocketAddr::from(([127, 0, 0, 1], 8333)).into(), false)
+            .unwrap_or_else(|err| panic!("failed to fill outbound queue: {err}"));
         let mut ctx = Context::new();
         ctx.network.p2p = Arc::clone(&p2p);
         let ctx = Arc::new(ctx);
@@ -1305,9 +1380,7 @@ mod addnode_validation_tests {
         let added = ctx.network.p2p.added_nodes();
         assert_eq!(
             added.as_slice(),
-            [bitcoin_rs_p2p::PeerEndpoint::Ip(
-                std::net::SocketAddr::from(([127, 0, 0, 2], 8333))
-            )]
+            [bitcoin_rs_p2p::PeerEndpoint::from(([127, 0, 0, 2], 8333))]
         );
     }
 
@@ -1353,8 +1426,7 @@ mod addnode_validation_tests {
             relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
-            endpoint: Some(bitcoin_rs_p2p::PeerEndpoint::Ip(addr)),
-            network: bitcoin_rs_p2p::PeerEndpoint::Ip(addr).net(),
+            addr: addr.into(),
             version: 70_016,
             services: 9,
             user_agent: "test".to_owned(),
@@ -1362,7 +1434,7 @@ mod addnode_validation_tests {
             best_known_height: 0,
             conn_time: 0,
             inbound: false,
-            addr_bind: bitcoin_rs_p2p::TransportRemote::new(addr),
+            addr_bind: addr,
             time_offset: 0,
             counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
             transport: bitcoin_rs_p2p::TransportProtocol::V1,
@@ -1393,8 +1465,7 @@ mod addnode_validation_tests {
             relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
-            endpoint: Some(endpoint),
-            network: endpoint.net(),
+            addr: bitcoin_rs_p2p::PeerRemote::Endpoint(endpoint),
             version: 70_016,
             services: 9,
             user_agent: "test".to_owned(),
@@ -1402,7 +1473,7 @@ mod addnode_validation_tests {
             best_known_height: 0,
             conn_time: 0,
             inbound: false,
-            addr_bind: bitcoin_rs_p2p::TransportRemote::new(addr),
+            addr_bind: addr,
             time_offset: 0,
             counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
             transport: bitcoin_rs_p2p::TransportProtocol::V1,
@@ -1678,8 +1749,7 @@ mod addnode_validation_tests {
             relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
-            endpoint: None,
-            network: bitcoin_rs_primitives::NetworkLabel::Onion,
+            addr: bitcoin_rs_p2p::PeerRemote::AnonymousTor(anon.connection_id()),
             version: 70_016,
             services: 0,
             user_agent: "anon".to_owned(),
@@ -1687,7 +1757,7 @@ mod addnode_validation_tests {
             best_known_height: 0,
             conn_time: 0,
             inbound: true,
-            addr_bind: bitcoin_rs_p2p::TransportRemote::new("127.0.0.1:9000".parse()?),
+            addr_bind: "127.0.0.1:9000".parse()?,
             time_offset: 0,
             counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
             transport: bitcoin_rs_p2p::TransportProtocol::V1,
@@ -2190,8 +2260,7 @@ mod peer_counter_tests {
             relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
-            endpoint: Some(bitcoin_rs_p2p::PeerEndpoint::Ip(parse(addr))),
-            network: bitcoin_rs_p2p::PeerEndpoint::Ip(parse(addr)).net(),
+            addr: parse(addr).into(),
             version: 70_016,
             services: 0,
             user_agent: "/test/".to_owned(),
@@ -2199,7 +2268,7 @@ mod peer_counter_tests {
             best_known_height: 0,
             conn_time: 0,
             inbound,
-            addr_bind: bitcoin_rs_p2p::TransportRemote::new(parse(bind)),
+            addr_bind: parse(bind),
             time_offset,
             counters,
             transport: bitcoin_rs_p2p::TransportProtocol::V1,
@@ -2228,7 +2297,7 @@ mod peer_counter_tests {
         for info in peers {
             let (tx, _rx) = unbounded();
             let lease = PeerLease::new(tx);
-            let Some(endpoint) = info.endpoint else {
+            let Some(endpoint) = info.addr.endpoint() else {
                 panic!("identified test peer missing endpoint");
             };
             peer_table.register(endpoint, lease.clone());
@@ -2608,8 +2677,7 @@ mod getnodeaddresses_tests {
             relay_transactions: true,
             compact_block_relay: false,
             send_headers: false,
-            endpoint: Some(bitcoin_rs_p2p::PeerEndpoint::Ip(parsed)),
-            network: bitcoin_rs_p2p::PeerEndpoint::Ip(parsed).net(),
+            addr: parsed.into(),
             version: 70_016,
             services,
             user_agent: "test".to_owned(),
@@ -2617,7 +2685,7 @@ mod getnodeaddresses_tests {
             best_known_height: 0,
             conn_time: 100,
             inbound: false,
-            addr_bind: bitcoin_rs_p2p::TransportRemote::new(parsed),
+            addr_bind: parsed,
             time_offset: 0,
             counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
             transport: bitcoin_rs_p2p::TransportProtocol::V1,
@@ -2627,14 +2695,45 @@ mod getnodeaddresses_tests {
     fn add_peer(ctx: &Context, info: PeerInfo) {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let lease = PeerLease::new(tx);
+        let endpoint = info
+            .addr
+            .endpoint()
+            .expect("identified test peer");
+        ctx.network.peer_table.register(endpoint, lease.clone());
         ctx.network
             .peer_table
-            .register(info.endpoint.expect("identified test peer"), lease.clone());
-        ctx.network.peer_table.publish_info(
-            info.endpoint.expect("identified test peer"),
-            &lease,
-            info,
+            .publish_info(endpoint, &lease, info);
+    }
+
+    #[test]
+    fn anonymous_handles_are_visible_and_disconnectable_but_not_destinations() {
+        let ctx = Context::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = PeerLease::new_inbound(tx);
+        let remote = bitcoin_rs_p2p::PeerRemote::AnonymousTor(lease.connection_id());
+        let mut info = peer("127.0.0.1:8333", 9);
+        info.addr = remote;
+        info.inbound = true;
+        ctx.network.peer_table.register(remote, lease.clone());
+        ctx.network.peer_table.publish_info(remote, &lease, info);
+        let ctx = Arc::new(ctx);
+        let listed = getpeerinfo(&ctx, &json!([])).expect("peer info");
+        let row = &listed.as_array().expect("peers")[0];
+        let handle = remote.to_string();
+        assert_eq!(
+            row.get("addr").and_then(JsonValueTrait::as_str),
+            Some(handle.as_str())
         );
+        assert_eq!(
+            row.get("network").and_then(JsonValueTrait::as_str),
+            Some("onion")
+        );
+        let destinations = getnodeaddresses(&ctx, &json!([0])).expect("destinations");
+        assert_eq!(destinations.as_array().expect("addresses").len(), 0);
+        assert!(addnode(&ctx, &json!([handle.as_str(), "add"])).is_err());
+        assert!(disconnectnode(&ctx, &json!([handle.as_str()])).is_ok());
+        assert!(lease.is_cancelled());
+        assert!(ctx.network.peer_table.is_empty());
     }
 
     #[test]

@@ -115,7 +115,7 @@ impl BlockSync {
             .into_iter()
             .filter_map(|session| {
                 let info = session.info?;
-                Some((session.lease.source(session.endpoint), info))
+                Some((session.lease.source(session.addr), info))
             })
             .collect::<Vec<_>>();
         let mut peers = live

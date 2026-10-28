@@ -151,7 +151,7 @@ fn generated_rpc_cookie_is_private_and_rotates() -> anyhow::Result<()> {
 fn overlay_targets_without_routes_are_rejected() -> anyhow::Result<()> {
     let onlynet_onion = UserConfig {
         p2p: P2pOverrides {
-            onlynet: Some(vec![bitcoin_rs_primitives::NetworkLabel::Onion]),
+            onlynet: Some(vec![bitcoin_rs_p2p::PeerNetwork::Onion]),
             ..P2pOverrides::default()
         },
         ..UserConfig::default()
@@ -160,7 +160,7 @@ fn overlay_targets_without_routes_are_rejected() -> anyhow::Result<()> {
 
     let onlynet_i2p = UserConfig {
         p2p: P2pOverrides {
-            onlynet: Some(vec![bitcoin_rs_primitives::NetworkLabel::I2p]),
+            onlynet: Some(vec![bitcoin_rs_p2p::PeerNetwork::I2p]),
             ..P2pOverrides::default()
         },
         ..UserConfig::default()
@@ -169,7 +169,7 @@ fn overlay_targets_without_routes_are_rejected() -> anyhow::Result<()> {
 
     let accept_without_sam = UserConfig {
         p2p: P2pOverrides {
-            i2pacceptincoming: Some(true),
+            i2p_accept: Some(true),
             ..P2pOverrides::default()
         },
         ..UserConfig::default()
@@ -181,12 +181,12 @@ fn overlay_targets_without_routes_are_rejected() -> anyhow::Result<()> {
     let routed = UserConfig {
         p2p: P2pOverrides {
             dns_seeds: Some(false),
-            onion: Some(SocketAddr::from(([127, 0, 0, 1], 9050))),
-            i2psam: Some(SocketAddr::from(([127, 0, 0, 1], 7656))),
-            i2pacceptincoming: Some(true),
+            onion_proxy: Some(SocketAddr::from(([127, 0, 0, 1], 9050))),
+            i2p_sam: Some(SocketAddr::from(([127, 0, 0, 1], 7656))),
+            i2p_accept: Some(true),
             onlynet: Some(vec![
-                bitcoin_rs_primitives::NetworkLabel::Onion,
-                bitcoin_rs_primitives::NetworkLabel::I2p,
+                bitcoin_rs_p2p::PeerNetwork::Onion,
+                bitcoin_rs_p2p::PeerNetwork::I2p,
             ]),
             ..P2pOverrides::default()
         },
@@ -194,26 +194,20 @@ fn overlay_targets_without_routes_are_rejected() -> anyhow::Result<()> {
     };
     let config = super::resolve(&[&routed])?;
     assert_eq!(
-        config.p2p.overlay.onion,
+        config.p2p.overlay.onion_proxy,
         Some(SocketAddr::from(([127, 0, 0, 1], 9050)))
     );
-    assert!(config.p2p.overlay.i2p_accept_incoming);
+    assert!(config.p2p.overlay.i2p_accept);
     assert_eq!(config.p2p.overlay.onlynet.len(), 2);
     assert!(
-        config
-            .p2p
-            .overlay
-            .onion_key_path
-            .as_deref()
-            .is_some_and(|path| path.ends_with("onion_v3_private_key"))
+        !config.p2p.overlay.identity_dir.as_os_str().is_empty(),
+        "inbound overlay services require an identity directory"
     );
-    assert!(
-        config
-            .p2p
-            .overlay
-            .i2p_key_path
-            .as_deref()
-            .is_some_and(|path| path.ends_with("i2p_private_key"))
+    assert_eq!(
+        config.p2p.overlay.port,
+        NetworkSelection::Mainnet
+            .consensus_network()
+            .default_p2p_port()
     );
     Ok(())
 }
@@ -232,7 +226,7 @@ fn malformed_overlay_connect_targets_are_rejected() -> anyhow::Result<()> {
     let routes_layer = UserConfig {
         p2p: P2pOverrides {
             dns_seeds: Some(false),
-            onion: Some(SocketAddr::from(([127, 0, 0, 1], 9050))),
+            onion_proxy: Some(SocketAddr::from(([127, 0, 0, 1], 9050))),
             ..P2pOverrides::default()
         },
         ..UserConfig::default()
@@ -293,7 +287,7 @@ fn malformed_i2p_with_routes_configured_rejects_target_not_missing_route() -> an
     let routes_layer = UserConfig {
         p2p: P2pOverrides {
             dns_seeds: Some(false),
-            i2psam: Some(SocketAddr::from(([127, 0, 0, 1], 7656))),
+            i2p_sam: Some(SocketAddr::from(([127, 0, 0, 1], 7656))),
             ..P2pOverrides::default()
         },
         ..UserConfig::default()
@@ -406,9 +400,9 @@ fn valid_overlay_connect_targets_enforce_routes() -> anyhow::Result<()> {
 
     let routed = UserConfig {
         p2p: P2pOverrides {
-            onion: Some(SocketAddr::from(([127, 0, 0, 1], 9050))),
+            onion_proxy: Some(SocketAddr::from(([127, 0, 0, 1], 9050))),
             dns_seeds: Some(false),
-            i2psam: Some(SocketAddr::from(([127, 0, 0, 1], 7656))),
+            i2p_sam: Some(SocketAddr::from(([127, 0, 0, 1], 7656))),
             connect: Some(vec![good_tor.clone(), good_i2p.clone()]),
             ..P2pOverrides::default()
         },
@@ -446,11 +440,11 @@ fn privacy_routes_with_default_dns_seeds_are_rejected() {
             ..P2pOverrides::default()
         },
         P2pOverrides {
-            onion: Some(proxy),
+            onion_proxy: Some(proxy),
             ..P2pOverrides::default()
         },
         P2pOverrides {
-            i2psam: Some(sam),
+            i2p_sam: Some(sam),
             ..P2pOverrides::default()
         },
     ] {
@@ -501,13 +495,13 @@ fn hostname_connect_targets_are_rejected_with_privacy_route() {
             ..P2pOverrides::default()
         },
         P2pOverrides {
-            onion: Some(proxy),
+            onion_proxy: Some(proxy),
             dns_seeds: Some(false),
             connect: Some(vec!["seed.bitcoin.sipa.be:8333".to_owned()]),
             ..P2pOverrides::default()
         },
         P2pOverrides {
-            i2psam: Some(sam),
+            i2p_sam: Some(sam),
             dns_seeds: Some(false),
             connect: Some(vec!["seed.bitcoin.sipa.be:8333".to_owned()]),
             ..P2pOverrides::default()
@@ -540,7 +534,7 @@ fn typed_overlay_connect_targets_are_accepted_with_dns_disabled() -> anyhow::Res
     let onion_routed = UserConfig {
         p2p: P2pOverrides {
             dns_seeds: Some(false),
-            onion: Some(proxy),
+            onion_proxy: Some(proxy),
             connect: Some(vec![good_tor.clone()]),
             ..P2pOverrides::default()
         },
@@ -568,7 +562,7 @@ fn typed_overlay_connect_targets_are_accepted_with_dns_disabled() -> anyhow::Res
     let i2p_routed = UserConfig {
         p2p: P2pOverrides {
             dns_seeds: Some(false),
-            i2psam: Some(sam),
+            i2p_sam: Some(sam),
             connect: Some(vec![good_i2p.clone()]),
             ..P2pOverrides::default()
         },

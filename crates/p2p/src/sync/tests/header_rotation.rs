@@ -8,15 +8,21 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders() -> TestResult
         inbound_headers_tx,
         peers,
     } = header_sync_with_genesis()?;
-    let invalid_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
-    let other_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
+    let invalid_peer = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
+    let other_peer = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8334,
+    ));
     let (invalid_tx, invalid_rx) = crate::test_support::message_channel();
     let (other_tx, other_rx) = crate::test_support::message_channel();
 
     let invalid_lease = crate::PeerLease::new(invalid_tx);
-    peers.register(crate::PeerEndpoint::Ip(invalid_peer), invalid_lease.clone());
+    peers.register(invalid_peer, invalid_lease.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(invalid_peer),
+        invalid_peer,
         &invalid_lease,
         synthetic_peer(invalid_peer, 9),
     );
@@ -28,7 +34,7 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders() -> TestResult
     );
     assert!(
         sync.scheduler.lock().header_request().is_some_and(
-            |request| request.source.endpoint == Some(crate::PeerEndpoint::Ip(invalid_peer))
+            |request| request.source.addr == invalid_peer
         ),
         "a pending getheaders must name the invalid peer before its batch arrives"
     );
@@ -52,29 +58,29 @@ fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders() -> TestResult
         "an attributed invalid-header fault must release the pending header request"
     );
     assert!(
-        !peers.is_connected(crate::PeerEndpoint::Ip(invalid_peer)),
+        !peers.is_connected(invalid_peer),
         "invalid header source must be removed from peer selection"
     );
     assert!(
-        !peers.is_connected(crate::PeerEndpoint::Ip(invalid_peer)),
+        !peers.is_connected(invalid_peer),
         "invalid header source must lose its outbound lease"
     );
 
     // Re-introduce a healthy peer; the next getheaders must rotate to it.
     let other_lease = crate::PeerLease::new(other_tx);
-    peers.register(crate::PeerEndpoint::Ip(other_peer), other_lease.clone());
+    peers.register(other_peer, other_lease.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(other_peer),
+        other_peer,
         &other_lease,
         synthetic_peer(other_peer, 8),
     );
     sync.tick();
     assert!(
-        peers.is_connected(crate::PeerEndpoint::Ip(other_peer)),
+        peers.is_connected(other_peer),
         "healthy peer must remain eligible for rotation"
     );
     assert!(
-        peers.is_connected(crate::PeerEndpoint::Ip(other_peer)),
+        peers.is_connected(other_peer),
         "healthy peer must retain its outbound lease"
     );
     assert!(
@@ -96,7 +102,10 @@ fn unattributed_invalid_headers_do_not_disconnect_any_peer() -> TestResult {
         inbound_headers_tx,
         peers,
     } = header_sync_with_genesis()?;
-    let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let peer_addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     let _rx = connect_peer(&peers, synthetic_peer(peer_addr, 8));
     inbound_headers_tx.send(InboundHeaders {
         headers: vec![nbits_mismatch_header(genesis.compute_hash(), 1)],
@@ -108,11 +117,11 @@ fn unattributed_invalid_headers_do_not_disconnect_any_peer() -> TestResult {
     sync.tick();
 
     assert!(
-        peers.is_connected(crate::PeerEndpoint::Ip(peer_addr)),
+        peers.is_connected(peer_addr),
         "local injection must not identify an arbitrary peer as faulty"
     );
     assert!(
-        peers.is_connected(crate::PeerEndpoint::Ip(peer_addr)),
+        peers.is_connected(peer_addr),
         "local injection must preserve peer outbound leases"
     );
     Ok(())
@@ -121,11 +130,14 @@ fn unattributed_invalid_headers_do_not_disconnect_any_peer() -> TestResult {
 #[test]
 fn disconnected_outbound_channel_does_not_mark_blocks_pending() -> TestResult {
     let (sync, peers, block_tree, applied_tip, _expected) = sync_with_header_chain(3)?;
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let addr = PeerRemote::Endpoint(crate::PeerEndpoint::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        8333,
+    ));
     register_info(&peers, synthetic_peer(addr, 100));
     let (tx, rx) = crate::test_support::message_channel();
     drop(rx);
-    peers.register(crate::PeerEndpoint::Ip(addr), crate::PeerLease::new(tx));
+    peers.register(addr, crate::PeerLease::new(tx));
 
     sync.tick();
 
@@ -265,7 +277,7 @@ fn common_prefix_winner_takes_over_deep_window() -> TestResult {
             .map(Block::block_hash)
             .collect::<Vec<_>>()
     );
-    assert!(peers.is_connected(crate::PeerEndpoint::Ip(owner)));
+    assert!(peers.is_connected(owner));
     sync.scheduler
         .lock()
         .window
@@ -313,13 +325,13 @@ fn same_address_reconnect_does_not_inherit_stalled_inflight() -> TestResult {
 
     let (replacement_tx, replacement_rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(replacement_tx);
-    peers.register(crate::PeerEndpoint::Ip(winner), lease.clone());
+    peers.register(winner, lease.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(winner),
+        winner,
         &lease,
         synthetic_peer(winner, 100),
     );
-    let replacement = lease.source_ip(winner);
+    let replacement = lease.source(winner);
     sync.on_peer_ready(replacement);
     assert!(
         sync.scheduler.lock().window.preferred_peer().is_none(),
@@ -394,9 +406,9 @@ fn stall_eviction_does_not_disconnect_replacement_connection() -> TestResult {
     };
     let (replacement_tx, _replacement_rx) = crate::test_support::message_channel();
     let replacement = PeerLease::new(replacement_tx);
-    peers.register(crate::PeerEndpoint::Ip(staller), replacement.clone());
+    peers.register(staller, replacement.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(staller),
+        staller,
         &replacement,
         synthetic_peer(staller, 200),
     );
@@ -404,7 +416,7 @@ fn stall_eviction_does_not_disconnect_replacement_connection() -> TestResult {
 
     assert!(selected.is_some());
     assert!(!evicted);
-    assert!(peers.is_connected(crate::PeerEndpoint::Ip(staller)));
+    assert!(peers.is_connected(staller));
     assert!(!replacement.is_cancelled());
     Ok(())
 }
@@ -448,14 +460,14 @@ fn byte_wedged_window_recovers_via_staller_disconnect_before_received_timeout() 
         assert!(!scheduler.window.has_request_capacity(&scheduler.stager));
         assert_eq!(
             scheduler.window.stalling_peer().map(|(addr, _)| addr),
-            Some(Some(crate::PeerEndpoint::Ip(staller)))
+            Some(staller)
         );
     }
     assert!(honest_rx.try_recv().is_err());
 
     std::thread::sleep(Duration::from_millis(150));
     sync.tick();
-    assert!(!peers.is_connected(crate::PeerEndpoint::Ip(staller)));
+    assert!(!peers.is_connected(staller));
     assert_eq!(
         sync.scheduler.lock().stager.received_len(),
         1,
