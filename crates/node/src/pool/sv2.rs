@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use bitcoin_rs_mining::MiningControl;
+use bitcoin_rs_primitives::BlockHash;
 use bitcoin_rs_stratum::{BlockStatus, ConnectionLimiter, PoolCore, RecordOutcome};
 use bitcoin_rs_stratum_v2::{
-    AdmitError, AuthorityKeypair, Connection, ERROR_CODE_SHARE_NOT_RECORDED,
+    AdmitError, AuthorityKeypair, BlockSubmission, Connection, ERROR_CODE_SHARE_NOT_RECORDED,
     ERROR_CODE_SUBMIT_SHARES_STALE_SHARE, Event, Limits, MAX_FEED_LEN, ServerConfig,
 };
 use pool_ledger::MinerId;
@@ -224,6 +225,11 @@ fn serve_connection(
     let mut accounts = HashMap::new();
     let mut input = vec![0; MAX_FEED_LEN];
     let mut buffered_input = None;
+    // Success acknowledgements held until a retained block record is durable.
+    // Each entry holds one consumed permit's queue slot, so the
+    // `MAX_PENDING_BLOCK_RECORDS` bound caps this queue; the reconcile worker
+    // normally drains entries within one 250ms pass.
+    let mut deferred: Vec<(BlockHash, BlockSubmission)> = Vec::new();
     let mut transmit = PendingTransmit::default();
     let start = Instant::now();
     let mut last_progress = start;
@@ -269,11 +275,12 @@ fn serve_connection(
                 }
             }
 
-            let Some(block_permit) = ledger.try_reserve_block_slot() else {
-                thread::sleep(SOCKET_POLL_INTERVAL);
-                continue;
-            };
-            let mut block_permit = Some(block_permit);
+            // A block-record reservation is only consumed by a `BlockFound`
+            // event. When the pending-block queue is full there is no permit,
+            // but shares and channel messages on the buffered frame must still
+            // be handled; the `BlockFound` arm errors if its event actually
+            // needs a missing permit.
+            let mut block_permit = ledger.try_reserve_block_slot();
             let length = buffered_input
                 .take()
                 .ok_or_else(|| anyhow!("SV2 buffered input length is missing"))?;
@@ -286,7 +293,17 @@ fn serve_connection(
                 control,
                 &mut accounts,
                 &mut block_permit,
+                &mut deferred,
             )?;
+            // Confirm blocks whose retained records became durable while this
+            // feed was handled. A closed channel settles its entry; a session
+            // fault is retried next iteration and surfaces on socket progress.
+            deferred.retain(|(hash, submission)| {
+                if !matches!(ledger.found_block_recorded(*hash), Ok(true)) {
+                    return true;
+                }
+                connection.confirm_block(submission).is_err()
+            });
             // Any consumed event or newly queued reply is progress: an idle
             // miner that keeps submitting (or being announced to) never trips
             // the idle deadline on a quiet socket alone.
@@ -329,6 +346,7 @@ fn handle_events(
     control: &dyn MiningControl,
     accounts: &mut HashMap<u32, MinerId>,
     block_permit: &mut Option<BlockRecordPermit>,
+    deferred: &mut Vec<(BlockHash, BlockSubmission)>,
 ) -> Result<()> {
     while let Some(event) = connection.poll_event() {
         match event {
@@ -386,12 +404,32 @@ fn handle_events(
                     .as_ref()
                     .map(|submitted| submitted.receipt().clone())
                     .map_err(Clone::clone);
+                // A queued record is retained with its reservation and the
+                // reconcile worker drains it about every 250ms. Hold
+                // `SubmitShares.Success` until the round is durable — the
+                // session contract and SV1 both withhold success until then —
+                // but keep the connection open while the ledger catches up
+                // instead of closing it under load. Only success is deferred;
+                // node rejections answer immediately below.
                 match permit.record_or_enqueue(account, found, &receipt) {
                     BlockRecordOutcome::Durable => {}
                     BlockRecordOutcome::Queued => {
-                        return Err(anyhow!(
-                            "SV2 block record queued for durable reconciliation"
-                        ));
+                        if matches!(
+                            &submission,
+                            Ok(submitted)
+                                if matches!(
+                                    submitted.receipt().status(),
+                                    BlockStatus::Applied | BlockStatus::Undetermined
+                                )
+                        ) {
+                            // The guard above ensures `submission` is `Ok`;
+                            // a mismatch falls through to the verdict below.
+                            let Ok(submitted) = submission else {
+                                return Err(anyhow!("SV2 block lost its submission"));
+                            };
+                            deferred.push((found.share.hash, submitted));
+                            continue;
+                        }
                     }
                     BlockRecordOutcome::Unrecordable => {
                         return Err(anyhow!(
@@ -999,6 +1037,7 @@ mod tests {
                 self.control.as_ref(),
                 &mut self.accounts,
                 &mut permit,
+                &mut Vec::new(),
             )?;
             let sent = self.connection.take_transmit();
             Ok(self.miner.open(&sent)?)

@@ -1626,13 +1626,27 @@ fn collect_window(
     target: u128,
 ) -> Result<WindowAccumulator, LedgerError> {
     let mut window = WindowAccumulator::new(target);
-    for item in shares.range(..=end_seq)?.rev() {
-        let (_, value) = item?;
-        let (account, work) = decode_share(value.value())?;
-        window.push_older(account, work)?;
-        if window.is_full() {
-            return Ok(window);
+    // Newest-first point lookups stop once the window fills. `range(..=end_seq)`
+    // materializes the whole share history before `.rev()` can stop early, so a
+    // busy pool pays full-history cost on every found block. Share seqs are
+    // contiguous (`bump` from zero) with only a pruned prefix removed, so this
+    // countdown covers every live row; gaps, if any, are skipped.
+    let mut seq = end_seq;
+    loop {
+        if seq < pruned_below {
+            break;
         }
+        if let Some(guard) = shares.get(seq)? {
+            let (account, work) = decode_share(guard.value())?;
+            window.push_older(account, work)?;
+            if window.is_full() {
+                return Ok(window);
+            }
+        }
+        if seq == pruned_below {
+            break;
+        }
+        seq -= 1;
     }
     if pruned_below > 0 {
         return Err(LedgerError::WindowPruned);

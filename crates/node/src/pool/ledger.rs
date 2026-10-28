@@ -317,7 +317,12 @@ struct PendingBlockRecords {
 pub(crate) enum BlockRecordOutcome {
     /// The found-block round is durably visible and protocol success may be sent.
     Durable,
-    /// The host retained the block for retry; the socket must not send success.
+    /// The host retained the block for retry with its reservation held. The
+    /// socket holds `SubmitShares.Success` until the reconcile drain makes
+    /// the round durable, mirroring the SV1 completion: delivery is
+    /// at-least-once (inline plus reconcile drain) against the idempotent
+    /// ledger consumer keyed on the block hash, since exactly-once delivery
+    /// does not exist.
     Queued,
     /// The block cannot be represented by the ledger; close without success.
     Unrecordable,
