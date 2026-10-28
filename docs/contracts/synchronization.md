@@ -166,12 +166,18 @@ live UTXO stable-view lock. It consumes an accepted immutable snapshot
 artifact or replays retained block bodies and undo records through the
 existing worker. Missing history produces a scoped `ScriptLive`
 `Unavailable`; it does not block the worker, other indexes, or authoritative
-chain commits. The paused-seed proof covers concurrent applies and lease
-retention. This closes the former `seed_live_from_utxo` lock-hold gap.
+chain commits. This closes the former `seed_live_from_utxo` lock-hold gap.
 
 - Proof: `EVT-02` step 1–7 fencing tests; the event-loop tick tests
-  (`crates/node/src/event_loop.rs`, `EMB-10`); the index paused-seed and
-  recovery suites.
+  (`crates/node/src/event_loop.rs`, `EMB-10`); paused-seed apply/lease
+  regressions `crates/index/src/runtime/seed_paused_tests.rs`
+  `seed_paused_write_permits_apply_and_retires_generation` (concurrent
+  applies land while the seed stream holds its pin, then retire to zero
+  leases) and `catch_up_drops_subsumed_seed_lease_for_lower_start`
+  (single-holder drain) plus
+  `crates/index/src/runtime/recovery_tests.rs`
+  `seed_first_leg_consumes_held_lease` (the forward leg consumes the held
+  bundle pin with at most one live lease, stalled legs park it back).
 
 ### `SYNC-04`: Failure classification and recovery semantics
 

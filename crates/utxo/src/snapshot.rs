@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 
 use bitcoin_rs_primitives::{Hash256, OutPoint, Txid, varint};
 use bitcoin_rs_storage::checkpoint::CheckpointReference;
@@ -518,9 +518,9 @@ fn hash_serialized_3_stable_inner(
             }
 
             entries.sort_unstable_by(|left, right| {
-                left.txid_le
-                    .cmp(&right.txid_le)
-                    .then_with(|| left.output.vout.cmp(&right.output.vout))
+                left.txid_le.cmp(&right.txid_le).then_with(|| {
+                    crate::compress::cmp_core_varint_key(left.output.vout, right.output.vout)
+                })
             });
 
             for entry in entries {
@@ -534,7 +534,9 @@ fn hash_serialized_3_stable_inner(
 }
 
 /// The single per-coin serialization owner for Core's `HASH_SERIALIZED`
-/// commitment. Callers supply coins in raw-txid, numeric-vout order.
+/// commitment. Callers supply coins in raw-txid order with vouts in Core
+/// VARINT key order (bytewise order of the subtract-one MSB VARINT encodings;
+/// see `crate::compress::cmp_core_varint_key`).
 pub(crate) struct SerializedUtxoHasher(Sha256);
 
 impl SerializedUtxoHasher {
@@ -830,8 +832,12 @@ impl VerifiedSnapshotArtifact {
             .byte_len()
             .checked_add(1)
             .ok_or(RawSeedError::Integrity)?;
-        let mut capped = Read::by_ref(&mut self.file).take(limit);
-        let mut tee = TeeReader::new(&mut capped);
+        // Buffer the small header/output/script reads in memory. The buffer
+        // sits below the tee, so the digest still covers exactly the bytes
+        // the decoder consumes; prefetch never reaches the hash.
+        let capped = Read::by_ref(&mut self.file).take(limit);
+        let mut buffered = BufReader::new(capped);
+        let mut tee = TeeReader::new(&mut buffered);
         let stream = read_raw_snapshot_stream(&mut tee, emit)?;
         let (digest, len) = tee.finish();
         let bound = len == self.witness.len

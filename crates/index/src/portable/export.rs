@@ -17,16 +17,310 @@ use super::chain::{BodyReader, ChainBase, Located};
 use super::manifest::{
     BundleFamily, BundleIdentity, IndexBundleManifestV1, IndexMode, MANIFEST_FILE, TxLookupArtifact,
 };
-use super::{BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, io_error, sync_dir};
-use crate::types::{HashPrefixRow, TxPosition, TxPositionValue, positions_are_valid};
+use super::{
+    BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, MAX_RESTORE_POSITIONS, io_error,
+    sync_dir,
+};
+use crate::types::{HashPrefixRow, TxPosition, TxPositionValue};
 use crate::{
-    IndexCapability, IndexError, IndexWatermark, IndexWatermarks, TxIndexFamily, TxIndexSnapshot,
+    IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexSnapshot,
 };
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+/// Directory fsync used by a [`Publication`].
+type SyncDir = fn(&Path) -> Result<(), IndexBundleError>;
+
+/// Owns every file one export creates in its bundle directory.
+///
+/// Files are created with create-new, so an entry that existed before the
+/// export is never opened, replaced, or removed. Until [`Self::commit`]
+/// makes the final directory entry durable, dropping the publication removes
+/// the created files newest first: the manifest goes before the artifact it
+/// names, and the artifact is removed only once the manifest's removal is
+/// itself durable. A failed, stale, or cancelled export therefore never
+/// leaves a manifest that names a missing artifact.
+struct Publication {
+    dir: PathBuf,
+    /// Created paths, oldest first.
+    created: Vec<PathBuf>,
+    committed: bool,
+    sync: SyncDir,
+}
+
+impl Publication {
+    fn new(dir: &Path) -> Self {
+        Self::with_sync(dir, sync_dir)
+    }
+
+    fn with_sync(dir: &Path, sync: SyncDir) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            created: Vec::new(),
+            committed: false,
+            sync,
+        }
+    }
+
+    /// Creates `path`, refusing to overwrite anything already there, and
+    /// takes ownership of its removal.
+    fn create_new(&mut self, path: &Path) -> Result<File, IndexBundleError> {
+        let file = create_new_file(path)?;
+        self.created.push(path.to_path_buf());
+        Ok(file)
+    }
+
+    /// Makes every created entry durable. Only success disarms the cleanup;
+    /// a failed directory fsync is returned, never retried, and the drop
+    /// removes the created files.
+    fn commit(mut self) -> Result<(), IndexBundleError> {
+        (self.sync)(&self.dir)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        while let Some(path) = self.created.pop() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "cannot remove a file of an unpublished index bundle; leaving older files in place"
+                    );
+                    return;
+                }
+            }
+            if let Err(error) = (self.sync)(&self.dir) {
+                // The removal may not be durable; removing an older file now
+                // could leave a surviving manifest naming a missing artifact.
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "cannot make an unpublished index bundle removal durable; leaving older files in place"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Creates `path`, refusing to overwrite anything already there.
+fn create_new_file(path: &Path) -> Result<File, IndexBundleError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                IndexBundleError::ExistingBundle(path.to_path_buf())
+            } else {
+                io_error(path, error)
+            }
+        })
+}
+
+/// Exports the `TxLookup` family at the applied tip into `request.dir`.
+pub(super) fn export(
+    host: &BundleHost<'_>,
+    request: &IndexBundleRequest,
+) -> Result<ExportReport, IndexBundleError> {
+    if !host.enabled.contains(IndexCapability::TxLookup) {
+        return Err(IndexBundleError::TxLookupDisabled);
+    }
+    let dir = request.dir.as_path();
+    let manifest_path = dir.join(MANIFEST_FILE);
+    if manifest_path
+        .try_exists()
+        .map_err(|error| io_error(&manifest_path, error))?
+    {
+        return Err(IndexBundleError::ExistingBundle(manifest_path));
+    }
+
+    let captured = Captured::take(host)?;
+    fs::create_dir_all(dir).map_err(|error| io_error(dir, error))?;
+    let artifact_path = dir.join(BundleFamily::TxLookup.file_name());
+    let mut publication = Publication::new(dir);
+    let file = publication.create_new(&artifact_path)?;
+    let identity = captured.identity(request);
+    let artifact = captured.write_artifact(host, file, &artifact_path, &identity)?;
+
+    // Abort stale output: the writer must still show exactly the captured
+    // fence (reset state, ordinary revision, and watermarks), or the stream
+    // may describe rows the index no longer holds; an equal watermark alone
+    // would miss a completed reset and rebuild in between.
+    let (after, _) = host.writer.fenced_watermarks()?;
+    if after != captured.fence {
+        return Err(IndexBundleError::Stale);
+    }
+
+    // The artifact's directory entry is durable before any manifest names it.
+    sync_dir(dir)?;
+    let mode = if host.enabled.contains(IndexCapability::ScriptHistory) {
+        IndexMode::Full
+    } else {
+        IndexMode::Utxo
+    };
+    let manifest = IndexBundleManifestV1::for_tx_lookup(&identity, mode, captured.floor, &artifact);
+    write_manifest(&mut publication, &manifest_path, &manifest.to_json()?)?;
+    publication.commit()?;
+    Ok(ExportReport {
+        base: IndexWatermark {
+            height: captured.chain.height,
+            hash: captured.chain.hash,
+        },
+        records: artifact.records,
+        bytes: artifact.bytes,
+    })
+}
+
+/// Writes and fsyncs `manifest.json` with create-new. Its directory entry
+/// becomes durable only through [`Publication::commit`]; until then the
+/// publication removes it on failure.
+fn write_manifest(
+    publication: &mut Publication,
+    path: &Path,
+    json: &[u8],
+) -> Result<(), IndexBundleError> {
+    let mut file = publication.create_new(path)?;
+    file.write_all(json)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| io_error(path, error))
+}
+
+/// Everything an export fixes at its start: the exact watermarks, the chain
+/// identity of the applied tip, and one snapshot taken at that watermark.
+struct Captured<'a> {
+    fence: IndexWriteFence,
+    chain: ChainBase,
+    /// The applied tip's cumulative transaction count, which is the base's.
+    chain_tx_count: u64,
+    snapshot: Box<dyn TxIndexSnapshot + 'a>,
+    floor: u32,
+    bodies: &'a dyn BlockBodySource,
+}
+
+impl<'a> Captured<'a> {
+    /// Requires the `TxLookup` watermark to be exactly the applied tip and the
+    /// snapshot to agree with it; otherwise nothing is written.
+    fn take(host: &BundleHost<'a>) -> Result<Self, IndexBundleError> {
+        let (fence, watermarks) = host.writer.fenced_watermarks()?;
+        let base = watermarks
+            .tx_lookup
+            .ok_or(IndexBundleError::NotReady("txindex has no watermark"))?;
+        let tip = host
+            .applied_tip
+            .load_full()
+            .ok_or(IndexBundleError::NotReady("there is no applied tip"))?;
+        if base.height != tip.height || base.hash != tip.hash.to_le_bytes() {
+            return Err(IndexBundleError::NotReady(
+                "the txindex watermark is not at the applied tip",
+            ));
+        }
+        let chain = ChainBase::capture(host.block_tree, &tip, tip.height, host.cancelled)?;
+        if !chain.validated {
+            return Err(IndexBundleError::NotReady(
+                "the base block is not on the active chain",
+            ));
+        }
+        // The base is the applied tip, so no block lies above it to read.
+        let chain_tx_count = chain.counted_base().ok_or(IndexBundleError::NotReady(
+            "the chain transaction count at the base is not established",
+        ))?;
+        let bodies = host
+            .body_source
+            .ok_or(IndexBundleError::NotReady("there is no block body source"))?;
+        let snapshot = host.reader.snapshot()?;
+        if snapshot.capability_watermark(IndexCapability::TxLookup)? != Some(base) {
+            return Err(IndexBundleError::Stale);
+        }
+        let floor = snapshot.capability_floor(IndexCapability::TxLookup)?;
+        Ok(Self {
+            fence,
+            chain,
+            chain_tx_count,
+            snapshot,
+            floor,
+            bodies,
+        })
+    }
+
+    fn identity(&self, request: &IndexBundleRequest) -> BundleIdentity {
+        BundleIdentity {
+            network: request.network,
+            genesis: self.chain.genesis,
+            format_version: crate::index::index_format_version(),
+            base_height: self.chain.height,
+            base_hash: self.chain.hash,
+            chainwork: self.chain.chainwork,
+            chain_tx_count: self.chain_tx_count,
+        }
+    }
+
+    /// Streams the records, patches the final header over the placeholder,
+    /// fsyncs, and returns the artifact's exact identity.
+    ///
+    /// The header's record and payload counts are known only after the row
+    /// stream, and the digest covers the header first, so the digest is taken
+    /// by one bounded hashed read of the final fsynced bytes rather than
+    /// during the write: it names exactly the file a manifest will publish.
+    fn write_artifact(
+        &self,
+        host: &BundleHost<'_>,
+        file: File,
+        path: &Path,
+        identity: &BundleIdentity,
+    ) -> Result<TxLookupArtifact, IndexBundleError> {
+        let write = |error| io_error(path, error);
+        let mut out = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
+        out.write_all(&[0_u8; HEADER_LEN]).map_err(write)?;
+        let mut rows = RowExporter {
+            host,
+            chain: &self.chain,
+            floor: self.floor,
+            reader: BodyReader::new(self.bodies),
+            located: Vec::new(),
+            positions: Vec::new(),
+            positions_written: 0,
+            path,
+        };
+        let (records, payload_bytes) = rows.stream(self.snapshot.as_ref(), &mut out)?;
+        let mut file = out
+            .into_inner()
+            .map_err(|error| io_error(path, error.into_error()))?;
+        let header = ArtifactHeader {
+            family: BundleFamily::TxLookup,
+            artifact_version: ARTIFACT_VERSION,
+            index_format: identity.format_version,
+            network_magic: identity.network.magic(),
+            base_height: identity.base_height,
+            base_hash: identity.base_hash,
+            records,
+            payload_bytes,
+        };
+        file.seek(SeekFrom::Start(0)).map_err(write)?;
+        file.write_all(&header.encode()).map_err(write)?;
+        file.sync_all().map_err(write)?;
+        drop(file);
+        let (sha256, bytes) = hash_file(path).map_err(write)?;
+        Ok(TxLookupArtifact {
+            sha256,
+            bytes,
+            records,
+            floor: self.floor,
+        })
+    }
+}
 
 /// Rows per export page. Export streams the family through bounded pages
 /// over one snapshot, so export memory stays flat in family size on every
@@ -97,236 +391,6 @@ fn stream_family_pages(
     }
 }
 
-/// Removes a created file on every exit path until disarmed, so no
-/// partial artifact outlives a failed, stale, or cancelled export.
-struct CreatedFile {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl CreatedFile {
-    fn create_new(path: &Path) -> Result<(Self, File), IndexBundleError> {
-        let file = create_new_file(path)?;
-        Ok((
-            Self {
-                path: path.to_path_buf(),
-                armed: true,
-            },
-            file,
-        ))
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CreatedFile {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Creates `path`, refusing to overwrite anything already there.
-fn create_new_file(path: &Path) -> Result<File, IndexBundleError> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                IndexBundleError::ExistingBundle(path.to_path_buf())
-            } else {
-                io_error(path, error)
-            }
-        })
-}
-
-/// Exports the `TxLookup` family at the applied tip into `request.dir`.
-pub(super) fn export(
-    host: &BundleHost<'_>,
-    request: &IndexBundleRequest,
-) -> Result<ExportReport, IndexBundleError> {
-    if !host.enabled.contains(IndexCapability::TxLookup) {
-        return Err(IndexBundleError::TxLookupDisabled);
-    }
-    let dir = request.dir.as_path();
-    let manifest_path = dir.join(MANIFEST_FILE);
-    if manifest_path
-        .try_exists()
-        .map_err(|error| io_error(&manifest_path, error))?
-    {
-        return Err(IndexBundleError::ExistingBundle(manifest_path));
-    }
-
-    let captured = Captured::take(host)?;
-    fs::create_dir_all(dir).map_err(|error| io_error(dir, error))?;
-    let artifact_path = dir.join(BundleFamily::TxLookup.file_name());
-    let (mut created, file) = CreatedFile::create_new(&artifact_path)?;
-    let identity = captured.identity(request);
-    let artifact = captured.write_artifact(host, file, &artifact_path, &identity)?;
-
-    // Abort stale output: the writer must still show exactly the captured
-    // watermarks, or the stream may describe rows the index no longer holds.
-    let (_, after) = host.writer.fenced_watermarks()?;
-    if after != captured.watermarks {
-        return Err(IndexBundleError::Stale);
-    }
-
-    sync_dir(dir)?;
-    let mode = if host.enabled.contains(IndexCapability::ScriptHistory) {
-        IndexMode::Full
-    } else {
-        IndexMode::Utxo
-    };
-    let manifest = IndexBundleManifestV1::for_tx_lookup(&identity, mode, captured.floor, &artifact);
-    publish_manifest(dir, &manifest_path, &manifest.to_json()?)?;
-    created.disarm();
-    Ok(ExportReport {
-        base: IndexWatermark {
-            height: captured.chain.height,
-            hash: captured.chain.hash,
-        },
-        records: artifact.records,
-        bytes: artifact.bytes,
-    })
-}
-
-/// Publishes `manifest.json` with create-new, fsync, and directory fsync.
-fn publish_manifest(dir: &Path, path: &Path, json: &[u8]) -> Result<(), IndexBundleError> {
-    let mut file = create_new_file(path)?;
-    let result = file
-        .write_all(json)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| io_error(path, error));
-    drop(file);
-    if let Err(error) = result {
-        let _ = fs::remove_file(path);
-        return Err(error);
-    }
-    sync_dir(dir)
-}
-
-/// Everything an export fixes at its start: the exact watermarks, the chain
-/// identity of the applied tip, and one snapshot taken at that watermark.
-struct Captured<'a> {
-    watermarks: IndexWatermarks,
-    chain: ChainBase,
-    /// The applied tip's cumulative transaction count, which is the base's.
-    chain_tx_count: u64,
-    snapshot: Box<dyn TxIndexSnapshot + 'a>,
-    floor: u32,
-    bodies: &'a dyn BlockBodySource,
-}
-
-impl<'a> Captured<'a> {
-    /// Requires the `TxLookup` watermark to be exactly the applied tip and the
-    /// snapshot to agree with it; otherwise nothing is written.
-    fn take(host: &BundleHost<'a>) -> Result<Self, IndexBundleError> {
-        let (_, watermarks) = host.writer.fenced_watermarks()?;
-        let base = watermarks
-            .tx_lookup
-            .ok_or(IndexBundleError::NotReady("txindex has no watermark"))?;
-        let tip = host
-            .applied_tip
-            .load_full()
-            .ok_or(IndexBundleError::NotReady("there is no applied tip"))?;
-        if base.height != tip.height || base.hash != tip.hash.to_le_bytes() {
-            return Err(IndexBundleError::NotReady(
-                "the txindex watermark is not at the applied tip",
-            ));
-        }
-        let chain = ChainBase::capture(host.block_tree, &tip, tip.height)?;
-        if !chain.validated {
-            return Err(IndexBundleError::NotReady(
-                "the base block is not on the active chain",
-            ));
-        }
-        // The base is the applied tip, so no block lies above it to read.
-        let chain_tx_count = chain.counted_base().ok_or(IndexBundleError::NotReady(
-            "the chain transaction count at the base is not established",
-        ))?;
-        let bodies = host
-            .body_source
-            .ok_or(IndexBundleError::NotReady("there is no block body source"))?;
-        let snapshot = host.reader.snapshot()?;
-        if snapshot.capability_watermark(IndexCapability::TxLookup)? != Some(base) {
-            return Err(IndexBundleError::Stale);
-        }
-        let floor = snapshot.capability_floor(IndexCapability::TxLookup)?;
-        Ok(Self {
-            watermarks,
-            chain,
-            chain_tx_count,
-            snapshot,
-            floor,
-            bodies,
-        })
-    }
-
-    fn identity(&self, request: &IndexBundleRequest) -> BundleIdentity {
-        BundleIdentity {
-            network: request.network,
-            genesis: self.chain.genesis,
-            format_version: crate::index::index_format_version(),
-            base_height: self.chain.height,
-            base_hash: self.chain.hash,
-            chainwork: self.chain.chainwork,
-            chain_tx_count: self.chain_tx_count,
-        }
-    }
-
-    /// Streams the records, patches the final header over the placeholder,
-    /// fsyncs, and returns the artifact's exact identity.
-    fn write_artifact(
-        &self,
-        host: &BundleHost<'_>,
-        file: File,
-        path: &Path,
-        identity: &BundleIdentity,
-    ) -> Result<TxLookupArtifact, IndexBundleError> {
-        let write = |error| io_error(path, error);
-        let mut out = BufWriter::with_capacity(IO_BUFFER_BYTES, file);
-        out.write_all(&[0_u8; HEADER_LEN]).map_err(write)?;
-        let mut rows = RowExporter {
-            host,
-            chain: &self.chain,
-            floor: self.floor,
-            reader: BodyReader::new(self.bodies),
-            located: Vec::new(),
-            positions: Vec::new(),
-            path,
-        };
-        let (records, payload_bytes) = rows.stream(self.snapshot.as_ref(), &mut out)?;
-        let mut file = out
-            .into_inner()
-            .map_err(|error| io_error(path, error.into_error()))?;
-        let header = ArtifactHeader {
-            family: BundleFamily::TxLookup,
-            artifact_version: ARTIFACT_VERSION,
-            index_format: identity.format_version,
-            network_magic: identity.network.magic(),
-            base_height: identity.base_height,
-            base_hash: identity.base_hash,
-            records,
-            payload_bytes,
-        };
-        file.seek(SeekFrom::Start(0)).map_err(write)?;
-        file.write_all(&header.encode()).map_err(write)?;
-        file.sync_all().map_err(write)?;
-        drop(file);
-        let (sha256, bytes) = hash_file(path).map_err(write)?;
-        Ok(TxLookupArtifact {
-            sha256,
-            bytes,
-            records,
-            floor: self.floor,
-        })
-    }
-}
-
 /// Turns stored `TxConfirmed` rows into full-txid records, one row at a time.
 struct RowExporter<'a> {
     host: &'a BundleHost<'a>,
@@ -337,6 +401,8 @@ struct RowExporter<'a> {
     located: Vec<([u8; 32], TxPosition)>,
     /// Scratch position list of the record being written.
     positions: Vec<TxPosition>,
+    /// Positions already written to the artifact.
+    positions_written: u64,
     path: &'a Path,
 }
 
@@ -383,6 +449,15 @@ impl RowExporter<'_> {
                     .iter()
                     .map(|(_, position)| *position),
             );
+            let added = u64::try_from(run).unwrap_or(u64::MAX);
+            if self.positions_written.saturating_add(added)
+                > u64::try_from(MAX_RESTORE_POSITIONS).unwrap_or(u64::MAX)
+            {
+                return Err(IndexBundleError::ExportTooLarge {
+                    limit_positions: MAX_RESTORE_POSITIONS,
+                });
+            }
+            self.positions_written += added;
             bytes += write_record(out, &txid, height, &self.positions)
                 .map_err(|error| io_error(self.path, error))?;
             records += 1;
@@ -428,9 +503,129 @@ impl RowExporter<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::error::Error;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    thread_local! {
+        static SYNC_CALLS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn calls() -> u32 {
+        SYNC_CALLS.with(Cell::get)
+    }
+
+    fn injected(dir: &Path) -> IndexBundleError {
+        io_error(dir, io::Error::other("injected directory fsync failure"))
+    }
+
+    /// Fails only the first directory fsync: the publication's final commit.
+    fn fail_first_sync(dir: &Path) -> Result<(), IndexBundleError> {
+        let call = calls();
+        SYNC_CALLS.with(|count| count.set(call + 1));
+        if call == 0 {
+            Err(injected(dir))
+        } else {
+            sync_dir(dir)
+        }
+    }
+
+    fn fail_every_sync(dir: &Path) -> Result<(), IndexBundleError> {
+        SYNC_CALLS.with(|count| count.set(count.get() + 1));
+        Err(injected(dir))
+    }
+
+    /// Creates the artifact and manifest the way `export` does.
+    fn stage(
+        publication: &mut Publication,
+        dir: &Path,
+    ) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+        let artifact = dir.join(BundleFamily::TxLookup.file_name());
+        let mut file = publication.create_new(&artifact)?;
+        file.write_all(b"artifact")?;
+        file.sync_all()?;
+        drop(file);
+        let manifest = dir.join(MANIFEST_FILE);
+        write_manifest(publication, &manifest, b"{}")?;
+        Ok((artifact, manifest))
+    }
+
+    #[test]
+    fn failed_final_directory_sync_removes_the_manifest_and_its_artifact() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let operator = dir.path().join("operator.dat");
+        fs::write(&operator, b"keep")?;
+        SYNC_CALLS.with(|count| count.set(0));
+        let mut publication = Publication::with_sync(dir.path(), fail_first_sync);
+        let (artifact, manifest) = stage(&mut publication, dir.path())?;
+        assert!(matches!(
+            publication.commit(),
+            Err(IndexBundleError::Io { .. })
+        ));
+        assert!(
+            !manifest.exists(),
+            "a manifest must not survive a failed commit"
+        );
+        assert!(
+            !artifact.exists(),
+            "the artifact is removed after the manifest"
+        );
+        assert_eq!(calls(), 3, "commit, then one fsync per durable removal");
+        assert_eq!(fs::read(&operator)?, b"keep");
+        Ok(())
+    }
+
+    #[test]
+    fn undurable_manifest_removal_keeps_the_artifact_it_names() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        SYNC_CALLS.with(|count| count.set(0));
+        let mut publication = Publication::with_sync(dir.path(), fail_every_sync);
+        let (artifact, manifest) = stage(&mut publication, dir.path())?;
+        assert!(publication.commit().is_err());
+        assert!(!manifest.exists());
+        assert!(
+            artifact.exists(),
+            "an artifact is never removed before its manifest's removal is durable"
+        );
+        assert_eq!(calls(), 2, "the failed fsync is not retried");
+        Ok(())
+    }
+
+    #[test]
+    fn committed_publication_keeps_both_files_and_never_replaces_an_entry() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let mut publication = Publication::new(dir.path());
+        let (artifact, manifest) = stage(&mut publication, dir.path())?;
+        publication.commit()?;
+        assert_eq!(fs::read(&artifact)?, b"artifact");
+        assert_eq!(fs::read(&manifest)?, b"{}");
+
+        let mut again = Publication::new(dir.path());
+        let refused = again.create_new(&manifest);
+        assert!(
+            matches!(&refused, Err(IndexBundleError::ExistingBundle(path)) if *path == manifest),
+            "create-new must refuse an existing manifest"
+        );
+        drop(refused);
+        drop(again);
+        assert_eq!(
+            fs::read(&manifest)?,
+            b"{}",
+            "a refused create leaves the existing entry untouched"
+        );
+        assert_eq!(fs::read(&artifact)?, b"artifact");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used)]
-mod tests {
+mod paged_export_tests {
     use super::*;
     use crate::types::ScriptHash;
     use crate::{ScriptLiveScan, TxIndexPage, TxIndexScan, TxIndexScanRow};

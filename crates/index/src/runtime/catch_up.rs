@@ -114,8 +114,11 @@ impl Worker {
             || watermark.map_or(0, |w| w.height.saturating_add(1)),
             |endpoint| endpoint.height.saturating_add(1),
         );
-        // The leg consumed the seed pin iff the seed covered this start and
-        // the grant took it (leaving the slot empty).
+        // Seed handoff is gated on a durable ScriptLive seed: only a live
+        // covering pin is consumed directly. Lower history-only legs leave
+        // the seed pin parked for the live leg and run under a transient
+        // grant that is dropped, so empty `BodyAbsent` legs never fold the
+        // reserve line and subsumed plants drain.
         let seed_covering = seed_lease
             .as_ref()
             .is_some_and(|lease| lease.floor().is_some_and(|floor| floor <= start_height));
@@ -211,13 +214,16 @@ impl Worker {
         }
 
         let action = self.finish_catch_up(state, chunk_end, target, &pass_history, pending)?;
-        // Only a commit-backed advance releases the pin: `chunk_end` short of
-        // the tip returns `Progressed` with rows retained and no durable
-        // commit, so the pin parks back like any other stall.
+        // Only a commit-backed advance releases the pin: any retained
+        // `pending` rows keep their history cover, whether the pass stalled,
+        // buffered, or progressed after the target tip moved past the batch
+        // endpoint. A short `chunk_end` is one such retained case; a moved
+        // tip at equal height is another.
         if !matches!(
             action,
             ReconcileAction::Progressed | ReconcileAction::CaughtUp
         ) || chunk_end < target.height
+            || pending.is_some()
         {
             Self::park_unused_seed_lease(seed_lease, from_seed, pass_history);
         }
@@ -259,21 +265,74 @@ impl Worker {
         pending: &mut Option<PendingForward>,
         seed_lease: &mut Option<HistoryLease>,
     ) -> Result<ControlFlow<ForwardLeg, HistoryLease>, DerivedIndexWorkerError> {
-        // Single-holder rule: a live seed pin covering this start is consumed
-        // directly with no second `request_history`. A dead pin is superseded
-        // (dropped) before the fresh request; a live pin starting above this
-        // leg stays parked for a later leg.
+        // History-only legs never consume the seed pin: the live seed stays
+        // parked for its covering leg while the lower leg runs under a
+        // transient grant that is dropped. Empty `BodyAbsent` legs therefore
+        // never install a floor-0 pin that folds the reserve line, and
+        // retained `Buffered` prefixes keep their rows without taking seed
+        // ownership. Only legs containing ScriptLive participate in the
+        // single-holder handoff below.
+        if !capabilities.contains(IndexCapability::ScriptLive) {
+            let action = match self.history.request_history(start_height) {
+                Ok(lease) => return Ok(ControlFlow::Continue(lease)),
+                Err(HistoryUnavailable::Pruned { below }) => {
+                    tracing::warn!(
+                        below,
+                        start_height,
+                        "derived index needs history the pruning authority deleted"
+                    );
+                    *pending = None;
+                    if capabilities.contains(IndexCapability::CompactFilters) {
+                        self.runtime.fail_compact_filters(
+                            &DerivedIndexWorkerError::HistoryUnavailable(
+                                HistoryUnavailable::Pruned { below },
+                            ),
+                        );
+                        ReconcileAction::Progressed
+                    } else {
+                        self.rebuild_from_pruned(capabilities, below, target)?
+                    }
+                }
+                Err(error) => {
+                    if !state.batch.is_empty() {
+                        *pending = Some(state.take(self.batch_limits));
+                    }
+                    tracing::debug!(%error, "derived index history grant deferred");
+                    ReconcileAction::Stalled
+                }
+            };
+            return Ok(ControlFlow::Break(ForwardLeg::Settled(action)));
+        }
+        // Single-holder rule for ScriptLive legs: a live seed pin covering
+        // this start is consumed directly with no second `request_history`.
+        // Any other seed pin is held aside during the fresh request — a dead
+        // pin is superseded, and a live higher pin is subsumed once the lower
+        // grant lands — so only the fresh pin stays live after success. A
+        // refusal restores the held pin, so a transient `Reserved`, `Missing`,
+        // `Shutdown`, or `Pruned` never loses the seed and never re-requests.
+        // With no durable ScriptLive watermark (subsumed plant), the covering
+        // check fails and both pins drain, leaving no parked seed behind.
+        let mut parked = None;
         if let Some(lease) = seed_lease.take() {
             if lease.floor().is_some_and(|floor| floor <= start_height) {
                 return Ok(ControlFlow::Continue(lease));
             }
             if lease.floor().is_some() {
-                *seed_lease = Some(lease);
+                parked = Some(lease);
             }
         }
         let action = match self.history.request_history(start_height) {
-            Ok(lease) => return Ok(ControlFlow::Continue(lease)),
+            Ok(lease) => {
+                // The lower fresh grant lands first, so the parked higher
+                // seed pin is subsumed (it pins a subset while the committed
+                // seed watermark already covers that height). Drop it here so
+                // only the fresh pin stays live; a refusal below restores it
+                // instead of re-requesting.
+                drop(parked);
+                return Ok(ControlFlow::Continue(lease));
+            }
             Err(HistoryUnavailable::Pruned { below }) => {
+                *seed_lease = parked;
                 tracing::warn!(
                     below,
                     start_height,
@@ -308,6 +367,7 @@ impl Worker {
                 }
             }
             Err(error) => {
+                *seed_lease = parked;
                 // The grant is deferred, not denied: keep the prepared rows
                 // so the retry continues where this pass left off instead of
                 // re-deriving them.
