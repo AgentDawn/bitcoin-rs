@@ -107,14 +107,15 @@ impl BlockSync {
         };
         // PeerTable -> historical is the ingress lock order. Snapshot all
         // peer data before holding download state, and stamp via send_then.
+        // Source-keyed live-session snapshot: anonymous (`endpoint: None`)
+        // sessions participate identically to addressed ones.
         let live = self
             .peer_table
-            .infos()
+            .usable_peers()
             .into_iter()
-            .filter_map(|info| {
-                info.endpoint
-                    .and_then(|endpoint| self.peer_table.ready_source(endpoint))
-                    .map(|source| (source, info))
+            .filter_map(|session| {
+                let info = session.info?;
+                Some((session.lease.source(session.endpoint), info))
             })
             .collect::<Vec<_>>();
         let mut peers = live

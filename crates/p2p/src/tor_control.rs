@@ -517,7 +517,6 @@ impl TorController {
 
     fn authenticate(&mut self, password: Option<&str>) -> io::Result<()> {
         if let Some(password) = password {
-            validate_password(password)?;
             let escaped = password.replace('\\', "\\\\").replace('"', "\\\"");
             self.command(&format!("AUTHENTICATE \"{escaped}\""))?;
             return Ok(());

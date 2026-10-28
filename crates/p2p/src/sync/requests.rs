@@ -351,10 +351,7 @@ impl BlockSync {
             return false;
         };
         chain_tip.height.saturating_sub(first_height) < COMPACT_RELAY_NEAR_TIP_BLOCKS
-            && request
-                .owner()
-                .endpoint
-                .is_some_and(|endpoint| self.peer_table.compact_relay_of(endpoint))
+            && self.peer_table.compact_relay_of_source(request.owner())
     }
 
     /// Requests the next window batch from `source`, a usable peer from the
@@ -380,10 +377,7 @@ impl BlockSync {
         // too: header-drain fetches and stripe retries reach this function
         // without passing the selector, so the gate is enforced at the one
         // path every body request takes (net_processing.cpp:6521-6525).
-        let Some(info) = source
-            .endpoint
-            .and_then(|endpoint| self.peer_table.info_of(endpoint))
-        else {
+        let Some(info) = self.peer_table.info_of_source(source) else {
             return GetdataRequestOutcome::default();
         };
         let policy = BlockDownloadPolicy {

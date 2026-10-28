@@ -87,9 +87,9 @@ pub use connection::{ConnectionId, OutboundRefusal, PeerLease, PeerSource, Queue
 pub use counters::{CountingStream, PeerCounters};
 pub use dispatch::{ChainQuery, FilterRequest, FilterServing, InventoryServing, TxInventory};
 pub use endpoint::{
-    DialFailure, DialRoutes, OverlayConfig, TransportRemote, accepted_ip_identity,
-    addrv2_gossip_enabled, connect_peer_stream, dialed_ip_identity, endpoint_from_addrv2,
-    endpoint_to_addrv2, format_endpoint, parse_endpoint,
+    DialFailure, DialRoutes, OverlayConfig, RouteDenial, RouteTable, TransportRemote,
+    accepted_ip_identity, addrv2_gossip_enabled, connect_peer_stream, dialed_ip_identity,
+    endpoint_from_addrv2, endpoint_to_addrv2, format_endpoint, parse_endpoint,
 };
 pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use inv::request_missing_parents;

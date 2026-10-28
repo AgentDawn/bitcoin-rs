@@ -476,7 +476,8 @@ mod tests {
         ) else {
             return Err("dead proxy must fail".into());
         };
-        assert_ne!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(matches!(error, DialFailure::Transport(_)));
+        assert!(!error.counts_as_peer_failure());
         Ok(())
     }
 
@@ -522,6 +523,7 @@ mod tests {
         let proxy = listener.local_addr()?;
         std::thread::spawn(move || -> io::Result<()> {
             let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut greeting = [0u8; 3];
             stream.read_exact(&mut greeting)?;
             stream.write_all(&[0x05, 0x00])?;
@@ -596,6 +598,7 @@ mod tests {
         let proxy = listener.local_addr()?;
         std::thread::spawn(move || -> io::Result<()> {
             let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut greeting = [0u8; 3];
             let _ = stream.read_exact(&mut greeting);
             // Delay 800ms before greeting reply: exceeds 200ms deadline with generous margin.
@@ -648,6 +651,7 @@ mod tests {
         let proxy = listener.local_addr()?;
         std::thread::spawn(move || -> io::Result<()> {
             let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut greeting = [0u8; 3];
             let _ = stream.read_exact(&mut greeting);
             // Send greeting reply immediately so greeting phase finishes in <1ms.

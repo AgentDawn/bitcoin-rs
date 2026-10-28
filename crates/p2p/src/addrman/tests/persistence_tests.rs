@@ -348,9 +348,6 @@ fn corrupt_unknown_and_wrong_network_files_fail_closed() {
     invalid_record["records"] = serde_json::json!([{"broken": true}]);
     cases.push(fixture_bytes(&invalid_record));
     cases.push(fixture_bytes(
-        &serde_json::json!({"version": 8, "magic": [2, 2, 2, 2]}),
-    ));
-    cases.push(fixture_bytes(
         &serde_json::json!({"version": 99, "magic": [1, 1, 1, 1]}),
     ));
     for bytes in cases {
@@ -361,6 +358,34 @@ fn corrupt_unknown_and_wrong_network_files_fail_closed() {
         rejected.save();
         assert_eq!(fs::read(&path).expect("source intact"), bytes);
         assert!(!rejected_backup(&path, &bytes).exists());
+    }
+}
+
+#[test]
+fn cross_network_pre_release_is_preserved_and_superseded() {
+    // Identification runs before scope: an unmarked pre-release file from
+    // another network is preserved and replaced, never misreported as a
+    // network refusal that disables writes.
+    for version in [1, 8, 9] {
+        let dir = tempfile::tempdir().expect("directory");
+        let base = dir.path().join("peers.dat");
+        let path = network_path(&base, [1; 4]);
+        let bytes = fixture_bytes(&serde_json::json!({"version": version, "magic": [2, 2, 2, 2]}));
+        fs::write(&path, &bytes).expect("foreign pre-release snapshot");
+        let fresh = AddressBook::open(Some(base.clone()), [1; 4], false, None);
+        assert!(fresh.state.lock().writable, "version {version}");
+        assert_eq!(fresh.len(), 0, "no historical records are imported");
+        assert_eq!(fs::read(&path).expect("source before save"), bytes);
+        let backup = rejected_backup(&path, &bytes);
+        assert_eq!(fs::read(&backup).expect("durable preservation"), bytes);
+        fresh.learn_dns("seed", &[target()], EPOCH);
+        fresh.save();
+        assert_eq!(fs::read(&backup).expect("preserved after save"), bytes);
+        assert_ne!(fs::read(&path).expect("fresh publication"), bytes);
+        let restored = AddressBook::open(Some(base), [1; 4], false, None);
+        assert!(restored.state.lock().writable);
+        assert_eq!(restored.len(), 1);
+        assert_indexes(&restored.state.lock());
     }
 }
 

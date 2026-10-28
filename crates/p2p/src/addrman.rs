@@ -1818,17 +1818,19 @@ fn read_book(
         return Err(invalid("address book checksum"));
     }
     let header: Header = serde_json::from_slice(&bytes[..payload_len]).map_err(io::Error::other)?;
-    if magic.is_some_and(|magic| magic != header.magic) {
-        return Err(invalid("address book network"));
-    }
     // Only the checked envelope identifies disposable development snapshots.
     // Their records are never decoded or converted into the current schema.
+    // Identification runs before scope: a cross-network pre-release file is
+    // preserved and superseded, never misreported as a network refusal.
     if header.format.is_none() && (1..=9).contains(&header.version) {
         return Ok(Some(Loaded {
             stored: None,
             magic: header.magic,
             bytes,
         }));
+    }
+    if magic.is_some_and(|magic| magic != header.magic) {
+        return Err(invalid("address book network"));
     }
     if header.format.as_deref() != Some(FORMAT) || header.version != SCHEMA_VERSION {
         return Err(invalid("unsupported address book format/version"));
