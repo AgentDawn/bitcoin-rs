@@ -12,7 +12,7 @@ use super::{
     state::ensure_fence_live, state::resume_capability_reset,
 };
 use bitcoin_rs_primitives::{OutPoint, encode};
-use bitcoin_rs_storage::{ColumnFamily, KvStore};
+use bitcoin_rs_storage::{ColumnFamily, KvStore, PrefixScanLimit};
 
 /// Mutation-only handle for durable prepared `TxIndex` writes.
 pub struct IndexWriter<S: KvStore> {
@@ -177,6 +177,34 @@ impl<S: KvStore> IndexWriter<S> {
         );
         commit_ordinary(self.indexer.store.as_ref(), self.generation, &fence, batch)?;
         Ok(written)
+    }
+
+    /// Clears an interrupted `ScriptLive` seed before genesis replay.
+    ///
+    /// Ordinary commits stamp the live watermark with every batch, and an
+    /// artifact seed clears this family before writing, so rows without a
+    /// watermark exist only after an interrupted seed. Forward replay would
+    /// publish its watermark over those mixed rows, so the replay entry
+    /// clears them first. Returns whether anything was reset.
+    pub(crate) fn reset_interrupted_script_live_seed(&self) -> Result<bool, IndexError> {
+        if self.watermarks()?.script_live.is_some() {
+            return Ok(false);
+        }
+        // One bounded row decides the probe: any `ScriptLive` row without a
+        // watermark is leftover from an interrupted seed.
+        let probe = self.indexer.store.scan_prefix_bounded(
+            ColumnFamily::ScriptLive,
+            &[],
+            PrefixScanLimit {
+                max_rows: 1,
+                max_bytes: usize::MAX,
+            },
+        )?;
+        if probe.rows.is_empty() {
+            return Ok(false);
+        }
+        self.reset_capabilities(IndexCapabilities::SCRIPT_LIVE)?;
+        Ok(true)
     }
 
     /// Seeds `ScriptLive` from an iterator of compact locators.

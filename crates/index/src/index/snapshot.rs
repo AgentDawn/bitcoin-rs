@@ -51,6 +51,17 @@ pub struct TxIndexScan {
     pub complete: bool,
 }
 
+/// One bounded page of a `TxIndex` family in ascending stored-key order.
+#[derive(Debug)]
+pub struct TxIndexPage {
+    /// Parsed rows of this page in ascending stored-key order.
+    pub rows: Vec<TxIndexScanRow>,
+    /// Whether the family ends with this page. With a positive `max_rows`
+    /// limit, a page that is not complete is always non-empty, so callers
+    /// advance with the last returned key until `complete`.
+    pub complete: bool,
+}
+
 /// Result of one bounded `ScriptLive` prefix scan.
 #[derive(Debug)]
 pub struct ScriptLiveScan {

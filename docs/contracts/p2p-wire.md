@@ -1,4 +1,4 @@
-# P2P wire contract (pointer)
+# P2P wire contract
 
 This page assigns ownership and cites proof under the
 [contracts precedence rule](README.md).

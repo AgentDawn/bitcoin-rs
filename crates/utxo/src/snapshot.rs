@@ -521,9 +521,9 @@ fn hash_serialized_3_stable_inner(
             }
 
             entries.sort_unstable_by(|left, right| {
-                left.txid_le
-                    .cmp(&right.txid_le)
-                    .then_with(|| left.output.vout.cmp(&right.output.vout))
+                left.txid_le.cmp(&right.txid_le).then_with(|| {
+                    crate::compress::cmp_core_varint_key(left.output.vout, right.output.vout)
+                })
             });
 
             for entry in entries {
@@ -537,7 +537,9 @@ fn hash_serialized_3_stable_inner(
 }
 
 /// The single per-coin serialization owner for Core's `HASH_SERIALIZED`
-/// commitment. Callers supply coins in raw-txid, numeric-vout order.
+/// commitment. Callers supply coins in raw-txid order with vouts in Core
+/// VARINT key order (bytewise order of the subtract-one MSB VARINT encodings;
+/// see `crate::compress::cmp_core_varint_key`).
 pub(crate) struct SerializedUtxoHasher(Sha256);
 
 impl SerializedUtxoHasher {
@@ -836,10 +838,11 @@ impl VerifiedSnapshotArtifact {
         // Bounded buffering for the record, output-header, and script reads
         // below: the decoder issues one small read per field, so millions of
         // outputs would otherwise become millions of tiny file reads. The
-        // buffer sits under the same descriptor, length cap, and digest check.
-        let mut buffered = BufReader::with_capacity(SEED_READ_BUFFER_BYTES, &mut self.file);
-        let mut capped = buffered.by_ref().take(limit);
-        let mut tee = TeeReader::new(&mut capped);
+        // buffer sits below the tee, so the digest still covers exactly the
+        // bytes the decoder consumes; prefetch never reaches the hash.
+        let capped = Read::by_ref(&mut self.file).take(limit);
+        let mut buffered = BufReader::with_capacity(SEED_READ_BUFFER_BYTES, capped);
+        let mut tee = TeeReader::new(&mut buffered);
         let stream = read_raw_snapshot_stream(&mut tee, emit)?;
         let (digest, len) = tee.finish();
         let bound = len == self.witness.len

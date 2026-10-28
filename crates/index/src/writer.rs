@@ -76,6 +76,9 @@ pub(crate) trait TxIndexWriter: Send + Sync {
 
     /// Resets only the selected derived row families through the durable reset protocol.
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError>;
+    /// Clears rows left by an interrupted `ScriptLive` seed before genesis
+    /// replay; returns whether anything was reset.
+    fn reset_interrupted_script_live_seed(&self) -> Result<bool, IndexError>;
     /// Stamps `watermark` on the selected capabilities so a rebuild starts at
     /// the first surviving height after a prune, without re-deriving deleted
     /// rows. `floor` is the first covered height.
@@ -174,6 +177,10 @@ where
 
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
         self.write().reset_capabilities(capabilities)
+    }
+
+    fn reset_interrupted_script_live_seed(&self) -> Result<bool, IndexError> {
+        self.write().reset_interrupted_script_live_seed()
     }
 
     fn anchor_watermark(

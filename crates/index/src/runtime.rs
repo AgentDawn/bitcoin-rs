@@ -179,7 +179,7 @@ impl DerivedIndexRuntime {
     }
 
     /// Reads the scoped `ScriptLive` outage message, if set.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fjall"))]
     #[must_use]
     pub(crate) fn script_live_failure(&self) -> Option<CompactString> {
         self.script_live_failure.read().clone()

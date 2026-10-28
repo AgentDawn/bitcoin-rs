@@ -63,14 +63,8 @@ pub struct ChainFollowers {
 impl ChainFollowers {
     /// Builds the follower set over its consumers.
     ///
-    /// PRE: each argument is the live consumer it names; `mempool` is `None`
-    /// only for a node that runs no admission gate.
-    ///
-    /// POST: the set holds exactly those consumers and mutates none of them.
-    ///
-    /// INVARIANT: construction does not attach observers or wake any
-    /// consumer; effects run only through [`Self::on_connect`] and
-    /// [`Self::on_disconnect`].
+    /// `mempool` is `None` only for a node without an admission gate. Effects
+    /// run through [`Self::on_connect`] and [`Self::on_disconnect`].
     #[must_use]
     pub(crate) fn new(
         blocks: Arc<RwLock<BlockLog>>,

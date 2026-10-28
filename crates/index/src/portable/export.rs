@@ -21,7 +21,10 @@ use super::chain::{BodyReader, ChainBase, Located};
 use super::manifest::{
     BundleFamily, BundleIdentity, IndexBundleManifestV1, IndexMode, MANIFEST_FILE, TxLookupArtifact,
 };
-use super::{BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, io_error, sync_dir};
+use super::{
+    BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, MAX_RESTORE_POSITIONS, io_error,
+    sync_dir,
+};
 use crate::types::{HashPrefixRow, TxPosition, TxPositionValue};
 use crate::{
     IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexScanRow,
@@ -311,6 +314,7 @@ impl<'a> Captured<'a> {
             reader: BodyReader::new(self.bodies),
             located: Vec::new(),
             positions: Vec::new(),
+            positions_written: 0,
             path,
         };
         let (records, payload_bytes) = rows.stream(self.base, &mut out)?;
@@ -351,6 +355,8 @@ struct RowExporter<'a> {
     located: Vec<([u8; 32], TxPosition)>,
     /// Scratch position list of the record being written.
     positions: Vec<TxPosition>,
+    /// Positions already written to the artifact.
+    positions_written: u64,
     path: &'a Path,
 }
 
@@ -484,6 +490,15 @@ impl RowExporter<'_> {
             self.positions.clear();
             self.positions
                 .extend(located[index..index + run].iter().map(|(_, position)| *position));
+            let added = u64::try_from(run).unwrap_or(u64::MAX);
+            if self.positions_written.saturating_add(added)
+                > u64::try_from(MAX_RESTORE_POSITIONS).unwrap_or(u64::MAX)
+            {
+                return Err(IndexBundleError::ExportTooLarge {
+                    limit_positions: MAX_RESTORE_POSITIONS,
+                });
+            }
+            self.positions_written += added;
             bytes += write_record(out, &txid, height, &self.positions)
                 .map_err(|error| io_error(self.path, error))?;
             records += 1;
