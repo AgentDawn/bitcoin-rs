@@ -11,7 +11,8 @@ use super::BlockSync;
 use super::chain::HistoricalAdvance;
 use crate::block_stager::StagedBlock;
 use crate::download_window::{
-    BlockDownloadPolicy, DownloadWindow, SyncBudget, servable_floor, serves_requested_height,
+    BlockDownloadPolicy, DownloadWindow, RefusalFilter, SyncBudget, servable_floor,
+    serves_requested_height,
 };
 use crate::{BlockStager, InboundBlock, Message};
 
@@ -147,6 +148,14 @@ impl BlockSync {
                 chainwork: base.chainwork,
                 chain_tx_count: base.chain_tx_count,
             };
+            // Snapshot this peer's refused hashes before taking the
+            // historical lock: the scheduler lock is never held together
+            // with it, so the per-entry filter reads a copy.
+            let refused = self
+                .scheduler
+                .lock()
+                .body_unavailable
+                .refused_hashes(*source, now);
             let request = {
                 let mut historical = self.historical.lock();
                 let HistoricalDownload { window, stager, .. } = &mut *historical;
@@ -154,6 +163,14 @@ impl BlockSync {
                 if window.peer_in_staller_cooldown(source.addr, now) {
                     continue;
                 }
+                // Bodies `source` already answered `notfound` for are
+                // excluded while the batch is built, exactly as the
+                // foreground path does: the scan plans around them and pins
+                // the cursor at the lowest refused height, so a later pass
+                // plans the same blocks again for another peer, or for this
+                // one once the retry interval has passed.
+                let is_refused = |hash| refused.contains(&hash);
+                let mut refusals = RefusalFilter::new(&is_refused);
                 window.next_peer_request(
                     stager,
                     *source,
@@ -164,26 +181,13 @@ impl BlockSync {
                     servable_floor(info, &policy),
                     &tree,
                     now,
+                    &mut refusals,
                 )
             };
             drop(tree);
             let Some(request) = request else {
                 continue;
             };
-            // A plan that names a body `source` already answered `notfound`
-            // for is dropped whole, exactly as the foreground path does: the
-            // lock is the scheduler's, taken after the historical lock is
-            // released, and nothing was marked, so a later pass plans the
-            // same blocks again for another peer, or for this one once the
-            // retry interval has passed.
-            if self
-                .scheduler
-                .lock()
-                .body_unavailable
-                .refuses_request(&request, now)
-            {
-                continue;
-            }
             let inventory = request
                 .entries()
                 .map(|(_, hash)| {
