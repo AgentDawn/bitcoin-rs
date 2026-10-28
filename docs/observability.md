@@ -30,7 +30,9 @@ Metrics MUST NOT carry per-event payloads, block/tx/peer identity, or any
 other high-cardinality label value. The only label values allowed are
 enumerations: backend names, durability modes, closed reason taxonomies
 (see `node.sync.stall_episodes_cleared{reason}` in `crates/p2p/src/download_window.rs`
-for the pattern), and the enum capability states of `node.capability.txindex_readiness`.
+for the pattern), and the enum capability states of `node.capability.txindex_readiness`, and
+the closed family labels of `index.family_planned_write_bytes{family}` where
+`family` in `{tx_lookup, script_history, script_live, headers, filters}`.
 No speculative instrumentation: a signal earns its place by an operator
 decision (alert, dashboard, SLO) or a named contract hook (below).
 Benchmark evidence identity (binary/configuration/corpus digests and hardware)
@@ -103,6 +105,34 @@ early-multi rows were not valid binding comparisons (all 60 s first refusals
 arrived after the corpus was fully requested; 30 s rounds 1-2 had no refusal).
 Synthetic regtest only (early/small and modern/large-OP_RETURN corpora, 3 runs
 per arm); no mainnet, p99, or whole-node claim.
+
+The call-site audit table below is a snapshot of its audited base. It has no
+row for `index.family_planned_write_bytes`. This clause describes it.
+
+`index.family_planned_write_bytes{family}` is a histogram in bytes with one
+label, `family`, in `{tx_lookup, script_history, script_live, headers,
+filters}`. The families are the transaction-id lookup rows, the script funding
+and spending rows, the live-view mutations, the block header identity rows, and
+the basic compact-filter rows. A forward batch commit records one observation
+for each family whose planned bytes are non-zero, after the store commit
+succeeds (`commit_forward_with_cursor` in `crates/index/src/index/write.rs`;
+`commit_forward` and `commit_block` use it). A failed commit records nothing,
+and no other commit path records this metric. The value is the sum, over the
+blocks of the batch, of the bytes each block planned for that family under the
+rule in the next table (`PendingRows::encoded_bytes_by_family` in
+`crates/index/src/index/rows.rs`). The sum is fixed as blocks join the batch,
+before the commit merges, sorts, and de-duplicates the batch rows. The value is
+row-size arithmetic over the prepared rows. It does not read the store, so it
+does not include write-ahead-log, storage-engine, or device write volume, and
+it is not a count of bytes written.
+
+| `family` | Planned bytes per block |
+| --- | --- |
+| `tx_lookup` | Distinct transaction-id rows times `HASH_PREFIX_ROW_SIZE` (12), plus every transaction-id position times `TX_POSITION_SIZE` (6). |
+| `script_history` | The same rule over the funding rows and the spending rows together. |
+| `script_live` | `SCRIPT_LIVE_ROW_SIZE` (43, the width of the row key) times the number of live-view operations. Inserts and deletes each count once. |
+| `headers` | `HEADER_ROW_SIZE` (80) times the number of header rows. |
+| `filters` | For each filter row, 98 plus the filter length. |
 
 ### `OBS-02`: `tracing::` is diagnostics, not an API
 
@@ -391,6 +421,10 @@ fields stay in tracing, where they can change with the implementation.
   vout index exceeding `u32`, which is not a practical valid-block fixture.
 - `composite_isolates_a_panicking_leg` exercises the real observer failure
   path and requires the operator counter to have no leg label.
+- `family_byte_histograms_recording` (`crates/index/src/index/rows.rs`) drives
+  `record_family_byte_histograms` against a local recorder. It checks the five
+  `family` label values with their byte values, and that a family with zero
+  planned bytes records nothing. It does not drive a commit.
 - Review enforcement: a new `metrics::` call site must cite an OBS clause in
   the PR. A series not in the ledger and not an operator signal is a
   review-failing diagnostic leak into the metrics API.

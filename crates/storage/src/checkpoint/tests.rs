@@ -624,7 +624,7 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
 
     // A valid same-directory rename retains its behavior.
     root.create_dir("stage-a")?;
-    root.rename_noreplace("stage-a", "stage-b")?;
+    super::fs::rename_noreplace(root.dir(), "stage-a", "stage-b")?;
     assert!(root.entry_exists("stage-b")?);
     assert!(!root.entry_exists("stage-a")?);
 
@@ -652,7 +652,7 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
         ".hidden/../escape",
     ];
     for hostile in hostile_destinations {
-        let error = match root.rename_noreplace("victim", hostile) {
+        let error = match super::fs::rename_noreplace(root.dir(), "victim", hostile) {
             Ok(()) => panic!("destination {hostile:?} was accepted"),
             Err(error) => error,
         };
@@ -670,7 +670,7 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
     // Crafted sources are confined symmetrically: an outside path must not be
     // importable into the root.
     for hostile in ["../victim", "/tmp/victim", "a/b", "", ".", "..", "link/"] {
-        let error = match root.rename_noreplace(hostile, "fresh-dest") {
+        let error = match super::fs::rename_noreplace(root.dir(), hostile, "fresh-dest") {
             Ok(()) => panic!("source {hostile:?} was accepted"),
             Err(error) => error,
         };
@@ -691,12 +691,12 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
         fs::create_dir(&outside)?;
         let root_path = dir.path().join(CHECKPOINT_ROOT);
         symlink(&outside, root_path.join("link"))?;
-        let error = match root.rename_noreplace("victim", "link/escape") {
+        let error = match super::fs::rename_noreplace(root.dir(), "victim", "link/escape") {
             Ok(()) => panic!("symlink-intermediate destination was accepted"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        let error = match root.rename_noreplace("link/escape", "fresh-dest") {
+        let error = match super::fs::rename_noreplace(root.dir(), "link/escape", "fresh-dest") {
             Ok(()) => panic!("symlink-intermediate source was accepted"),
             Err(error) => error,
         };
@@ -714,7 +714,7 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
 
     // An existing destination is preserved by NOREPLACE: the collision fails
     // without consuming the source or clobbering operator data.
-    let collision = match root.rename_noreplace("victim", "operator-notes") {
+    let collision = match super::fs::rename_noreplace(root.dir(), "victim", "operator-notes") {
         Ok(()) => panic!("rename onto operator data was accepted"),
         Err(collision) => collision,
     };
@@ -730,7 +730,7 @@ fn rename_noreplace_refuses_escape_but_keeps_same_dir_renames()
     // Nothing escaped the checkpoint root and the root still behaves.
     assert!(!dir.path().join("escape").exists());
     assert!(!dir.path().join("tmp").join("checkpoint-escape").exists());
-    root.rename_noreplace("victim", "victim-promoted")?;
+    super::fs::rename_noreplace(root.dir(), "victim", "victim-promoted")?;
     assert!(root.entry_exists("victim-promoted")?);
     Ok(())
 }
@@ -827,5 +827,32 @@ fn open_file_refuses_fifo_without_blocking() -> Result<(), Box<dyn std::error::E
         std::fs::symlink_metadata(&fifo_path)?.file_type().is_fifo(),
         "substituted FIFO is preserved, not consumed"
     );
+    Ok(())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+#[test]
+fn rename_noreplace_refuses_an_existing_destination_and_keeps_both_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let data = open_root(dir.path())?;
+    fs::write(dir.path().join("staged"), b"new")?;
+    fs::write(dir.path().join("taken"), b"operator")?;
+
+    let error = super::fs::rename_noreplace(&data, "staged", "taken")
+        .err()
+        .ok_or("rename over an existing file must fail")?;
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(dir.path().join("taken"))?, b"operator");
+    assert_eq!(fs::read(dir.path().join("staged"))?, b"new");
+
+    super::fs::rename_noreplace(&data, "staged", "free")?;
+    assert_eq!(fs::read(dir.path().join("free"))?, b"new");
+    assert!(!dir.path().join("staged").exists());
     Ok(())
 }

@@ -10,6 +10,7 @@ use super::telemetry::metric_count;
 use crate::Message;
 use crate::connection::PeerSource;
 use crate::download_window::BlockDownloadPolicy;
+use crate::download_window::RefusalFilter;
 use crate::download_window::SyncPeer;
 use crate::download_window::statically_fanout_eligible;
 use crate::download_window::{peer_can_serve_height, servable_floor, serves_requested_height};
@@ -97,6 +98,17 @@ impl UnavailableBodies {
             .is_some_and(|answered_at| Self::live(*answered_at, now))
     }
 
+    /// Live hashes `source` answered `notfound` for within
+    /// [`BODY_UNAVAILABLE_RETRY`] of `now`, for lanes that consult the
+    /// ledger without nesting the scheduler lock inside their own.
+    pub(super) fn refused_hashes(&self, source: PeerSource, now: Instant) -> Vec<Hash256> {
+        self.answered
+            .iter()
+            .filter_map(|((owner, hash), answered_at)| {
+                (*owner == source && Self::live(*answered_at, now)).then_some(*hash)
+            })
+            .collect()
+    }
     /// Forgets `source`'s answer for `hash`: it delivered the body, so the
     /// earlier `notfound` no longer describes it.
     pub(super) fn clear(&mut self, source: PeerSource, hash: Hash256) {
@@ -385,16 +397,13 @@ impl BlockSync {
         }
         let servable_floor = servable_floor(&info, &policy);
         let tree = self.chain.block_tree();
-        // Entries `source` already answered `notfound` for are excluded from
-        // its batch instead of dropping the batch whole, so one missing body
-        // no longer blocks the bodies `source` can serve — and a missing
-        // body no longer blocks the rest of the batch from another peer that
-        // holds it. The carried frontier clamps to the lowest excluded
-        // height, so nothing excluded strands below the window cursor; the
-        // next peer this tick replans it, or `source` does once the retry
-        // interval has passed. Nothing waits on the refused peer and no
-        // message goes out for a body it lacks, so a peer is never polled
-        // for it at wake-up pace.
+        // Bodies `source` already answered `notfound` for are excluded while
+        // the batch is built, never by dropping it: the scan plans around
+        // them and pins the cursor at the lowest refused height, so the next
+        // peer this tick — or `source` once the retry interval has passed —
+        // can still be offered the bodies it holds. Nothing was marked for a
+        // refused body, and no message names one, so a peer that lacks a body
+        // is never polled for it at wake-up pace.
         let request = {
             let mut scheduler = self.scheduler.lock();
             let SchedulerState {
@@ -403,23 +412,20 @@ impl BlockSync {
                 body_unavailable,
                 ..
             } = &mut *scheduler;
-            window
-                .next_peer_request(
-                    stager,
-                    source,
-                    allow_expired_retry_from_peer,
-                    chain_tip,
-                    required.height,
-                    peer_best_height,
-                    servable_floor,
-                    &tree,
-                    now,
-                )
-                .and_then(|request| {
-                    let owner = request.owner();
-                    let unavailable = &*body_unavailable;
-                    request.excluding(|hash| unavailable.refuses(owner, hash, now))
-                })
+            let is_refused = |hash| body_unavailable.refuses(source, hash, now);
+            let mut refusals = RefusalFilter::new(&is_refused);
+            window.next_peer_request(
+                stager,
+                source,
+                allow_expired_retry_from_peer,
+                chain_tip,
+                required.height,
+                peer_best_height,
+                servable_floor,
+                &tree,
+                now,
+                &mut refusals,
+            )
         };
         drop(tree);
         let Some(request) = request else {

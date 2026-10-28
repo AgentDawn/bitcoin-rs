@@ -13,7 +13,9 @@ use bitcoin::p2p::message_filter::{
     CFCheckpt, CFHeaders, CFilter, GetCFCheckpt, GetCFHeaders, GetCFilters,
 };
 use bitcoin::p2p::message_network::{Reject, VersionMessage};
-use bitcoin_rs_primitives::{Block, ConsensusDecode, ConsensusEncode, Header, Tx, deserialize};
+use bitcoin_rs_primitives::{
+    BlockPayload, ConsensusDecode, ConsensusEncode, Header, Tx, deserialize,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -68,8 +70,8 @@ pub enum Message {
     MemPool,
     /// `tx`
     Tx(Tx),
-    /// `block`
-    Block(Block),
+    /// `block`: one decode at the wire decoder via `BlockPayload::from_raw`.
+    Block(BlockPayload),
     /// Already-serialized `block` payload. Written as a `block` command
     /// without re-encoding; the decoder never produces this variant.
     BlockPayload(bytes::Bytes),
@@ -174,8 +176,10 @@ impl Message {
             Self::SendAddrV2 => "sendaddrv2",
             Self::Unknown { command, .. } => return command.clone(),
         };
-        #[expect(clippy::expect_used)]
-        CommandString::try_from_static(name).expect("static P2P command")
+        match CommandString::try_from_static(name) {
+            Ok(command) => command,
+            Err(_) => unreachable!("static P2P command name is valid"),
+        }
     }
 
     /// Large relay payloads that the writer emits as their own writev.
@@ -406,6 +410,7 @@ impl FramedMessage {
 /// error when it exceeds [`MAX_MESSAGE_PAYLOAD`].
 pub(crate) fn message_payload(message: &Message) -> Result<bytes::Bytes, PeerError> {
     let payload = match message {
+        Message::Block(block) => block.bytes().clone(),
         Message::BlockPayload(bytes) => bytes.clone(),
         other => bytes::Bytes::from(encode_payload(other)?),
     };
@@ -549,8 +554,9 @@ impl V1Receiver {
         }
 
         observe(&body.command, &body.payload);
-        let message = decode_payload(&body.command, &body.payload)?;
-        Ok((message, bytes::Bytes::from(body.payload)))
+        let payload = bytes::Bytes::from(body.payload);
+        let message = decode_payload(&body.command, &payload)?;
+        Ok((message, payload))
     }
 
     /// Completes the current header, then validates it before any payload
@@ -588,6 +594,9 @@ fn pending_body(
     }
 
     let command = read_command(&header[4..16])?;
+    if command.is_empty() {
+        return Err(PeerError::InvalidCommand(String::new()));
+    }
     let payload_len_u32 = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
     let payload_len =
         usize::try_from(payload_len_u32).map_err(|_| PeerError::PayloadTooLarge(usize::MAX))?;
@@ -615,7 +624,7 @@ pub(crate) fn wire_len(message: &Message) -> Result<usize, PeerError> {
     let payload_len = match message {
         Message::BlockPayload(payload) => payload.len(),
         Message::Tx(tx) => tx.total_size(),
-        Message::Block(block) => block.total_size(),
+        Message::Block(block) => block.bytes().len(),
         Message::Headers(headers) => {
             let count = u64::try_from(headers.len())
                 .map_err(|_| PeerError::PayloadTooLarge(headers.len()))?;
@@ -644,8 +653,10 @@ pub fn encode_payload(message: &Message) -> Result<Vec<u8>, PeerError> {
     let mut payload = Vec::new();
     match message {
         Message::Tx(tx) => tx.consensus_encode(&mut payload),
-        Message::Block(block) => block.consensus_encode(&mut payload),
-        Message::BlockPayload(bytes) => payload.extend_from_slice(bytes),
+        Message::Block(block) => payload.extend_from_slice(block.bytes()),
+        Message::BlockPayload(bytes) => {
+            payload.extend_from_slice(bytes);
+        }
         Message::Headers(headers) => {
             let count = u64::try_from(headers.len())
                 .map_err(|_| PeerError::PayloadTooLarge(headers.len()))?;
@@ -665,7 +676,7 @@ fn encode_varint(payload: &mut Vec<u8>, value: u64) {
 }
 
 /// Decodes a command's payload, or an unknown command into [`Message::Unknown`].
-pub(crate) fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, PeerError> {
+pub(crate) fn decode_payload(command: &str, payload: &bytes::Bytes) -> Result<Message, PeerError> {
     // COMMANDS is the allow-list for typed decoding.
     if !crate::compat::is_typed_command(command) {
         return Ok(Message::Unknown {
@@ -685,7 +696,7 @@ pub(crate) fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, P
         "getheaders" => Message::GetHeaders(decode_getheaders(payload)?),
         "mempool" => empty_payload(payload, Message::MemPool)?,
         "tx" => Message::Tx(deserialize::<Tx>(payload)?),
-        "block" => Message::Block(deserialize::<Block>(payload)?),
+        "block" => Message::Block(BlockPayload::from_raw(payload.clone())?),
         "headers" => Message::Headers(decode_headers(payload)?),
         "sendheaders" => empty_payload(payload, Message::SendHeaders)?,
         "getaddr" => empty_payload(payload, Message::GetAddr)?,
@@ -1059,12 +1070,14 @@ mod tests {
 
     #[test]
     fn block_message_roundtrip_preserves_wire_payload() -> Result<(), super::PeerError> {
+        use bitcoin_rs_primitives::BlockPayload;
+
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = serialize(&block);
-        let native_block =
-            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
-                .map_err(super::PeerError::NativeDecode)?;
-        let message = super::Message::Block(native_block);
+        let message = super::Message::Block(
+            BlockPayload::from_raw(bytes::Bytes::from(block_bytes.clone()))
+                .map_err(super::PeerError::NativeDecode)?,
+        );
         let payload = encode_payload(&message)?;
         let expected_hash = block.block_hash();
 
@@ -1074,16 +1087,16 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let (decoded, raw) = read_message(&mut cursor, Magic::REGTEST)?;
 
-        let super::Message::Block(decoded_block) = decoded else {
+        let super::Message::Block(decoded_payload) = decoded else {
             return Err(super::PeerError::Protocol(
                 "expected block message in roundtrip test",
             ));
         };
 
-        let reencoded = bitcoin_rs_primitives::consensus_bytes(&decoded_block);
-        assert_eq!(raw.as_ref(), reencoded.as_slice());
+        assert_eq!(raw.as_ref(), decoded_payload.bytes().as_ref());
         assert_eq!(raw.as_ref(), payload.as_slice());
-        let native_hash = decoded_block.header.compute_hash();
+        assert_eq!(raw.as_ref(), block_bytes.as_slice());
+        let native_hash = decoded_payload.block().header.compute_hash();
         assert_eq!(native_hash.as_bytes(), &expected_hash.to_byte_array());
 
         Ok(())
@@ -1130,13 +1143,16 @@ mod tests {
 
     #[test]
     fn block_payload_writes_the_same_frame_as_decoded_block() -> Result<(), PeerError> {
+        use bitcoin_rs_primitives::BlockPayload;
+
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let block_bytes = serialize(&block);
-        let native_block =
-            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Block>(&block_bytes)
-                .map_err(super::PeerError::NativeDecode)?;
-        let decoded = super::Message::Block(native_block);
-        let payload = super::Message::BlockPayload(bytes::Bytes::from(block_bytes));
+        let payload_bytes = bytes::Bytes::from(block_bytes);
+        let decoded = super::Message::Block(
+            BlockPayload::from_raw(payload_bytes.clone())
+                .map_err(super::PeerError::NativeDecode)?,
+        );
+        let payload = super::Message::BlockPayload(payload_bytes);
 
         let mut decoded_wire = Vec::new();
         let mut payload_wire = Vec::new();
@@ -1175,7 +1191,9 @@ mod tests {
             super::Message::Ping(0x1234_5678_9abc_def0),
             super::Message::Verack,
             super::Message::Headers(vec![bitcoin_rs_primitives::Header::default(); 2_000]),
-            super::Message::Block(bitcoin_rs_primitives::Block::default()),
+            super::Message::Block(bitcoin_rs_primitives::BlockPayload::from_local(
+                bitcoin_rs_primitives::Block::default(),
+            )),
             super::Message::BlockPayload(bytes::Bytes::from(vec![0_u8; 80])),
             super::Message::Unknown {
                 command: super::command_string("unknown")?,
@@ -1190,5 +1208,18 @@ mod tests {
             assert_eq!(written, buffer.len());
         }
         Ok(())
+    }
+
+    #[test]
+    fn empty_command_in_v1_header_is_rejected() {
+        let mut frame = Vec::with_capacity(HEADER_LEN);
+        frame.extend_from_slice(&Magic::REGTEST.to_bytes());
+        frame.extend_from_slice(&[0u8; 12]); // all zeroes command
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&super::checksum(&[]));
+
+        let mut cursor = Cursor::new(frame);
+        let result = read_message(&mut cursor, Magic::REGTEST);
+        assert!(matches!(result, Err(PeerError::InvalidCommand(_))));
     }
 }

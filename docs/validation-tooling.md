@@ -271,6 +271,20 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     and mempool restoration (process-test mapping in [`e2e/REORG-COVERAGE.md`](../e2e/REORG-COVERAGE.md)).
 - **Feature requirement**: The AssumeUTXO recovery unit module is gated by
   `fjall`; without it, that filter selects no tests.
+- **Host prerequisite (AssumeUTXO non-UTF-8 snapshot test)**:
+  `e2e/tests/assumeutxo.rs::invalid_core_snapshots_fail_without_activating`
+  requires `/tmp` to accept arbitrary non-NUL byte filenames for its Unix
+  fixture. The test owns a temporary directory under `/tmp` containing
+  `core-\xff.dat`; the UTF-8 `core200.dat` symlink stays in the node datadir,
+  and the RPC receives `{"path":"core200.dat"}`. It copies the snapshot to the
+  target, removes the original, and creates the symlink rather than renaming
+  across potentially different filesystems. The owned target directory is
+  removed at test end or on an early error. This leaves the node datadir and
+  global `TMPDIR` on their configured disk-backed filesystem, even if that
+  filesystem rejects non-UTF-8 entry names. The former rename-in-datadir
+  fixture could fail with `EILSEQ` (92) before RPC; that failure was not JSON
+  serialization. A byte-capable `/tmp` remains a host prerequisite; record an
+  incapable lane as `BLOCKED` rather than skipping or weakening the scenario.
 - **Reproduce**:
   ```sh
   cargo test --locked -p bitcoin-rs-chainstate --lib recovery_marker_order_tests
@@ -336,7 +350,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     outside the workspace (not a compatibility commitment, no production pool
     qualification; see [`tools/stratum-sv2/README.md`](../tools/stratum-sv2/README.md)); and the standalone in-process LDK L1 adapter ([`tools/ldk/README.md`](../tools/ldk/README.md)).
   - **Intentionally unsupported**: Core IPC adapters.
-  - **Lightning interop (evidence-gated, not a lane verdict)**: LND `v0.21.4-beta` five cells passed in the retained `parent-live-4` run with stated provenance limits (dirty source, `.outline` runner copy, no fresh Core comparison; `docs/lightning-interop-matrix.md` §2–§3.1). CLN `v26.06.9` startup `failed` in retained qualified `run-2` (`.outline/evidence/lightning-live-cln/run-2/evidence.json`): version gate refusal `1400` below `220000` with Core 31.1 reaching `getinfo` ready, other 4 cells `not exercised` on causal startup, `getblockfrompeer` probed as `rs=method_not_found` and `core=rpc_error` (fallback only), source HEAD `aab50bd64` with 7 dirty entries and 758 inputs (`stale_allowed:false`), node `48129ac5…`, runner frozen `86eba76…` with parent job `bg_543` checksum before plus `bash -n` plus private `ShellCheck` plus real campaign plus checksum after in one chain with exit `0` in `.outline/evidence/lightning-live-cln/run-2/verification.json`, `run-1` raw only with no claim (same matrix section).
+  - **Lightning interop (evidence-gated, not a lane verdict)**: LND `v0.21.4-beta` five cells `not exercised`: the only record (`parent-live-4`) is unretained gitignored scratch (61-dirty source, `.outline` runner copy diverging from the tracked script, unverified manifest signature, no fresh Core comparison; `docs/lightning-interop-matrix.md` §2–§3.1). CLN `v26.06.9` startup `failed` in retained qualified `run-2` (`.outline/evidence/lightning-live-cln/run-2/evidence.json`): version gate refusal `1400` below `220000` with Core 31.1 reaching `getinfo` ready, other 4 cells `not exercised` on causal startup, `getblockfrompeer` probed as `rs=method_not_found` and `core=rpc_error` (fallback only), source HEAD `aab50bd64` with 7 dirty entries and 758 inputs (`stale_allowed:false`), node `48129ac5…`, runner frozen `86eba76…` with parent job `bg_543` checksum before plus `bash -n` plus private `ShellCheck` plus real campaign plus checksum after in one chain with exit `0` in `.outline/evidence/lightning-live-cln/run-2/verification.json`, `run-1` raw only with no claim (same matrix section).
 - **Reproduction & audit**:
   - Audit status strings against the canonical matrix:
     ```sh
