@@ -41,13 +41,14 @@ impl SpentCoinScripts for NoSpentScripts {
 
 /// Upper bound on a `script_pubkey` admitted into the authoritative UTXO set.
 ///
-/// Mirrors `bitcoin_rs_consensus::MAX_SCRIPT_SIZE` as applied by the node's
-/// `build_utxo_changes`: outputs with `is_op_return()` or a script longer than
-/// this never enter the UTXO set, so they must never enter the Live view
-/// either -- the spendability predicate matches authoritative UTXO admission
-/// exactly. Duplicated as a literal because this crate does not depend on the
-/// consensus crate; the node crate asserts the two are equal.
-pub const MAX_LIVE_SCRIPT_SIZE: usize = 10_000;
+/// Single source: `bitcoin_rs_script::MAX_SCRIPT_SIZE`, applied by
+/// `build_utxo_changes` — outputs with `is_op_return()` or a script longer
+/// than this never enter the UTXO set, so they must never enter the Live view
+/// either. The spendability predicate matches authoritative UTXO admission
+/// exactly. History rows deliberately keep oversized scripts (real on-chain
+/// activity, pinned by `live_predicate_matches_utxo_admission_not_history`);
+/// that asymmetry is bounded by consensus block size, not by this constant.
+pub use bitcoin_rs_script::MAX_SCRIPT_SIZE as MAX_LIVE_SCRIPT_SIZE;
 
 /// Derives the capability-selected rows of one serialized block body.
 ///
@@ -127,6 +128,11 @@ pub(super) fn pending_rows_for_block_with_header(
             let script = tx
                 .span_bytes(output.script_pubkey())
                 .unwrap_or_else(|| unreachable!("output span belongs to the parsed image"));
+            // History keeps every non-OP_RETURN output, including scripts past
+            // MAX_LIVE_SCRIPT_SIZE: it records on-chain activity, while Live
+            // mirrors UTXO admission. The asymmetry is deliberate (pinned by
+            // live_predicate_matches_utxo_admission_not_history) and bounded
+            // by consensus block size.
             if capabilities.contains(IndexCapability::ScriptHistory) && !is_op_return_script(script)
             {
                 rows.funding_rows.push(PositionedRow {
