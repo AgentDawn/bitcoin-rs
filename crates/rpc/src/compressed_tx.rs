@@ -1143,10 +1143,10 @@ struct InputParts {
     signature: SigParts,
 }
 
-/// One public-key recovery attempt: the transaction being rebuilt, the
-/// input under reconstruction, and the resolved prevout commitment.
+/// One public-key recovery attempt: the input under reconstruction and
+/// the resolved prevout commitment. The sighash cache over the immutable
+/// skeleton is passed separately so one cache serves every input.
 struct Recovery<'a> {
-    tx: &'a Tx,
     index: usize,
     sig: &'a [u8; 64],
     hash_type: u8,
@@ -1157,8 +1157,9 @@ struct Recovery<'a> {
 
 /// Recovers the public key for one compressed ECDSA input, grinding
 /// recovery ids `0..=3` against the resolved sighash and prevout script.
-fn recover_pubkey(request: &Recovery<'_>) -> Result<Vec<u8>, CodecError> {
-    let cache = SighashCache::new(request.tx);
+/// `cache` must borrow the immutable skeleton every recovery input
+/// commits to; callers build it once per [`decompress_finalize`] call.
+fn recover_pubkey(cache: &SighashCache<'_>, request: &Recovery<'_>) -> Result<Vec<u8>, CodecError> {
     let digest = match request.kind {
         PrevoutKind::P2pkh(_) => cache
             .legacy_signature_hash(
@@ -1468,6 +1469,11 @@ pub(crate) fn decompress_finalize(
     resolver: &dyn PrevoutResolver,
 ) -> Result<Tx, CodecError> {
     let DecompressPlan { mut tx, inputs } = plan;
+    // One cache over the immutable skeleton serves every input: sighash
+    // midstates are per-transaction, so rebuilding them per input repeats
+    // the same hashing work. The skeleton is only mutated after all fills
+    // are computed, so the shared borrow stays valid for the whole loop.
+    let cache = SighashCache::new(&tx);
     // Reconstruction reads the immutable skeleton (sighash inputs), so
     // compute every authorization first and apply them afterwards.
     let mut fills: Vec<(Script, Witness)> = Vec::with_capacity(inputs.len());
@@ -1511,15 +1517,17 @@ pub(crate) fn decompress_finalize(
                         } else {
                             hash_type.ok_or(CodecError::NonCanonical)?
                         };
-                        let public = recover_pubkey(&Recovery {
-                            tx: &tx,
-                            index,
-                            sig,
-                            hash_type: hash_type_byte,
-                            kind: &kind,
-                            prevout,
-                            stored_pkh: pubkey_hash.as_ref(),
-                        })?;
+                        let public = recover_pubkey(
+                            &cache,
+                            &Recovery {
+                                index,
+                                sig,
+                                hash_type: hash_type_byte,
+                                kind: &kind,
+                                prevout,
+                                stored_pkh: pubkey_hash.as_ref(),
+                            },
+                        )?;
                         let mut sig_item = der_encode(sig);
                         sig_item.push(hash_type_byte);
                         match kind {

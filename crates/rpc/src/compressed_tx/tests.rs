@@ -1499,3 +1499,278 @@ fn mainnet_bodies_truth() {
         );
     }
 }
+
+#[test]
+fn shared_sighash_cache_recovers_every_input() {
+    // One cache over the immutable skeleton must serve every compressed
+    // input: the legacy input and the segwit input below share the same
+    // transaction midstates, so rebuilding the cache per input repeats
+    // identical hashing work.
+    let signer_a = Signer::new(31);
+    let signer_b = Signer::new(32);
+    let prevout_a = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2pkh_script(signer_a.pubkey_hash()),
+    };
+    let prevout_b = TxOut {
+        value: Amount::from_sat(60_000),
+        script_pubkey: p2wpkh_script(signer_b.pubkey_hash()),
+    };
+    let prev_tx_a = funding_tx(prevout_a.clone());
+    let prev_tx_b = funding_tx(prevout_b.clone());
+
+    // Skeleton first: sighashes commit to outpoints, sequences, outputs,
+    // and locktime, never to the authorizations being reconstructed.
+    let mut tx = Tx {
+        version: 2,
+        inputs: vec![
+            TxIn {
+                previous_output: OutPoint::new(prev_tx_a.txid(), 0),
+                script_sig: Script::new(),
+                sequence: Sequence::from_consensus(0xffff_fffd),
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: OutPoint::new(prev_tx_b.txid(), 0),
+                script_sig: Script::new(),
+                sequence: Sequence::from_consensus(0xffff_fffd),
+                witness: Witness::new(),
+            },
+        ],
+        outputs: vec![TxOut {
+            value: Amount::from_sat(40_000),
+            script_pubkey: Script::from_bytes(
+                vec![0x00, 0x14].into_iter().chain([7_u8; 20]).collect(),
+            ),
+        }],
+        lock_time: LockTime::ZERO,
+    };
+    let digest_a = SighashCache::new(&tx)
+        .legacy_signature_hash(0, prevout_a.script_pubkey.as_bytes(), 1)
+        .unwrap();
+    let digest_b = SighashCache::new(&tx)
+        .segwit_v0_signature_hash_raw(
+            1,
+            p2pkh_script(signer_b.pubkey_hash()).as_bytes(),
+            prevout_b.value,
+            1,
+        )
+        .unwrap();
+    let sig_item_a = signer_a.ecdsa_item(digest_a, false);
+    let mut script_sig = super::push_data(&sig_item_a);
+    script_sig.extend_from_slice(&super::push_data(&signer_a.compressed_pubkey()));
+    tx.inputs[0].script_sig = Script::from_bytes(script_sig);
+    let sig_item_b = signer_b.ecdsa_item(digest_b, false);
+    tx.inputs[1].witness = Witness::from_stack(vec![sig_item_b, signer_b.compressed_pubkey()]);
+
+    // The shared cache pins the new call shape at compile time: one
+    // `SighashCache` borrowed alongside both recovery requests. The
+    // transaction carries DER signatures plus a sighash byte; recovery
+    // needs the 64-byte compact form, so strip the trailing byte and
+    // parse the DER prefix.
+    fn compact_of(der_plus_hashtype: &[u8]) -> [u8; 64] {
+        let parsed = bitcoin::secp256k1::ecdsa::Signature::from_der(
+            &der_plus_hashtype[..der_plus_hashtype.len() - 1],
+        )
+        .unwrap();
+        parsed.serialize_compact()
+    }
+    let cache = SighashCache::new(&tx);
+    let compact_a = compact_of(&sig_item_a);
+    let compact_b = compact_of(&tx.inputs[1].witness[0]);
+    let kind_a = super::prevout_kind(prevout_a.script_pubkey.as_bytes());
+    let kind_b = super::prevout_kind(prevout_b.script_pubkey.as_bytes());
+    let resolved_a = ResolvedPrevout {
+        txout: prevout_a.clone(),
+        confirmed_height: Some(100),
+    };
+    let resolved_b = ResolvedPrevout {
+        txout: prevout_b.clone(),
+        confirmed_height: Some(101),
+    };
+    let recovered_a = super::recover_pubkey(
+        &cache,
+        &super::Recovery {
+            index: 0,
+            sig: &compact_a,
+            hash_type: 1,
+            kind: &kind_a,
+            prevout: &resolved_a,
+            stored_pkh: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(recovered_a, signer_a.compressed_pubkey());
+    let recovered_b = super::recover_pubkey(
+        &cache,
+        &super::Recovery {
+            index: 1,
+            sig: &compact_b,
+            hash_type: 1,
+            kind: &kind_b,
+            prevout: &resolved_b,
+            stored_pkh: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(recovered_b, signer_b.compressed_pubkey());
+
+    // End to end: both inputs compress and the split prepare/finalize
+    // path (which now builds that single cache) restores the pair.
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx_a, 0);
+    resolver.register_tx(101, &prev_tx_b, 0);
+    let (compressed, warnings) = compress_transaction(
+        &tx,
+        &mut resolver,
+        CompressOptions {
+            compress_outpoints: true,
+        },
+    )
+    .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let plan = super::decompress_prepare(&compressed, &mut resolver).unwrap();
+    assert_eq!(plan.inputs.len(), 2);
+    let restored = super::decompress_finalize(plan, &resolver).unwrap();
+    assert_eq!(&restored, &tx);
+    assert_eq!(
+        &super::decompress_transaction(&compressed, &mut resolver).unwrap(),
+        &tx
+    );
+}
+
+#[test]
+fn production_resolver_clones_only_the_requested_output() {
+    use std::sync::Arc;
+
+    use bitcoin_rs_chain::BlockBodySource;
+
+    use crate::context::Context;
+
+    struct StubBody(Vec<u8>);
+    impl BlockBodySource for StubBody {
+        fn block_body(
+            &self,
+            height: u32,
+            _hash: bitcoin_rs_primitives::BlockHash,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_chain::BlockBodyReadError> {
+            Ok((height == 100).then(|| self.0.clone()))
+        }
+    }
+
+    struct StubTxIndex(Txid);
+    impl bitcoin_rs_index::DerivedIndexQuery for StubTxIndex {
+        fn transaction(&self, _txid: &Txid) -> Result<Option<Tx>, bitcoin_rs_index::TxQueryError> {
+            Ok(None)
+        }
+        fn outpoint_value(
+            &self,
+            _outpoint: &OutPoint,
+        ) -> Result<Option<u64>, bitcoin_rs_index::TxQueryError> {
+            Ok(None)
+        }
+        fn transaction_height(
+            &self,
+            txid: &Txid,
+        ) -> Result<Option<u32>, bitcoin_rs_index::TxQueryError> {
+            Ok((self.0 == *txid).then_some(100))
+        }
+        fn index_info(
+            &self,
+        ) -> Result<bitcoin_rs_index::DerivedIndexInfo, bitcoin_rs_index::TxQueryError> {
+            Ok(bitcoin_rs_index::DerivedIndexInfo {
+                synced: true,
+                best_block_height: 100,
+            })
+        }
+    }
+
+    // One funding transaction with three distinct outputs: resolving or
+    // locating the middle one must return exactly that output, proving
+    // the resolver cloned the requested `TxOut` rather than the whole
+    // funding transaction.
+    let funding = Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: Script::from_bytes(vec![0x01, 0x2a]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        outputs: vec![
+            TxOut {
+                value: Amount::from_sat(11_000),
+                script_pubkey: p2pkh_script([1_u8; 20]),
+            },
+            TxOut {
+                value: Amount::from_sat(22_000),
+                script_pubkey: p2wpkh_script([2_u8; 20]),
+            },
+            TxOut {
+                value: Amount::from_sat(33_000),
+                script_pubkey: p2pkh_script([3_u8; 20]),
+            },
+        ],
+        lock_time: LockTime::ZERO,
+    };
+    let txid = funding.txid();
+
+    let mut block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+    block.txs = vec![funding.clone()];
+    let body = consensus_bytes(&block);
+
+    let mut ctx = Context::new();
+    ctx.chain.block_body_source = Some(Arc::new(StubBody(body)));
+    ctx.indexes.derived_index = Some(Arc::new(StubTxIndex(txid)));
+    ctx.chain
+        .add_block(bitcoin_rs_index::block_log::BlockRecord {
+            hash: bitcoin_rs_primitives::BlockHash::from(
+                bitcoin_rs_primitives::Hash256::from_le_bytes(&[9_u8; 32]),
+            ),
+            height: 100,
+            body_size: 0,
+            header: None,
+            tx_count: 1,
+            time: 0,
+        });
+    let ctx = Arc::new(ctx);
+    let latch = bitcoin_rs_chain::LatchReader::fixture_never();
+    let mut resolver = crate::context::RpcPrevoutResolver::new(&ctx, latch).unwrap();
+
+    // `prevout` resolves each vout to its own output.
+    for (vout, expected) in funding.outputs.iter().enumerate() {
+        let vout = u32::try_from(vout).unwrap();
+        let resolved = resolver
+            .prevout(&OutPoint::new(txid, vout))
+            .unwrap()
+            .expect("funding output must resolve");
+        assert_eq!(&resolved.txout, expected, "vout {vout} must match");
+        assert_eq!(resolved.confirmed_height, Some(100));
+    }
+    // The middle output differs from its neighbours: a whole-transaction
+    // mix-up would surface here, not just a missing-output failure.
+    let middle = resolver.prevout(&OutPoint::new(txid, 1)).unwrap().unwrap();
+    assert_eq!(middle.txout, funding.outputs[1]);
+    assert_ne!(middle.txout, funding.outputs[0]);
+    assert_ne!(middle.txout, funding.outputs[2]);
+
+    // `outpoint_at` is the flat-index inverse and returns the same TxOuts.
+    assert_eq!(resolver.flat_output_index(100, &txid, 1).unwrap(), Some(1));
+    for flat in [0_u32, 1, 2] {
+        let (outpoint, resolved) = resolver
+            .outpoint_at(100, flat)
+            .unwrap()
+            .expect("flat index must locate an output");
+        let vout = flat;
+        assert_eq!(outpoint, OutPoint::new(txid, vout));
+        assert_eq!(
+            resolved.txout,
+            funding.outputs[usize::try_from(vout).unwrap()]
+        );
+        assert_eq!(resolved.confirmed_height, Some(100));
+    }
+
+    // Proved-absent stays `None` on both paths, never an error.
+    assert!(resolver.prevout(&OutPoint::new(txid, 9)).unwrap().is_none());
+    assert!(resolver.outpoint_at(100, 9).unwrap().is_none());
+}

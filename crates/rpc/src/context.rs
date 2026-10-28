@@ -1145,20 +1145,36 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
         Ok(())
     }
 
-    /// Returns a clone of the transaction `txid` cached with the retained
-    /// body at `height`; the body is parsed once at retain time, so this
-    /// lookup scans cached transactions without reparsing.
-    fn body_tx(&mut self, height: u32, txid: &Txid) -> Result<Option<Tx>, LookupError> {
+    /// Borrows the transaction `txid` cached with the retained body at
+    /// `height` without cloning; the body is parsed once at retain time,
+    /// so this lookup scans cached transactions without reparsing.
+    /// Callers clone only the requested output via [`Self::body_txout`].
+    fn body_tx_ref(&mut self, height: u32, txid: &Txid) -> Result<Option<&Tx>, LookupError> {
         self.ensure_body(height)?;
         let Some(body) = self.bodies.iter().find(|body| body.height == height) else {
             return Err(LookupError::BodyMissing(height));
         };
-        for (row, tx) in body.rows.iter().zip(body.txs.iter()) {
-            if row.txid == *txid {
-                return Ok(Some(tx.clone()));
-            }
-        }
-        Ok(None)
+        Ok(body
+            .rows
+            .iter()
+            .zip(body.txs.iter())
+            .find_map(|(row, tx)| (row.txid == *txid).then_some(tx)))
+    }
+
+    /// Clones only the requested output `vout` of `txid` at `height`;
+    /// the retained funding transaction itself is never cloned, so
+    /// per-input prevout lookups cost one `TxOut`, not one `Tx`.
+    fn body_txout(
+        &mut self,
+        height: u32,
+        txid: &Txid,
+        vout: u32,
+    ) -> Result<Option<TxOut>, LookupError> {
+        let vout = usize::try_from(vout).map_err(|_| LookupError::Missing)?;
+        let Some(tx) = self.body_tx_ref(height, txid)? else {
+            return Ok(None);
+        };
+        Ok(tx.outputs.get(vout).cloned())
     }
 
     fn resolve_prevout(
@@ -1180,11 +1196,10 @@ impl<'ctx> RpcPrevoutResolver<'ctx> {
         let Some(height) = height else {
             return Ok(None);
         };
-        let Some(tx) = self.body_tx(height, &outpoint.txid)? else {
+        let Some(txout) = self.body_txout(height, &outpoint.txid, outpoint.vout)? else {
             return Ok(None);
         };
-        let vout = usize::try_from(outpoint.vout).map_err(|_| LookupError::Missing)?;
-        Ok(tx.outputs.get(vout).cloned().map(|txout| ResolvedPrevout {
+        Ok(Some(ResolvedPrevout {
             txout,
             confirmed_height: Some(height),
         }))
@@ -1260,11 +1275,7 @@ impl PrevoutResolver for RpcPrevoutResolver<'_> {
         let Some((txid, vout)) = located else {
             return Ok(None);
         };
-        let Some(tx) = self.body_tx(height, &txid)? else {
-            return Ok(None);
-        };
-        let vout_index = usize::try_from(vout).map_err(|_| LookupError::Missing)?;
-        let Some(txout) = tx.outputs.get(vout_index).cloned() else {
+        let Some(txout) = self.body_txout(height, &txid, vout)? else {
             return Ok(None);
         };
         Ok(Some((
