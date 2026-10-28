@@ -14,7 +14,9 @@ use crate::types::TxPosition;
 use bitcoin_rs_chain::{
     BlockBodySource, BlockTreeReader, ChainTxCount, ChainWork, NodeId, NodeStatus, TipSnapshot,
 };
-use bitcoin_rs_primitives::{BlockHash, Hash256, Header, Tx, layout::ParsedBlock, varint};
+use bitcoin_rs_primitives::{
+    BlockHash, Hash256, Header, Tx, deserialize, layout::ParsedBlock, varint,
+};
 
 /// The applied-tip ancestry up to a bundle base, with the base's identity.
 ///
@@ -299,10 +301,21 @@ pub(super) fn is_top_level_span(position: TxPosition, start: u32, len: u32) -> b
 
 /// Reads single transactions through the existing body source, with a
 /// one-body memo keyed by block identity. The strict span rule needs the
-/// whole body on every lookup, so the memo serves all reads.
+/// whole body, so the memo keeps the body together with its parsed top-level
+/// transaction spans: a block is read and parsed once per memo fill, and each
+/// lookup is a binary search plus one transaction decode.
 pub(super) struct BodyReader<'a> {
     source: &'a dyn BlockBodySource,
-    whole_body: Option<(u32, Hash256, Vec<u8>)>,
+    whole_body: Option<HeldBody>,
+}
+
+/// One memoized block body and its top-level transaction spans.
+struct HeldBody {
+    height: u32,
+    hash: Hash256,
+    body: Vec<u8>,
+    /// `(start, len)` of every top-level transaction, ascending by start.
+    spans: Vec<(u32, u32)>,
 }
 
 impl<'a> BodyReader<'a> {
@@ -325,26 +338,35 @@ impl<'a> BodyReader<'a> {
         hash: Hash256,
         position: TxPosition,
     ) -> Result<Located, IndexBundleError> {
-        let Some(body) = self.whole_body_bytes(height, hash)? else {
+        let Some(held) = self.held_body(height, hash)? else {
             return Ok(Located::BodyMissing);
         };
-        let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
-                height,
-                reason: format!("block does not parse: {error}"),
-            })?;
-        for tx in parsed.transactions() {
-            let span = tx.span();
-            if is_top_level_span(position, span.start(), span.len()) {
-                return Ok(Located::Found(tx.materialize()));
-            }
+        let Ok(index) = held
+            .spans
+            .binary_search_by_key(&position.offset(), |&(start, _)| start)
+        else {
+            return Ok(Located::Mismatch);
+        };
+        let (start, len) = held.spans[index];
+        if !is_top_level_span(position, start, len) {
+            return Ok(Located::Mismatch);
         }
-        Ok(Located::Mismatch)
+        let bytes = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(len).ok())
+            .and_then(|(start, len)| held.body.get(start..start.checked_add(len)?))
+            .unwrap_or_else(|| unreachable!("parsed span lies inside its body"));
+        deserialize::<Tx>(bytes)
+            .map(Located::Found)
+            .map_err(|error| IndexBundleError::BodyRead {
+                height,
+                reason: format!("parsed transaction does not decode: {error}"),
+            })
     }
 
     /// Transactions the block `(height, hash)` holds, or `None` when the body
     /// is absent or pruned. Metadata answers without I/O when the source keeps
-    /// it; otherwise the memoized whole body is parsed for its count.
+    /// it; otherwise the memoized spans give the count.
     pub(super) fn block_tx_count(
         &mut self,
         height: u32,
@@ -361,33 +383,26 @@ impl<'a> BodyReader<'a> {
                 }
             });
         }
-        let Some(body) = self.whole_body_bytes(height, hash)? else {
-            return Ok(None);
-        };
-        let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
-                height,
-                reason: format!("block does not parse: {error}"),
-            })?;
-        Ok(Some(u64::try_from(parsed.tx_count()).unwrap_or(u64::MAX)))
+        Ok(self
+            .held_body(height, hash)?
+            .map(|held| u64::try_from(held.spans.len()).unwrap_or(u64::MAX)))
     }
 
-    /// Memoized whole body for `(height, hash)`, or `None` when the source
-    /// has no body. A read failure is `BodyRead`, never `BodyMissing`.
-    fn whole_body_bytes(
+    /// Memoized body and spans for `(height, hash)`, or `None` when the
+    /// source has no body. A read or parse failure is `BodyRead`, never
+    /// `BodyMissing`.
+    fn held_body(
         &mut self,
         height: u32,
         hash: Hash256,
-    ) -> Result<Option<&[u8]>, IndexBundleError> {
+    ) -> Result<Option<&HeldBody>, IndexBundleError> {
         let hit = self
             .whole_body
             .as_ref()
-            .is_some_and(|(held_height, held_hash, _)| {
-                *held_height == height && *held_hash == hash
-            });
+            .is_some_and(|held| held.height == height && held.hash == hash);
         if !hit {
-            match self.source.block_body(height, BlockHash::from(hash)) {
-                Ok(Some(body)) => self.whole_body = Some((height, hash, body)),
+            let body = match self.source.block_body(height, BlockHash::from(hash)) {
+                Ok(Some(body)) => body,
                 Ok(None) => return Ok(None),
                 Err(error) => {
                     return Err(IndexBundleError::BodyRead {
@@ -395,9 +410,24 @@ impl<'a> BodyReader<'a> {
                         reason: error.to_string(),
                     });
                 }
-            }
+            };
+            let spans = ParsedBlock::parse_exact(&body)
+                .map_err(|error| IndexBundleError::BodyRead {
+                    height,
+                    reason: format!("block does not parse: {error}"),
+                })?
+                .transactions()
+                .iter()
+                .map(|tx| (tx.span().start(), tx.span().len()))
+                .collect();
+            self.whole_body = Some(HeldBody {
+                height,
+                hash,
+                body,
+                spans,
+            });
         }
-        Ok(self.whole_body.as_ref().map(|(_, _, body)| body.as_slice()))
+        Ok(self.whole_body.as_ref())
     }
 }
 
@@ -410,7 +440,7 @@ mod tests {
 
     use bitcoin::hashes::Hash as _;
     use bitcoin_rs_chain::{BlockBodyReadError, BlockTree};
-    use bitcoin_rs_primitives::{CompactTarget, deserialize};
+    use bitcoin_rs_primitives::CompactTarget;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
