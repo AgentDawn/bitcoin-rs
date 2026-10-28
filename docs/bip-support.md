@@ -68,8 +68,10 @@ Linked capability names lead to code or tests; notes link scope and evidence own
 | :-- | :-- | :--: | :--: | :-- |
 | 32 | [BIP32 derivation](../crates/rpc/src/handlers/util.rs) | ✅ | — | Ranged descriptor addresses; no key custody |
 | 173/350 | [Segwit addresses](../crates/rpc/src/convert.rs) | ✅ | — | Wallet-free script address rendering |
-| 380 | [Output descriptors](../crates/rpc/src/handlers/util.rs) | ✅ | — | getdescriptorinfo/deriveaddresses; scantxoutset rejects ranged/multipath forms |
-| 389 | [Multipath descriptors](../crates/rpc/src/handlers/util.rs) | ✅ | — | Multipath key expressions in getdescriptorinfo/deriveaddresses; rejected by scantxoutset |
+| 380 | [Output descriptors](../crates/rpc/src/handlers/util.rs) | ✅ | — | getdescriptorinfo/deriveaddresses |
+| 380 | scantxoutset public-descriptor scans ([#1676](https://github.com/gosuda/bitcoin-rs/pull/1676)) | ☐ | — | bounded public-descriptor scans ([API-35](contracts/external-api.md#api-35-bounded-public-descriptor-utxo-scans)) |
+| 389 | [Multipath descriptors](../crates/rpc/src/handlers/util.rs) | ✅ | — | Multipath key expressions in getdescriptorinfo/deriveaddresses |
+| 389 | scantxoutset public multipath scans ([#1676](https://github.com/gosuda/bitcoin-rs/pull/1676)) | ☐ | — | bounded public multipath scans ([API-35](contracts/external-api.md#api-35-bounded-public-descriptor-utxo-scans)) |
 | 352 | [Silent Payments](../crates/index/src/silent_payments.rs) | 🧪 | — | Opt-in keyless codec and authenticated `getblocktweaks` extension; external wallet interoperability unverified; [docs](silent-payments.md) |
 
 ## Out of scope by policy

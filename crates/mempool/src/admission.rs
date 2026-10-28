@@ -2427,9 +2427,6 @@ mod tests {
     {
         struct Observer(AtomicUsize);
         impl crate::MempoolObserver for Observer {
-            fn wants_accepted_transactions(&self) -> bool {
-                false
-            }
             fn on_mutation(&self, _: &crate::MutationEnvelope) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
@@ -2437,7 +2434,7 @@ mod tests {
         let observer = Arc::new(Observer(AtomicUsize::new(0)));
         let preview_gateway = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits::default()))),
-            Some(observer.clone()),
+            Some((observer.clone(), crate::BodyInterest::Metadata)),
             ValidationEngine::Native,
             None,
         ));
@@ -3003,9 +3000,6 @@ mod tests {
     struct ReorgRecording(Mutex<Vec<(Txid, AdmissionOrigin)>>);
 
     impl crate::MempoolObserver for ReorgRecording {
-        fn wants_accepted_transactions(&self) -> bool {
-            false
-        }
         fn on_mutation(&self, envelope: &crate::MutationEnvelope) {
             let mut seen = self.0.lock();
             for change in &envelope.result.changes {
@@ -3024,9 +3018,6 @@ mod tests {
     struct ReorgBatchLog(Mutex<Vec<ReorgBatch>>);
 
     impl crate::MempoolObserver for ReorgBatchLog {
-        fn wants_accepted_transactions(&self) -> bool {
-            false
-        }
         fn on_mutation(&self, envelope: &crate::MutationEnvelope) {
             let mut seen = self.0.lock();
             seen.push((
@@ -3045,7 +3036,7 @@ mod tests {
         let leg: Arc<dyn crate::MempoolObserver> = observer.clone();
         Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits::default()))),
-            Some(leg),
+            Some((leg, crate::BodyInterest::Metadata)),
             ValidationEngine::Native,
             None,
         ))
@@ -3261,7 +3252,7 @@ mod tests {
         let leg: Arc<dyn crate::MempoolObserver> = log.clone();
         let gateway = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(limits))),
-            Some(leg),
+            Some((leg, crate::BodyInterest::Metadata)),
             ValidationEngine::Native,
             None,
         ));
@@ -3647,7 +3638,7 @@ mod tests {
         let leg: Arc<dyn crate::MempoolObserver> = log.clone();
         let gateway = Arc::new(MempoolGateway::new(
             Arc::new(RwLock::new(Mempool::new(crate::MempoolLimits::default()))),
-            Some(leg),
+            Some((leg, crate::BodyInterest::Metadata)),
             ValidationEngine::Native,
             None,
         ));
@@ -3673,7 +3664,7 @@ mod tests {
                             max_total_bytes: 100,
                             ..crate::MempoolLimits::default()
                         }))),
-                        Some(observer),
+                        Some((observer, crate::BodyInterest::Metadata)),
                         ValidationEngine::Native,
                         None,
                     );
@@ -3799,7 +3790,7 @@ mod tests {
                     max_total_bytes: 100,
                     ..crate::MempoolLimits::default()
                 }))),
-                Some(observer),
+                Some((observer, crate::BodyInterest::Metadata)),
                 ValidationEngine::Native,
                 None,
             ));

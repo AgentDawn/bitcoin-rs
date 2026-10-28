@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use bitcoin::hex::FromHex;
 use bitcoin_rs_chain::regtest_fixture::{self, REGTEST_BITS};
-use bitcoin_rs_mempool::{AdmissionOrigin, MempoolEntry, SubmitOutcome};
+use bitcoin_rs_mempool::{AdmissionOrigin, BodyInterest, MempoolEntry, SubmitOutcome};
 use bitcoin_rs_mining::{
     BlockTemplate, BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult,
     BlockValidationResult, CoinbaseBudget, MempoolSequenceWake, MiningControl,
@@ -865,7 +865,7 @@ pub(crate) fn wire_mining(state: &NodeState) -> Result<WiredMining> {
     signal.attach_sequence_wake(&wake);
     state
         .mempool_gateway()
-        .attach_observer_leg("mining-test", signal)
+        .attach_observer_leg("mining-test", signal, BodyInterest::Metadata)
         .map_err(anyhow::Error::msg)?;
     let handler = Arc::new(rpc_handler(state, control));
     Ok(WiredMining { mining, handler })

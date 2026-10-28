@@ -6,7 +6,8 @@ use bitcoin::hashes::Hash as _;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_mempool::{
-    Mempool, MempoolEntry, MempoolLimits, MempoolObserver, MutationEnvelope, MutationOutcome,
+    BodyInterest, Mempool, MempoolEntry, MempoolLimits, MempoolObserver, MutationEnvelope,
+    MutationOutcome,
 };
 use bitcoin_rs_mining::FakeMiningControl;
 use bitcoin_rs_p2p::DEFAULT_TX_RELAY_QUEUE_CAPACITY;
@@ -122,9 +123,6 @@ fn consumer_preserves_exact_connection_id() {
         captured: Arc<Mutex<Option<bitcoin_rs_mempool::AdmissionOrigin>>>,
     }
     impl MempoolObserver for OriginRecorder {
-        fn wants_accepted_transactions(&self) -> bool {
-            false
-        }
         fn on_mutation(&self, envelope: &MutationEnvelope) {
             if envelope
                 .result
@@ -144,9 +142,12 @@ fn consumer_preserves_exact_connection_id() {
     let recorded_origin = Arc::new(Mutex::new(None));
     let gateway = Arc::new(MempoolGateway::new(
         Arc::clone(&pool),
-        Some(Arc::new(OriginRecorder {
-            captured: Arc::clone(&recorded_origin),
-        })),
+        Some((
+            Arc::new(OriginRecorder {
+                captured: Arc::clone(&recorded_origin),
+            }),
+            BodyInterest::Metadata,
+        )),
         ValidationEngine::Native,
         None,
     ));
