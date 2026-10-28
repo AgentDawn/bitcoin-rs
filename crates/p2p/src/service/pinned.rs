@@ -146,6 +146,8 @@ mod tests {
         assert_eq!(pins.retries[&endpoint].delay, Duration::from_secs(2));
         let info = crate::PeerInfo {
             addr: endpoint.into(),
+            endpoint: Some(endpoint),
+            network: endpoint.net(),
             version: 70016,
             wtxid_relay: false,
             relay_transactions: true,
@@ -157,7 +159,7 @@ mod tests {
             best_known_height: 0,
             conn_time: 0,
             inbound: false,
-            addr_bind: "127.0.0.1:1".parse().expect("bind"),
+            addr_bind: crate::TransportRemote::new("127.0.0.1:1".parse().expect("bind")),
             time_offset: 0,
             counters: std::sync::Arc::new(crate::PeerCounters::default()),
             transport: crate::TransportProtocol::V1,

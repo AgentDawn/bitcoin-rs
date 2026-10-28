@@ -109,7 +109,9 @@ impl BlockSync {
             }
         }
 
-        self.switch_branch_if_outweighed();
+        if let Some(demoted_tip) = self.switch_branch_if_outweighed() {
+            self.record_demoted_tip(demoted_tip);
+        }
         // The gate recheck runs after the branch switch so admissibility
         // reads the settled applied tip: a body on a winning branch that
         // just replaced the applied tip must not be judged against the old
@@ -187,7 +189,7 @@ impl BlockSync {
     /// operations precede the scheduler lock to preserve the `PeerTable` ->
     /// scheduler ordering used elsewhere.
     fn discard_inadmissible_header_bodies(&self, invalid: &[(Hash256, Option<crate::PeerSource>)]) {
-        let blamed: Vec<crate::PeerRemote> = invalid
+        let blamed: Vec<crate::PeerSource> = invalid
             .iter()
             .filter_map(|(_, source)| *source)
             .filter(|source| {
@@ -201,16 +203,15 @@ impl BlockSync {
                     false
                 }
             })
-            .map(|source| source.addr)
             .collect();
         let mut scheduler = self.scheduler.lock();
         for (hash, _) in invalid {
             scheduler.stager.discard(hash);
         }
-        for peer_addr in &blamed {
+        for source in &blamed {
             scheduler
                 .window
-                .mark_peer_unresponsive(*peer_addr, Instant::now());
+                .mark_peer_unresponsive(*source, Instant::now());
         }
         tracing::debug!(
             discarded = invalid.len(),
@@ -269,8 +270,10 @@ impl BlockSync {
                 HeaderAdmission::Accepted {
                     announced_tip: Some(tip_hash),
                     active_height,
+                    demoted_tip,
                     ..
                 } => {
+                    self.record_admitted_tips(demoted_tip, Some(tip_hash), source);
                     // A staged retry that now admits is the same
                     // announcement the headers drain credits — the
                     // delivering connection demonstrated the tip even if
@@ -744,8 +747,8 @@ impl BlockSync {
                         self.scheduler
                             .lock()
                             .window
-                            .mark_peer_unresponsive(source.addr, now);
-                        tracing::warn!(peer_addr = %source.addr, %hash, "block sync: peer served mutated block body; disconnecting");
+                            .mark_peer_unresponsive(source, now);
+                        tracing::warn!(peer_addr = ?source.endpoint, %hash, "block sync: peer served mutated block body; disconnecting");
                     }
                 }
             }

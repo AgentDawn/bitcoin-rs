@@ -311,6 +311,38 @@ impl CoreValue for Option<PathBuf> {
     }
 }
 
+impl CoreValue for Option<SocketAddr> {
+    fn apply(value: &str, slot: &mut Self) {
+        if let Ok(addr) = value.parse() {
+            *slot = Some(addr);
+        }
+    }
+}
+
+impl CoreValue for Option<Vec<bitcoin_rs_node::options::NetworkLabel>> {
+    fn apply(value: &str, slot: &mut Self) {
+        let entries = slot.get_or_insert_with(Vec::new);
+        for item in value.split(',') {
+            if let Ok(label) = bitcoin_rs_node::options::parse_network_label(item.trim()) {
+                if !entries.contains(&label) {
+                    entries.push(label);
+                }
+            }
+        }
+    }
+}
+impl CoreValue for Option<Vec<bitcoin_rs_node::options::PeerNetwork>> {
+    fn apply(value: &str, slot: &mut Self) {
+        let entries = slot.get_or_insert_with(Vec::new);
+        for item in value.split(',') {
+            if let Ok(network) = bitcoin_rs_node::options::parse_peer_network(item.trim()) {
+                if !entries.contains(&network) {
+                    entries.push(network);
+                }
+            }
+        }
+    }
+}
 /// Sets the one Core key that no table row can express: `listen` is a boolean
 /// switch over the bind list, not an address, and only its false value is an
 /// override. Returns whether it consumed `key`.
@@ -420,6 +452,7 @@ mod compat_tests {
     use anyhow::Result;
     use bitcoin_rs_node::{Auth, Network, NodeConfig, resolve};
     use std::fs;
+    use std::net::SocketAddr;
 
     fn load_conf(text: &str, network: Network) -> Result<NodeConfig> {
         let temp = tempfile::tempdir()?;
@@ -451,6 +484,45 @@ mod compat_tests {
         assert_eq!(config.p2p.listen, []);
         assert!(config.indexes.txindex);
         assert_eq!(config.storage.dbcache_mb, 768);
+
+        let conf_with_overlays = load_conf(
+            r"
+proxy=127.0.0.1:9050
+onion=127.0.0.1:9051
+dnsseed=0
+proxyrandomize=1
+torcontrol=127.0.0.1:9052
+i2psam=127.0.0.1:7656
+i2pacceptincoming=1
+onlynet=onion,i2p
+",
+            Network::Mainnet,
+        )?;
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.proxy,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9050)))
+        );
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.onion_proxy,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9051)))
+        );
+        assert!(conf_with_overlays.p2p.overlay.randomize_credentials);
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.tor_control,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9052)))
+        );
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.i2p_sam,
+            Some(SocketAddr::from(([127, 0, 0, 1], 7656)))
+        );
+        assert!(conf_with_overlays.p2p.overlay.i2p_accept);
+        assert_eq!(
+            conf_with_overlays.p2p.overlay.onlynet,
+            vec![
+                bitcoin_rs_node::options::PeerNetwork::Onion,
+                bitcoin_rs_node::options::PeerNetwork::I2p
+            ]
+        );
         Ok(())
     }
 
@@ -548,6 +620,44 @@ mod feature_option_tests {
             Ok(_) => panic!("configuration must be refused"),
             Err(error) => error.to_string(),
         }
+    }
+
+    #[test]
+    fn relay_switches_are_bare_cli_flags_and_the_command_line_beats_environment() -> Result<()> {
+        let off = load(&[], &[])?.p2p;
+        assert!(
+            !off.relay_offers.package_relay
+                && !off.relay_offers.stale_tip_relay
+                && !off.relay_offers.stale_tip_prefers_blocks
+        );
+
+        let on = load(
+            &[
+                "--p2p-package-relay",
+                "--p2p-stale-tip-relay",
+                "--p2p-stale-tip-prefers-blocks",
+            ],
+            &[],
+        )?
+        .p2p;
+        assert!(
+            on.relay_offers.package_relay
+                && on.relay_offers.stale_tip_relay
+                && on.relay_offers.stale_tip_prefers_blocks
+        );
+
+        let env_on = load(&[], &[("BITCOIN_RS_P2P_PACKAGE_RELAY", "true")])?.p2p;
+        assert!(env_on.relay_offers.package_relay);
+        let cli_off = load(
+            &["--p2p-package-relay=false"],
+            &[("BITCOIN_RS_P2P_PACKAGE_RELAY", "true")],
+        )?
+        .p2p;
+        assert!(!cli_off.relay_offers.package_relay);
+
+        let dangling = refusal(&["--p2p-stale-tip-prefers-blocks"], &[]);
+        assert!(dangling.contains("--p2p-stale-tip-relay"));
+        Ok(())
     }
 
     #[test]

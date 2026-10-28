@@ -348,6 +348,118 @@ fn gossip_cache_is_shared_stable_until_expiry_and_rotates_new_discoveries() {
 }
 
 #[test]
+fn gossip_addrv2_rotates_successive_replies_and_caches_within_ttl() {
+    let book = book();
+    for n in 1..200 {
+        book.learn_dns("seed", &[addr(n)], 10_000);
+        if book.len() == 64 {
+            break;
+        }
+    }
+    assert_eq!(book.len(), 64);
+    let tick = Instant::now();
+    let before = book.state.lock().revision;
+    let first = book.gossip_addrv2_at(10_000, tick);
+    assert_eq!(first.len(), 32);
+    assert_eq!(book.state.lock().revision, before);
+    assert_eq!(
+        book.gossip_addrv2_at(10_000, tick),
+        first,
+        "repeats within the TTL are served from the cache without advancing rotation"
+    );
+    let second = book.gossip_addrv2_at(10_100, tick + GOSSIP_CACHE_TTL);
+    assert_ne!(
+        first, second,
+        "successive addrv2 rounds must rotate, not replay the first insertion-order records"
+    );
+    let endpoints =
+        |rows: &[bitcoin::p2p::address::AddrV2Message]| -> std::collections::HashSet<PeerEndpoint> {
+            rows.iter()
+                .map(|row| crate::endpoint::endpoint_from_addrv2(row).expect("addrv2 round-trips"))
+                .collect()
+        };
+    let first_set = endpoints(&first);
+    let second_set = endpoints(&second);
+    assert!(
+        first_set.is_disjoint(&second_set),
+        "two full 32-row windows over 64 records must not overlap"
+    );
+    assert_eq!(first_set.len() + second_set.len(), 64);
+    assert_eq!(
+        book.gossip_addrv2_at(10_100, tick + 2 * GOSSIP_CACHE_TTL),
+        first,
+        "rotation wraps fairly after a full cycle"
+    );
+    assert_eq!(book.state.lock().revision, before, "cache is not persisted");
+}
+
+#[test]
+fn gossip_addrv2_applies_current_overlay_filtering_per_reply() {
+    let book = book();
+    for n in 1..10 {
+        book.learn_dns("seed", &[addr(n)], 10_000);
+    }
+    let tor = PeerEndpoint::TorV3 {
+        key: [7; 32],
+        port: 8333,
+    };
+    let i2p = PeerEndpoint::I2p {
+        hash: [9; 32],
+        port: 8333,
+    };
+    book.learn_dns("seed", &[tor, i2p], 10_000);
+    assert!(book.state.lock().by_addr.contains_key(&tor));
+    assert!(book.state.lock().by_addr.contains_key(&i2p));
+    let tick = Instant::now();
+    let ip_only = book.gossip_addrv2_at(10_000, tick);
+    assert_ne!(ip_only.len(), 0);
+    assert!(
+        ip_only.iter().all(|row| matches!(
+            row.addr,
+            bitcoin::p2p::address::AddrV2::Ipv4(_) | bitcoin::p2p::address::AddrV2::Ipv6(_)
+        )),
+        "without overlay transports only IP rows are gossiped"
+    );
+    book.set_addrv2_gossip(true, false);
+    let with_tor = book.gossip_addrv2_at(10_000, tick);
+    assert!(
+        with_tor.iter().any(|row| matches!(
+            &row.addr,
+            bitcoin::p2p::address::AddrV2::TorV3(key) if *key == [7; 32]
+        )),
+        "enabling Tor applies on the next reply, not after the TTL"
+    );
+    assert!(
+        with_tor
+            .iter()
+            .all(|row| !matches!(row.addr, bitcoin::p2p::address::AddrV2::I2p(_))),
+        "unconfigured I2P stays filtered"
+    );
+    book.set_addrv2_gossip(true, true);
+    let with_both = book.gossip_addrv2_at(10_000, tick);
+    assert!(with_both.iter().any(|row| matches!(
+        &row.addr,
+        bitcoin::p2p::address::AddrV2::TorV3(key) if *key == [7; 32]
+    )));
+    assert!(with_both.iter().any(|row| matches!(
+        &row.addr,
+        bitcoin::p2p::address::AddrV2::I2p(hash) if *hash == [9; 32]
+    )));
+    book.set_addrv2_gossip(false, false);
+    let ip_again = book.gossip_addrv2_at(10_000, tick);
+    assert!(
+        ip_again.iter().all(|row| matches!(
+            row.addr,
+            bitcoin::p2p::address::AddrV2::Ipv4(_) | bitcoin::p2p::address::AddrV2::Ipv6(_)
+        )),
+        "disabling overlays drops them on the next reply"
+    );
+    for reply in [&ip_only, &with_tor, &with_both, &ip_again] {
+        assert!(reply.len() <= MAX_GOSSIP, "gossip cap preserved");
+    }
+}
+
+#[test]
 fn pending_attempts_keep_endpoint_and_network_group_ownership_until_released() {
     let book = book();
     book.learn_dns("seed", &[addr(1)], 10_000);

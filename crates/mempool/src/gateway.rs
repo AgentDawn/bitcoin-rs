@@ -1693,6 +1693,26 @@ impl MempoolGateway {
         }
     }
 
+    /// Hands each individually refused member of a refused package, in package
+    /// (dependency) order, to the peer lifecycle exactly as a refused single
+    /// transaction would be. Members with no individual refusal, such as those
+    /// caught only by an aggregate fee, topology or cluster check, are not
+    /// recorded. `requests` and `prepared` are the same-length batch the
+    /// refusal was decided on, and a non-peer origin records nothing. PRE: the
+    /// caller holds the pool write lock with the stamped state revalidated.
+    pub(crate) fn record_peer_package_refusal(
+        &self,
+        pool: &Mempool,
+        requests: &[AdmissionRequest],
+        prepared: &[PreparedAdmission],
+    ) {
+        for (request, job) in requests.iter().zip(prepared) {
+            if let Some((error, scope)) = job.rejection {
+                self.record_peer_failure(pool, request, error, scope);
+            }
+        }
+    }
+
     /// Retains `tx` in the reconstruction ring. PRE: the caller holds the pool
     /// write lock, which is what makes the ring consistent with the pool.
     fn retain_for_reconstruction(&self, tx: &Arc<Tx>) {
@@ -4044,6 +4064,9 @@ mod tests {
         candidate.inputs.push(candidate.inputs[0].clone());
         candidate.inputs[0].witness = Witness::from_stack(vec![vec![1]]);
         let origin = AdmissionOrigin::Peer(crate::PeerToken {
+            endpoint: Some(bitcoin_rs_primitives::PeerEndpoint::Ip(
+                core::net::SocketAddr::from(([127, 0, 0, 1], 8333)),
+            )),
             addr: Some(bitcoin_rs_primitives::PeerEndpoint::from((
                 [127, 0, 0, 1],
                 8333,

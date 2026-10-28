@@ -100,6 +100,18 @@ impl OverlayConfig {
         }
         Ok(())
     }
+    /// Whether any Tor route or control surface is configured.
+    #[must_use]
+    pub fn tor_configured(&self) -> bool {
+        self.onion_proxy.is_some() || self.proxy.is_some() || self.tor_control.is_some()
+    }
+
+    /// Whether an I2P SAM bridge is configured.
+    #[must_use]
+    pub fn i2p_configured(&self) -> bool {
+        self.i2p_sam.is_some()
+    }
+
     /// Whether this network has a route.
     pub fn configured(&self, network: PeerNetwork) -> bool {
         match network {
@@ -114,6 +126,29 @@ impl OverlayConfig {
     }
     pub(crate) fn local_dns_allowed(&self) -> bool {
         self.proxy.is_none() && (self.allows(PeerNetwork::Ipv4) || self.allows(PeerNetwork::Ipv6))
+    }
+
+    /// Snapshot of the dial routes for the shared selection prefilter. The
+    /// SAM session stays transport-owned and is attached by the transport;
+    /// only proxy routes and the `onlynet` restriction are snapshotted here.
+    #[must_use]
+    pub fn dial_routes(&self) -> crate::DialRoutes {
+        fn label(network: PeerNetwork) -> bitcoin_rs_primitives::NetworkLabel {
+            use bitcoin_rs_primitives::NetworkLabel as Label;
+            match network {
+                PeerNetwork::Ipv4 => Label::Ipv4,
+                PeerNetwork::Ipv6 => Label::Ipv6,
+                PeerNetwork::Onion => Label::Onion,
+                PeerNetwork::I2p => Label::I2p,
+            }
+        }
+        crate::DialRoutes {
+            proxy: self.proxy,
+            onion: self.onion_proxy,
+            proxy_randomize_credentials: self.randomize_credentials,
+            sam_session: None,
+            onlynet: self.onlynet.iter().map(|network| label(*network)).collect(),
+        }
     }
 }
 
