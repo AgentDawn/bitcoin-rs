@@ -50,7 +50,9 @@ block size. Queue/model attributes are recorded for context only.
 
 import argparse
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import TypedDict
@@ -59,6 +61,10 @@ type Json = str | int | float | bool | None | list[Json] | dict[str, Json]
 type JsonObject = dict[str, Json]
 
 SECTOR_BYTES = 512
+
+# Kernel block-layer counters are 64-bit unsigned; anything outside
+# ``0 <= v <= 2**64 - 1`` is not a counter value and must be rejected.
+U64_MAX = (1 << 64) - 1
 
 MOUNTINFO_DEFAULT = "/proc/self/mountinfo"
 DISKSTATS_DEFAULT = "/proc/diskstats"
@@ -186,6 +192,12 @@ def read_mountinfo(path: str | Path = MOUNTINFO_DEFAULT) -> list[MountInfo]:
         right_fields = right.split(" ")
         if len(left_fields) < 6 or len(right_fields) < 2:
             continue
+        # The kernel separates fields with single spaces and escapes literal
+        # spaces inside mountpoints, so an empty field means a malformed or
+        # hand-edited line. Skipping it beats shifting every index and
+        # attributing the scratch path to the wrong mount (often ``/``).
+        if "" in left_fields or "" in right_fields:
+            continue
         try:
             entry: MountInfo = {
                 "mount_id": left_fields[0],
@@ -280,11 +292,11 @@ class CounterHandle:
             "diskstats_sectors_written": None,
         }
         if (
-            sample["sysfs_sectors_written"] < 0
-            or sample["writes_completed"] < 0
-            or sample["in_flight"] < 0
+            not 0 <= sample["sysfs_sectors_written"] <= U64_MAX
+            or not 0 <= sample["writes_completed"] <= U64_MAX
+            or not 0 <= sample["in_flight"] <= U64_MAX
         ):
-            raise ValueError("counter file holds a negative value")
+            raise ValueError("counter file holds a value outside 0 <= v <= 2**64 - 1")
         # Recorded diagnostic only: the diskstats value is stored alongside the
         # sysfs counter and is never cross-validated against it.
         text = _read_text(self.diskstats_path)
@@ -301,7 +313,7 @@ class CounterHandle:
                         sectors = int(parts[9])
                     except ValueError:
                         break
-                    if sectors >= 0:
+                    if 0 <= sectors <= U64_MAX:
                         sample["diskstats_sectors_written"] = sectors
                     break
         return sample
@@ -316,7 +328,11 @@ def try_read(handle: CounterHandle) -> CounterSample | None:
 
 
 def _counter_int(value: Json) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= U64_MAX
+    ):
         return None
     return value
 
@@ -364,7 +380,32 @@ def identify_scope(
     sys_base_path = Path(sys_base)
     diskstats = Path(diskstats_path)
     real = str(Path(scratch).resolve())
-    mechanisms: list[str] = [str(mountinfo_path)]
+    try:
+        scratch_is_dir = stat.S_ISDIR(os.stat(real).st_mode)
+        scratch_reason: str | None = None
+    except OSError as error:
+        scratch_is_dir = False
+        scratch_reason = f"cannot stat scratch path {real}: {error}"
+    # ``Path.resolve()`` never touches the filesystem, so without this stat a
+    # removed scratch path would still resolve against its old mount and
+    # report ``available``. The scratch stat is itself a checked mechanism.
+    mechanisms: list[str] = [str(mountinfo_path), real]
+    if not scratch_is_dir:
+        if scratch_reason is None:
+            scratch_reason = f"scratch path {real} is not a directory"
+        return None, {
+            "scratch_realpath": real,
+            "counter_unit": "sectors of 512 bytes (kernel block-layer unit)",
+            "counter_scope": (
+                "host-visible block-device writes when available; "
+                "not flash-internal write amplification"
+            ),
+            "mount": None,
+            "mechanisms_checked": mechanisms,
+            "status": "unavailable",
+            "scope_kind": "unavailable",
+            "reason": scratch_reason,
+        }
     info: ScopeDoc = {
         "scratch_realpath": real,
         "counter_unit": "sectors of 512 bytes (kernel block-layer unit)",
