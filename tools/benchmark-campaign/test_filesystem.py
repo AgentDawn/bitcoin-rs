@@ -2,6 +2,7 @@
 """Contract tests for the filesystem-aware Linux measurement boundary."""
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -98,6 +99,13 @@ def _standard_table(root: Path, spec: MountSpec) -> Path:
     return table
 
 
+def _real_scratch(root: Path, name: str = "scratch") -> Path:
+    """Create a real scratch directory; ``identify_scope`` stats it."""
+    scratch = root / name
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
 def _mount_dict(mount_id: str, majmin: str, point: str) -> filesystem.MountInfo:
     return {
         "mount_id": mount_id,
@@ -141,9 +149,14 @@ class MountBoundaryTests(unittest.TestCase):
         self.assertIsNone(pick_mount("/nothing/here", []))
 
     def test_nonutf8_child_mount_maps_to_child(self) -> None:
-        child = "/data/\udcffraw"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            # Non-UTF8 names are unrepresentable in ``pathlib`` (str-only),
+            # so the byte path is created with ``os.mkdir`` directly.
+            raw_child = os.fsencode(root) + b"/\xffraw"
+            os.mkdir(raw_child)
+            os.mkdir(raw_child + b"/scratch")
+            child = os.fsdecode(raw_child)
             sys_base = root / "sys"
             sys_base.mkdir()
             _make_device(sys_base, "8:2", _ext4_device(11))
@@ -154,7 +167,9 @@ class MountBoundaryTests(unittest.TestCase):
                     _mountline(MountSpec(majmin="8:1", point="/", source="/dev/sda1")),
                     _mountline(
                         MountSpec(
-                            majmin="8:2", point=r"/data/\377raw", source="/dev/sdb1"
+                            majmin="8:2",
+                            point=str(root) + r"/\377raw",
+                            source="/dev/sdb1",
                         )
                     ),
                 ],
@@ -277,9 +292,10 @@ class CounterTests(unittest.TestCase):
                 "259   2 nvme0n1p2 0 0 0 0 10 0 1000 0 0 0 0 0 0 0\n",
                 encoding="utf-8",
             )
-            table = _standard_table(root, _standard_mount("259:2", "/data"))
+            table = _standard_table(root, _standard_mount("259:2", "/"))
+            scratch = _real_scratch(root)
             handle, scope = identify_scope(
-                "/data/scratch",
+                scratch,
                 mountinfo_path=table,
                 sys_base=sys_base,
                 diskstats_path=diskstats,
@@ -302,7 +318,7 @@ class CounterTests(unittest.TestCase):
             _make_device(sys_base, "8:1", _ext4_device(42))
             table = _standard_table(root, _standard_mount("8:1", "/"))
             handle, scope = identify_scope(
-                "/x",
+                _real_scratch(root),
                 mountinfo_path=table,
                 sys_base=sys_base,
                 diskstats_path=root / "no-diskstats",
@@ -318,7 +334,7 @@ class CounterTests(unittest.TestCase):
             sys_base.mkdir()
             table = _standard_table(root, _standard_mount("8:1", "/"))
             handle, scope = identify_scope(
-                "/x", mountinfo_path=table, sys_base=sys_base
+                _real_scratch(root), mountinfo_path=table, sys_base=sys_base
             )
             self.assertIsNone(handle)
             self.assertEqual(scope["status"], "unavailable")
@@ -332,7 +348,7 @@ class CounterTests(unittest.TestCase):
             _make_device(sys_base, "8:1", DeviceFixture("not a counter file\n"))
             table = _standard_table(root, _standard_mount("8:1", "/"))
             handle, scope = identify_scope(
-                "/x", mountinfo_path=table, sys_base=sys_base
+                _real_scratch(root), mountinfo_path=table, sys_base=sys_base
             )
             self.assertIsNone(handle)
             self.assertEqual(scope["status"], "unavailable")
@@ -345,7 +361,7 @@ class CounterTests(unittest.TestCase):
             _make_device(sys_base, "8:1", DeviceFixture("1 2 3\n"))
             table = _standard_table(root, _standard_mount("8:1", "/"))
             handle, scope = identify_scope(
-                "/x", mountinfo_path=table, sys_base=sys_base
+                _real_scratch(root), mountinfo_path=table, sys_base=sys_base
             )
             self.assertIsNone(handle)
             self.assertEqual(scope["status"], "unavailable")
@@ -427,7 +443,7 @@ class ScopeLabelTests(unittest.TestCase):
             table = root / "mountinfo"
             table.write_text("", encoding="utf-8")
             handle, scope = identify_scope(
-                "/x", mountinfo_path=table, sys_base=root / "sys"
+                _real_scratch(root), mountinfo_path=table, sys_base=root / "sys"
             )
             self.assertIsNone(handle)
             self.assertEqual(scope["status"], "unavailable")
@@ -554,9 +570,9 @@ class NoDoubleCountTests(unittest.TestCase):
                 "259   2 nvme0n1p2 0 0 0 0 9 0 100 0 0 0 0 0 0 0\n",
                 encoding="utf-8",
             )
-            table = _standard_table(root, _standard_mount("259:2", "/data"))
+            table = _standard_table(root, _standard_mount("259:2", "/"))
             handle, scope = identify_scope(
-                "/data/x",
+                _real_scratch(root),
                 mountinfo_path=table,
                 sys_base=sys_base,
                 diskstats_path=diskstats,
@@ -603,9 +619,9 @@ class NoDoubleCountTests(unittest.TestCase):
             (part / "stat").write_text(_stat_text(100), encoding="utf-8")
             sys_base.mkdir()
             (sys_base / "259:1").symlink_to(part)
-            table = _standard_table(root, _standard_mount("259:1", "/data"))
+            table = _standard_table(root, _standard_mount("259:1", "/"))
             handle, scope = identify_scope(
-                "/data/x", mountinfo_path=table, sys_base=sys_base
+                _real_scratch(root), mountinfo_path=table, sys_base=sys_base
             )
             self.assertIsNone(handle)
             self.assertEqual(scope["status"], "unavailable")
@@ -668,6 +684,156 @@ class DeltaTests(unittest.TestCase):
             table = _standard_table(root, _standard_mount("8:1", "/"))
             _, scope = identify_scope("/", mountinfo_path=table, sys_base=sys_base)
         json.dumps(scope)
+
+
+class ScratchValidationTests(unittest.TestCase):
+    def _available_fixture(
+        self, root: Path
+    ) -> tuple[Path, Path, Path]:
+        sys_base = root / "sys"
+        sys_base.mkdir()
+        _make_device(sys_base, "8:1", _ext4_device(5))
+        table = _standard_table(root, _standard_mount("8:1", "/"))
+        return sys_base, table, _real_scratch(root)
+
+    def test_removed_scratch_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base, table, scratch = self._available_fixture(root)
+            scratch.rmdir()
+            handle, scope = identify_scope(
+                scratch, mountinfo_path=table, sys_base=sys_base
+            )
+            self.assertIsNone(handle)
+            self.assertEqual(scope["status"], "unavailable")
+            self.assertIn("cannot stat", str(scope.get("reason", "")))
+
+    def test_file_scratch_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base = root / "sys"
+            sys_base.mkdir()
+            _make_device(sys_base, "8:1", _ext4_device(5))
+            table = _standard_table(root, _standard_mount("8:1", "/"))
+            candidate = root / "file-scratch"
+            candidate.write_text("not a directory", encoding="utf-8")
+            handle, scope = identify_scope(
+                candidate, mountinfo_path=table, sys_base=sys_base
+            )
+            self.assertIsNone(handle)
+            self.assertEqual(scope["status"], "unavailable")
+            self.assertIn("not a directory", str(scope.get("reason", "")))
+
+    def test_mechanisms_include_scratch_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base, table, scratch = self._available_fixture(root)
+            handle, scope = identify_scope(
+                scratch, mountinfo_path=table, sys_base=sys_base
+            )
+            self.assertEqual(scope["status"], "available")
+            assert handle is not None
+            mechanisms = scope.get("mechanisms_checked")
+            assert isinstance(mechanisms, list)
+            self.assertIn(str(scratch.resolve()), mechanisms)
+
+
+class MountParseStrictnessTests(unittest.TestCase):
+    def test_consecutive_spaces_line_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / "mountinfo"
+            table.write_text(
+                "1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n"
+                "2  0 8:2 / /data rw,relatime - ext4 /dev/sdb1 rw\n",
+                encoding="utf-8",
+            )
+            mounts = read_mountinfo(table)
+            self.assertEqual([mount["majmin"] for mount in mounts], ["8:1"])
+
+    def test_consecutive_spaces_do_not_misattribute_scratch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scratch = _real_scratch(root)
+            sys_base = root / "sys"
+            sys_base.mkdir()
+            _make_device(sys_base, "8:1", _ext4_device(5))
+            table = root / "mountinfo"
+            _write_mountinfo(
+                table,
+                [
+                    _mountline(MountSpec(majmin="8:1", point="/", source="/dev/sda1")),
+                    f"9  0 8:9 / {scratch} rw,relatime - ext4 /dev/sdz1 rw",
+                ],
+            )
+            handle, scope = identify_scope(
+                scratch, mountinfo_path=table, sys_base=sys_base
+            )
+            self.assertEqual(scope["status"], "available")
+            self.assertEqual(scope["majmin"], "8:1")
+
+
+class CounterBoundTests(unittest.TestCase):
+    def test_huge_sysfs_counter_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base = root / "sys"
+            sys_base.mkdir()
+            _make_device(sys_base, "8:1", DeviceFixture(_stat_text(1 << 64)))
+            handle = CounterHandle(
+                "8:1", "sda", sys_base / "8:1" / "stat", root / "no-diskstats"
+            )
+            with self.assertRaises(ValueError):
+                handle.read()
+
+    def test_huge_counter_makes_scope_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base = root / "sys"
+            sys_base.mkdir()
+            _make_device(sys_base, "8:1", DeviceFixture(_stat_text(1 << 64)))
+            table = _standard_table(root, _standard_mount("8:1", "/"))
+            handle, scope = identify_scope(
+                _real_scratch(root), mountinfo_path=table, sys_base=sys_base
+            )
+            self.assertIsNone(handle)
+            self.assertEqual(scope["status"], "unavailable")
+            self.assertIn("2**64", str(scope.get("reason", "")))
+
+    def test_huge_diskstats_value_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base = root / "sys"
+            sys_base.mkdir()
+            _make_device(sys_base, "8:1", _ext4_device(42))
+            diskstats = root / "diskstats"
+            diskstats.write_text(
+                f"8 1 sda 0 0 0 0 0 0 {1 << 64} 0 0 0 0 0 0\n", encoding="utf-8"
+            )
+            table = _standard_table(root, _standard_mount("8:1", "/"))
+            handle, scope = identify_scope(
+                _real_scratch(root),
+                mountinfo_path=table,
+                sys_base=sys_base,
+                diskstats_path=diskstats,
+            )
+            self.assertEqual(scope["status"], "available")
+            assert handle is not None
+            self.assertIsNone(handle.read()["diskstats_sectors_written"])
+
+    def test_delta_rejects_out_of_range_counters(self) -> None:
+        before: filesystem.CounterSample = {
+            "sysfs_sectors_written": 1 << 64,
+            "writes_completed": 9,
+            "in_flight": 0,
+            "diskstats_sectors_written": None,
+        }
+        after: filesystem.CounterSample = {
+            "sysfs_sectors_written": (1 << 64) + 10,
+            "writes_completed": 9,
+            "in_flight": 0,
+            "diskstats_sectors_written": None,
+        }
+        self.assertIsNone(delta_bytes(before, after))
 
 
 if __name__ == "__main__":
