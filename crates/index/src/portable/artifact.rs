@@ -23,8 +23,7 @@
 //! total order.
 
 use super::manifest::BundleFamily;
-use crate::runtime::MAX_SERIALIZED_BLOCK_BYTES;
-use crate::types::{HEIGHT_SIZE, HashPrefixRow, TX_POSITION_SIZE, TxPosition};
+use crate::types::{HEIGHT_SIZE, HashPrefixRow, TX_POSITION_SIZE, TxPosition, positions_are_valid};
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
@@ -114,30 +113,6 @@ impl ArtifactHeader {
             payload_bytes,
         })
     }
-}
-
-/// Reports whether `positions` are a valid, block-ordered position list:
-/// nonzero lengths inside one serialized block, strictly ascending and
-/// non-overlapping. This is the exact predicate the query engine applies
-/// before trusting a stored row.
-pub(super) fn positions_are_valid(positions: &[TxPosition]) -> bool {
-    let mut previous: Option<TxPosition> = None;
-    for &position in positions {
-        let Some(end) = position.end() else {
-            return false;
-        };
-        if position.byte_len() == 0
-            || usize::try_from(end).map_or(true, |end| end > MAX_SERIALIZED_BLOCK_BYTES)
-            || previous.is_some_and(|prior| {
-                position.offset() <= prior.offset()
-                    || position.offset() < prior.end().unwrap_or(u32::MAX)
-            })
-        {
-            return false;
-        }
-        previous = Some(position);
-    }
-    true
 }
 
 /// Writes one `TxLookup` record and returns its encoded length.

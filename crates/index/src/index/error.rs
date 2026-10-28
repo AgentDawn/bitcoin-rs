@@ -15,7 +15,7 @@ pub enum IndexError {
     AnchorUnsupportedSelection,
     #[error("invalid block header length {len}")]
     InvalidHeaderLength { len: usize },
-    #[error("transaction byte range does not fit u32 at block offset {offset}")]
+    #[error("transaction byte range is not addressable at block offset {offset}")]
     UnaddressablePosition { offset: u64 },
     #[error("compact filter or parent filter commitment is unavailable or corrupt")]
     InvalidCompactFilter,

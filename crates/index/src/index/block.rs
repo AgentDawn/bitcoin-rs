@@ -8,8 +8,8 @@ use super::{
     rows::PositionedRow,
 };
 use crate::{
-    types::HashPrefixRow, types::ScriptHash, types::SpendingPrefixRow, types::TxidRow,
-    types::U24_MAX, types::encode_height,
+    types::HashPrefixRow, types::MAX_POSITION_END_BYTES, types::ScriptHash,
+    types::SpendingPrefixRow, types::TxidRow, types::U24_MAX, types::encode_height,
 };
 use bitcoin_rs_primitives::{Hash256, OutPoint, Txid, encode, layout::ParsedBlock};
 
@@ -79,7 +79,13 @@ pub(super) fn pending_rows_for_block_with_header(
 
     for tx in parsed.transactions() {
         let span = tx.span();
-        if span.start() > U24_MAX || span.len() > U24_MAX {
+        // The stored position must satisfy the same predicate every reader
+        // applies: u24-addressable and ending inside one serialized block.
+        // A body larger than the consensus cap is refused here, so a row the
+        // writer admits is never corrupt to an exporter or a restore.
+        let end = u64::from(span.start()).saturating_add(u64::from(span.len()));
+        let past_cap = u64::try_from(MAX_POSITION_END_BYTES).map_or(true, |cap| end > cap);
+        if span.start() > U24_MAX || span.len() > U24_MAX || past_cap {
             return Err(IndexError::UnaddressablePosition {
                 offset: u64::from(span.start()),
             });
