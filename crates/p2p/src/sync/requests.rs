@@ -41,38 +41,43 @@ pub(super) const COMPACT_RELAY_NEAR_TIP_BLOCKS: u32 = 5;
 /// more; a fresh `notfound` starts the interval again.
 pub(super) const BODY_UNAVAILABLE_RETRY: Duration = Duration::from_mins(1);
 
+/// Safety ceiling on retained availability records: every live record below
+/// it is kept, so ledger pressure can never evict one peer's live answer to
+/// make room for another's. The bound caps memory at a few mebibytes, and
+/// evicting above it costs at most one redundant round trip — never a stall —
+/// because per-entry filtering only re-asks a peer it wrongly forgot.
+pub(super) const MAX_UNAVAILABLE_BODY_RECORDS: usize = 65_536;
+
 /// Exact connections that answered an outstanding body request with
 /// `notfound`, keyed by connection identity and block hash.
 ///
-/// PRE: `capacity` is the window's pending-block budget, the most requests
-///   the scheduler keeps in flight at once.
-/// POST: holds at most `capacity` records; a record older than
-///   [`BODY_UNAVAILABLE_RETRY`] never refuses anything.
+/// PRE: none; the ledger is retention-bounded, not budget-bounded. Its live
+///   size follows live peers by refusals per peer within
+///   [`BODY_UNAVAILABLE_RETRY`], which is unrelated to `max_pending_blocks`.
+/// POST: holds every live record up to [`MAX_UNAVAILABLE_BODY_RECORDS`];
+///   a record older than [`BODY_UNAVAILABLE_RETRY`] never refuses anything.
 /// INVARIANT: records are keyed by exact [`PeerSource`], so a same-address
 ///   replacement never inherits its predecessor's answer, and ages come from
 ///   the monotonic clock the caller passes in. A lookup is one hash probe.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct UnavailableBodies {
-    capacity: usize,
     answered: hashbrown::HashMap<(PeerSource, Hash256), Instant>,
 }
 
 impl UnavailableBodies {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            answered: hashbrown::HashMap::new(),
-        }
+    pub(super) fn new() -> Self {
+        Self::default()
     }
 
     /// Records that `source` answered `notfound` for `hash` at `now`.
     ///
-    /// Expired records leave first; when the table is still full the oldest
-    /// record leaves, so the bound holds without refusing the newest answer.
+    /// Expired records leave first and every live record is retained. Only
+    /// when the safety ceiling is still reached does the oldest live record
+    /// leave, so the bound holds without refusing the newest answer.
     pub(super) fn note(&mut self, source: PeerSource, hash: Hash256, now: Instant) {
         self.answered
             .retain(|_, answered_at| Self::live(*answered_at, now));
-        if self.answered.len() >= self.capacity
+        if self.answered.len() >= MAX_UNAVAILABLE_BODY_RECORDS
             && !self.answered.contains_key(&(source, hash))
             && let Some(oldest) = self
                 .answered
@@ -561,5 +566,97 @@ impl BlockSync {
             }
         }
         None
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::BODY_UNAVAILABLE_RETRY;
+    use super::MAX_UNAVAILABLE_BODY_RECORDS;
+    use super::UnavailableBodies;
+    use crate::connection::PeerSource;
+    use bitcoin_rs_primitives::Hash256;
+    use std::net::IpAddr;
+    use std::net::Ipv4Addr;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    fn test_source(port: u16) -> PeerSource {
+        PeerSource::for_test(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+    }
+
+    fn test_hash(counter: u64) -> Hash256 {
+        let mut bytes = [0_u8; 32];
+        bytes[..8].copy_from_slice(&counter.to_le_bytes());
+        Hash256::from_le_bytes(&bytes)
+    }
+
+    #[test]
+    fn retains_every_live_record_without_a_budget_capacity() {
+        let first = test_source(9_830);
+        let second = test_source(9_831);
+        let base = Instant::now();
+        let mut ledger = UnavailableBodies::new();
+
+        // Two refusing peers alternate while a small pending budget could
+        // hold only one request: neither live record may evict the other.
+        ledger.note(first, test_hash(1), base);
+        ledger.note(second, test_hash(1), base + Duration::from_secs(1));
+        ledger.note(first, test_hash(2), base + Duration::from_secs(2));
+        let now = base + Duration::from_secs(2);
+        assert!(ledger.refuses(first, test_hash(1), now));
+        assert!(ledger.refuses(second, test_hash(1), now));
+        assert!(ledger.refuses(first, test_hash(2), now));
+        assert!(
+            !ledger.refuses(second, test_hash(2), now),
+            "records are keyed by exact connection"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn safety_ceiling_evicts_oldest_live_and_stays_bounded() {
+        let base = Instant::now();
+        let mut ledger = UnavailableBodies::new();
+        // `for_test` mints a fresh connection identity per call, so bind each
+        // test connection once and reuse it: re-minting would address a
+        // different connection and never hit the noted record.
+        let filler = test_source(9_832);
+        let newcomer = test_source(9_833);
+
+        // Fill the ledger without going through the per-note expiry sweep,
+        // so all ceiling records are live at distinct ages.
+        let ceiling = u64::try_from(MAX_UNAVAILABLE_BODY_RECORDS)
+            .expect("the safety ceiling fits in a hash counter");
+        for counter in 0..ceiling {
+            let at = base + Duration::from_micros(counter);
+            ledger.answered.insert((filler, test_hash(counter)), at);
+        }
+        let now = base + Duration::from_millis(100);
+        ledger.note(newcomer, test_hash(u64::MAX), now);
+
+        assert_eq!(
+            ledger.answered.len(),
+            MAX_UNAVAILABLE_BODY_RECORDS,
+            "the ceiling bounds the ledger"
+        );
+        assert!(
+            ledger.refuses(newcomer, test_hash(u64::MAX), now),
+            "the newest answer is recorded"
+        );
+        assert!(
+            !ledger.refuses(filler, test_hash(0), now),
+            "only the oldest live record leaves at the ceiling"
+        );
+        assert!(ledger.refuses(filler, test_hash(1), now));
+        assert!(
+            ledger.refuses(
+                filler,
+                test_hash(1),
+                base + Duration::from_micros(1)
+                    + BODY_UNAVAILABLE_RETRY.saturating_sub(Duration::from_millis(1)),
+            ),
+            "a retained record refuses until the interval has passed"
+        );
     }
 }

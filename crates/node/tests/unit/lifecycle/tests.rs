@@ -342,7 +342,7 @@ fn disabled_zmq_still_seals_the_observer_slot() {
         Arc::new(bitcoin_rs_mempool::CompositeObserver::new());
     let gateway = Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
         pool,
-        Some(observer),
+        Some((observer, bitcoin_rs_mempool::BodyInterest::Metadata)),
         ValidationEngine::Native,
         None,
     ));

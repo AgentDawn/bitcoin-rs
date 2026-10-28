@@ -118,7 +118,8 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
 -> Result<(), Box<dyn std::error::Error>> {
     use bitcoin::hashes::{Hash as _, hash160};
     use bitcoin_rs_mempool::{
-        AdmissionOrigin, Mempool, MempoolGateway, MempoolLimits, MempoolObserver, MutationEnvelope,
+        AdmissionOrigin, BodyInterest, Mempool, MempoolGateway, MempoolLimits, MempoolObserver,
+        MutationEnvelope,
     };
     use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, TxIn, TxOut, Witness};
     use bitcoin_rs_storage::StorageError;
@@ -129,9 +130,6 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
     struct Stream(Mutex<Vec<(Txid, bitcoin_rs_mempool::MutationOutcome, AdmissionOrigin)>>);
 
     impl MempoolObserver for Stream {
-        fn wants_accepted_transactions(&self) -> bool {
-            false
-        }
         fn on_mutation(&self, envelope: &MutationEnvelope) {
             let mut seen = self.0.lock();
             for change in &envelope.result.changes {
@@ -172,7 +170,7 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
     let stream = Arc::new(Stream::default());
     let gateway = Arc::new(MempoolGateway::new(
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-        Some(stream.clone()),
+        Some((stream.clone(), BodyInterest::Metadata)),
         ValidationEngine::Native,
         None,
     ));

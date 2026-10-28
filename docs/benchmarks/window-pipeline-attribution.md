@@ -13,8 +13,8 @@ are implemented in [PR #1701](https://github.com/gosuda/bitcoin-rs/pull/1701)
 documentation-cleanup branch (#1703). On #1701, `crates/chainstate/src/lib.rs`
 emits `transition_held_us`, `window.rs` emits `flush_wait_us`, and
 `crates/node/benches/sync_pipeline.rs::main` dispatches `--window-attribution`.
-Use that implementation branch for the control arm; the command below cannot
-run on #1703 until those changes are integrated. Implementation does not prove
+Use that implementation branch for the control arm; the invocation described
+in section 3 cannot run on #1703 until those changes are integrated. Implementation does not prove
 that a measurement campaign ran. Rules shared by all cells are in
 [README.md](README.md); the attribution method is
 [`docs/contracts/hot-path-attribution.md`](../contracts/hot-path-attribution.md).
@@ -53,25 +53,21 @@ reported side by side and never added (`HPA-12`).
 
 ## 3. Replay harness (implemented in #1701)
 
-This section describes the mode implemented in #1701. The command below needs
-that implementation; it is unavailable on the #1703 branch alone.
+This section describes the mode implemented in #1701 as a protocol reference
+only. That implementation is unavailable on the #1703 branch alone, so nothing
+in this section is executable here; run it on a #1701 checkout.
 
-### 3.1 Invocation
+### 3.1 Invocation (reference only; runs on a #1701 checkout, not on #1703)
 
-Run from the repository root so `rust-toolchain.toml` selects the toolchain
-that built the binary. `TMPDIR` must name a directory on a disk-backed
-filesystem, because the harness refuses `tmpfs` and `ramfs`: a group flush
-there is not a durable write.
-
-```bash
-cargo bench -p bitcoin-rs-node --bench sync_pipeline -- \
-  --window-attribution <control|candidate> <single_group|multi_group>
-```
-
-The flag takes exactly one arm and one scenario. Cargo appends `--bench`, which
-the parser ignores. Pin the cores with `taskset -c <set>` before `cargo bench`.
-One invocation is one run: it executes every unit of one arm and one scenario in
-one process.
+The #1701 replay is invoked as `sync_pipeline --window-attribution
+<control|candidate> <single_group|multi_group>`: one arm and one scenario per
+process in a single process run (a Cargo-appended `--bench` is ignored by the
+parser), launched from the repository root of a #1701 checkout so
+`rust-toolchain.toml` selects the toolchain that built the binary, with cores
+pinned via `taskset -c <set>` and `TMPDIR` on a disk-backed filesystem (the
+harness refuses `tmpfs` and `ramfs`: a group flush there is not a durable
+write). The exact shape above is recorded so a future integration can replay it
+verbatim; it is not an executable step for this branch.
 
 ### 3.2 Scenarios and units
 
