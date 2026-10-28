@@ -91,7 +91,7 @@ QUEUE_KEYS = (
     "nr_requests",
 )
 
-_MAJMIN_RE = re.compile(r"^\d+:\d+$")
+_MAJMIN_RE = re.compile(r"[0-9]+:[0-9]+")
 
 
 class MountInfo(TypedDict):
@@ -392,7 +392,14 @@ def identify_scope(
             reason=(f"no {mountinfo_path} entry contains the scratch path"),
         )
         return None, info
-    if override is not None and not _MAJMIN_RE.match(override):
+    if not _MAJMIN_RE.fullmatch(mount["majmin"]):
+        info.update(
+            status="unavailable",
+            scope_kind="unavailable",
+            reason=f"malformed MAJ:MIN {mount['majmin']!r} for {mount['mountpoint']}",
+        )
+        return None, info
+    if override is not None and not _MAJMIN_RE.fullmatch(override):
         info.update(
             status="unavailable",
             scope_kind="unavailable",
@@ -443,9 +450,7 @@ def identify_scope(
             ),
         )
         return None, info
-    major_text = chosen.split(":")[0] if ":" in chosen else ""
-    major = int(major_text) if major_text.isdigit() else 0
-    if _is_composite_fstype(fstype) or major == 0:
+    if _is_composite_fstype(fstype) or int(chosen.split(":")[0]) == 0:
         info.update(
             status="unavailable",
             scope_kind="composite_anonymous",

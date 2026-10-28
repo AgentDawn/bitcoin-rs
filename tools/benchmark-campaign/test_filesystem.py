@@ -575,6 +575,20 @@ class NoDoubleCountTests(unittest.TestCase):
             }
             self.assertEqual(delta_bytes(sample, after), 10 * filesystem.SECTOR_BYTES)
 
+    def test_malformed_mount_majmin_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sys_base = root / "sys"
+            sys_base.mkdir()
+            for majmin in ("\u00b2:1", "\u0663:1", "8", "../8:1"):
+                table = _standard_table(root, _standard_mount(majmin, "/"))
+                handle, scope = identify_scope(
+                    "/", mountinfo_path=table, sys_base=sys_base
+                )
+                self.assertIsNone(handle)
+                self.assertEqual(scope["status"], "unavailable")
+                self.assertIn("malformed", str(scope.get("reason", "")))
+
     def test_partition_of_stacked_device_is_ambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
