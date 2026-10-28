@@ -52,6 +52,47 @@ fn ordered(mut txs: Vec<Tx>) -> Result<Vec<Tx>, SubmitError> {
     Ok(txs)
 }
 
+/// The ancestors before the last member (the subject) in topological order,
+/// stable over the sender's order, and the subject last.
+///
+/// BIP331 lets an `ancpkginfo` list ancestors in any order. A package that
+/// cannot be ordered this way (too many members, or an ancestor that spends
+/// the subject) is returned unchanged so [`crate::package::check_structure`]
+/// reports it as before.
+fn ancestors_in_topological_order(txs: &[Tx]) -> alloc::borrow::Cow<'_, [Tx]> {
+    use alloc::borrow::Cow;
+    let Some((_, ancestors)) = txs.split_last() else {
+        return Cow::Borrowed(txs);
+    };
+    if txs.len() > crate::standardness::MAX_PACKAGE_COUNT {
+        return Cow::Borrowed(txs);
+    }
+    let ids: Vec<Txid> = txs.iter().map(Tx::txid).collect();
+    let mut placed = alloc::vec![false; txs.len()];
+    let mut order = Vec::with_capacity(txs.len());
+    while order.len() < ancestors.len() {
+        let next = ancestors.iter().enumerate().position(|(index, tx)| {
+            !placed[index]
+                && tx.inputs.iter().all(|input| {
+                    ids.iter()
+                        .enumerate()
+                        .filter(|(other, id)| *other != index && **id == input.previous_output.txid)
+                        .all(|(other, _)| placed[other])
+                })
+        });
+        let Some(next) = next else {
+            return Cow::Borrowed(txs);
+        };
+        placed[next] = true;
+        order.push(next);
+    }
+    if order.iter().enumerate().all(|(at, index)| at == *index) {
+        return Cow::Borrowed(txs);
+    }
+    order.push(ancestors.len());
+    Cow::Owned(order.into_iter().map(|index| txs[index].clone()).collect())
+}
+
 /// BIP331 ancestor shape over a package that already passed
 /// [`crate::package::check_structure`]: the last transaction is the subject
 /// and every other member is a transitive ancestor of it. Walking from the
@@ -102,8 +143,10 @@ impl MempoolGateway {
     }
 
     /// Atomically submits a BIP331 ancestor package relayed by `source`: the
-    /// subject last, preceded by its unconfirmed ancestors in the peer's
-    /// topological order. The order is never changed, members are never
+    /// subject last, preceded by its unconfirmed ancestors. BIP331 does not
+    /// require the sender to sort the ancestors, so they are put in
+    /// topological order first, keeping the sender's order between
+    /// independent members; the subject stays last. Members are never
     /// submitted individually, and nothing is replaced or evicted for
     /// capacity. Structure and shape failures leave the pool, observers and
     /// the orphan and reject caches untouched. An admission refusal commits
@@ -116,9 +159,10 @@ impl MempoolGateway {
         time: u64,
         chain: &dyn AdmissionChain,
     ) -> Result<MutationResult, SubmitError> {
-        crate::package::check_structure(txs)?;
-        check_ancestor_shape(txs)?;
-        self.submit_package_atomic(txs, AdmissionOrigin::Peer(source), None, |_| time, chain)
+        let txs = ancestors_in_topological_order(txs);
+        crate::package::check_structure(&txs)?;
+        check_ancestor_shape(&txs)?;
+        self.submit_package_atomic(&txs, AdmissionOrigin::Peer(source), None, |_| time, chain)
     }
 
     /// The resident BIP331 ancestor package of `tip`: its unconfirmed
@@ -627,6 +671,20 @@ mod tests {
         let local = gateway(1_000, None);
         let result = local.submit_local_package(descending, LocalOrigin::Rpc, None, now, &chain)?;
         assert_eq!(txids(&result), ids(&ascending));
+        Ok(())
+    }
+
+    #[test]
+    fn peer_package_admits_ancestors_the_sender_did_not_sort() -> TestResult {
+        let chain = funded(&[1]);
+        let grandparent = spend_coins(&[coin(1)], &[100_000]);
+        let parent = spend_outputs(&[OutPoint::new(grandparent.txid(), 0)], &[98_000]);
+        let subject = spend_outputs(&[OutPoint::new(parent.txid(), 0)], &[96_000]);
+        let unsorted = vec![parent.clone(), grandparent.clone(), subject.clone()];
+
+        let peer = gateway(1_000, None);
+        let result = peer.submit_peer_package(&unsorted, source(), unix_time_secs(), &chain)?;
+        assert_eq!(txids(&result), ids(&[grandparent, parent, subject]));
         Ok(())
     }
 
