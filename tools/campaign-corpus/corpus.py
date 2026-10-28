@@ -1342,7 +1342,8 @@ def _index_chunks(
 def _load_index(path: Path) -> IndexDocument:
     """Parse and structurally validate an index file. No source I/O is performed."""
     try:
-        data = path.read_bytes()
+        with open(path, "rb") as handle:
+            data = handle.read(_MAX_INDEX_BYTES + 1)
     except OSError as err:
         raise ContractError(f"cannot read index file {path}: {err}") from err
     if len(data) > _MAX_INDEX_BYTES:

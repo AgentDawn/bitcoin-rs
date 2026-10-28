@@ -1853,6 +1853,32 @@ class IndexedParity(unittest.TestCase):
             self.assertEqual([height for height, _, _ in triples], [0, 1, 2])
             self.assertEqual(triples[2][1], FIX_STOP_HASH)
 
+    def test_oversized_index_refuses_without_buffering_it(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            index_path = Path(raw) / "huge.index"
+            index_path.write_bytes(b" " * 16)
+            reads: list[int] = []
+            real_open = open
+
+            def bounded_open(path: object, mode: str = "r", *args: object) -> object:
+                handle = real_open(path, mode, *args)  # type: ignore[call-overload]
+                if Path(str(path)) != index_path:
+                    return handle
+                real_read = handle.read
+
+                def read(size: int = -1) -> bytes:
+                    reads.append(size)
+                    return real_read(size)
+
+                handle.read = read
+                return handle
+
+            with mock.patch.object(corpus, "_MAX_INDEX_BYTES", 8):
+                with mock.patch("builtins.open", bounded_open):
+                    with self.assertRaisesRegex(ContractError, "size bound"):
+                        corpus._load_index(index_path)
+            self.assertEqual(reads, [9])
+
     def test_kills_same_length_source_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
