@@ -12,7 +12,7 @@ use bitcoin_rs_primitives::BlockHash;
 use bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter;
 use bitcoin_rs_mining::pool::stratum::sv2::{
     AdmitError, AuthorityKeypair, BlockSubmission, Connection, ERROR_CODE_SHARE_NOT_RECORDED,
-    ERROR_CODE_SUBMIT_SHARES_STALE_SHARE, Event, Limits, MAX_FEED_LEN, ServerConfig,
+    ERROR_CODE_SUBMIT_SHARES_STALE_SHARE, Event, Limits, MAX_FEED_LEN, PendingBlock, ServerConfig,
 };
 use bitcoin_rs_mining::pool::{BlockStatus, PoolCore, RecordOutcome};
 use bitcoin_rs_mining::pool::ledger::MinerId;
@@ -31,6 +31,73 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// announcements count as progress, so an idle-but-live miner waiting for
 /// work is not closed while templates keep flowing.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A block whose `SubmitShares.Success` is withheld until both its ledger
+/// round is durable and authoritative node state has been re-queried.
+/// `pending` retains the candidate for bounded re-submission when the first
+/// verdict was `Undetermined` (journal backpressure); `attempts` bounds the
+/// recovery work so one slow dependency cannot stall the connection.
+struct DeferredBlock {
+    hash: BlockHash,
+    pending: PendingBlock,
+    submission: BlockSubmission,
+    attempts: u32,
+}
+
+/// Bounded re-submissions retained per deferred block before the ledger
+/// convergence path takes over.
+const DEFERRED_RESUBMIT_ATTEMPTS: u32 = 5;
+
+/// Block-record reservation and deferred success queue, which travel together
+/// through event handling.
+struct BlockPipeline<'a> {
+    permit: &'a mut Option<BlockRecordPermit>,
+    deferred: &'a mut Vec<DeferredBlock>,
+}
+
+/// Settles one deferred block. Returns the waiter when it must stay pending;
+/// otherwise emits its verdict and returns `None`.
+fn settle_one_deferred(
+    mut entry: DeferredBlock,
+    ledger: &LedgerHost,
+    control: &dyn MiningControl,
+    connection: &mut Connection,
+    core: &PoolCore,
+) -> Option<DeferredBlock> {
+    if !matches!(ledger.found_block_recorded(entry.hash), Ok(true)) {
+        return Some(entry);
+    }
+    if entry.submission.receipt().status() == BlockStatus::Undetermined
+        && entry.attempts < DEFERRED_RESUBMIT_ATTEMPTS
+    {
+        entry.attempts = entry.attempts.saturating_add(1);
+        match entry.pending.submit(control) {
+            Ok(fresh) if fresh.receipt().status() == BlockStatus::Applied => {
+                core.invalidate_active();
+                entry.submission = fresh;
+            }
+            Ok(fresh) if fresh.receipt().status() == BlockStatus::Rejected => {
+                if fresh.receipt().is_stale_parent() {
+                    let _ = connection
+                        .reject_block(&fresh, ERROR_CODE_SUBMIT_SHARES_STALE_SHARE);
+                }
+                return None;
+            }
+            Ok(fresh) => {
+                entry.submission = fresh;
+                return Some(entry);
+            }
+            Err(_) => return Some(entry),
+        }
+    }
+    if entry.submission.receipt().status() == BlockStatus::Applied {
+        if connection.confirm_block(&entry.submission).is_err() {
+            return Some(entry);
+        }
+        return None;
+    }
+    Some(entry)
+}
 
 /// Owned SV2 listener and connection threads.
 pub(crate) struct Sv2Service {
@@ -227,11 +294,12 @@ fn serve_connection(
     let mut accounts = HashMap::new();
     let mut input = vec![0; MAX_FEED_LEN];
     let mut buffered_input = None;
-    // Success acknowledgements held until a retained block record is durable.
+    // Success acknowledgements held until a retained block record is durable
+    // and an `Undetermined` node verdict has had bounded recovery work.
     // Each entry holds one consumed permit's queue slot, so the
     // `MAX_PENDING_BLOCK_RECORDS` bound caps this queue; the reconcile worker
     // normally drains entries within one 250ms pass.
-    let mut deferred: Vec<(BlockHash, BlockSubmission)> = Vec::new();
+    let mut deferred: Vec<DeferredBlock> = Vec::new();
     let mut transmit = PendingTransmit::default();
     let start = Instant::now();
     let mut last_progress = start;
@@ -248,14 +316,21 @@ fn serve_connection(
             }
             // Confirm blocks whose retained records became durable even when
             // the miner sends no more bytes; a silent socket must not delay
-            // `SubmitShares.Success` until the next frame.
+            // `SubmitShares.Success` until the next frame. An `Undetermined`
+            // verdict (journal backpressure) is never confirmed on ledger
+            // durability alone: it stays pending for bounded authoritative
+            // recovery (one re-submission per poll) instead of producing a
+            // false success while the block is still unapplied.
             let deferred_before = deferred.len();
-            deferred.retain(|(hash, submission)| {
-                if !matches!(ledger.found_block_recorded(*hash), Ok(true)) {
-                    return true;
+            let mut still_deferred = Vec::with_capacity(deferred.len());
+            for entry in std::mem::take(&mut deferred) {
+                if let Some(waiter) =
+                    settle_one_deferred(entry, ledger, control, &mut connection, core)
+                {
+                    still_deferred.push(waiter);
                 }
-                connection.confirm_block(submission).is_err()
-            });
+            }
+            deferred = still_deferred;
             if deferred.len() != deferred_before {
                 last_progress = Instant::now();
             }
@@ -310,8 +385,10 @@ fn serve_connection(
                 ledger,
                 control,
                 &mut accounts,
-                &mut block_permit,
-                &mut deferred,
+                BlockPipeline {
+                    permit: &mut block_permit,
+                    deferred: &mut deferred,
+                },
             )?;
             // Shed tickets the host never acknowledged: a stuck ledger or a
             // silent miner must not pin the bounded pending-ack budget and
@@ -367,9 +444,12 @@ fn handle_events(
     ledger: &LedgerHost,
     control: &dyn MiningControl,
     accounts: &mut HashMap<u32, MinerId>,
-    block_permit: &mut Option<BlockRecordPermit>,
-    deferred: &mut Vec<(BlockHash, BlockSubmission)>,
+    pipeline: BlockPipeline<'_>,
 ) -> Result<()> {
+    let BlockPipeline {
+        permit: block_permit,
+        deferred,
+    } = pipeline;
     while let Some(event) = connection.poll_event() {
         match event {
             Event::ChannelOpened {
@@ -438,10 +518,33 @@ fn handle_events(
                 // `SubmitShares.Success` until the round is durable — the
                 // session contract and SV1 both withhold success until then —
                 // but keep the connection open while the ledger catches up
-                // instead of closing it under load. Only success is deferred;
-                // node rejections answer immediately below.
+                // instead of closing it under load. An `Undetermined`
+                // verdict is always deferred, even when the record is already
+                // durable: journal backpressure leaves the block unapplied,
+                // so immediate success would be false. The deferred waiter
+                // retains the candidate for bounded re-submission instead of
+                // dropping it. Only success is deferred; node rejections
+                // answer immediately below.
                 match permit.record_or_enqueue(account, found, &receipt) {
-                    BlockRecordOutcome::Durable => {}
+                    BlockRecordOutcome::Durable => {
+                        if matches!(
+                            &submission,
+                            Ok(submitted)
+                                if submitted.receipt().status() == BlockStatus::Undetermined
+                        ) {
+                            let Ok(submitted) = submission else {
+                                return Err(anyhow!("SV2 block lost its submission"));
+                            };
+                            let hash = found.share.hash;
+                            deferred.push(DeferredBlock {
+                                hash,
+                                pending,
+                                submission: submitted,
+                                attempts: 0,
+                            });
+                            continue;
+                        }
+                    }
                     BlockRecordOutcome::Queued => {
                         if matches!(
                             &submission,
@@ -456,7 +559,13 @@ fn handle_events(
                             let Ok(submitted) = submission else {
                                 return Err(anyhow!("SV2 block lost its submission"));
                             };
-                            deferred.push((found.share.hash, submitted));
+                            let hash = found.share.hash;
+                            deferred.push(DeferredBlock {
+                                hash,
+                                pending,
+                                submission: submitted,
+                                attempts: 0,
+                            });
                             continue;
                         }
                     }
@@ -468,8 +577,21 @@ fn handle_events(
                 }
                 let submission = submission.context("SV2 block submission failed")?;
                 match submission.receipt().status() {
-                    BlockStatus::Applied | BlockStatus::Undetermined => {
+                    BlockStatus::Applied => {
                         connection.confirm_block(&submission)?;
+                    }
+                    BlockStatus::Undetermined => {
+                        // Fallback retention: every `Undetermined` should already
+                        // be deferred above, but never confirm an unapplied
+                        // block. Retain for bounded recovery instead.
+                        let hash = found.share.hash;
+                        deferred.push(DeferredBlock {
+                            hash,
+                            pending,
+                            submission,
+                            attempts: 0,
+                        });
+                        continue;
                     }
                     BlockStatus::Rejected if submission.receipt().is_stale_parent() => {
                         connection
@@ -648,7 +770,7 @@ mod tests {
     use bitcoin_rs_mining::pool::ledger::{Ledger, MinerId, PayoutPolicy, PoolConfig};
     use zeroize::Zeroizing;
 
-    use super::{LedgerHost, announce_current_job, handle_events};
+    use super::{BlockPipeline, DeferredBlock, LedgerHost, announce_current_job, handle_events};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1021,6 +1143,7 @@ mod tests {
         accounts: HashMap<u32, MinerId>,
         miner: Miner,
         job: Arc<Job>,
+        deferred: Vec<DeferredBlock>,
         _directory: tempfile::TempDir,
     }
 
@@ -1045,6 +1168,7 @@ mod tests {
                 accounts: HashMap::new(),
                 miner,
                 job,
+                deferred: Vec::new(),
                 _directory: directory,
             })
         }
@@ -1066,8 +1190,10 @@ mod tests {
                 &self.ledger,
                 self.control.as_ref(),
                 &mut self.accounts,
-                &mut permit,
-                &mut Vec::new(),
+                BlockPipeline {
+                    permit: &mut permit,
+                    deferred: &mut self.deferred,
+                },
             )?;
             let sent = self.connection.take_transmit();
             Ok(self.miner.open(&sent)?)
@@ -1164,5 +1290,46 @@ mod tests {
         assert_eq!(host.credited_shares()?, 1);
 
         new_parent_work_is_accepted(&mut host, &channel)
+    }
+
+    #[test]
+    fn undetermined_sv2_block_withholds_success_and_retries_authoritative_state() -> TestResult {
+        let mut host = Host::new()?;
+        let channel = host.open_channel()?;
+        let job = Arc::clone(&host.job);
+        let winner = block_nonces(&job, &channel.prefix, 1)?
+            .pop()
+            .ok_or("a winning nonce exists")?;
+
+        // Journal backpressure leaves the chain outcome unknown: the host must
+        // retain the submission instead of confirming an unapplied block.
+        *host.control.submit.lock() =
+            bitcoin_rs_mining::BlockValidationResult::Inconclusive;
+        let pending = host.submit(&channel, 1, &job, winner)?;
+        assert!(
+            !has(&pending, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS),
+            "Undetermined success must be withheld, not confirmed"
+        );
+        let hash = header_hash(&job, &channel.prefix, winner)?;
+        assert!(host.ledger.found_block_recorded(hash)?);
+        assert_eq!(host.deferred.len(), 1, "Undetermined work is retained");
+        assert_eq!(host.node_submissions(), 1);
+
+        // Authoritative recovery applies the block: the retained waiter retries
+        // once and then confirms instead of producing a false success.
+        *host.control.submit.lock() = bitcoin_rs_mining::BlockValidationResult::Accepted;
+        let entry = host.deferred.pop().ok_or("retained waiter missing")?;
+        let waiter = super::settle_one_deferred(
+            entry,
+            &host.ledger,
+            host.control.as_ref(),
+            &mut host.connection,
+            &host.core,
+        );
+        assert!(waiter.is_none(), "Applied retry confirms and drops the waiter");
+        assert_eq!(host.node_submissions(), 2, "deferred retry re-queries node state");
+        let confirmed = host.miner.open(&host.connection.take_transmit())?;
+        assert!(has(&confirmed, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS));
+        Ok(())
     }
 }

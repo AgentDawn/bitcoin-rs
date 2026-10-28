@@ -1282,6 +1282,45 @@ fn applied_block_retires_job_and_second_submit_is_stale() {
     miner.server.shutdown();
 }
 
+/// Journal backpressure (`Inconclusive`) retains bounded submission-recovery
+/// work instead of dropping the block: the node is re-queried a bounded
+/// number of times, the share stays acknowledged, and the block record stays
+/// durable for chain reconciliation.
+#[test]
+fn inconclusive_block_submission_retries_with_bounded_recovery() {
+    let mut miner = MinerFixture::start(0x22);
+    let job = Arc::clone(&miner.job);
+    *miner.control.submit.lock() = BlockValidationResult::Inconclusive;
+    let winner = miner.winning_nonce(0);
+    let response = miner.submit(100, &job, winner);
+    assert!(
+        response.contains("\"error\":null"),
+        "inconclusive share stays acknowledged while recovery runs: {response}"
+    );
+    assert_eq!(
+        miner.control.submit_calls.load(Ordering::SeqCst),
+        5,
+        "inconclusive retries bounded recovery work instead of exiting once"
+    );
+    {
+        let blocks = miner
+            .ledger
+            .blocks
+            .lock()
+            .unwrap_or_else(|error| panic!("test operation failed: {error}"));
+        assert_eq!(
+            blocks.len(),
+            1,
+            "inconclusive block is retained, not dropped"
+        );
+    }
+    assert!(
+        miner.pool.current_installed().is_some(),
+        "no retire without an applied block"
+    );
+    miner.server.shutdown();
+}
+
 /// An already-validated share whose block the node rejects as a stale parent
 /// is a `STALE_SHARE` protocol error, not success: the ledger record stays
 /// durable, nothing else is submitted, and the connection remains usable.

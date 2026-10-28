@@ -524,8 +524,23 @@ impl PoolCore {
                 Ok(receipt) => {
                     if receipt.status() == BlockStatus::Applied {
                         self.invalidate_active();
+                        return Ok(receipt);
                     }
-                    return Ok(receipt);
+                    if receipt.status() != BlockStatus::Undetermined {
+                        return Ok(receipt);
+                    }
+                    // Inconclusive (journal backpressure or a header-only
+                    // duplicate) leaves the chain outcome unknown: retain
+                    // bounded recovery work and re-query authoritative node
+                    // state instead of exiting. A retry that observes an
+                    // applied duplicate converges to `Applied`; exhaustion
+                    // returns the last `Undetermined` receipt for the ledger
+                    // to reconcile from chain observation.
+                    attempt += 1;
+                    if attempt >= ATTEMPTS {
+                        return Ok(receipt);
+                    }
+                    self.retry_pause(attempt - 1, found.share.hash);
                 }
                 Err(
                     MiningControlError::Unavailable(message) | MiningControlError::Failed(message),
