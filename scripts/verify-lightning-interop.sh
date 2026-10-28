@@ -194,7 +194,8 @@ VALID_TARGETS=("all" "ldk-server" "lampo" "lnd" "cln" "alby-hub" "fedimint" "ldk
 BITCOIN_RS_BIN=""
 TARGET="all"
 OUTPUT_JSON=""
-BITCOIND_BIN="/home/alpha/bitcoin-core-31.1/bin/bitcoind"
+# Same default as scripts/install-bitcoind.sh --print-path.
+BITCOIND_BIN="${BITCOIND_PREFIX:-${HOME}/bitcoin-core-31.1}/bin/bitcoind"
 WORKDIR=""
 TIMEOUT_SECONDS=120
 # --verify-pins-only: qualify pins/provenance and host runnability, start no node and no daemon.
@@ -274,7 +275,8 @@ Options:
   --output-json <path>         Path to write evidence JSON report
                                (default: ./lightning-interop-evidence.json)
   --bitcoind-bin <path>        Path to Bitcoin Core binary for differential comparison
-                               (default: /home/alpha/bitcoin-core-31.1/bin/bitcoind)
+                               (default: ${BITCOIND_PREFIX:-$HOME/bitcoin-core-31.1}/bin/bitcoind,
+                               as printed by scripts/install-bitcoind.sh --print-path)
   --workdir <dir>              Directory for node data, configs, and logs
                                (default: mktemp -d /tmp/lightning-interop.XXXXXX)
   --keep                       Compatibility flag (workdir and logs are preserved unconditionally)
