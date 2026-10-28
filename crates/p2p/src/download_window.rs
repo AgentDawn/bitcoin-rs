@@ -80,42 +80,6 @@ impl PeerRequest {
         self.entries.len()
     }
 
-    /// Rebuilds the batch without the entries `exclude` rejects.
-    ///
-    /// The carried frontier clamps to the lowest excluded height so that
-    /// `mark_requested` never advances the window cursor past a hash this
-    /// peer cannot serve: excluded heights stay re-plannable for the next
-    /// peer instead of stranding below the cursor. Returns `None` when
-    /// every entry is excluded; the caller then sends and marks nothing,
-    /// leaving the cursor untouched for another peer or a later retry.
-    pub(crate) fn excluding(
-        &self,
-        mut exclude: impl FnMut(Hash256) -> bool,
-    ) -> Option<Self> {
-        let mut excluded_floor: Option<u32> = None;
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
-            if exclude(entry.hash) {
-                excluded_floor = Some(
-                    excluded_floor.map_or(entry.height, |floor: u32| floor.min(entry.height)),
-                );
-            } else {
-                entries.push(*entry);
-            }
-        }
-        if entries.is_empty() {
-            return None;
-        }
-        let next_request_height = match excluded_floor {
-            Some(floor) => self.next_request_height.min(floor),
-            None => self.next_request_height,
-        };
-        Some(Self {
-            owner: self.owner,
-            entries,
-            next_request_height,
-        })
-    }
 }
 
 /// Per-peer availability view for one request build.
