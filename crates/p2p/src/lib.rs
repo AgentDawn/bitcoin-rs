@@ -36,6 +36,9 @@ pub mod inv;
 /// Inbound accept loop, outbound dial, and their shared start-epoch wiring.
 pub mod listener;
 pub(crate) mod netgroup;
+/// Opt-in Tor and IVNP I2P transport configuration.
+pub mod overlay;
+pub use overlay::{OverlayConfig, OverlayNetworkState};
 
 /// Bitcoin Core `net:*` tracepoint payload mapping.
 mod net_trace;
@@ -74,7 +77,9 @@ pub(crate) use block_stager::BlockStager;
 pub use chain_query::{ActiveChainQuery, RecentBlockSlot};
 pub use compact_blocks::{CompactBlockHints, Reconstruction};
 pub use compat::{COMMANDS, CORE_UNTYPED_COMMANDS, PINNED_CORE_VERSION};
-pub use connection::{ConnectionId, OutboundRefusal, PeerLease, PeerSource, QueuedFrame};
+pub use connection::{
+    ConnectionId, OutboundRefusal, PeerLease, PeerRemote, PeerSource, QueuedFrame,
+};
 pub use counters::{CountingStream, PeerCounters};
 pub use dispatch::{ChainQuery, FilterRequest, FilterServing, InventoryServing, TxInventory};
 pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
@@ -101,3 +106,5 @@ pub use download_window::default_sync_budget;
 
 /// Bounded automatic reconnect avoidance; manual bans retain their owner.
 pub mod discouragement;
+
+pub use bitcoin_rs_primitives::{PeerAddress, PeerEndpoint, PeerNetwork};
