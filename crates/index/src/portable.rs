@@ -134,6 +134,12 @@ pub enum IndexBundleError {
         /// Height of the block holding the locator.
         height: u32,
     },
+    /// The restore locator pass would exceed its bounded memory budget.
+    #[error("restore refused: locator pass exceeds {limit_bytes} bytes")]
+    RestoreTooLarge {
+        /// Memory ceiling for the grouped locator pass.
+        limit_bytes: usize,
+    },
     /// The bundle omits transactions in the covered range; stamping its base
     /// would claim a completeness the rows do not have.
     #[error("bundle omits transactions at height {height}: expected {expected}, found {actual}")]
