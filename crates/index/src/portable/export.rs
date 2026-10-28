@@ -21,7 +21,7 @@ use super::{
     BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, MAX_RESTORE_POSITIONS, io_error,
     sync_dir,
 };
-use crate::types::{HashPrefixRow, TxPosition, TxPositionValue};
+use crate::types::{HashPrefixRow, TxPosition, TxPositionValue, positions_are_valid};
 use crate::{
     IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexSnapshot,
 };
