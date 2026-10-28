@@ -50,23 +50,30 @@ One `offline-full-validation-config-v1` document binds every arm:
   bound through the freeze tip plus the packed manifest tip, and any source
   or index mutation refuses before any child starts.
 - **Pinned corpus**: after config load, the campaign copies archive and
-  manifest into a private campaign directory, re-hashes both, and
-  chmod's them `0o400`. When `indexed` is present it also copies the index
-  document and every declared `blkNNNNN.dat` source into private custody at
-  `0o400`. Both arms read the archive pin: `_corpus_path_for_arm` binds
-  `{corpus_path}` to `custody/archive`, the single regular file whose bytes
-  equal the indexed logical stream by the verified parity above. The index
-  and blk pins are custody-pinned and re-hashed before and after every
-  child, but they are never passed as `{corpus_path}`: the custody `sources`
-  directory holds multiple `blkNNNNN.dat` files while the timed command
-  expects one regular corpus file, and Core opens each `-loadblock` path
-  with `fopen(path, "rb")` (`bitcoin-core/src/node/blockstorage.cpp`,
-  `ImportBlocks`). Before and after every child, the controller re-hashes
-  every pin (archive, manifest, index, each blk source) and checks device,
-  inode, size, and mtime. A same-user child that chmod's and rewrites a pin
-  fails closed. Dual custody transiently holds the corpus twice (packed
-  bytes plus indexed sources); no third copy is materialized because parity
-  already binds the executed bytes to the indexed stream.
+  manifest to the literal custody paths `<root>/custody/archive` and
+  `<root>/custody/manifest` (where `<root>` is the `<temporary>/arms`
+  directory `main()` creates inside its `TemporaryDirectory` with
+  `prefix="offline-full-validation-"` under the `--output` parent),
+  re-hashes both, and chmod's them `0o400`. When `indexed` is present it
+  also copies the index document to `custody/index` and every declared
+  `blkNNNNN.dat` source into `custody/sources/` at `0o400`. Every arm reads
+  the pins via the `{corpus_path}` / `{manifest_path}` placeholders:
+  `_corpus_path_for_arm` binds `{corpus_path}` to `custody/archive`, the
+  single regular file whose bytes equal the indexed logical stream by the
+  verified parity above. The index and blk pins are custody-pinned and
+  re-hashed before and after every child, but they are never passed as
+  `{corpus_path}`: the custody `sources` directory holds multiple
+  `blkNNNNN.dat` files while the timed command expects one regular corpus
+  file. Before and after every child, the controller re-hashes every pin
+  (archive, manifest, index, each blk source) and checks device, inode,
+  size, and mtime. A same-user child that chmod's and rewrites a pin fails
+  closed. The pins persist across all 14 arms, but they are transient
+  working copies, not retained artifacts: when the campaign finishes,
+  `TemporaryDirectory` removes the whole tree and only the result JSON
+  published to `--output` survives. Dual custody transiently holds the
+  corpus twice (packed bytes plus indexed sources); no third copy is
+  materialized because parity already binds the executed bytes to the
+  indexed stream.
 - **Posture**: `assume_valid` must be false. `txindex`, `blockfilterindex`,
   and `coinstatsindex` must be off. Cache policy is the closed set
   `process-cold/page-cache-unspecified`. The sibling MuHash comparator
@@ -81,9 +88,14 @@ One `offline-full-validation-config-v1` document binds every arm:
   exit. `reopen` then runs an untimed reopen command against the same data
   directory and requires the same certified state.
 - **Binaries**: SHA-256 pinned. `command[0]` is the `{binary}` placeholder.
-  The controller copies the pinned program into a private arm directory,
-  verifies the copy, strips owner-write (`0o500`), and re-hashes immediately
-  before every spawn. Placeholders are `{binary}`, `{data_dir}`,
+  The controller copies the pinned program to `<root>/<NN>-<role>/node-under-test`
+  (one verified copy per arm, 14 total, `00-core/node-under-test` through
+  `13-candidate/node-under-test`), verifies the copy, strips owner-write
+  (`0o500`), and re-hashes immediately before every spawn. Each copy persists
+  through its arm timed phase and, in reopen mode, the untimed reopen phase
+  (which reuses and re-hashes the same copy). Like the custody pins,
+  these 14 copies are transient: 16 file copies live under the temporary
+  root during the campaign and none is retained. Placeholders are `{binary}`, `{data_dir}`,
   `{corpus_path}`, `{manifest_path}`, `{state_path}`. The timed command
   must carry a known assume-valid-off token (`-assumevalid=0`,
   `--assume-valid-height=0`, or the two-token form with `0`) and must not

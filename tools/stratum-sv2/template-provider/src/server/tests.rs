@@ -711,9 +711,6 @@ struct SubmissionGate {
 }
 
 impl MempoolObserver for SubmissionGate {
-    fn wants_accepted_transactions(&self) -> bool {
-        false
-    }
     fn on_mutation(&self, envelope: &MutationEnvelope) {
         if envelope.origin == AdmissionOrigin::Block {
             self.entered

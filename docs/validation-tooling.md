@@ -230,9 +230,16 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 - **What is verified**:
   - Seeds imported from `rust-bitcoin/qa-assets`, `bitcoin/bitcoin`, and `btcsuite/btcd`
     feed fuzz targets (`p2p_message`, `block_validate`, `tx_validate`, `script_eval`, `utxo_snapshot`).
-  - Native consensus codec round-trip enforces that every corpus seed satisfies
-    pinned verdicts (`accepted` with byte-identical re-encoding, or typed `rejected:<kind>`)
-    without untyped failures or panics.
+  - Seed validator `scripts/validate-corpus-seeds.sh` checks the corpus filesystem only:
+    every entry is a non-symlink regular file named by its own SHA-1 digest, no larger
+    than `FUZZ_MAX_SEED_BYTES`, with a positive total count and modes normalized to
+    `0644` (the `-n`/`-b` flood budget applies only when passed). It performs no codec,
+    verdict, or consensus check and exits nonzero on the first refusal.
+  - Native consensus codec round-trip (`crates/primitives/tests/differential.rs`) checks
+    every corpus seed against pinned verdicts (`accepted` with byte-identical re-encoding,
+    or typed `rejected:<kind>`) without untyped failures or panics, but only when the
+    corpus checkout exists and carries `verdicts.json`: an absent corpus skips loudly,
+    and an absent `verdicts.json` degrades to a verdict-shape check with a warning.
 - **Reproduce**:
   ```sh
   # Native codec roundtrip check over corpus seeds:
@@ -264,6 +271,20 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     and mempool restoration (process-test mapping in [`e2e/REORG-COVERAGE.md`](../e2e/REORG-COVERAGE.md)).
 - **Feature requirement**: The AssumeUTXO recovery unit module is gated by
   `fjall`; without it, that filter selects no tests.
+- **Host prerequisite (AssumeUTXO non-UTF-8 snapshot test)**:
+  `e2e/tests/assumeutxo.rs::invalid_core_snapshots_fail_without_activating`
+  requires `/tmp` to accept arbitrary non-NUL byte filenames for its Unix
+  fixture. The test owns a temporary directory under `/tmp` containing
+  `core-\xff.dat`; the UTF-8 `core200.dat` symlink stays in the node datadir,
+  and the RPC receives `{"path":"core200.dat"}`. It copies the snapshot to the
+  target, removes the original, and creates the symlink rather than renaming
+  across potentially different filesystems. The owned target directory is
+  removed at test end or on an early error. This leaves the node datadir and
+  global `TMPDIR` on their configured disk-backed filesystem, even if that
+  filesystem rejects non-UTF-8 entry names. The former rename-in-datadir
+  fixture could fail with `EILSEQ` (92) before RPC; that failure was not JSON
+  serialization. A byte-capable `/tmp` remains a host prerequisite; record an
+  incapable lane as `BLOCKED` rather than skipping or weakening the scenario.
 - **Reproduce**:
   ```sh
   cargo test --locked -p bitcoin-rs-chainstate --lib recovery_marker_order_tests
@@ -284,18 +305,32 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 - **Owner scripts & tools**:
   - Harness: `tools/benchmark-campaign/offline_full_validation.py`.
   - Harness tests: `tools/benchmark-campaign/test_offline_full_validation.py`.
+  - Corpus exporter: `tools/campaign-corpus/corpus.py` (`export` pulls the frozen
+    archive from a Core node REST interface, `verify` rebinds an archive to its manifest).
 - **What is verified**:
-  - Executes Bitcoin Core 31.1 and `bitcoin-rs` on the same hash-pinned Core-framed
-    block archive (`blk*.dat`).
+  - Executes the SHA-256 pinned `core.binary` and `candidate.binary` programs named
+    in `offline-full-validation-config-v1` on the same hash-pinned Core-framed
+    block archive (`blk*.dat`). The harness performs no Core version check of its
+    own, so for a Core 31.1 arm point `core.binary` at the
+    `scripts/install-bitcoind.sh --print-path` output (by default
+    `${HOME}/bitcoin-core-31.1/bin/bitcoind` unless `BITCOIND_PREFIX` is set).
+    Each arm runs its verified
+    copy at `<root>/<NN>-<role>/node-under-test` (for example `00-core/node-under-test`),
+    which is what the `{binary}` placeholder in each arm command expands to.
   - Asserts identical certified end state (height, best block hash, UTXO count,
     total amount, `MuHash3072`, `hash_serialized_3`) and compares full validation timing.
-  - Unit tests prove custody checks, file validation, and ratio calculation in CI;
+  - Unit tests prove custody checks, file validation, and percentile summaries in CI;
     live C150 / Cmodern full-mainnet execution is **planned / not yet executed**.
 - **Reproduce**:
   ```sh
   # Run comparator harness behavioral tests (Python 3.13):
-  pytest tools/benchmark-campaign/test_offline_full_validation.py
+  python3 tools/benchmark-campaign/test_offline_full_validation.py
   python3 tools/campaign-corpus/test_corpus.py
+
+  # Export the frozen input archive from a Core node REST interface
+  # (fetches /rest/blockhashbyheight/<height>.hex and /rest/block/<hash>.bin):
+  python3 tools/campaign-corpus/corpus.py export --rest-url <host:port> \
+    --corpus-id C150 --archive <archive-path> --manifest <manifest-path>
   ```
 
 ---
@@ -315,11 +350,22 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     outside the workspace (not a compatibility commitment, no production pool
     qualification; see [`tools/stratum-sv2/README.md`](../tools/stratum-sv2/README.md)); and the standalone in-process LDK L1 adapter ([`tools/ldk/README.md`](../tools/ldk/README.md)).
   - **Intentionally unsupported**: Core IPC adapters.
+  - **Lightning interop (evidence-gated, not a lane verdict)**: LND `v0.21.4-beta` five cells `not exercised`: the only record (`parent-live-4`) is unretained gitignored scratch (61-dirty source, `.outline` runner copy diverging from the tracked script, unverified manifest signature, no fresh Core comparison; `docs/lightning-interop-matrix.md` §2–§3.1). CLN `v26.06.9` startup `failed` in retained qualified `run-2` (`.outline/evidence/lightning-live-cln/run-2/evidence.json`): version gate refusal `1400` below `220000` with Core 31.1 reaching `getinfo` ready, other 4 cells `not exercised` on causal startup, `getblockfrompeer` probed as `rs=method_not_found` and `core=rpc_error` (fallback only), source HEAD `aab50bd64` with 7 dirty entries and 758 inputs (`stale_allowed:false`), node `48129ac5…`, runner frozen `86eba76…` with parent job `bg_543` checksum before plus `bash -n` plus private `ShellCheck` plus real campaign plus checksum after in one chain with exit `0` in `.outline/evidence/lightning-live-cln/run-2/verification.json`, `run-1` raw only with no claim (same matrix section).
 - **Reproduction & audit**:
   - Audit status strings against the canonical matrix:
     ```sh
     # Inspect rows and status vocabulary
     cat docs/api/ecosystem-compat.toml
+    ```
+  - Reproduce the Lightning evidence record (wall-clock bounded; parent runs builds/gates once):
+    ```sh
+    # CLN live cell with pinned artifacts; see docs/lightning-interop-matrix.md §4 for the exact command
+    timeout --signal=TERM --kill-after=30 900 bash scripts/verify-lightning-interop.sh --target cln \
+      --bitcoin-rs-bin <path-to-built-bitcoin-rs> \
+      --bitcoind-bin <path-to-bitcoin-core-31.1> \
+      --cln-bin <extract-dir>/usr/bin/lightningd \
+      --cln-release-archive <dir>/clightning-v26.06.9-Ubuntu-26.04-amd64.tar.xz \
+      --cln-library-path <dir>/libpq-probe/root/usr/lib/x86_64-linux-gnu
     ```
 
 ---

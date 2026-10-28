@@ -134,6 +134,18 @@ pub enum IndexBundleError {
         /// Height of the block holding the locator.
         height: u32,
     },
+    /// The restore locator pass would exceed its bounded position budget.
+    #[error("restore refused: bundle carries more than {limit_positions} positions")]
+    RestoreTooLarge {
+        /// Position ceiling for the grouped locator pass.
+        limit_positions: usize,
+    },
+    /// Export would produce a bundle the restore pass cannot accept.
+    #[error("export refused: bundle would carry more than {limit_positions} positions")]
+    ExportTooLarge {
+        /// Position ceiling shared with restore.
+        limit_positions: usize,
+    },
     /// The bundle omits transactions in the covered range; stamping its base
     /// would claim a completeness the rows do not have.
     #[error("bundle omits transactions at height {height}: expected {expected}, found {actual}")]
@@ -186,6 +198,10 @@ pub(crate) enum BundleOutcome {
     /// ordinary backfill proceeds.
     RestoreWithheld(Withheld),
 }
+
+/// Maximum transaction positions one bundle may carry. Export and restore
+/// share this bound so export cannot publish an unimportable artifact.
+pub(crate) const MAX_RESTORE_POSITIONS: usize = 4_194_304;
 
 /// A published export.
 #[derive(Debug)]

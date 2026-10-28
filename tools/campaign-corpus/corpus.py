@@ -96,6 +96,9 @@ class ContractError(ValueError):
 
 @dataclass(frozen=True)
 class FrameMeta:
+    """Index record into the archive: `offset` is the byte offset of the
+    frame magic; the payload starts at `offset + HEADER_LEN`."""
+
     offset: int
     payload_length: int
 

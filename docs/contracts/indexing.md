@@ -505,9 +505,11 @@ Proof: these tests establish the memo-retention rule:
     artifact and the manifest that sits beside it; it is not authentication.
     Restore binds each record to the receiver's chain by the locator check,
     not to the exporter's identity.
-  - Restore proves that every record present resolves in the receiver's chain.
-    It does not prove that no record is missing: no check compares the record
-    count with the chain's transaction count.
+  - Restore proves that every record present resolves in the receiver's chain
+    and, when every covered body is available, that none is missing: the
+    per-height record count must equal the receiver's transaction count or the
+    bundle is refused before any write. An absent or pruned covered body
+    withholds the restore instead of proving completeness.
   - The clause makes no performance, interoperability with other
     implementations, or cross-version claim.
 - Executable proof covers the manifest and artifact codec, the configuration
@@ -795,9 +797,9 @@ Core/Kyoto runner are described in
   one historical height-150,000 pair, not a gain or modern-mainnet claim. Stage 2 closes
   at the accepted scoped requirements; Stage 3 remains blocked only on qualified v6
   occurrence-schema acceptance. Limits remain: live mid-stream `Stale` export race
-  unobserved, no power-loss campaign (SIGKILL bounds stop at process kill), no
-  full-TxLookup completeness proof (every present record resolves; no missing-record
-  check), and private receipts are not a checked-in portable process suite.
+  unobserved, no power-loss campaign (SIGKILL bounds stop at process kill), completeness
+  is checked only against covered bodies the receiver holds (an absent body
+  withholds), and private receipts are not a checked-in portable process suite.
 
 ## Proven by
 

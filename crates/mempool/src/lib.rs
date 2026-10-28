@@ -54,7 +54,7 @@ pub(crate) use eviction::evict_lowest_fee_packages;
 pub use fee_diagram::FeeDiagramError;
 pub use fee_estimator::{FeeEstimator, FeeRate};
 pub use gateway::{
-    AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError, ChainChangeGuard,
+    AdmissionRequest, AdmitError, AdmitOutcome, BodyInterest, ChainChangeError, ChainChangeGuard,
     CompositeObserver, MempoolGateway, MempoolObserver,
 };
 #[cfg(any(test, feature = "test-seam"))]
