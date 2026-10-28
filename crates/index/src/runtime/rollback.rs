@@ -203,11 +203,17 @@ impl Worker {
         };
         // Side channel: `produce` can only return `IndexError`, so a byte
         // binding failure is stashed here and classified after the stream
-        // returns. The sentinel never escapes this function.
+        // returns. The sentinel never escapes this function. Shutdown is
+        // polled at entry above, every 4,096 emits inside both the raw
+        // traversal and the fenced stream, and before the final watermark
+        // commit; a trip keeps the bundle (artifact plus any lease) and
+        // stalls so the retry reuses it without a second take or lease.
         let poisoned: Cell<bool> = Cell::new(false);
+        let cancelled = || self.runtime.should_stop();
         let result = self.writer.seed_script_live_stream(
             &mut |emit| match artifact.for_each_coin_raw::<IndexError, _>(
                 &mut |outpoint, script| emit(*outpoint, ScriptHash::from_script_bytes(script)),
+                &cancelled,
             ) {
                 Ok(()) => Ok(()),
                 Err(RawSeedError::Integrity) => {
@@ -216,8 +222,10 @@ impl Worker {
                 }
                 Err(RawSeedError::Io(error)) => Err(IndexError::Storage(StorageError::Io(error))),
                 Err(RawSeedError::Emit(error)) => Err(error),
+                Err(RawSeedError::Cancelled) => Err(IndexError::Cancelled),
             },
             tip,
+            &cancelled,
         );
         match result {
             Ok(written) => {
@@ -238,6 +246,20 @@ impl Worker {
                     lease: bundle.lease,
                 });
                 Ok(SeedFlow::Seeded)
+            }
+            Err(IndexError::Cancelled) => {
+                // Stopped mid-seed keeps the bundle (artifact plus any
+                // lease): the run loop exits on the flag and a retry reuses
+                // the same bundle without a second take or a second lease
+                // request while it covers `H`. A cancelled prefix is
+                // cleared by the retry's opening reset. Checked before
+                // poison and fatal branches so cancellation never drops
+                // retry ownership.
+                *self.seed_bundle.lock() = Some(SeedBundle {
+                    artifact: Some(artifact),
+                    lease: bundle.lease,
+                });
+                Ok(SeedFlow::Return(ReconcileAction::Stalled))
             }
             Err(_) if poisoned.take() => {
                 // Poison: the bytes are not the witnessed state. Drop the

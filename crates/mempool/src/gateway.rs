@@ -26,7 +26,7 @@ use bitcoin_rs_consensus::{
 use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid, Wtxid};
 use bitcoin_rs_script::VerifyFlags;
 use bitcoin_rs_script::{is_p2sh, is_witness_program};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -670,16 +670,17 @@ struct PublishState {
 /// Every mutating method flows through exactly one path, `Self::commit`,
 /// which runs, in this exact order:
 ///
-/// 1. take the pool write lock,
+/// 1. take the commit-ordering lock, then the pool write lock,
 /// 2. mutate and assign per-change mempool sequences,
-/// 3. while still holding the write lock, enqueue the non-empty envelope on
-///    the publish state's FIFO queue and elect a drainer if none exists,
-/// 4. release the write lock and the publish-state lock,
+/// 3. release the write lock, join accepted bodies to the committed changes,
+///    then enqueue the non-empty envelope on the publish state's FIFO queue
+///    and elect a drainer if none exists,
+/// 4. release the ordering lock and the publish-state lock,
 /// 5. the elected drainer pops batches one at a time — releasing the
 ///    publish-state lock before every observer call — and returns the
 ///    publish state to idle only once the queue is empty.
 ///
-/// Commits serialize under the write lock and step 3 enqueues under that
+/// Commits serialize under the ordering lock and step 3 enqueues under that
 /// same ownership, so the queue order is the commit order and the sequence
 /// order: every committed, non-empty batch is published exactly once, in
 /// order, even across nested and concurrent callers. Publication is
@@ -700,6 +701,13 @@ pub struct MempoolGateway {
     /// can attach its own named leg after construction. An absent composite
     /// means nobody is listening and the publish path stays allocation-free.
     observer: Option<Arc<CompositeObserver>>,
+    /// Serializes commit-to-enqueue so the publish queue order is the commit
+    /// order. Taken before the pool write lock and released after the
+    /// publish enqueue; the pool guard itself drops before the body join so
+    /// admission-lock time stays out of the join. Lock order is
+    /// commit-order, pool, publish, and it is never held across an observer
+    /// call.
+    commit_order: Mutex<()>,
     publish: Mutex<PublishState>,
     /// BIP152 reconstruction extras: replaced bodies, peer orphans and peer
     /// policy rejects. A leaf lock: pool guards precede it, and nothing else
@@ -760,6 +768,7 @@ impl MempoolGateway {
             pool,
             lifecycle: Mutex::new(crate::orphan::AdmissionLifecycle::default()),
             observer: composite,
+            commit_order: Mutex::new(()),
             publish: Mutex::new(PublishState {
                 queue: VecDeque::new(),
                 draining: false,
@@ -1533,7 +1542,16 @@ impl MempoolGateway {
             .observer
             .as_ref()
             .is_some_and(|observer| observer.wants_bodies());
+        // Linearizable commit-to-enqueue: held from the pool mutation through
+        // the publish enqueue so the queue order is the commit order even
+        // though the join no longer runs under the pool write lock. Dropped
+        // before the drain so observer re-entry never blocks on it.
+        let order = self.commit_order.lock();
         let mut elected = false;
+        // Publication decided under the write lock; the index/body join below
+        // runs after the pool guard drops so large packages do not burn
+        // admission-lock time on a quadratic scan.
+        let mut pending = None;
         let outcome = {
             let mut pool = self.pool.write();
             pool.accepted_capture = bodies_wanted.then(Vec::new);
@@ -1554,37 +1572,69 @@ impl MempoolGateway {
                 }
                 self.update_admission_lifecycle(&pool, result);
                 if !result.changes.is_empty() && self.observer.is_some() {
-                    let mut captured = captured;
-                    let transactions = result
-                        .changes
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, change)| {
-                            if !matches!(change.outcome, crate::MutationOutcome::Accepted) {
-                                return None;
-                            }
-                            captured
-                                .iter()
-                                .position(|(txid, _)| *txid == Txid(change.txid))
-                                .map(|position| (index, captured.swap_remove(position).1))
-                        })
-                        .collect();
-                    let mut publish = self.publish.lock();
-                    publish.queue.push_back(MutationEnvelope {
-                        origin,
-                        result: result.clone(),
-                        accepted_transactions: transactions,
-                    });
-                    elected = !publish.draining;
-                    publish.draining = true;
+                    pending = Some((result.clone(), captured));
                 }
             }
             outcome
         };
+        if let Some((result, captured)) = pending {
+            let transactions = Self::join_accepted_bodies(&result, captured, bodies_wanted);
+            let mut publish = self.publish.lock();
+            publish.queue.push_back(MutationEnvelope {
+                origin,
+                result,
+                accepted_transactions: transactions,
+            });
+            elected = !publish.draining;
+            publish.draining = true;
+        }
+        drop(order);
         if elected {
             self.drain();
         }
         Ok(outcome)
+    }
+
+    /// Joins committed `Accepted` changes to their captured bodies.
+    ///
+    /// Capture runs under the pool write lock so bodies match the commit; the
+    /// index/body join itself needs no pool state and runs after the guard
+    /// drops. A missing body with capture enabled means an accept path
+    /// bypassed the capture and is logged instead of silently dropped;
+    /// without capture the envelope simply carries no bodies.
+    fn join_accepted_bodies(
+        result: &MutationResult,
+        captured: Vec<(Txid, Arc<Tx>)>,
+        bodies_wanted: bool,
+    ) -> Vec<(usize, Arc<Tx>)> {
+        let mut bodies = HashMap::with_capacity(captured.len());
+        for (txid, body) in captured {
+            bodies.insert(txid, body);
+        }
+        result
+            .changes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, change)| {
+                if !matches!(change.outcome, crate::MutationOutcome::Accepted) {
+                    return None;
+                }
+                let Some(body) = bodies.remove(&Txid(change.txid)) else {
+                    if bodies_wanted {
+                        tracing::warn!(
+                            txid = ?change.txid,
+                            "accepted transaction has no captured body; envelope omits it",
+                        );
+                    }
+                    debug_assert!(
+                        !bodies_wanted,
+                        "capture was enabled but an Accepted change has no body",
+                    );
+                    return None;
+                };
+                Some((index, body))
+            })
+            .collect()
     }
 
     /// Finalizes peer-only holding/rejection while the exact admission state
