@@ -6,7 +6,8 @@
 //! commits for the scan); the manifest plus archive pin is bound by hash
 //! (a transactional outbox is unnecessary here because publication is a
 //! single atomic `create_new` state file after the checkpoint, and reruns
-//! are idempotent by tip comparison, so no exactly-once delivery is
+//! either resume by tip comparison under a matching full-validation
+//! provenance record or are refused, so no exactly-once delivery is
 //! assumed).
 //!
 //! Consumes the single regular Core-framed archive file bound by
@@ -25,19 +26,20 @@
 //! Guarantees: exact bytes (framing walk plus per-record manifest binding
 //! plus archive digest, verified for skipped prefix records and on reopen
 //! too), full validation (`--assume-valid-height 0` with the validation mode
-//! pinned to `Full` instead of any inherited live mode, indexes off, and no
-//! stale persisted derived-index namespace), durable bodies plus undo
+//! pinned to `Full` instead of any inherited live mode, indexes off, no
+//! stale persisted derived-index namespace, and no resumed prefix without a
+//! matching full-validation provenance record), durable bodies plus undo
 //! (authoritative commit path), production clean checkpoint (nonzero when
 //! publication fails), foreground only (no fork, no daemonize, no spawned
 //! descendants), and an eight-field certified state. Reopen against the same
-//! data directory is idempotent: when the applied tip already equals the
-//! manifest stop, no block is reconnected, but the archive is still walked
-//! and rebound.
+//! data directory resumes the applied prefix only when the provenance record
+//! this importer wrote at certification matches the applied tip; otherwise
+//! the rerun is refused and the operator revalidates from a fresh directory.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
@@ -177,6 +179,7 @@ pub fn run_offline_import(
     check_manifest_network(&manifest_doc, config.network.identity_name())?;
     check_manifest_shape(&manifest_doc)?;
 
+    let data_dir = config.data_dir.clone();
     let node = crate::state::NodeState::open(config, None)?;
     let chainstate = node.chainstate();
 
@@ -195,6 +198,15 @@ pub fn run_offline_import(
             if !entry.hash.eq_ignore_ascii_case(&tip.hash.to_string()) {
                 bail!("applied tip hash does not match the manifest entry");
             }
+            // Fail closed on provenance: `TipSnapshot`/`DurableHead` record
+            // height, hash, work, and transaction count but not the
+            // `ValidationMode` that committed the prefix, so a prefix
+            // connected under `AssumeValid`/`Fast` (scripts skipped) is
+            // indistinguishable from a `Full` one. The skip below runs only
+            // when this importer's provenance record binds the same tip;
+            // otherwise the rerun is refused and the operator revalidates
+            // from a fresh data directory.
+            require_full_validation_provenance(&data_dir, tip)?;
             if height == manifest_doc.stop_height {
                 // Tip already current: connect nothing, but still walk the
                 // archive below so the reopen re-binds every record and the
@@ -261,7 +273,7 @@ pub fn run_offline_import(
         bail!("archive digest does not match the manifest");
     }
 
-    verify_and_certify(&node, &manifest_doc, state)?;
+    verify_and_certify(&node, &data_dir, &manifest_doc, state)?;
     Ok(())
 }
 
@@ -343,9 +355,11 @@ fn read_record(
 /// exactly once. Any other failure, a skipped publication (no applied tip to
 /// checkpoint), or a second refusal propagates.
 ///
-/// Reruns stay idempotent by tip comparison: neither the refused attempt nor
-/// the checkpoint moves the applied tip, so a restart resumes from the same
-/// durable state.
+/// Neither the refused attempt nor the checkpoint moves the applied tip, so
+/// the inline retry resumes from the same durable state. A cross-process
+/// rerun over the same data directory resumes by tip comparison only under
+/// a matching provenance record; without one it is refused, so the operator
+/// wipes the data directory and revalidates from genesis.
 fn connect_batch(
     node: &crate::state::NodeState,
     batch: &mut Vec<bitcoin_rs_primitives::BlockPayload>,
@@ -474,6 +488,27 @@ fn check_manifest_network(doc: &Manifest, expected_network: &str) -> Result<()> 
     Ok(())
 }
 
+/// Sidecar binding the applied tip this importer fully validated.
+///
+/// The persisted tip (`TipSnapshot`) and commit point (`DurableHead`) record
+/// height, hash, work, and transaction count, but not the `ValidationMode`
+/// that committed each block. A prefix connected under `AssumeValid`
+/// (scripts skipped below the anchor while the gate trusted it) or `Fast`
+/// (scripts skipped below the header tip) is therefore indistinguishable at
+/// reopen from one connected under `Full`. This record closes that gap: it is
+/// written only after this importer certifies the tip under the pinned
+/// `Full` mode, and a resume skips its prefix only while the record still
+/// binds the same tip.
+const FULL_VALIDATION_PROVENANCE_FILE: &str = "offline-full-validation-provenance.json";
+const FULL_VALIDATION_PROVENANCE_SCHEMA: &str = "offline-full-validation-provenance-v1";
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct FullValidationProvenance {
+    schema: String,
+    height: u32,
+    tip_hash: String,
+}
+
 /// Maps an absolute block height to its position in the packed
 /// `blocks`/`entries` array. Both the reopen entry lookup and the skip
 /// count after a tip at `height` go through this coordinate, so a resume
@@ -485,6 +520,87 @@ fn block_index_for_height(start_height: u32, height: u32) -> Result<usize> {
         .checked_sub(start_height)
         .with_context(|| format!("applied tip height {height} is outside the manifest range"))?;
     usize::try_from(offset).context("tip height does not fit")
+}
+
+/// Allows the resume skip only while the provenance record binds the tip.
+///
+/// Refuses when the record is absent, unreadable, the wrong schema, or names
+/// a different tip: a normal live run under `AssumeValid`/`Fast` leaves no
+/// such record, and a stale record (older certification, foreign data dir,
+/// torn write) never matches the current tip. Failing closed here keeps the
+/// skip from certifying unexecuted scripts as fully validated; the remedy is
+/// a fresh data directory, which revalidates every record from genesis.
+fn require_full_validation_provenance(
+    data_dir: &Path,
+    tip: &bitcoin_rs_chain::TipSnapshot,
+) -> Result<()> {
+    match read_full_validation_provenance(data_dir) {
+        Ok(record)
+            if record.height == tip.height
+                && record.tip_hash.eq_ignore_ascii_case(&tip.hash.to_string()) =>
+        {
+            Ok(())
+        }
+        Ok(record) => bail!(
+            "offline import refuses to resume over the applied tip at height {}: the full-validation provenance record binds height {} and no longer matches this tip, so revalidate from a fresh data directory",
+            tip.height,
+            record.height
+        ),
+        Err(error) => bail!(
+            "offline import refuses to resume over the applied tip at height {}: no readable full-validation provenance record ({error:#}), so revalidate from a fresh data directory",
+            tip.height
+        ),
+    }
+}
+
+fn provenance_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(FULL_VALIDATION_PROVENANCE_FILE)
+}
+
+fn read_full_validation_provenance(data_dir: &Path) -> Result<FullValidationProvenance> {
+    let path = provenance_path(data_dir);
+    let raw = std::fs::read(&path)
+        .with_context(|| format!("cannot read provenance {}", path.display()))?;
+    if raw.len() > 4096 {
+        bail!("provenance {} exceeds its bound", path.display());
+    }
+    let doc: FullValidationProvenance = sonic_rs::from_slice(&raw)
+        .with_context(|| format!("provenance {} is not valid JSON", path.display()))?;
+    if doc.schema != FULL_VALIDATION_PROVENANCE_SCHEMA {
+        bail!("provenance {} has an unknown schema", path.display());
+    }
+    Ok(doc)
+}
+
+/// Atomically publishes the full-validation provenance for `tip`.
+///
+/// The tmp-file plus rename keeps a torn write from ever reading as a
+/// match: a crash between write and rename leaves the previous record (or
+/// none), and the resume gate refuses anything but an exact tip bind.
+fn write_full_validation_provenance(
+    data_dir: &Path,
+    tip: &bitcoin_rs_chain::TipSnapshot,
+) -> Result<()> {
+    let doc = FullValidationProvenance {
+        schema: FULL_VALIDATION_PROVENANCE_SCHEMA.to_owned(),
+        height: tip.height,
+        tip_hash: tip.hash.to_string(),
+    };
+    let mut raw = sonic_rs::to_vec_pretty(&doc).context("cannot encode provenance")?;
+    raw.push(b'\n');
+    let tmp = data_dir.join(".offline-full-validation-provenance.json.tmp");
+    std::fs::write(&tmp, &raw)
+        .with_context(|| format!("cannot write provenance {}", tmp.display()))?;
+    File::open(&tmp)
+        .with_context(|| format!("cannot open provenance {}", tmp.display()))?
+        .sync_all()
+        .with_context(|| format!("cannot fsync provenance {}", tmp.display()))?;
+    std::fs::rename(&tmp, provenance_path(data_dir)).context("cannot publish provenance")?;
+    File::open(data_dir)
+        .with_context(|| format!("cannot open data dir {}", data_dir.display()))?
+        .sync_all()
+        .with_context(|| format!("cannot fsync data dir {}", data_dir.display()))?;
+    Ok(())
 }
 
 /// Pins the offline-import validation mode, refusing to inherit.
@@ -625,6 +741,7 @@ fn check_manifest_shape(doc: &Manifest) -> Result<()> {
 
 fn verify_and_certify(
     node: &crate::state::NodeState,
+    data_dir: &Path,
     manifest: &Manifest,
     state_path: &Path,
 ) -> Result<()> {
@@ -675,7 +792,9 @@ fn verify_and_certify(
                 .map_err(|error| anyhow::anyhow!("hash_serialized_3 failed: {error}"))?;
             // Snapshot-isolated read: the stable view blocks commits for the
             // scan, so txout counts and hashes belong to one tip. No
-            // exactly-once delivery is assumed; reruns are idempotent by tip.
+            // exactly-once delivery is assumed; reruns resume by tip
+            // comparison under a matching provenance record, and are refused
+            // without one.
             Ok::<_, anyhow::Error>((
                 u64::try_from(view.len())
                     .map_err(|error| anyhow::anyhow!("txout count does not fit: {error}"))?,
@@ -700,6 +819,15 @@ fn verify_and_certify(
     if generation.is_none() {
         bail!("clean checkpoint publication skipped: no applied tip");
     }
+    // Bind full-validation provenance to the certified tip before publishing
+    // the certified state: the tip below already passed full validation
+    // (every record connected under the pinned `Full` mode, bodies plus undo
+    // durable, tip re-verified, checkpoint published), so the record is true
+    // the moment it lands. Ordering it first keeps a later `write_state`
+    // failure (for example `create_new` refusing a reused state path)
+    // resumable: the rerun still matches provenance and re-certifies instead
+    // of forcing a from-genesis revalidation.
+    write_full_validation_provenance(data_dir, &tip)?;
     write_state(state_path, &certified)?;
     Ok(())
 }
@@ -1008,9 +1136,9 @@ mod tests {
     }
 
     #[test]
-    fn skipped_prefix_records_stay_bound_to_the_manifest() {
-        // The per-record binding covers records the resume cursor skips, so a
-        // corrupted prefix of the right length is still refused.
+    fn connected_records_stay_bound_to_the_manifest() {
+        // The per-record binding covers every record the import connects, so
+        // a corrupted payload of the right length is still refused.
         let header = [7u8; HEADER_LEN];
         let doc_hash = header_hash_hex(&header);
         let good = binding_entry(3, &doc_hash);
@@ -1049,37 +1177,182 @@ mod tests {
         assert!(refuse_stale_persisted_indexes(stray.path()).is_err());
     }
 
+    /// Two real regtest blocks (genesis plus one mined child) framed as a
+    /// Core archive with a matching manifest, so the provenance tests run the
+    /// real entry point instead of asserting on helpers alone.
+    struct TwoBlockArchive {
+        blocks: Vec<bitcoin_rs_primitives::Block>,
+        corpus: Vec<u8>,
+        manifest: Vec<u8>,
+        stop_hash: String,
+    }
+
+    fn two_block_archive() -> TwoBlockArchive {
+        use sha2::Digest as _;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let child = bitcoin_rs_chain::regtest_fixture::mined_regtest_child_at(
+            genesis.block_hash(),
+            1,
+        )
+        .expect("mine child");
+        let blocks = vec![genesis, child];
+        let magic = bitcoin_rs_primitives::Network::Regtest.magic();
+        let mut corpus = Vec::new();
+        let mut entries = Vec::new();
+        let mut offset: u64 = 0;
+        for (index, block) in blocks.iter().enumerate() {
+            let payload =
+                bitcoin_rs_primitives::BlockPayload::from_local(block.clone());
+            let raw = payload.bytes();
+            let mut framed = Vec::with_capacity(8 + raw.len());
+            framed.extend_from_slice(&magic);
+            framed.extend_from_slice(
+                &u32::try_from(raw.len()).expect("payload fits").to_le_bytes(),
+            );
+            framed.extend_from_slice(raw);
+            entries.push(format!(
+                r#"{{"height":{index},"hash":"{hash}","offset":{offset},"payload_length":{len}}}"#,
+                index = u32::try_from(index).expect("index fits"),
+                hash = block.block_hash().to_string(),
+                len = raw.len()
+            ));
+            offset += u64::try_from(framed.len()).expect("offset fits");
+            corpus.extend_from_slice(&framed);
+        }
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&corpus);
+        let manifest = format!(
+            r#"{{"schema":"core-framed-archive-manifest-v1","network":"regtest","network_magic":"fabfb5da","start_height":0,"stop_height":1,"archive_sha256":"{digest}","archive_bytes":{bytes},"blocks":[{blocks}]}}"#,
+            digest = bitcoin_rs_primitives::encode::hex_encode(&hasher.finalize()),
+            bytes = corpus.len(),
+            blocks = entries.join(",")
+        );
+        let stop_hash = blocks[1].block_hash().to_string();
+        TwoBlockArchive {
+            blocks,
+            corpus,
+            manifest: manifest.into_bytes(),
+            stop_hash,
+        }
+    }
+
+    fn offline_import_config(data_dir: &std::path::Path) -> crate::NodeConfig {
+        let mut config =
+            crate::NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
+        config.data_dir = data_dir.to_path_buf();
+        config.p2p.listen.clear();
+        config
+    }
+
+    fn write_archive_fixture(
+        dir: &std::path::Path,
+        archive: &TwoBlockArchive,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let corpus = dir.join("corpus.bin");
+        let manifest = dir.join("manifest.json");
+        std::fs::write(&corpus, &archive.corpus).expect("write corpus");
+        std::fs::write(&manifest, &archive.manifest).expect("write manifest");
+        (corpus, manifest)
+    }
+
     #[test]
-    fn nonzero_start_height_maps_index_and_skip() {
-        let doc = Manifest {
-            network: "regtest".to_owned(),
-            network_magic: "fabfb5da".to_owned(),
-            start_height: 100,
-            stop_height: 102,
-            archive_sha256: "ab".repeat(32),
-            archive_bytes: 294,
-            blocks: vec![
-                entry(100, &"ab".repeat(32), 0, 90),
-                entry(101, &"cd".repeat(32), 98, 90),
-                entry(102, &"ef".repeat(32), 196, 90),
-            ],
-        };
-        assert!(check_manifest_shape(&doc).is_ok());
-        // Resume at H=101 reads entry 101-100=1 and skips 101+1-100=2 records.
-        assert_eq!(
-            block_index_for_height(doc.start_height, 101).expect("index"),
-            1
+    fn offline_import_fresh_dir_validates_and_records_provenance() {
+        // Fresh data directory: every record is connected under the pinned
+        // `Full` mode, the tip certifies, and the provenance record binds the
+        // certified tip for later resumes.
+        let archive = two_block_archive();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join("node");
+        let (corpus, manifest) = write_archive_fixture(dir.path(), &archive);
+        let state = dir.path().join("state.json");
+        run_offline_import(offline_import_config(&data_dir), &corpus, &manifest, &state)
+            .expect("fresh import succeeds");
+        let record =
+            read_full_validation_provenance(&data_dir).expect("provenance recorded");
+        assert_eq!(record.height, 1, "provenance binds the certified tip");
+        assert!(
+            record.tip_hash.eq_ignore_ascii_case(&archive.stop_hash),
+            "provenance binds the certified tip hash"
         );
-        let next = 101u32.checked_add(1).expect("next");
-        assert_eq!(
-            block_index_for_height(doc.start_height, next).expect("skip"),
-            2
+        let text =
+            String::from_utf8(std::fs::read(&state).expect("read state")).expect("utf8");
+        assert!(text.contains("\"height\": 1"), "state certifies height 1");
+        assert!(
+            text.contains(&archive.stop_hash),
+            "state certifies the archive tip"
         );
-        // Below-range heights are refused rather than underflowing.
-        assert!(block_index_for_height(doc.start_height, 99).is_err());
-        // Start-at-zero behavior is unchanged.
-        assert_eq!(block_index_for_height(0, 1).expect("index"), 1);
-        assert_eq!(block_index_for_height(0, 2).expect("skip"), 2);
+    }
+
+    #[test]
+    fn offline_import_certified_dir_resumes_idempotently() {
+        // The provenance record this importer wrote at certification lets a
+        // rerun skip the already-validated prefix: the tip is current, so no
+        // block is reconnected, but the archive is still walked and rebound.
+        let archive = two_block_archive();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join("node");
+        let (corpus, manifest) = write_archive_fixture(dir.path(), &archive);
+        run_offline_import(
+            offline_import_config(&data_dir),
+            &corpus,
+            &manifest,
+            &dir.path().join("state.json"),
+        )
+        .expect("first import succeeds");
+        let resume_state = dir.path().join("state-resume.json");
+        run_offline_import(
+            offline_import_config(&data_dir),
+            &corpus,
+            &manifest,
+            &resume_state,
+        )
+        .expect("certified directory resumes");
+        let text =
+            String::from_utf8(std::fs::read(&resume_state).expect("read state")).expect("utf8");
+        assert!(text.contains("\"height\": 1"), "resume still certifies height 1");
+        assert!(
+            text.contains(&archive.stop_hash),
+            "resume still certifies the archive tip"
+        );
+    }
+
+    #[test]
+    fn offline_import_refuses_tip_without_provenance() {
+        // A data directory whose tip came from anywhere but this importer
+        // (here: blocks connected directly, as a live `AssumeValid`/`Fast`
+        // run would leave them) carries no provenance record, so the import
+        // refuses instead of skipping unexecuted scripts into a full-validation
+        // certificate. The corpus path is never even opened: the tip check
+        // runs first.
+        let archive = two_block_archive();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join("node");
+        {
+            let live =
+                crate::state::NodeState::open(offline_import_config(&data_dir), None)
+                    .expect("open node");
+            for block in &archive.blocks {
+                live.apply_block(&bitcoin_rs_primitives::BlockPayload::from_local(
+                    block.clone(),
+                ))
+                .expect("connect");
+            }
+            // No provenance written; dropping releases the data-dir lock so
+            // the entry point below can reopen the directory.
+        }
+        let (corpus, manifest) = write_archive_fixture(dir.path(), &archive);
+        let error = run_offline_import(
+            offline_import_config(&data_dir),
+            &corpus,
+            &manifest,
+            &dir.path().join("state.json"),
+        )
+        .expect_err("tip without provenance refuses");
+        let message = error.to_string();
+        assert!(
+            message.contains("provenance") && message.contains("fresh data directory"),
+            "refusal must name provenance and the remedy, got: {message}"
+        );
     }
 
     #[test]
