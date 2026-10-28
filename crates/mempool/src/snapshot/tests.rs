@@ -51,9 +51,6 @@ impl AdmissionChain for Coins {
 #[derive(Default)]
 struct Seen(Mutex<Vec<crate::MutationEnvelope>>);
 impl crate::MempoolObserver for Seen {
-    fn wants_accepted_transactions(&self) -> bool {
-        false
-    }
     fn on_mutation(&self, batch: &crate::MutationEnvelope) {
         self.0.lock().push(batch.clone());
     }
@@ -62,7 +59,10 @@ impl crate::MempoolObserver for Seen {
 fn gateway(limits: MempoolLimits, seen: Option<Arc<Seen>>) -> MempoolGateway {
     MempoolGateway::new(
         Arc::new(RwLock::new(Mempool::new(limits))),
-        seen.map(|observer| -> Arc<dyn crate::MempoolObserver> { observer }),
+        seen.map(|observer| {
+            let leg: Arc<dyn crate::MempoolObserver> = observer;
+            (leg, crate::BodyInterest::Metadata)
+        }),
         ValidationEngine::Native,
         None,
     )
