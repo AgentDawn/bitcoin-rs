@@ -27,8 +27,10 @@ use super::{
 };
 use crate::types::{HASH_PREFIX_ROW_SIZE, HashPrefixRow, TxPosition, TxPositionValue, positions_are_valid};
 use crate::{
-    IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexSnapshot,
+    IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily,
 };
+#[cfg(test)]
+use crate::TxIndexSnapshot;
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
 use std::cmp::Reverse;
