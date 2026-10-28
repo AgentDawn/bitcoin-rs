@@ -701,13 +701,7 @@ mod tests {
         assert!(!scheduler.body_unavailable.refuses(racer, unknown, now));
 
         assert!(release_unavailable_body(&mut scheduler, owner, hash, now));
-use super::BODY_UNAVAILABLE_RETRY;
-    use super::MAX_UNAVAILABLE_BODY_RECORDS;
-    use bitcoin_rs_primitives::Hash256;
-    use std::net::IpAddr;
-    use std::net::Ipv4Addr;
-    use std::net::SocketAddr;
-    use std::time::Duration;
+    }
 
     fn test_source(port: u16) -> PeerSource {
         PeerSource::for_test(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))

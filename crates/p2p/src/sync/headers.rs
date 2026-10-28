@@ -1827,7 +1827,8 @@ mod stale_tip_routing_tests {
             moved, pre_tip,
             "the above-floor prefix must move the tip before the tail fails"
         );
-        let fresh = crate::PeerSource::for_test(([127, 0, 0, 1], 18499).into());
+        let fresh =
+            crate::PeerSource::for_test(std::net::SocketAddr::from(([127, 0, 0, 1], 18499)));
         let pending = sync.stale_tips().pending_for(fresh, |_| true);
         assert!(
             pending.contains(&pre_tip),

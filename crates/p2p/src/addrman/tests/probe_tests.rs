@@ -22,7 +22,7 @@ fn collision_book() -> Arc<AddressBook> {
 }
 fn state(book: &AddressBook, addr: PeerEndpoint) -> Candidate {
     let manager = book.state.lock();
-    manager.stored.records[manager.by_addr[&endpoint]].clone()
+    manager.stored.records[manager.by_addr[&addr]].clone()
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn make_tried_clears_all_refs_demotes_and_removes_only_colliding_new_reference()
                 add_ref(&mut manager, victim, &source(2), EPOCH);
             }
             manager.stored.anchors.push(Anchor {
-                endpoint: target(),
+                addr: target(),
                 confirmed_at: EPOCH - 10,
             });
         }
@@ -84,7 +84,7 @@ fn make_tried_clears_all_refs_demotes_and_removes_only_colliding_new_reference()
         assert_eq!(refs(&manager, target()), 1);
         assert_eq!(refs(&manager, victim), victim_refs - 1);
         assert_eq!(
-            manager.stored.anchors[0].endpoint,
+            manager.stored.anchors[0].addr,
             target(),
             "demotion retains anchor identity"
         );
@@ -197,7 +197,7 @@ fn anchors_consume_durably_and_return_original_metadata_only_before_dispatch() {
     assert_eq!(
         manager.stored.anchors,
         [Anchor {
-            endpoint: addr(2),
+            addr: addr(2),
             confirmed_at: EPOCH
         }]
     );
@@ -227,7 +227,7 @@ fn failed_anchor_consumption_exposes_no_claims_and_newer_confirmation_wins_retur
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            endpoint: target(),
+            addr: target(),
             confirmed_at: EPOCH
         }]
     );
@@ -240,7 +240,7 @@ fn failed_anchor_consumption_exposes_no_claims_and_newer_confirmation_wins_retur
             .stored
             .anchors,
         [Anchor {
-            endpoint: target(),
+            addr: target(),
             confirmed_at: EPOCH
         }]
     );
@@ -254,7 +254,7 @@ fn failed_anchor_consumption_exposes_no_claims_and_newer_confirmation_wins_retur
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            endpoint: target(),
+            addr: target(),
             confirmed_at: EPOCH + 100
         }]
     );
@@ -278,10 +278,11 @@ fn manager_from_collision_snapshot(row: &serde_json::Value) -> Manager {
         }
         manager.stored.records.push(Candidate {
             creation_id: u64::try_from(manager.stored.records.len()).expect("creation ID"),
-            endpoint: entry["endpoint"]
+            addr: entry["endpoint"]
                 .as_str()
                 .expect("endpoint")
-                .parse_endpoint(),
+                .parse()
+                .expect("address"),
             services: Some(9),
             source: Source::Ip(
                 entry["primary_source"]
@@ -311,7 +312,8 @@ fn manager_from_collision_snapshot(row: &serde_json::Value) -> Manager {
             row["second_challenger"]["endpoint"]
                 .as_str()
                 .expect("second")
-                .parse_endpoint(),
+                .parse()
+                .expect("address"),
         );
     }
     manager.last_good = row["last_good"].as_u64().expect("good");
@@ -343,10 +345,11 @@ fn assert_collision_snapshot(manager: &Manager, row: &serde_json::Value) {
         let addr: PeerEndpoint = entry["endpoint"]
             .as_str()
             .expect("endpoint")
-            .parse_endpoint();
+            .parse()
+            .expect("address");
         let actual = manager
             .by_addr
-            .get(&endpoint)
+            .get(&addr)
             .map(|index| &manager.stored.records[*index]);
         assert_eq!(
             actual.is_some(),
@@ -384,7 +387,7 @@ fn assert_collision_snapshot(manager: &Manager, row: &serde_json::Value) {
             .map(|bucket| {
                 vec![
                     usize::from(*bucket),
-                    manager.new_slot(endpoint, usize::from(*bucket)) % 64,
+                    manager.new_slot(addr, usize::from(*bucket)) % 64,
                 ]
             })
             .collect();
@@ -420,7 +423,7 @@ fn collision_transitions_match_actual_core_snapshots() {
             .stored
             .records
             .iter()
-            .map(|entry| entry.endpoint)
+            .map(|entry| entry.addr)
             .collect();
         manager.resolve_collisions(&HashSet::new(), &allowed, EPOCH);
         assert_collision_snapshot(&manager, after);
@@ -453,14 +456,14 @@ fn collision_queue_counts_challengers_and_caps_ten_even_for_one_incumbent() {
             .parse()
             .expect("address");
         assert!(manager.learn(
-            endpoint,
+            addr,
             Some(9),
             source(u8::try_from(index + 2).expect("source")),
             EPOCH - 100_000,
             EPOCH,
             0
         ));
-        assert!(!manager.good(endpoint, true, EPOCH - 30));
+        assert!(!manager.good(addr, true, EPOCH - 30));
         let expected = rows
             .iter()
             .find(|row| row["case"] == format!("queue-add-{}", index + 1))
@@ -559,7 +562,7 @@ fn anchor_reservation_precedes_publication_and_failed_commit_rolls_it_back() {
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            endpoint: target(),
+            addr: target(),
             confirmed_at: EPOCH
         }]
     );
@@ -571,7 +574,7 @@ fn anchor_reservation_precedes_publication_and_failed_commit_rolls_it_back() {
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            endpoint: target(),
+            addr: target(),
             confirmed_at: EPOCH
         }],
         "preexisting dial cannot consume an unused anchor"
@@ -596,7 +599,7 @@ fn collision_resolution_uses_creation_order_not_reversed_good_order() {
         .stored
         .records
         .iter()
-        .map(|entry| entry.endpoint)
+        .map(|entry| entry.addr)
         .collect();
     manager.resolve_collisions(&HashSet::new(), &allowed, EPOCH);
     assert!(manager.stored.records[manager.by_addr[&challenger()]].tried);
@@ -683,7 +686,7 @@ fn returned_anchor_releases_same_as_group_and_rejection_preserves_other_purposes
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            endpoint: anchor,
+            addr: anchor,
             confirmed_at: EPOCH
         }]
     );

@@ -296,7 +296,7 @@ fn losing_fork_credit_survives_winner_disconnect() -> TestResult {
         peers
             .infos()
             .into_iter()
-            .find(|info| info.endpoint == Some(crate::PeerEndpoint::Ip(peer_a)))
+            .find(|info| info.endpoint == peer_a.endpoint())
             .ok_or("peer A info missing")?
             .best_known_height,
         0,
@@ -314,7 +314,7 @@ fn losing_fork_credit_survives_winner_disconnect() -> TestResult {
         peers
             .infos()
             .into_iter()
-            .find(|info| info.endpoint == Some(crate::PeerEndpoint::Ip(peer_a)))
+            .find(|info| info.endpoint == peer_a.endpoint())
             .ok_or("peer A info missing after reorg")?
             .best_known_height,
         2,

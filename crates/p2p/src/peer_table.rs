@@ -1418,18 +1418,18 @@ mod tests {
         let second_remote = PeerRemote::AnonymousTor(second.connection_id());
         table.register(first_remote, first.clone());
         table.register(second_remote, second.clone());
-        let source = first.source(first_remote);
+        let source = first.source(None);
         let token = bitcoin_rs_mempool::PeerToken::from(source);
         assert_eq!(token.addr, None);
         assert_eq!(PeerSource::from(token), source);
         assert_ne!(
             token,
-            bitcoin_rs_mempool::PeerToken::from(second.source(second_remote))
+            bitcoin_rs_mempool::PeerToken::from(second.source(None))
         );
         assert_eq!(table.live_inbound_count(), 2);
         assert!(table.remove_current(first_remote, &first));
         assert!(!table.is_current(PeerSource::from(token)));
-        assert!(table.is_current(second.source(second_remote)));
+        assert!(table.is_current(second.source(None)));
         assert_eq!(table.live_inbound_count(), 1);
     }
 
@@ -1467,8 +1467,8 @@ mod tests {
     }
     use crate::test_support::QueuedMessages as _;
 
-    fn addr(port: u16) -> PeerRemote {
-        PeerRemote::from(([127, 0, 0, 1], port))
+    fn addr(port: u16) -> PeerEndpoint {
+        PeerEndpoint::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
     }
 
     fn lease() -> PeerLease {
@@ -1476,7 +1476,7 @@ mod tests {
         PeerLease::new(tx)
     }
 
-    fn info(addr: PeerRemote, start_height: i32) -> PeerInfo {
+    fn info(addr: PeerEndpoint, start_height: i32) -> PeerInfo {
         info_with_counters(
             addr,
             start_height,
@@ -1485,14 +1485,14 @@ mod tests {
     }
 
     fn info_with_counters(
-        addr: PeerRemote,
+        addr: PeerEndpoint,
         start_height: i32,
         counters: std::sync::Arc<crate::counters::PeerCounters>,
     ) -> PeerInfo {
         PeerInfo {
-            addr,
-            endpoint: addr.endpoint(),
-            network: addr.network().into(),
+            addr: PeerRemote::Endpoint(addr),
+            endpoint: Some(addr),
+            network: addr.net(),
             version: 70016,
             wtxid_relay: false,
             relay_transactions: true,
@@ -1505,8 +1505,7 @@ mod tests {
             conn_time: 0,
             inbound: false,
             addr_bind: crate::TransportRemote::new(
-                addr.endpoint()
-                    .and_then(crate::PeerEndpoint::socket_addr)
+                addr.socket_addr()
                     .unwrap_or_else(|| panic!("expected IP fixture")),
             ),
             time_offset: 0,
@@ -1918,27 +1917,23 @@ mod tests {
         );
     }
 
-    fn flooder(port: u16) -> PeerRemote {
-        PeerRemote::from(([1, 2, 3, 4], port))
+    fn flooder(port: u16) -> PeerEndpoint {
+        PeerEndpoint::Ip(std::net::SocketAddr::from(([1, 2, 3, 4], port)))
     }
 
-    fn newcomer() -> PeerRemote {
-        PeerRemote::from(([5, 6, 7, 8], 8333))
+    fn newcomer() -> PeerEndpoint {
+        PeerEndpoint::Ip(std::net::SocketAddr::from(([5, 6, 7, 8], 8333)))
     }
 
-    fn netgroup(addr: PeerRemote) -> Vec<u8> {
-        crate::netgroup::NetGroups::default().group(
-            addr.endpoint()
-                .unwrap_or_else(|| panic!("known destination"))
-                .address(),
-        )
+    fn netgroup(addr: PeerEndpoint) -> Vec<u8> {
+        crate::netgroup::NetGroups::default().group(addr.address())
     }
 
     /// Offers an inbound `lease` from `addr` to a table capped at
     /// `max_inbound`.
     fn offer(
         table: &PeerTable,
-        addr: PeerRemote,
+        addr: PeerEndpoint,
         lease: PeerLease,
         max_inbound: usize,
     ) -> Option<PeerLease> {
@@ -2352,7 +2347,7 @@ mod tests {
                 .port()
                 == 2
         });
-        assert_eq!(removed, vec![addr(2)]);
+        assert_eq!(removed, vec![crate::PeerRemote::Endpoint(addr(2))]);
         assert!(b.is_cancelled());
         assert!(!a.is_cancelled());
         assert_eq!(table.len(), 1);
@@ -2569,7 +2564,7 @@ mod tests {
                 .port()
                 == 2
         });
-        assert_eq!(removed, vec![addr(2)]);
+        assert_eq!(removed, vec![crate::PeerRemote::Endpoint(addr(2))]);
         assert_eq!(table.traffic_totals(), (0, 42));
 
         drop(stream_second);

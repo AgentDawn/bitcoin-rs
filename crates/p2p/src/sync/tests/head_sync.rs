@@ -260,7 +260,7 @@ fn staged_body_retries_after_source_replacement_without_replacement_credit() -> 
     let replacement_session = peers
         .sessions()
         .into_iter()
-        .find(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+        .find(|session| session.endpoint == peer.endpoint())
         .ok_or("replacement peer session missing")?;
     assert!(
         !replacement_session.demonstrated_tips.contains(&block3_hash),
@@ -398,7 +398,7 @@ fn known_header_batch_still_credits_the_announcer() -> TestResult {
         peers
             .infos()
             .into_iter()
-            .find(|info| info.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+            .find(|info| info.endpoint == peer.endpoint())
             .ok_or("peer info missing")?
             .best_known_height,
         1,
@@ -1010,7 +1010,7 @@ fn staged_retry_acceptance_credits_the_delivering_peer() -> TestResult {
     let session = peers
         .sessions()
         .into_iter()
-        .find(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+        .find(|session| session.endpoint == peer.endpoint())
         .ok_or("peer session missing")?;
     assert_eq!(
         session.demonstrated_tips,
@@ -1056,7 +1056,7 @@ fn fork_tip_attests_its_shared_active_ancestor() -> TestResult {
         peers
             .infos()
             .into_iter()
-            .find(|info| info.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+            .find(|info| info.endpoint == peer.endpoint())
             .ok_or("peer info missing")?
             .best_known_height,
         1,
@@ -1089,7 +1089,7 @@ fn fork_evidence_cannot_credit_a_tainted_ancestor_height() -> TestResult {
         peers
             .infos()
             .into_iter()
-            .find(|info| info.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+            .find(|info| info.endpoint == peer.endpoint())
             .map(|info| info.best_known_height)
     };
     assert_eq!(peer_height(), Some(1));
@@ -1145,7 +1145,7 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> TestResult {
         peers
             .sessions()
             .into_iter()
-            .find(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+            .find(|session| session.endpoint == peer.endpoint())
             .ok_or("peer session missing")?
             .demonstrated_tips,
         vec![Hash256::from(fork_tip.compute_hash())],
@@ -1169,7 +1169,7 @@ fn retained_unresolved_tips_are_deduplicated_and_capped() -> TestResult {
     let retained = peers
         .sessions()
         .into_iter()
-        .find(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+        .find(|session| session.endpoint == peer.endpoint())
         .ok_or("peer session missing")?
         .demonstrated_tips;
     assert_eq!(
@@ -1228,7 +1228,7 @@ fn delivered_tip_evidence_is_compacted_to_the_max_resolving_tip() -> TestResult 
         peers
             .sessions()
             .into_iter()
-            .find(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(peer)))
+            .find(|session| session.endpoint == peer.endpoint())
             .ok_or("peer session missing")?
             .demonstrated_tips,
         vec![Hash256::from(tip2.compute_hash())],

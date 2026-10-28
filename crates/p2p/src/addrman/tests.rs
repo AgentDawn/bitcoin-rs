@@ -61,11 +61,7 @@ fn invalid_and_duplicate_addresses_do_not_create_records() {
     book.learn_peer(
         addr(2).address(),
         &[
-            (
-                crate::parse_endpoint("127.0.0.1:1").expect("addr"),
-                9,
-                10_000,
-            ),
+            ("127.0.0.1:1".parse().expect("addr"), 9, 10_000),
             (addr(1), 9, 20_000),
         ],
         10_000,
@@ -107,7 +103,7 @@ fn promotion_collision_never_overwrites_a_proven_peer() {
     let incumbent = book.state.lock().stored.records[0].clone();
     let challenger = {
         let manager = book.state.lock();
-        let target = manager.tried_slot(incumbent.endpoint);
+        let target = manager.tried_slot(incumbent.addr);
         (1..65535_u16)
             .map(|port| PeerEndpoint::new(first.address(), port))
             .find(|candidate| *candidate != first && manager.tried_slot(*candidate) == target)
@@ -121,7 +117,7 @@ fn promotion_collision_never_overwrites_a_proven_peer() {
             .stored
             .records
             .iter()
-            .find(|entry| entry.endpoint == first)
+            .find(|entry| entry.addr == first)
             .expect("incumbent")
             .tried
     );
@@ -130,7 +126,7 @@ fn promotion_collision_never_overwrites_a_proven_peer() {
             .stored
             .records
             .iter()
-            .find(|entry| entry.endpoint == challenger)
+            .find(|entry| entry.addr == challenger)
             .expect("challenger")
             .tried
     );
@@ -533,17 +529,17 @@ fn assert_indexes(manager: &Manager) {
     assert_eq!(manager.by_addr.len(), manager.stored.records.len());
     let mut count = 0;
     for (index, entry) in manager.stored.records.iter().enumerate() {
-        assert_eq!(manager.by_addr.get(&entry.endpoint), Some(&index));
+        assert_eq!(manager.by_addr.get(&entry.addr), Some(&index));
         if entry.tried {
             assert_eq!(
-                manager.tried[manager.tried_slot(entry.endpoint)],
+                manager.tried[manager.tried_slot(entry.addr)],
                 u32::try_from(index).expect("index")
             );
             count += 1;
         } else {
             for bucket in &entry.new_buckets {
                 assert_eq!(
-                    manager.new[manager.new_slot(entry.endpoint, usize::from(*bucket))],
+                    manager.new[manager.new_slot(entry.addr, usize::from(*bucket))],
                     u32::try_from(index).expect("index")
                 );
                 count += 1;
@@ -637,7 +633,7 @@ fn health_matches_71_actual_core_boundaries_and_probabilities() {
     for row in data["rows"].as_array().expect("rows") {
         let entry = Candidate {
             creation_id: 0,
-            endpoint: target(),
+            addr: target(),
             services: Some(9),
             source: source(1),
             last_seen: row["seen"].as_u64().expect("seen"),
@@ -978,7 +974,7 @@ fn stale_future_and_outage_candidates_survive_until_actual_new_slot_replacement(
 fn capacity_and_file_budget_have_explicit_bounded_representations() {
     let entry = Candidate {
         creation_id: 0,
-        endpoint: "2fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+        addr: "2fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
             .parse::<IpAddr>()
             .map(|ip| PeerEndpoint::new(ip, u16::MAX))
             .expect("IP"),
@@ -1073,7 +1069,7 @@ fn assert_core_operation(manager: &Manager, case: &str, accepted: Option<bool>) 
         let seen = entry.map_or(-1, |entry| i64::try_from(entry.last_seen).expect("seen"));
         assert_eq!(seen, expected["seen"].as_i64().expect("seen"), "{case}");
         if let Some(present) = expected["other_present"].as_bool() {
-            let other = crate::parse_endpoint("8.8.9.89:8333").expect("collider");
+            let other = "8.8.9.89:8333".parse().expect("collider");
             assert_eq!(manager.by_addr.contains_key(&other), present, "{case}");
             assert_eq!(
                 refs(manager, other),
@@ -1107,7 +1103,7 @@ fn all_24_addsingle_attempt_good_observations_match_actual_core() {
         assert_core_operation(&manager, &format!("source-{n}"), Some(accepted));
     }
     drop(manager);
-    let other = crate::parse_endpoint("8.8.9.89:8333").expect("collider");
+    let other = "8.8.9.89:8333".parse().expect("collider");
     let book = oracle_book();
     let mut manager = book.state.lock();
     manager.learn(target(), Some(0), source(1), EPOCH - 1000, EPOCH, 0);
@@ -1229,8 +1225,7 @@ fn ring_manager(second_port: u16) -> (Manager, PeerEndpoint, PeerEndpoint) {
                 .parse::<IpAddr>()
                 .expect("ip"),
             port,
-        )
-        .into();
+        );
         assert!(manager.learn(peer, Some(9), source(1), EPOCH, EPOCH, 0));
         let bucket = usize::try_from(row["new_bucket"].as_u64().expect("bucket")).expect("bucket");
         assert_eq!(
@@ -1330,7 +1325,7 @@ fn table_choice_is_half_even_when_new_health_is_bad_and_selection_work_is_bounde
         .stored
         .records
         .iter()
-        .map(|entry| entry.endpoint == bad)
+        .map(|entry| entry.addr == bad)
         .collect();
     for _ in 0..1000 {
         assert_eq!(manager.select(&eligible, EPOCH), Some(bad));

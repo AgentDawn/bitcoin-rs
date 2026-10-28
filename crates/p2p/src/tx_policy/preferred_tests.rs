@@ -469,7 +469,7 @@ fn registered_inbound(
         bitcoin::p2p::ServiceFlags::NETWORK | bitcoin::p2p::ServiceFlags::WITNESS,
     );
     table.publish_info(
-        crate::PeerEndpoint::Ip(addr),
+        addr,
         &lease,
         crate::PeerInfo::inbound_from_version(
             addr,
@@ -481,7 +481,7 @@ fn registered_inbound(
             Arc::new(crate::PeerCounters::default()),
         ),
     );
-    (lease.source_ip(addr), receiver)
+    (lease.source(Some(addr)), receiver)
 }
 
 #[test]

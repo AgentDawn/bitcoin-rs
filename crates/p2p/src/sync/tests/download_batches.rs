@@ -370,7 +370,7 @@ fn ineligible_peers_receive_no_block_requests_during_fanout() -> TestResult {
     sync.tick();
     sync.tick();
     assert!(
-        !peers.is_connected(crate::PeerEndpoint::Ip(test_addr(9250, 0)?)),
+        !peers.is_connected(test_addr(9250, 0)?),
         "a peer that misses the request timeout must release its outbound slot"
     );
     assert!(

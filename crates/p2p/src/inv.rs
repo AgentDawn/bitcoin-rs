@@ -142,7 +142,7 @@ pub(crate) const fn is_within_inventory_bound(items: &[Inventory]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin_rs_primitives::PeerEndpoint;
+    use std::net::SocketAddr;
 
     use bitcoin::hashes::Hash as _;
 
@@ -372,6 +372,7 @@ mod tests {
 
         let stale = PeerToken {
             endpoint: None,
+            addr: None,
             connection_id: source.connection_id.wrapping_add(1),
         };
         assert!(!request_missing_parents(&table, stale, &[parent(1)]));

@@ -146,10 +146,7 @@ fn superseded_session_gets_no_probe_and_cannot_send_getheaders() -> TestResult {
     let old_source = current_source(&peers, peer);
 
     let (replacement_tx, replacement_rx) = crate::test_support::message_channel();
-    peers.register(
-        crate::PeerEndpoint::Ip(peer),
-        PeerLease::new(replacement_tx),
-    );
+    peers.register(peer, PeerLease::new(replacement_tx));
 
     sync.tick();
 
@@ -269,7 +266,7 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick() -> TestResult {
         !peers
             .sessions()
             .iter()
-            .any(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(low))),
+            .any(|session| session.endpoint == low.endpoint()),
         "the failed probe source must be evicted instead of lingering table-resident",
     );
 
@@ -288,7 +285,7 @@ fn failed_probe_send_falls_back_to_best_peer_in_the_same_tick() -> TestResult {
             .lock()
             .header_request()
             .map(|request| request.source.endpoint),
-        Some(Some(crate::PeerEndpoint::Ip(high))),
+        Some(high.endpoint()),
         "the fallback owner must hold the pending request"
     );
     assert!(high_rx.try_recv().is_err());
@@ -329,7 +326,7 @@ fn failed_probe_send_excludes_dead_highest_peer_from_header_fallback() -> TestRe
             .lock()
             .header_request()
             .map(|request| request.source.endpoint),
-        Some(Some(crate::PeerEndpoint::Ip(live))),
+        Some(live.endpoint()),
         "the lower live peer must own the fallback request"
     );
     assert!(live_rx.try_recv().is_err());
@@ -382,7 +379,7 @@ fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick() -> TestResult 
         !peers
             .sessions()
             .iter()
-            .any(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(dead))),
+            .any(|session| session.endpoint == dead.endpoint()),
         "the dead peer session must not survive into the next tick",
     );
     assert_ne!(
@@ -390,7 +387,7 @@ fn dead_probe_peer_is_evicted_and_not_repicked_on_the_next_tick() -> TestResult 
             .lock()
             .header_request()
             .map(|request| request.source.endpoint),
-        Some(Some(crate::PeerEndpoint::Ip(dead))),
+        Some(dead.endpoint()),
         "the pending request must not be keyed to the dead addr",
     );
     let request = next_getheaders(&live_rx)?;
@@ -412,21 +409,21 @@ fn reconciler_sweeps_cancelled_lease_sessions_within_one_tick() -> TestResult {
     let addr = test_addr(9767, 0)?;
     let _rx = connect_peer(&peers, synthetic_peer(addr, 5));
     peers
-        .lease(crate::PeerEndpoint::Ip(addr))
+        .lease(addr)
         .ok_or("peer missing from table")?
         .cancel();
     assert!(
         peers
             .sessions()
             .iter()
-            .any(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(addr)))
+            .any(|session| session.endpoint == addr.endpoint())
     );
     sync.tick();
     assert!(
         !peers
             .sessions()
             .iter()
-            .any(|session| session.endpoint == Some(crate::PeerEndpoint::Ip(addr))),
+            .any(|session| session.endpoint == addr.endpoint()),
         "the reconciler must sweep cancelled-lease sessions",
     );
     Ok(())

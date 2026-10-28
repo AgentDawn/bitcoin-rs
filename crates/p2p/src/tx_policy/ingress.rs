@@ -1282,7 +1282,8 @@ mod tests {
         assert_eq!(capacity.held(), 1);
 
         // A replacement connection cannot adopt the claim.
-        let replacement = PeerSource::for_test(([127, 0, 0, 1], 8333).into());
+        let replacement =
+            PeerSource::for_test(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
         let rep_payload = make_payload(&[tx]);
         let rep_err = table.admit_package(&capacity, &inventory, replacement, rep_payload);
         assert_eq!(rep_err.err(), Some(PackageRefusal::Unsolicited));

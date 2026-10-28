@@ -312,16 +312,18 @@ mod tests {
         let table = PeerTable::new();
         let (tx, _rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(tx);
-        assert!(!table.register(crate::PeerEndpoint::Ip(peer), lease.clone()));
+        let bind_socket = bind
+            .endpoint()
+            .and_then(crate::PeerEndpoint::socket_addr)
+            .unwrap_or_else(|| panic!("expected IP fixture"));
+        assert!(!table.register(peer, lease.clone()));
         assert!(
             table.publish_info(
-                crate::PeerEndpoint::Ip(peer),
+                peer,
                 &lease,
                 PeerInfo::inbound_from_version(
                     peer,
-                    bind.endpoint()
-                        .and_then(crate::PeerEndpoint::socket_addr)
-                        .unwrap_or_else(|| panic!("expected IP fixture")),
+                    bind_socket,
                     &fake_version(),
                     0,
                     0,
@@ -333,8 +335,11 @@ mod tests {
 
         let infos = table.infos();
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].endpoint, Some(crate::PeerEndpoint::Ip(peer)));
-        assert_eq!(infos[0].addr_bind, crate::TransportRemote::new(bind));
+        assert_eq!(infos[0].endpoint, peer.endpoint());
+        assert_eq!(
+            infos[0].addr_bind,
+            crate::TransportRemote::new(bind_socket)
+        );
         assert_ne!(
             infos[0].endpoint,
             Some(crate::PeerEndpoint::Ip(infos[0].addr_bind.socket_addr()))

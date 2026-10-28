@@ -355,10 +355,13 @@ mod tests {
     use super::super::HeaderRequestState;
     use super::*;
     use crate::connection::PeerSource;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr};
 
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    fn addr(port: u16) -> crate::PeerRemote {
+        crate::PeerRemote::Endpoint(crate::PeerEndpoint::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+        ))
     }
 
     fn usable(source: PeerSource) -> UsablePeer {

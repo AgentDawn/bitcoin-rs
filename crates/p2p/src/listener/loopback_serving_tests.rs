@@ -252,7 +252,7 @@ impl Client {
             0,
             &lease,
             Instant::now() + FAILSAFE,
-            crate::PeerEndpoint::Ip(node.addr),
+            node.addr,
             &own,
         )?;
         let mut client = Self {

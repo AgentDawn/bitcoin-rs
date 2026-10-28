@@ -684,8 +684,8 @@ mod tests {
         } else {
             crate::PeerLease::new(sender)
         };
-        let source = lease.source_ip(addr);
-        table.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+        let source = lease.source(Some(addr));
+        table.register(addr, lease.clone());
         if ready {
             let version = crate::handshake::version_message(
                 1,
@@ -703,7 +703,7 @@ mod tests {
                 Arc::new(crate::PeerCounters::default()),
             );
             info.wtxid_relay = wtxid;
-            table.publish_info(crate::PeerEndpoint::Ip(addr), &lease, info);
+            table.publish_info(addr, &lease, info);
         }
         (source, receiver)
     }
@@ -1077,8 +1077,8 @@ mod tests {
         let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
         let (sender, receiver) = message_channel_bounded(1024);
         let lease = crate::PeerLease::new(sender).with_shared_budget(aggregate);
-        let source = lease.source_ip(addr);
-        table.register(crate::PeerEndpoint::Ip(addr), lease.clone());
+        let source = lease.source(Some(addr));
+        table.register(addr, lease.clone());
         let version = crate::handshake::version_message(
             1,
             0,
@@ -1095,7 +1095,7 @@ mod tests {
             Arc::new(crate::PeerCounters::default()),
         );
         info.wtxid_relay = true;
-        table.publish_info(crate::PeerEndpoint::Ip(addr), &lease, info);
+        table.publish_info(addr, &lease, info);
         (source, receiver)
     }
 

@@ -2972,9 +2972,10 @@ mod tests {
                 best_known_height: 0,
                 conn_time: 0,
                 inbound: false,
-                addr_bind: addr
-                    .socket_addr()
-                    .unwrap_or_else(|| panic!("expected IP fixture")),
+                addr_bind: crate::TransportRemote::new(
+                    addr.socket_addr()
+                        .unwrap_or_else(|| panic!("expected IP fixture")),
+                ),
                 time_offset: 0,
                 counters: Arc::new(crate::PeerCounters::default()),
                 transport: crate::TransportProtocol::V1,
@@ -3499,11 +3500,11 @@ mod tests {
                 10_000,
                 Arc::new(crate::PeerCounters::default()),
             );
-            table.register(crate::PeerEndpoint::Ip(address), lease.clone());
-            assert!(table.publish_info(crate::PeerEndpoint::Ip(address), &lease, info));
+            table.register(address, lease.clone());
+            assert!(table.publish_info(address, &lease, info));
             if port != 1 {
                 assert!(table.note_announced_tip(
-                    lease.source_ip(address),
+                    lease.source(Some(address)),
                     bitcoin_rs_primitives::Hash256::from_le_bytes(&[7; 32]),
                     Some(2)
                 ));
@@ -5123,7 +5124,7 @@ mod tests {
         let (frames, _outbound) = crossbeam_channel::unbounded();
         let peer = crate::PeerLease::new(frames);
         service.peer_table.register(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 8334)).into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 8334)),
             peer.clone(),
         );
 

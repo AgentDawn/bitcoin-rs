@@ -130,7 +130,7 @@ fn unowned_frontier_schedules_recovery_when_a_capable_peer_exists() {
     match plan.header_action {
         HeaderAction::Probe(source) => assert_eq!(
             source.endpoint,
-            Some(crate::PeerEndpoint::Ip(addr_of(9001)))
+            addr_of(9001).endpoint()
         ),
         action => panic!("expected Probe, got {action:?}"),
     }
@@ -313,7 +313,7 @@ fn probe_rotates_past_the_dead_pending_owner() {
         HeaderAction::Probe(source) => {
             assert_eq!(
                 source.endpoint,
-                Some(crate::PeerEndpoint::Ip(addr_of(9001)))
+                addr_of(9001).endpoint()
             );
             assert_ne!(source, dead_owner);
         }
@@ -333,7 +333,7 @@ fn non_serving_peers_are_never_probe_picks() {
     match frontier.plan().header_action {
         HeaderAction::Probe(source) => assert_eq!(
             source.endpoint,
-            Some(crate::PeerEndpoint::Ip(addr_of(9002)))
+            addr_of(9002).endpoint()
         ),
         action => panic!("expected Probe, got {action:?}"),
     }
@@ -475,9 +475,9 @@ fn convicted_connection_cannot_pass_its_stall_to_a_replacement() -> TestResult {
     let staller = test_addr(9810, 0)?;
     let (tx, rx) = crate::test_support::message_channel();
     let conn1 = PeerLease::new(tx);
-    peers.register(crate::PeerEndpoint::Ip(staller), conn1.clone());
+    peers.register(staller, conn1.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(staller),
+        staller,
         &conn1,
         synthetic_peer(staller, 200),
     );
@@ -506,12 +506,12 @@ fn convicted_connection_cannot_pass_its_stall_to_a_replacement() -> TestResult {
             None,
             block,
             serialized,
-            Some(conn1.source_ip(staller)),
+            Some(conn1.source(staller.endpoint())),
             now,
         );
         scheduler
             .window
-            .mark_received_from(tail, 80, Some(conn1.source_ip(staller)), now);
+            .mark_received_from(tail, 80, Some(conn1.source(staller.endpoint())), now);
     }
 
     let next_apply = sync
@@ -539,9 +539,9 @@ fn convicted_connection_cannot_pass_its_stall_to_a_replacement() -> TestResult {
     };
     let (tx2, rx2) = crate::test_support::message_channel();
     let conn2 = PeerLease::new(tx2);
-    peers.register(crate::PeerEndpoint::Ip(staller), conn2.clone());
+    peers.register(staller, conn2.clone());
     peers.publish_info(
-        crate::PeerEndpoint::Ip(staller),
+        staller,
         &conn2,
         synthetic_peer(staller, 200),
     );
@@ -551,7 +551,7 @@ fn convicted_connection_cannot_pass_its_stall_to_a_replacement() -> TestResult {
         !peers.disconnect_source(owner),
         "convicting a replaced connection must not disconnect its successor"
     );
-    let conn2_source = conn2.source_ip(staller);
+    let conn2_source = conn2.source(staller.endpoint());
     assert!(peers.is_current(conn2_source));
     assert!(!conn2.is_cancelled());
     sync.reconcile_peer_sessions();
