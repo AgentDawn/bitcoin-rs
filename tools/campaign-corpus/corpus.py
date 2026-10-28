@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import http.client
 import json
 import os
 import re
+import stat
 import struct
 import sys
 import uuid
@@ -1159,12 +1161,44 @@ def _lower_hex(value: object, label: str, digits: int) -> str:
     return text
 
 
+def _open_source_nofollow(path: Path) -> BinaryIO:
+    """Open an indexed source without following symlinks.
+
+    `_source_path` validation and `open()` are otherwise a TOCTOU pair: a
+    symlink swapped in between would be followed and hashed. `O_NOFOLLOW`
+    makes the open itself authoritative: a symlink fails with `ELOOP`
+    instead of being traversed, and `fstat` pins regular-file identity
+    before the descriptor is wrapped.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as err:
+        if err.errno == errno.ELOOP:
+            raise ContractError(f"source {path.name!r} must not be a symlink") from err
+        raise ContractError(f"cannot open source file {path}: {err}") from err
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError as err:
+        os.close(fd)
+        raise ContractError(f"cannot stat source file {path}: {err}") from err
+    if not stat.S_ISREG(mode):
+        os.close(fd)
+        raise ContractError(f"source {path.name!r} is not a regular file")
+    return os.fdopen(fd, "rb")
+
+
 def _hash_file(path: Path) -> tuple[int, str]:
-    """Stream a source file, returning its size and SHA-256 hex digest."""
+    """Stream a source file, returning its size and SHA-256 hex digest.
+
+    The open never follows symlinks (see `_open_source_nofollow`), so a
+    symlink swapped in after `_source_path` validation fails closed here
+    instead of hashing attacker-chosen bytes.
+    """
     hasher = hashlib.sha256()
     size = 0
+    handle = _open_source_nofollow(path)
     try:
-        with open(path, "rb") as handle:
+        with handle:
             while True:
                 chunk = handle.read(1 << 20)
                 if not chunk:
@@ -1223,12 +1257,7 @@ class _SingleSourceReader:
         if self._current != entry.source:
             self.close()
             path = _source_path(self._source_dir, recorded.name)
-            try:
-                self._handle = self._stack.enter_context(path.open("rb"))
-            except OSError as err:
-                raise ContractError(
-                    f"cannot open source {recorded.name}: {err}"
-                ) from err
+            self._handle = self._stack.enter_context(_open_source_nofollow(path))
             self._current = entry.source
         handle = self._handle
         if handle is None:
@@ -1692,7 +1721,9 @@ def build_index_from_scan(
     links, so side-branch blocks in the same files are ignored. Every source
     is fully hashed (streaming) before any frame is accepted, so same-length
     source replacement is rejected. Frames are re-read in height order to bind
-    the logical digest. Full proof-of-work, merkle-root recomputation, and
+    the logical digest, and every source is re-hashed after the re-read: a
+    file mutated between the pre-hash, the scan, and the re-read fails the
+    build instead of publishing an index over mixed generations. Full proof-of-work, merkle-root recomputation, and
     coinbase consensus rules are not reimplemented here: they remain owned by
     the Rust validation engines that consume the identical logical byte stream
     (the same bytes the packed archive carries), plus ``classify_census`` for
@@ -1722,13 +1753,14 @@ def build_index_from_scan(
         _check_source_name(name)
     sources: list[IndexSource] = []
     for name in blk_names:
-        size, digest = _hash_file(source_dir / name)
+        validated = _source_path(source_dir, name)
+        size, digest = _hash_file(validated)
         sources.append(IndexSource(name=name, size=size, sha256=digest))
     by_hash: dict[str, _ScanRecord] = {}
     for position, source in enumerate(sources):
         path = _source_path(source_dir, source.name)
         try:
-            with open(path, "rb") as handle:
+            with _open_source_nofollow(path) as handle:
                 for meta, payload in iter_frames(handle, freeze.network_magic):
                     block_hash = header_block_hash(payload)
                     prev_display = payload[4:36][::-1].hex()
@@ -1794,6 +1826,7 @@ def build_index_from_scan(
             )
     finally:
         reader.close()
+    _reverify_sources(source_dir, sources)
     scratch = _unique_scratch(index_path)
     try:
         with open(scratch, "xb") as index_fh:
@@ -1809,6 +1842,25 @@ def build_index_from_scan(
         except OSError as err:
             print(f"warning: cannot remove index scratch file: {err}", file=sys.stderr)
     return summary
+
+
+def _reverify_sources(source_dir: Path, sources: Sequence[IndexSource]) -> None:
+    """Re-hash every source after the scan/re-read and refuse on drift.
+
+    The pre-hash, the frame scan, and the height-ordered re-read are three
+    separate opens. Without this gate a file replaced mid-build could mix
+    generations: the scan would locate frames in one generation while the
+    re-read binds digests from another. Re-hashing here binds all three
+    passes to one generation before `writer.finish` runs.
+    """
+    for source in sources:
+        path = _source_path(source_dir, source.name)
+        size, digest = _hash_file(path)
+        if size != source.size or digest != source.sha256:
+            raise ContractError(
+                f"source {source.name} changed during the scan;"
+                " rebuild on a quiescent directory"
+            )
 
 
 def _actual_frame_spans(
@@ -1827,7 +1879,7 @@ def _actual_frame_spans(
         path = _source_path(source_dir, source.name)
         actual: set[tuple[int, int]] = set()
         try:
-            with open(path, "rb") as handle:
+            with _open_source_nofollow(path) as handle:
                 for meta, _payload in iter_frames(handle, magic):
                     actual.add((meta.offset, meta.payload_length))
         except OSError as err:
