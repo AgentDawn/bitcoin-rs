@@ -8,6 +8,12 @@ native verification uses `secp256k1` for ECDSA, Schnorr and Taproot tweaks
 strict-Rust cryptography implementation. The historical `KeepKernel` verdict
 below does not describe today's manifest defaults or qualify the pending gates.
 
+Implementation and command availability below describe the #1703 checkout,
+not every unmerged branch. The strict-Rust qualification gaps are separate
+from the window attribution spans and harness implemented in
+[#1701](https://github.com/gosuda/bitcoin-rs/pull/1701); see
+[their branch-specific status](window-pipeline-attribution.md).
+
 > **Policy superseded (issue #1117).** The manifest policy this page's recorded
 > verdict (`KeepKernel`) answered — "`kernel` is a library default" — no longer
 > exists: #1117 moved engine selection to the runtime `validation.engine`
