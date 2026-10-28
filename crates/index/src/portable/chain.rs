@@ -10,6 +10,7 @@
 
 use super::artifact::CANCEL_POLL_RECORDS;
 use super::{IndexBundleError, Withheld};
+use std::collections::{HashMap, VecDeque};
 use crate::types::TxPosition;
 use bitcoin_rs_chain::{
     BlockBodySource, BlockTreeReader, ChainTxCount, ChainWork, NodeId, NodeStatus, TipSnapshot,
@@ -299,14 +300,33 @@ pub(super) fn is_top_level_span(position: TxPosition, start: u32, len: u32) -> b
     position.offset() == start && position.byte_len() == len
 }
 
-/// Reads single transactions through the existing body source, with a
-/// one-body memo keyed by block identity. The strict span rule needs the
-/// whole body, so the memo keeps the body together with its parsed top-level
-/// transaction spans: a block is read and parsed once per memo fill, and each
-/// lookup is a binary search plus one transaction decode.
+/// Reads single transactions through the existing body source, with a small
+/// bounded LRU of parsed bodies keyed by block identity. The strict span rule
+/// needs the whole body, so each entry keeps the body together with its
+/// parsed top-level transaction spans: a block is read and parsed once per
+/// cache fill, and each lookup is a binary search plus one transaction
+/// decode.
+///
+/// Stored locator order is transaction-id order, so consecutive records
+/// usually name different heights and a one-body memo reloads and reparses a
+/// block per record. The window keeps recently used bodies resident across
+/// those interleaved lookups.
+///
+/// How many parsed block bodies are kept resident. The bound is on body
+/// count, not bytes: each body is at most `MAX_SERIALIZED_BLOCK_BYTES`
+/// (4 MiB), so eight bodies pin at most ~32 MiB transiently on the bundle
+/// worker.
+const BODY_CACHE_BLOCKS: usize = 8;
+
 pub(super) struct BodyReader<'a> {
     source: &'a dyn BlockBodySource,
-    whole_body: Option<HeldBody>,
+    /// Parsed bodies, most-recently-used first, capped at
+    /// [`BODY_CACHE_BLOCKS`] entries.
+    bodies: VecDeque<HeldBody>,
+    /// Transaction counts observed per `(height, hash)`, retained after the
+    /// body itself is evicted so the completeness pass reuses the first
+    /// parse instead of re-reading the block.
+    counts: HashMap<(u32, Hash256), u64>,
 }
 
 /// One memoized block body and its top-level transaction spans.
@@ -322,7 +342,8 @@ impl<'a> BodyReader<'a> {
     pub(super) fn new(source: &'a dyn BlockBodySource) -> Self {
         Self {
             source,
-            whole_body: None,
+            bodies: VecDeque::with_capacity(BODY_CACHE_BLOCKS),
+            counts: HashMap::new(),
         }
     }
 
@@ -365,42 +386,63 @@ impl<'a> BodyReader<'a> {
     }
 
     /// Transactions the block `(height, hash)` holds, or `None` when the body
-    /// is absent or pruned. Metadata answers without I/O when the source keeps
-    /// it; otherwise the memoized spans give the count.
+    /// is absent or pruned. A count observed while resolving a locator is
+    /// reused without re-reading the block; otherwise metadata answers
+    /// without I/O when the source keeps it, else the cached spans give the
+    /// count.
     pub(super) fn block_tx_count(
         &mut self,
         height: u32,
         hash: Hash256,
     ) -> Result<Option<u64>, IndexBundleError> {
+        if let Some(&count) = self.counts.get(&(height, hash)) {
+            return Ok(Some(count));
+        }
         if let Some(metadata) = self
             .source
             .block_body_metadata(height, BlockHash::from(hash))
         {
-            return u64::try_from(metadata.tx_count).map(Some).map_err(|_| {
+            let count = u64::try_from(metadata.tx_count).map_err(|_| {
                 IndexBundleError::BodyRead {
                     height,
                     reason: "the transaction count does not fit u64".to_owned(),
                 }
-            });
+            })?;
+            self.counts.insert((height, hash), count);
+            return Ok(Some(count));
         }
-        Ok(self
+        let count = self
             .held_body(height, hash)?
-            .map(|held| u64::try_from(held.spans.len()).unwrap_or(u64::MAX)))
+            .map(|held| u64::try_from(held.spans.len()).unwrap_or(u64::MAX));
+        if let Some(count) = count {
+            self.counts.insert((height, hash), count);
+        }
+        Ok(count)
     }
 
-    /// Memoized body and spans for `(height, hash)`, or `None` when the
-    /// source has no body. A read or parse failure is `BodyRead`, never
-    /// `BodyMissing`.
+    /// Cached body and spans for `(height, hash)`, or `None` when the
+    /// source has no body. Hits move the entry to the front of the bounded
+    /// LRU; misses load, parse, count, and evict the least-recently-used
+    /// entry past [`BODY_CACHE_BLOCKS`]. A read or parse failure is
+    /// `BodyRead`, never `BodyMissing`.
     fn held_body(
         &mut self,
         height: u32,
         hash: Hash256,
     ) -> Result<Option<&HeldBody>, IndexBundleError> {
-        let hit = self
-            .whole_body
-            .as_ref()
-            .is_some_and(|held| held.height == height && held.hash == hash);
-        if !hit {
+        if let Some(index) = self
+            .bodies
+            .iter()
+            .position(|held| held.height == height && held.hash == hash)
+        {
+            let held = self
+                .bodies
+                .remove(index)
+                .unwrap_or_else(|| unreachable!("cached body index is in bounds"));
+            self.bodies.push_front(held);
+            return Ok(self.bodies.front());
+        }
+        {
             let body = match self.source.block_body(height, BlockHash::from(hash)) {
                 Ok(Some(body)) => body,
                 Ok(None) => return Ok(None),
@@ -419,15 +461,21 @@ impl<'a> BodyReader<'a> {
                 .transactions()
                 .iter()
                 .map(|tx| (tx.span().start(), tx.span().len()))
-                .collect();
-            self.whole_body = Some(HeldBody {
+                .collect::<Vec<_>>();
+            self.counts
+                .entry((height, hash))
+                .or_insert_with(|| u64::try_from(spans.len()).unwrap_or(u64::MAX));
+            self.bodies.push_front(HeldBody {
                 height,
                 hash,
                 body,
                 spans,
             });
+            while self.bodies.len() > BODY_CACHE_BLOCKS {
+                self.bodies.pop_back();
+            }
         }
-        Ok(self.whole_body.as_ref())
+        Ok(self.bodies.front())
     }
 }
 
