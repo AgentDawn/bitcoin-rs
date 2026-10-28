@@ -2,6 +2,7 @@ use crate::PeerRemote;
 pub(crate) use crate::test_support::{OrFail, TestResult};
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -2881,9 +2882,9 @@ struct NotFoundFixture {
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     blocks: Vec<Block>,
     blocks_tx: InboundBlockSender,
-    owner: SocketAddr,
+    owner: PeerRemote,
     owner_rx: crate::test_support::MessageReceiver,
-    alternate: SocketAddr,
+    alternate: PeerRemote,
     alternate_rx: Option<crate::test_support::MessageReceiver>,
 }
 
