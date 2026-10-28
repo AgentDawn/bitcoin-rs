@@ -3407,6 +3407,99 @@ fn confirmed_payout_with_shallow_depth_reverts_and_restores_reservation() {
     assert_eq!(reserved_total, total, "revert must restore the reservation");
     fund.ledger.check_invariants().fixture("conservation");
 }
+
+/// A chain observer with a transaction index but no script index: transaction
+/// positions answer, spend lookups fail. Mirrors the node observer when
+/// `txindex` is enabled without the spend index.
+struct TxOnlyChain<'a> {
+    inner: &'a FakeChain,
+}
+
+impl ChainView for TxOnlyChain<'_> {
+    fn tip_height(&self) -> Result<u32, ChainViewError> {
+        self.inner.tip_height()
+    }
+    fn block_location(
+        &self,
+        block_hash: &Hash32,
+        claimed_height: u32,
+    ) -> Result<BlockLocation, ChainViewError> {
+        self.inner.block_location(block_hash, claimed_height)
+    }
+    fn coinbase_of(
+        &self,
+        block_hash: &Hash32,
+    ) -> Result<Option<ObservedCoinbase>, ChainViewError> {
+        self.inner.coinbase_of(block_hash)
+    }
+    fn tx_status(&self, txid: &Hash32) -> Result<TxStatus, ChainViewError> {
+        self.inner.tx_status(txid)
+    }
+    fn confirmed_spender(
+        &self,
+        _outpoint: &OutPoint,
+    ) -> Result<Option<ConfirmedSpend>, ChainViewError> {
+        Err(ChainViewError(
+            "payout spend observation requires script index".into(),
+        ))
+    }
+}
+
+#[test]
+fn confirmed_replacement_confirms_without_spend_index() {
+    // With txindex but no script index, a confirmed replacement payout must not
+    // abort reconciliation: the original transaction has left the mempool
+    // (`Unknown`), so its spend lookup would fail, but the replacement's
+    // conclusive confirmation is authoritative on its own. Spend observations
+    // are only required when no batch transaction conclusively confirms.
+    let fund = funded(0, 1_000_001);
+    let batch = prepared(&fund);
+    let first = pay_tx(
+        &batch,
+        &[outpoint(0xA1, 0), outpoint(0xA2, 0)],
+        Some(40_000),
+    );
+    fund.ledger
+        .record_signed(&receipt(&batch, &first))
+        .fixture("first");
+    let replacement = pay_tx(
+        &batch,
+        &[outpoint(0xA2, 0), outpoint(0xA4, 0)],
+        Some(30_000),
+    );
+    fund.ledger
+        .record_signed(&receipt(&batch, &replacement))
+        .fixture("replacement");
+    fund.chain.set_tx(replacement.txid, TxStatus::InMempool);
+    fund.ledger
+        .record_broadcast(&batch.id, &replacement.txid, &fund.chain)
+        .fixture("broadcast replacement");
+    // Depth 2 meets `payout_confirmations = 2`; the original is `Unknown`.
+    confirm_tx(&fund, replacement.txid, 0xB2, 102, 103);
+    let tx_only = TxOnlyChain { inner: &fund.chain };
+    let transitions = fund.ledger.reconcile_payouts(&tx_only).fixture("confirm");
+    assert_eq!(
+        transitions,
+        vec![BatchTransition {
+            batch_id: batch.id,
+            from: BatchState::Broadcast,
+            to: BatchState::Confirmed,
+        }],
+        "authoritative confirmation must win over missing abandonment evidence"
+    );
+    let confirmed = fund
+        .ledger
+        .batch(&batch.id)
+        .fixture("batch")
+        .fixture("exists");
+    assert_eq!(confirmed.state, BatchState::Confirmed);
+    assert_eq!(
+        confirmed.confirmation.fixture("confirmation").txid,
+        replacement.txid
+    );
+    fund.ledger.check_invariants().fixture("invariants");
+}
+
 #[test]
 fn prepare_caps_outputs_by_serialized_weight_before_count() {
     // The count cap alone admits 2,500 P2TR/P2WSH outputs (~430,000 WU) before

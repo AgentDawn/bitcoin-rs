@@ -2437,7 +2437,10 @@ fn observe_batch(
     batch: &PayoutBatch,
     tip: u32,
 ) -> Result<BatchObservation, LedgerError> {
-    let mut txs = Vec::with_capacity(batch.transactions.len());
+    // Phase one: authoritative transaction confirmation evidence. Spend observations
+    // (abandonment evidence) require a script index and must not block confirmation
+    // when the transaction evidence alone is conclusive.
+    let mut confirmed = Vec::with_capacity(batch.transactions.len());
     for tx in &batch.transactions {
         let status = chain.tx_status(&tx.txid)?;
         let (canonical, depth) = match status {
@@ -2447,8 +2450,19 @@ fn observe_batch(
             ),
             _ => (false, 0),
         };
+        confirmed.push((tx, status, canonical, depth));
+    }
+    let conclusive = confirmed.iter().any(|(_, _, canonical, depth)| {
+        *canonical && *depth >= u64::from(config.payout_confirmations)
+    });
+    let mut txs = Vec::with_capacity(batch.transactions.len());
+    for (tx, status, canonical, depth) in confirmed {
         let confirmed_here = canonical && matches!(status, TxStatus::Confirmed { .. });
-        let dead_by = if confirmed_here || status == TxStatus::InMempool {
+        // When one transaction conclusively confirms the payout, skip spend-index
+        // lookups entirely: missing abandonment evidence (e.g. no script index
+        // after the replaced transaction left the mempool) must not abort the
+        // confirmation. Only without conclusive confirmation do we need spends.
+        let dead_by = if conclusive || confirmed_here || status == TxStatus::InMempool {
             None
         } else {
             find_dead_spend(chain, config, batch, tx, tip)?
