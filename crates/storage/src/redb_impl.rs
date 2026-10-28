@@ -60,8 +60,9 @@ fn write_with_durability(
     };
     metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => durability_label)
         .increment(1);
-    metrics::histogram!("storage.write_bytes", "backend" => "redb")
-        .record(crate::metric_f64_from_usize(batch.encoded_bytes));
+    metrics::histogram!("storage.write_bytes", "backend" => "redb").record(
+        bitcoin_rs_primitives::u64_to_f64(u64::try_from(batch.encoded_bytes).unwrap_or(u64::MAX)),
+    );
 
     #[cfg(any(test, feature = "test-seam"))]
     if let Some(fault) = faults.take_at(crate::trait_::PersistBoundary::Apply) {
@@ -147,8 +148,9 @@ fn write_durable_if(
     write_txn.commit().map_err(StorageError::backend)?;
     metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => "durable")
         .increment(1);
-    metrics::histogram!("storage.write_bytes", "backend" => "redb")
-        .record(crate::metric_f64_from_usize(batch.encoded_bytes));
+    metrics::histogram!("storage.write_bytes", "backend" => "redb").record(
+        bitcoin_rs_primitives::u64_to_f64(u64::try_from(batch.encoded_bytes).unwrap_or(u64::MAX)),
+    );
     #[cfg(any(test, feature = "test-seam"))]
     if let Some(fault) = sync_fault {
         return Err(fault.injected_error());

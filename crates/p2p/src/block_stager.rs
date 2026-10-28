@@ -156,7 +156,6 @@ impl BlockStager {
 
     /// Decoded heap bytes owned by currently staged blocks (capacity-based,
     /// excluding allocator rounding and the preserved serialized buffers).
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn decoded_bytes(&self) -> usize {
         self.decoded_bytes
@@ -170,8 +169,8 @@ impl BlockStager {
         self.decoded_bytes.saturating_add(self.received_bytes)
     }
 
-    /// Highest attributed retained total ever observed this run.
-    #[cfg(test)]
+    /// Highest attributed retained total ever observed this run; feeds the
+    /// retained-bytes high-water gauge.
     #[must_use]
     pub(crate) const fn retained_attributed_bytes_high_water(&self) -> usize {
         self.retained_bytes_high_water

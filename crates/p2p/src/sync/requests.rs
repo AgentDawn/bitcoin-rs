@@ -109,7 +109,6 @@ impl UnavailableBodies {
             })
             .collect()
     }
-
     /// Forgets `source`'s answer for `hash`: it delivered the body, so the
     /// earlier `notfound` no longer describes it.
     pub(super) fn clear(&mut self, source: PeerSource, hash: Hash256) {

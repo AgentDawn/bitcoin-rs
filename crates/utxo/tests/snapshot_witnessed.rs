@@ -124,16 +124,19 @@ fn raw_projection(
     artifact: &mut VerifiedSnapshotArtifact,
 ) -> Result<Vec<RawCoin>, RawSeedError<Infallible>> {
     let mut coins = Vec::new();
-    artifact.for_each_coin_raw(&mut |outpoint: &OutPoint, script: &[u8]| {
-        // `OutPoint` is packed: copy it onto the stack before touching fields.
-        let outpoint = *outpoint;
-        coins.push(RawCoin {
-            txid: *outpoint.txid.as_bytes(),
-            vout: outpoint.vout,
-            script_pubkey: script.to_vec(),
-        });
-        Ok::<(), Infallible>(())
-    })?;
+    artifact.for_each_coin_raw(
+        &mut |outpoint: &OutPoint, script: &[u8]| {
+            // `OutPoint` is packed: copy it onto the stack before touching fields.
+            let outpoint = *outpoint;
+            coins.push(RawCoin {
+                txid: *outpoint.txid.as_bytes(),
+                vout: outpoint.vout,
+                script_pubkey: script.to_vec(),
+            });
+            Ok::<(), Infallible>(())
+        },
+        &|| false,
+    )?;
     Ok(coins)
 }
 
@@ -452,10 +455,13 @@ fn emit_failure_aborts_as_emit() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
     let mut calls = 0_u64;
-    let result = artifact.for_each_coin_raw(&mut |_: &OutPoint, _: &[u8]| {
-        calls += 1;
-        Err(Boom)
-    });
+    let result = artifact.for_each_coin_raw(
+        &mut |_: &OutPoint, _: &[u8]| {
+            calls += 1;
+            Err(Boom)
+        },
+        &|| false,
+    );
     assert!(matches!(result, Err(RawSeedError::Emit(Boom))));
     assert_eq!(calls, 1);
     Ok(())
@@ -485,10 +491,13 @@ fn empty_snapshot_mints_and_traverses_zero_coins() -> Result<(), Box<dyn std::er
         }),
     );
     let mut count = 0_u64;
-    artifact.for_each_coin_raw(&mut |_: &OutPoint, _: &[u8]| {
-        count += 1;
-        Ok::<(), Infallible>(())
-    })?;
+    artifact.for_each_coin_raw(
+        &mut |_: &OutPoint, _: &[u8]| {
+            count += 1;
+            Ok::<(), Infallible>(())
+        },
+        &|| false,
+    )?;
     assert_eq!(count, 0);
     Ok(())
 }
@@ -559,10 +568,13 @@ fn first_offer_wins_take_clears_demand() -> Result<(), Box<dyn std::error::Error
 
     // The winner survived the loser's close: its bytes still traverse.
     let mut count = 0_u64;
-    taken.for_each_coin_raw(&mut |_: &OutPoint, _: &[u8]| {
-        count += 1;
-        Ok::<(), Infallible>(())
-    })?;
+    taken.for_each_coin_raw(
+        &mut |_: &OutPoint, _: &[u8]| {
+            count += 1;
+            Ok::<(), Infallible>(())
+        },
+        &|| false,
+    )?;
     assert_eq!(count, 1);
     Ok(())
 }
@@ -598,4 +610,84 @@ fn cell_handles_are_thread_shareable() {
     assert_send_sync::<SeedSlot>();
     assert_send_sync::<SeedOfferCell>();
     assert_send::<VerifiedSnapshotArtifact>();
+}
+
+/// Cancellation is polled at entry and every 4,096 emitted coins; a trip
+/// returns `Cancelled` with the bundle intact so the caller can retry.
+#[test]
+fn seed_traversal_polls_cancellation_every_4096_coins() -> Result<(), Box<dyn std::error::Error>> {
+    let set = bitcoin_rs_utxo::UtxoSet::new();
+    let mut changes = BlockChanges::default();
+    for i in 0..9_000_u64 {
+        changes.add(UtxoAdd::new(
+            OutPoint::new(txid(200_000 + i).into(), 0),
+            txout(i),
+            false,
+            1,
+        ));
+    }
+    commit_block_changes(&set, &changes, &txid(199_999))?;
+    let tip = txid(200_001);
+    let mut bytes = Vec::new();
+    let (_, (), witness) = write_snapshot_witnessed(&set, &tip, 7, &mut bytes, ())?;
+    let witness = witness.ok_or("valid encode must mint a witness")?;
+    let mut file = file_with(&bytes)?;
+    let (_, (), read_witness) = read_snapshot_strict_v4_witnessed(&mut file, ())?;
+    let mut artifact = VerifiedSnapshotArtifact::seal(
+        file,
+        read_witness,
+        SeedProvenance::Checkpoint(CheckpointReference {
+            generation: 3,
+            manifest_sha256: [4_u8; 32],
+        }),
+    );
+    assert_eq!(witness.sha256(), read_witness.sha256());
+
+    // Immediate cancellation emits nothing.
+    let mut count = 0_u64;
+    let immediate = artifact.for_each_coin_raw(
+        &mut |_: &OutPoint, _: &[u8]| {
+            count += 1;
+            Ok::<(), Infallible>(())
+        },
+        &|| true,
+    );
+    assert!(
+        matches!(immediate, Err(RawSeedError::Cancelled)),
+        "entry poll must stop before any emit: {immediate:?}"
+    );
+    assert_eq!(count, 0, "a cancelled entry must not traverse");
+
+    // Mid-stream cancellation stops at the next 4,096 boundary with a
+    // partial traversal and no integrity verdict.
+    let seen = std::cell::Cell::new(0_u64);
+    let mut emitted = 0_u64;
+    let mid = artifact.for_each_coin_raw(
+        &mut |_: &OutPoint, _: &[u8]| {
+            seen.set(seen.get() + 1);
+            emitted += 1;
+            Ok::<(), Infallible>(())
+        },
+        &|| seen.get() >= 5_000,
+    );
+    assert!(
+        matches!(mid, Err(RawSeedError::Cancelled)),
+        "mid-stream stop must report cancellation: {mid:?}"
+    );
+    assert!(
+        (4_096..9_000).contains(&emitted),
+        "cancellation must stop at a poll boundary with partial work: {emitted}"
+    );
+
+    // Without cancellation the same descriptor traverses every coin.
+    let mut all = 0_u64;
+    artifact.for_each_coin_raw(
+        &mut |_: &OutPoint, _: &[u8]| {
+            all += 1;
+            Ok::<(), Infallible>(())
+        },
+        &|| false,
+    )?;
+    assert_eq!(all, 9_000, "retry after cancellation must replay all coins");
+    Ok(())
 }

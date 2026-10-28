@@ -327,6 +327,9 @@ fn flush_group(
     committed: &mut Vec<ConnectOutcome>,
     payloads: &[&BlockPayload],
 ) -> core::result::Result<(), WindowApplyError> {
+    if group.pending.is_empty() {
+        return Ok(());
+    }
     // The staged prefix is a contiguous suffix starting at `committed.len()`,
     // so the newest staged block is borrowed straight from the caller's apply
     // batch — no clone in chainstate. Empty group: nothing staged, no hook.

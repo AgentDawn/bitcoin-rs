@@ -296,7 +296,7 @@ fn publish_swap_between_commit_and_open_yields_integrity() -> Result<(), Box<dyn
         Ok(())
     };
     assert!(matches!(
-        seed.for_each_coin_raw(&mut emit),
+        seed.for_each_coin_raw(&mut emit, &|| false),
         Err(RawSeedError::Integrity)
     ));
     assert_eq!(coins, 0);

@@ -79,6 +79,7 @@ impl PeerRequest {
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
+
 }
 
 /// Per-peer availability view for one request build.

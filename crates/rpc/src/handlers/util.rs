@@ -71,7 +71,12 @@ pub(crate) fn getrpcinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, Rp
         .as_ref()
         .ok_or_else(|| RpcError::Internal("debug log path is not configured".to_owned()))?;
     typed_to_sonic(&v31::GetRpcInfo {
-        active_commands: Vec::new(),
+        active_commands: ctx
+            .active_calls
+            .snapshot()
+            .into_iter()
+            .map(|(method, duration)| v31::ActiveCommand { method, duration })
+            .collect(),
         log_path: path.to_string_lossy().into_owned(),
     })
 }
@@ -697,6 +702,151 @@ fn scan_key_script(
         script_pubkey: derived.script_pubkey().into_bytes(),
         desc: with_checksum(&format!("{kind}({origin}{public}{suffix}")),
     })
+}
+
+/// Expands a scan descriptor over an optional derivation range, bounded by script and byte budgets.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "descriptor scanner interface retained for callers and tests"
+    )
+)]
+pub(crate) fn scan_descriptor_range(
+    text: &str,
+    network: Network,
+    range: Option<(u32, u32)>,
+    cancelled: impl Fn() -> Result<bool, RpcError>,
+) -> Result<Vec<ScanScript>, RpcError> {
+    scan_descriptor_range_budgeted(text, network, range, 1024_u64, 1_048_576_u64, cancelled)
+}
+
+/// Expands a scan descriptor over an optional derivation range against remaining caller-supplied budgets.
+#[expect(
+    clippy::too_many_lines,
+    reason = "descriptor range expansion and budget validation"
+)]
+pub(crate) fn scan_descriptor_range_budgeted(
+    text: &str,
+    network: Network,
+    range: Option<(u32, u32)>,
+    remaining_scripts: u64,
+    remaining_bytes: u64,
+    cancelled: impl Fn() -> Result<bool, RpcError>,
+) -> Result<Vec<ScanScript>, RpcError> {
+    let (payload, _) = checked_checksum(text, ChecksumRequirement::Optional)?;
+    let chain = convert::bitcoin_network(network);
+    if let Some(raw) = parse_unspendable(payload) {
+        if remaining_scripts < 1 {
+            return Err(RpcError::InvalidParameter(
+                "At most 1024 scan descriptors are supported".into(),
+            ));
+        }
+        let script = match raw.map_err(descriptor_error)? {
+            Unspendable::Address(address) => address
+                .require_network(chain)
+                .map_err(|_| RpcError::InvalidAddressOrKey("Address is not valid".into()))?
+                .script_pubkey(),
+            Unspendable::Raw(script) => script,
+        };
+        let script_len = u64::try_from(script.len())
+            .map_err(|_| RpcError::InvalidParameter("Scan script byte limit exceeded".into()))?;
+        if script_len > remaining_bytes {
+            return Err(RpcError::InvalidParameter(
+                "Scan script byte limit exceeded".into(),
+            ));
+        }
+        return Ok(vec![ScanScript {
+            desc: crate::tx_render::script_descriptor(script.as_bytes(), network),
+            script_pubkey: script.into_bytes(),
+        }]);
+    }
+    // Parsing public keys directly rejects WIF/xprv without converting or
+    // deriving secrets. Other descriptor endpoints retain their own contract.
+    let descriptor = MiniscriptDescriptor::<DescriptorPublicKey>::from_str(payload)
+        .map_err(|error| RpcError::InvalidAddressOrKey(error.to_string()))?;
+    ensure_keys_match_network(&descriptor, chain).map_err(descriptor_error)?;
+    if descriptor_needs_private_keys(&descriptor) {
+        return Err(RpcError::InvalidAddressOrKey(
+            GENERATEBLOCK_NEEDS_PRIVATE_KEYS.into(),
+        ));
+    }
+    let kind = match &descriptor {
+        MiniscriptDescriptor::Pkh(_) => "pkh",
+        MiniscriptDescriptor::Wpkh(_) => "wpkh",
+        MiniscriptDescriptor::Sh(sh)
+            if matches!(sh.as_inner(), miniscript::descriptor::ShInner::Wpkh(_)) =>
+        {
+            "sh(wpkh"
+        }
+        MiniscriptDescriptor::Tr(tr) if tr.tap_tree().is_none() => "tr",
+        _ => {
+            return Err(RpcError::InvalidParameter(
+                "Supported scan descriptors are addr, raw, pkh, wpkh, sh(wpkh), and key-only tr"
+                    .into(),
+            ));
+        }
+    };
+    let is_range = descriptor.has_wildcard();
+    let (begin, end) = if is_range {
+        range.unwrap_or((0, 1000))
+    } else {
+        (0, 0)
+    };
+    let paths = if descriptor.is_multipath() {
+        #[expect(
+            clippy::redundant_clone,
+            reason = "explicit clone before into_single_descriptors"
+        )]
+        descriptor
+            .clone()
+            .into_single_descriptors()
+            .map_err(|error| RpcError::InvalidAddressOrKey(error.to_string()))?
+    } else {
+        vec![descriptor]
+    };
+    let paths_len = u64::try_from(paths.len()).map_err(|_| {
+        RpcError::InvalidParameter("At most 1024 scan descriptors are supported".into())
+    })?;
+    let count = paths_len.saturating_mul(
+        u64::from(end)
+            .saturating_sub(u64::from(begin))
+            .saturating_add(1),
+    );
+    if count > remaining_scripts {
+        return Err(RpcError::InvalidParameter(
+            "At most 1024 scan descriptors are supported".into(),
+        ));
+    }
+    let max_script_size: u64 = match kind {
+        "pkh" => 25,
+        "wpkh" => 22,
+        "sh(wpkh" => 23,
+        _ => 34,
+    };
+    let preflight_bytes = count.saturating_mul(max_script_size);
+    if preflight_bytes > remaining_bytes {
+        return Err(RpcError::InvalidParameter(
+            "Scan script byte limit exceeded".into(),
+        ));
+    }
+    let count_usize = usize::try_from(count).map_err(|_| {
+        RpcError::InvalidParameter("At most 1024 scan descriptors are supported".into())
+    })?;
+    let mut scripts = Vec::with_capacity(count_usize);
+    'outer: for index in begin..=end {
+        for path in &paths {
+            if cancelled()? {
+                break 'outer;
+            }
+            let derived = path
+                .at_derivation_index(index)
+                .map_err(|error| RpcError::InvalidAddressOrKey(error.to_string()))?;
+            let script = scan_key_script(&derived, kind)?;
+            scripts.push(script);
+        }
+    }
+    Ok(scripts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,7 +1658,82 @@ mod tests {
     }
 
     #[test]
+    fn getrpcinfo_reports_held_calls_oldest_first_and_removes_by_identity() {
+        let mut ctx = Context::new();
+        ctx.debug_log_path = Some(std::path::PathBuf::from("/tmp/debug.log"));
+        let ctx = Arc::new(ctx);
 
+        let first = ctx.active_calls.begin("getblock");
+        let second = ctx.active_calls.begin("getblock");
+        let result =
+            getrpcinfo(&ctx, &json!([])).unwrap_or_else(|err| panic!("getrpcinfo failed: {err}"));
+        let commands = result
+            .get("active_commands")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("active_commands missing: {result:?}"));
+        assert_eq!(commands.len(), 2, "both held calls are active: {result:?}");
+        for command in commands {
+            assert_eq!(
+                command.get("method").and_then(Value::as_str),
+                Some("getblock")
+            );
+            assert!(
+                command
+                    .get("duration")
+                    .and_then(JsonValueTrait::as_u64)
+                    .is_some(),
+                "duration is elapsed microseconds: {command:?}"
+            );
+        }
+
+        drop(first);
+        let result =
+            getrpcinfo(&ctx, &json!([])).unwrap_or_else(|err| panic!("getrpcinfo failed: {err}"));
+        let commands = result
+            .get("active_commands")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("active_commands missing: {result:?}"));
+        assert_eq!(
+            commands.len(),
+            1,
+            "dropping one guard removes exactly its own entry: {result:?}"
+        );
+        drop(second);
+        let snapshot = ctx.active_calls.snapshot();
+        assert!(snapshot.is_empty(), "all held calls removed: {snapshot:?}");
+    }
+
+    #[test]
+    fn dispatch_registers_the_call_and_unknown_methods_never_register() {
+        let mut ctx = Context::new();
+        ctx.debug_log_path = Some(std::path::PathBuf::from("/tmp/debug.log"));
+        let handler = crate::handlers::Handler::new(Arc::new(ctx));
+
+        let result = handler
+            .dispatch("getrpcinfo", &json!([]))
+            .unwrap_or_else(|err| panic!("getrpcinfo dispatch failed: {err}"));
+        let commands = result
+            .get("active_commands")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("active_commands missing: {result:?}"));
+        assert_eq!(commands.len(), 1, "getrpcinfo includes itself: {result:?}");
+        assert_eq!(
+            commands[0].get("method").and_then(Value::as_str),
+            Some("getrpcinfo")
+        );
+        assert!(
+            handler.context().active_calls.snapshot().is_empty(),
+            "no residue after the call returns"
+        );
+
+        assert!(handler.dispatch("nosuchmethod", &json!([])).is_err());
+        assert!(
+            handler.context().active_calls.snapshot().is_empty(),
+            "unknown methods never register"
+        );
+    }
+
+    #[test]
     fn getmemoryinfo_reports_resident_bytes_as_the_whole_locked_pool() {
         use alloc::sync::Arc;
 
