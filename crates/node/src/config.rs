@@ -57,14 +57,10 @@ impl ScriptIndexMode {
 
     /// Derived-index capabilities this mode and txindex jointly enable.
     ///
-    /// PRE: none.
-    /// POST: one of `NONE`, `TX_LOOKUP`, `SCRIPT_LIVE`, `TX_LOOKUP_SCRIPT_LIVE`,
-    /// `TX_AND_SCRIPTS`. Full always includes `TxLookup` regardless of txindex (Esplora
+    /// Full always includes `TxLookup` regardless of txindex (Esplora
     /// prevout and fee rendering needs exact historical transactions); the
     /// RPC-visible `derived_index_query` gate still requires an explicit
     /// `--txindex`.
-    /// INVARIANT: the match is exhaustive over `(bool, Self)`; an
-    /// unreachable combination is not spellable from `crates/node`.
     #[must_use]
     pub const fn enabled_capabilities(self, txindex: bool) -> IndexCapabilities {
         match (txindex, self) {

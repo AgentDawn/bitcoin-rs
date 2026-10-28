@@ -282,12 +282,24 @@ pub(super) fn open_and_run(
     // reconciliation proceeds and the operator reads the refusal in the log:
     // a one-shot key left set, a lagging export, or a bad bundle must never
     // keep the index from reaching the tip. Only writer or reader failures,
-    // which can leave the store uncertain, fail the worker.
+    // which can leave the store uncertain, fail the worker. A failed import
+    // cleanup surfaces as `Index`, so partial rows never mix with derived
+    // rows on the way to readiness.
     match crate::portable::run(&host, &spec.bundle) {
         Ok(None) => {}
         Ok(Some(outcome)) => log_bundle_outcome(&outcome),
         Err(IndexBundleError::Cancelled) => return Err(DerivedIndexWorkerError::Stopped),
         Err(IndexBundleError::Index(error)) => return Err(DerivedIndexWorkerError::Index(error)),
+        Err(IndexBundleError::Incomplete {
+            height,
+            expected,
+            actual,
+        }) => tracing::error!(
+            height,
+            expected,
+            actual,
+            "portable txindex bundle is incomplete; ordinary reconciliation proceeds"
+        ),
         Err(error) => tracing::error!(
             %error,
             "portable txindex bundle request refused; ordinary reconciliation proceeds"
@@ -648,5 +660,27 @@ mod tests {
         assert!(matches!(result, Err(DerivedIndexWorkerError::Stopped)));
         assert!(!path.exists());
         Ok(())
+    }
+
+    /// An incomplete bundle is a refusal: ordinary reconciliation proceeds
+    /// and backfill earns readiness. Only an `Index` error — including a
+    /// failed import cleanup that may have left partial rows — fails the
+    /// worker and stops readiness.
+    #[test]
+    fn incomplete_is_a_refusal_only_index_failures_stop_readiness() {
+        let refusal = IndexBundleError::Incomplete {
+            height: 7,
+            expected: 2,
+            actual: 1,
+        };
+        assert!(
+            !matches!(refusal, IndexBundleError::Index(_)),
+            "an incomplete bundle must not take the worker-failure path"
+        );
+        let fatal = IndexBundleError::Index(IndexError::InvalidWatermark);
+        assert!(
+            matches!(fatal, IndexBundleError::Index(_)),
+            "cleanup and writer failures must take the worker-failure path"
+        );
     }
 }

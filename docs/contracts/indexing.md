@@ -353,6 +353,21 @@ Proof: these tests establish the memo-retention rule:
   `undo_read_failure_is_not_a_missing_undo`, which proves a storage-error
   undo read fails the worker with its own error while an absent record
   resets and reseeds.
+  Reseeding sources (`IDX-07` artifact-or-retained-history, never the live
+  UTXO set): `crates/index/src/runtime/recovery_tests.rs`
+  `forward_script_live_follows_undo_present_missing_or_corrupt` (a
+  missing/corrupt undo resets only `ScriptLive` while siblings keep their
+  rows, then reseeds at the tip) and
+  `seed_first_leg_consumes_held_lease` (the forward leg consumes the bundle
+  pin with at most one live lease, stalled legs park it back, progress
+  releases it); `crates/index/src/runtime/seed_paused_tests.rs`
+  `seed_paused_write_permits_apply_and_retires_generation` (concurrent
+  applies land while the seed stream holds its pin, then retire to zero
+  leases), `catch_up_drops_subsumed_seed_lease_for_lower_start`
+  (single-holder drain), `seed_reorg_below_h_rolls_back_through_pinned_undo`
+  (sub-`H` reorg rewinds through the pinned undo), and
+  `seed_prune_while_paused_refuses_at_or_above_floor` (pruned history yields
+  scoped terminal `Unavailable` while the worker stays alive).
 
 ### `IDX-11`: Portable index bundle
 
@@ -391,7 +406,10 @@ Proof: these tests establish the memo-retention rule:
   `TxConfirmed` rows of one snapshot at the applied tip. Export never writes a
   `ScriptHistory` artifact, and restore refuses a manifest that declares one
   (`UnsupportedCapability`). `ScriptLive` is never a bundle capability and is
-  reseeded from the UTXO set. `CompactFilters` is not a bundle family. A bundle
+  never reseeded from the live UTXO set; after restore or reset it first
+  accepts a verified immutable snapshot artifact, then replays complete
+  retained history, and otherwise reports `Unavailable` (`IDX-07`).
+  `CompactFilters` is not a bundle family. A bundle
   carries no block bodies, undo records, or chainstate.
 - **Export** publishes a manifest only when all of these hold:
   - `TxLookup` is enabled (`TxLookupDisabled`).
@@ -408,9 +426,12 @@ Proof: these tests establish the memo-retention rule:
     (`BodyUnavailable` for an absent body, `SourceRow` for any other mismatch).
 - Export fsyncs the artifact, fsyncs the directory, then publishes the manifest
   with create-new, fsync, and a directory fsync. Directory sync is a no-op off
-  Unix. An export that returns an error attempts to remove the artifact it
-  created, and a manifest that fails to write or fsync is removed. A failure of
-  the final directory sync is a known gap (see Live gaps).
+  Unix. A failed, stale, or cancelled export removes what it created newest
+  first (manifest before artifact) through `portable/export.rs` `Publication`:
+  each removal is followed by a directory sync, so the artifact is removed only
+  after the manifest removal is durable. When that durability cannot be
+  established the artifact is left in place rather than risk a surviving
+  manifest that names a missing artifact.
 - **Restore validation** completes before any write. Faults are reported in this
   order: manifest fields, artifact length, SHA-256, artifact header, record
   framing and order, chain identity, a fresh `TxLookup`, locator mismatch.
@@ -421,6 +442,20 @@ Proof: these tests establish the memo-retention rule:
     cumulative transaction count at the base. A bundle with a different index
     format version is refused; the bundle is not a migration path
     ([db-migration.md](../policies/db-migration.md)).
+  - The receiver's count at the base is its block tree's count when the tree
+    holds one. A restart restores the cumulative count on the applied tip
+    only, so a base below the tip is usually uncounted. The count is then the
+    nearest counted node's count at or above the base (the tree's, or the
+    published one for the applied tip) minus the transaction count of every
+    block above the base up to that node, each read through the block body
+    source (its metadata when it has any, else the whole body). Nothing comes
+    from the manifest, an underflow refuses (`Identity`), and the cost is one
+    body read per block from the base to that node, polled for cancellation
+    like the other bundle loops. A chain with no counted node from the base up
+    to the tip is refused (`Identity`): without a counted anchor the exact
+    cumulative count cannot be established, whatever bodies exist. Absent
+    bodies are the withhold case below. Export needs no such read: its base
+    is the applied tip.
   - Restore needs a fresh capability. It refuses (`NotFresh`) only when
     `TxLookup` already has a watermark, and it never resets a ready index.
     `TxConfirmed` rows without a `TxLookup` watermark are leftovers of an
@@ -436,9 +471,11 @@ Proof: these tests establish the memo-retention rule:
     locator outcome in record order decides: a mismatch found before any
     unavailable body is a refusal (`Locator`); an unavailable body found first
     withholds the bundle.
-  - If the receiver has no block body source, or a body a locator needs is
-    absent or pruned, the bundle is withheld, not refused: restore writes
-    nothing, logs a warning, and ordinary backfill proceeds.
+  - If the receiver has no block body source, or a body a locator needs, or a
+    body the count derivation above needs, is absent or pruned, the bundle is
+    withheld, not refused: restore writes nothing, logs a warning, and
+    ordinary backfill proceeds. Any identity refusal is reported before a
+    withhold.
 - **Restore apply**: The row stream writes the receiver's own 80-byte header for
   every height from 0 to the base (from its block tree, not from the bundle)
   and then the `TxConfirmed` rows. A batch commits after 65,536 rows (headers
@@ -464,20 +501,25 @@ Proof: these tests establish the memo-retention rule:
 - **Non-claims**:
   - No bundle carries `ScriptHistory`, `ScriptLive`, or `CompactFilters` rows.
     An operator who needs those indexes builds them through `IDX-01`.
-  - The bundle carries no signature. The SHA-256 binds the artifact to the
-    manifest that sits beside it. Restore binds each record to the receiver's
-    chain by the locator check, not to the exporter's identity.
-  - Restore proves that every record present resolves in the receiver's chain.
-    It does not prove that no record is missing: no check compares the record
-    count with the chain's transaction count.
-  - No test compares restored rows with rows an ordinary derivation writes.
+  - The bundle carries no signature. The SHA-256 detects changes between the
+    artifact and the manifest that sits beside it; it is not authentication.
+    Restore binds each record to the receiver's chain by the locator check,
+    not to the exporter's identity.
+  - Restore proves that every record present resolves in the receiver's chain
+    and, when every covered body is available, that none is missing: the
+    per-height record count must equal the receiver's transaction count or the
+    bundle is refused before any write. An absent or pruned covered body
+    withholds the restore instead of proving completeness.
   - The clause makes no performance, interoperability with other
     implementations, or cross-version claim.
-- Executable proof covers only the manifest and artifact codec and the
-  configuration surface. The export, restore, apply, cleanup, and
-  failure-handling rules above are stated from the code and have no executable
-  proof (see Live gaps).
-- Proof (codec and configuration only): the `crates/index/src/portable/manifest.rs`
+- Executable proof covers the manifest and artifact codec, the configuration
+  surface, the publication cleanup, and the Fjall lifecycle paths (export,
+  restore, withhold, cancellation, damage refusal, interrupted-import reset).
+  It does not cover a live mid-stream `Stale` export race or power loss. The scoped
+  cross-process cases (ahead-tip restore, divergent-base refusal, post-restore reorg,
+  same-prefix wrong-full-id refusal) are covered by the private scoped run cited
+  in Live gaps, not by a checked-in portable process suite.
+- Proof: the `crates/index/src/portable/manifest.rs`
   tests `manifest_round_trips_through_json_and_validates`,
   `unknown_fields_are_denied_at_every_level`,
   `script_live_is_never_a_capability_and_script_history_is_refused`, and
@@ -486,15 +528,28 @@ Proof: these tests establish the memo-retention rule:
   `prefix_collisions_order_by_full_txid_and_fold_into_one_sorted_row`,
   `framing_refuses_each_violation`, and
   `hashing_reader_digest_equals_the_one_shot_digest`; the
+  `crates/index/src/portable/export.rs` publication unit tests (tempdir scope)
+  `failed_final_directory_sync_removes_the_manifest_and_its_artifact`,
+  `undurable_manifest_removal_keeps_the_artifact_it_names`, and
+  `committed_publication_keeps_both_files_and_never_replaces_an_entry`; the
   `crates/node/tests/config_layered.rs` tests
   `index_bundle_is_an_explicit_one_shot_request`,
   `index_bundle_import_and_export_never_resolve_by_precedence`,
   `index_bundle_requires_the_transaction_index_it_moves`, and
-  `index_bundle_rejects_empty_and_unusable_directories_on_every_surface`; and the
+  `index_bundle_rejects_empty_and_unusable_directories_on_every_surface`; the
   `bin/bitcoin-rs/src/config.rs` tests
   `index_bundle_directories_resolve_from_the_command_line_and_stay_exclusive`,
   `empty_index_bundle_directories_are_refused_by_clap_and_the_environment`, and
-  `bitcoin_conf_cannot_request_a_bundle_or_relay_feature`.
+  `bitcoin_conf_cannot_request_a_bundle_or_relay_feature`; and the
+  `crates/index/tests/portable_bundle.rs` lifecycle tests
+  `export_then_restore_serves_the_same_queries_as_backfill`,
+  `damaged_bundles_are_refused_before_any_write_or_reset`,
+  `export_preserves_a_preexisting_destination`,
+  `cancelled_export_removes_only_its_own_staging`,
+  `cancelled_restore_writes_nothing_and_restart_completes`,
+  `missing_bodies_withhold_readiness_until_ordinary_backfill`,
+  `restore_below_a_restarted_receivers_tip_then_reconciles_forward`, and
+  `interrupted_import_is_cleared_on_restart_and_restore_retries`.
 
 ### `IDX-12`: Historical prefix queries (one-shot, server-selected)
 
@@ -610,10 +665,36 @@ consumer usage and defers to this clause for every consistency rule.
   | Positive floor on full script history | `Unavailable(Shared(HistoryUnproven { floor }))` |
   | Row, scan, body-read, and body-byte budgets, truncated scans, `BlockBodyMissing`, disabled capability, worker failure/stop, missing authority, lifecycle causes | `Unavailable(Shared(...))` with the identical wrapped variant |
   | Snapshot-open and body-read storage failures | `Storage(...)` |
-- Provenance: the surface above is implemented in this change. Executable
-  proof references for its gate, floor, ancestry, reset, reorg, and error
-  behavior are recorded by the parent after runs; this clause makes no
-  pass/fail claim about them.
+- Proof: `crates/index/src/runtime/query_tests.rs`
+  `historical_extension_during_read_keeps_same_anchor` (tip extension
+  mid-read keeps the same anchor),
+  `historical_wake_without_tip_move_stays_valid_while_strict_retries`
+  (a wake without a tip move stays valid for history while strict retries),
+  `historical_reorg_above_anchor_stays_valid` and
+  `historical_reorg_below_anchor_retries` plus
+  `historical_unknown_watermark_hash_retries` (reorg placement decides
+  valid versus `Retry`),
+  `historical_reset_completing_after_snapshot_stays_valid` and
+  `historical_no_covered_prefix_for_reset_claim` (reset mid-read versus
+  reset claim in the snapshot),
+  `historical_stale_watermark_anchors_at_fork_and_excludes_orphans` and
+  `historical_deep_stale_branch_exhausts_shared_ancestry_budget` (fork
+  anchor versus shared ancestry-budget exhaustion),
+  `historical_tx_positive_floor_scopes_absence_and_rejects_anchor_below_floor`,
+  `historical_full_history_positive_floor_is_unproven`, and
+  `historical_standalone_spender_scoped_none_above_floor` (floor scoping
+  and the positive-floor history split),
+  `historical_mixed_cap_script_anchors_at_sh_watermark` and
+  `historical_mixed_cap_tx_anchors_at_tx_watermark` (per-call capability
+  anchors), `historical_duplicate_txid_returns_earliest_verified_and_skips_stale`
+  (earliest verified occurrence),
+  `historical_budgets_truncation_and_missing_map_to_shared` and
+  `historical_budgets_health_and_capability_map_to_shared` (truncation,
+  missing body, worker failure, and disabled capability map to shared
+  `Unavailable`); `crates/index/src/runtime/query.rs`
+  `covered_anchor_rejects_watermark_height_mismatch` (a watermark whose
+  height disagrees with its hash retries instead of joining an uncovered
+  prefix).
 
 ### Compact-filter data and serving
 
@@ -690,19 +771,35 @@ Core/Kyoto runner are described in
   checkpoints, block bodies, and derived indexes is normative in
   [recovery.md](recovery.md) (`RCV-01`–`RCV-04`); a `kill -9` gate that
   re-applies real block bodies through it is not yet exercised.
-- **Portable bundle end to end**: No test runs an export, a restore, a
-  withheld restore, or an interrupted import against a store (`IDX-11`). The
-  export, restore, and cleanup rules in that clause rest on the code paths
-  `portable/export.rs`, `portable/restore.rs`, `index/write.rs`
-  `import_tx_lookup_stream`, and `runtime/startup.rs` `open_and_run`, plus the
-  codec and configuration tests it lists.
-- **Orphan manifest after a failed export**: `publish_manifest` ends with a
-  directory sync (`portable/export.rs`). If that sync fails after
-  `manifest.json` exists, the export returns an error, the artifact is removed,
-  and the manifest stays. Restore of that directory then fails reading the
-  artifact, and a new export into it is refused as `ExistingBundle` until the
-  operator clears the directory. The code does not remove the manifest on this
-  path.
+- **Portable bundle cross-process scope**: `crates/index/tests/portable_bundle.rs`
+  proves export/restore equality, damage refusal, existing-destination
+  preservation, export/restore cancellation, missing-body withhold with ordinary
+  backfill, restore-below-receiver-tip forward reconciliation, and interrupted-import reset
+  over real Fjall stores (`IDX-11`). The live Core200/C150/withheld receipts are
+  private external runs, not a repository portable process suite. Scoped live run
+  `.outline/evidence/snapshot-stage2-live/runs/20261026T200208Z-remaining-1850397/`
+  (binary SHA-256 `9406226483c7ac4c29f822e133a1f36bea82cc2c1078d9795f16388b8a4e5df2`,
+  PASS 64/0, error null, survivors []) covers four selected cases: base-200 bundle
+  into same-chain receiver at 202 restores and serves all 202 txid/blockhash/sample
+  queries; off-chain base refuses with `bundle identity refused: the bundle base is not
+  on the receiver's active chain` and zero `LOG_RESTORED` while the receiver stays honest
+  at 201 and the bundle
+  base coinbase stays unserved; genuine restore at 200 then a Core P2P fork unseats
+  the base to 202 with the old base coinbase gone and the new 202 queries reconciled;
+  valid outer digest with a wrong full txid sharing the 8-byte prefix refuses at the
+  `recorded locator at height 88` guard with zero `LOG_RESTORED`. Foreign-format
+  refusal reuses prior run
+  `.outline/evidence/snapshot-stage2-live/runs/20261026T190659Z-remaining-1337602/`
+  case-4 PASS (`bundle uses a different index format version`); it was NOT_REQUESTED
+  in the scoped run and counts are not combined. Cost is closed as characterization
+  only from `.outline/evidence/snapshot-stage2-live/runs/20261026T192106Z-c150-cost/`
+  (`measurements.json` plus separate post-validation-stopped `allocated-supplement.json`),
+  one historical height-150,000 pair, not a gain or modern-mainnet claim. Stage 2 closes
+  at the accepted scoped requirements; Stage 3 remains blocked only on qualified v6
+  occurrence-schema acceptance. Limits remain: live mid-stream `Stale` export race
+  unobserved, no power-loss campaign (SIGKILL bounds stop at process kill), completeness
+  is checked only against covered bodies the receiver holds (an absent body
+  withholds), and private receipts are not a checked-in portable process suite.
 
 ## Proven by
 
@@ -741,6 +838,18 @@ Core/Kyoto runner are described in
 - `crates/index/src/capabilities.rs` tests `missing_source_is_the_disabled_txindex_row`,
   `attached_source_is_the_worker_row`: `getcapabilities` advertises one
   txindex row from `derived_index_status` (`IDX-02`).
+- `crates/index/tests/portable_bundle.rs` (`IDX-11` lifecycle over real Fjall stores):
+  `export_then_restore_serves_the_same_queries_as_backfill`,
+  `damaged_bundles_are_refused_before_any_write_or_reset`,
+  `export_preserves_a_preexisting_destination`,
+  `cancelled_export_removes_only_its_own_staging`,
+  `cancelled_restore_writes_nothing_and_restart_completes`,
+  `missing_bodies_withhold_readiness_until_ordinary_backfill`, and
+  `interrupted_import_is_cleared_on_restart_and_restore_retries`; and
+  `crates/index/src/portable/export.rs` publication unit tests (tempdir scope):
+  `failed_final_directory_sync_removes_the_manifest_and_its_artifact`,
+  `undurable_manifest_removal_keeps_the_artifact_it_names`, and
+  `committed_publication_keeps_both_files_and_never_replaces_an_entry`.
 
 ### Query-budget regression evidence
 
