@@ -557,7 +557,9 @@ fn a_bulk_tail_parked_on_the_aggregate_leaves_the_margin_for_control() -> TestRe
     drop(hold);
     assert_eq!(
         read_messages(&mut served.client, 1)?,
-        vec![Message::Block(block_a)],
+        vec![Message::Block(
+            bitcoin_rs_primitives::BlockPayload::from_local(block_a),
+        )],
         "the tail is served once the aggregate has room"
     );
 
@@ -724,9 +726,7 @@ fn conditional_local_retry_defers_then_readies_with_no_reply() -> TestResult {
     let sink = ProductionSink::new(&lease, Some(credit));
     let shared = shared_with(ScriptedChain { blocks: Vec::new() });
     let addr = bitcoin_rs_primitives::PeerEndpoint::from(([127, 0, 0, 1], 8333));
-    assert!(super::handle_compact_outcome(
-        outcome, &sink, addr, &shared
-    ).is_none());
+    assert!(super::handle_compact_outcome(outcome, &sink, addr, &shared).is_none());
     assert!(receiver.is_empty());
     assert!(!lease.is_cancelled());
     drop(sink);

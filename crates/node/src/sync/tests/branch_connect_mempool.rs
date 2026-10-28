@@ -56,7 +56,7 @@ fn mutated_connect_body_through_switch_to_branch_preserves_subtree()
     for block in &fork_blocks {
         bodies.insert(
             Hash256::from_le_bytes(block.block_hash().as_bytes()),
-            (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+            BlockPayload::from_local(block.clone()),
         );
     }
 
@@ -118,7 +118,8 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
 -> Result<(), Box<dyn std::error::Error>> {
     use bitcoin::hashes::{Hash as _, hash160};
     use bitcoin_rs_mempool::{
-        AdmissionOrigin, Mempool, MempoolGateway, MempoolLimits, MempoolObserver, MutationEnvelope,
+        AdmissionOrigin, BodyInterest, Mempool, MempoolGateway, MempoolLimits, MempoolObserver,
+        MutationEnvelope,
     };
     use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, TxIn, TxOut, Witness};
     use bitcoin_rs_storage::StorageError;
@@ -129,9 +130,6 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
     struct Stream(Mutex<Vec<(Txid, bitcoin_rs_mempool::MutationOutcome, AdmissionOrigin)>>);
 
     impl MempoolObserver for Stream {
-        fn wants_accepted_transactions(&self) -> bool {
-            false
-        }
         fn on_mutation(&self, envelope: &MutationEnvelope) {
             let mut seen = self.0.lock();
             for change in &envelope.result.changes {
@@ -172,7 +170,7 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
     let stream = Arc::new(Stream::default());
     let gateway = Arc::new(MempoolGateway::new(
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-        Some(stream.clone()),
+        Some((stream.clone(), BodyInterest::Metadata)),
         ValidationEngine::Native,
         None,
     ));
@@ -290,9 +288,9 @@ fn disconnect_readmits_the_package_in_order_and_drops_the_nonfinal_member()
             ),
             role: bitcoin_rs_chainstate::ChainstateRole::Ordinary,
         });
-    handles.apply_block(&genesis, None)?;
+    handles.apply_block(&BlockPayload::from_local(genesis))?;
     for block in &blocks {
-        handles.apply_block(block, None)?;
+        handles.apply_block(&BlockPayload::from_local(block.clone()))?;
     }
 
     let parent = parent_tx.ok_or_else(|| std::io::Error::other("package not built"))?;

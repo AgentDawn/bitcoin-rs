@@ -1352,7 +1352,7 @@ mod tests {
     #[test]
     fn hostile_50000_item_getdata_parks_the_tail() {
         let block = Block::default();
-        let block_wire_len = wire_len_of(&Message::Block(block.clone()));
+        let block_wire_len = wire_len_of(&block_payload(&block));
         let (outbound_tx, _undrained_rx) = crossbeam_channel::unbounded();
         let lease = PeerLease::new_with_budget(
             outbound_tx,
@@ -1581,7 +1581,7 @@ mod tests {
     #[test]
     fn send_refusal_mid_stream_aborts_production() {
         let block = Block::default();
-        let block_wire_len = wire_len_of(&Message::Block(block.clone()));
+        let block_wire_len = wire_len_of(&block_payload(&block));
         let (outbound_tx, _undrained_rx) = crossbeam_channel::unbounded();
         let lease = PeerLease::new_with_budget(
             outbound_tx,

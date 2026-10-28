@@ -628,3 +628,88 @@ assumevalid=0000000000000000000000000000000000000000000000000000000000000000
         }
     }
 }
+
+#[cfg(test)]
+mod feature_option_tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use anyhow::Result;
+    use bitcoin_rs_node::{Network, NodeConfig};
+    use clap::Parser as _;
+
+    use super::{CliArgs, parse_for_network, resolve};
+
+    fn load(args: &[&str], vars: &[(&str, &str)]) -> Result<NodeConfig> {
+        let argv = std::iter::once("bitcoin-rs").chain(args.iter().copied());
+        let cli = CliArgs::try_parse_from(argv)?;
+        resolve(
+            cli,
+            vars.iter()
+                .map(|(key, value)| (OsString::from(*key), OsString::from(*value))),
+        )
+    }
+
+    fn refusal(args: &[&str], vars: &[(&str, &str)]) -> String {
+        match load(args, vars) {
+            Ok(_) => panic!("configuration must be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn index_bundle_directories_resolve_from_the_command_line_and_stay_exclusive() -> Result<()> {
+        let import = load(&["--txindex=true", "--index-bundle-import", "/srv/in"], &[])?.indexes;
+        assert_eq!(import.bundle_import.as_deref(), Some(Path::new("/srv/in")));
+        assert_eq!(import.bundle_export, None);
+
+        let export = load(
+            &["--txindex=true"],
+            &[("BITCOIN_RS_INDEX_BUNDLE_EXPORT", "/srv/out")],
+        )?
+        .indexes;
+        assert_eq!(export.bundle_export.as_deref(), Some(Path::new("/srv/out")));
+
+        // A command-line request never overrides a conflicting environment one.
+        let conflict = refusal(
+            &["--txindex=true", "--index-bundle-import", "/srv/in"],
+            &[("BITCOIN_RS_INDEX_BUNDLE_EXPORT", "/srv/out")],
+        );
+        assert!(conflict.contains("mutually exclusive"));
+        assert!(refusal(&["--index-bundle-export", "/srv/out"], &[]).contains("--txindex"));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_index_bundle_directories_are_refused_by_clap_and_the_environment() {
+        for flag in ["--index-bundle-import", "--index-bundle-export"] {
+            assert!(CliArgs::try_parse_from(["bitcoin-rs", flag, ""]).is_err());
+            assert!(CliArgs::try_parse_from(["bitcoin-rs", flag, "  "]).is_err());
+            assert!(CliArgs::try_parse_from(["bitcoin-rs", flag]).is_err());
+        }
+        for key in [
+            "BITCOIN_RS_INDEX_BUNDLE_IMPORT",
+            "BITCOIN_RS_INDEX_BUNDLE_EXPORT",
+        ] {
+            assert!(load(&["--txindex=true"], &[(key, "")]).is_err());
+        }
+    }
+
+    /// A one-shot restore or export is operator opt-in on the options the
+    /// table names; the Core-compatible file has no spelling for it.
+    #[test]
+    fn bitcoin_conf_cannot_request_a_bundle() {
+        let layers = parse_for_network(
+            "
+index-bundle-import=/srv/in
+indexbundleexport=/srv/out
+",
+            Network::Regtest,
+        )
+        .expect("fixture parses");
+        for layer in &layers {
+            assert_eq!(layer.indexes.bundle_import, None);
+            assert_eq!(layer.indexes.bundle_export, None);
+        }
+    }
+}

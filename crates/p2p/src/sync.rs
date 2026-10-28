@@ -216,6 +216,12 @@ pub struct BlockSync {
 /// never admit. The oldest mark is evicted first.
 const MAX_DEFERRED_OWNED_FETCHES: usize = 16;
 
+/// Blocks above the applied tip within which an unrequested compact block
+/// earns the mempool scan, as in Core (`net_processing.cpp:4664`). A block
+/// further ahead, which the mempool is unlikely to help reconstruct, routes
+/// only its header to admission and downloads through the window.
+const COMPACT_RECONSTRUCTION_MAX_AHEAD: u32 = 2;
+
 /// Appends one deferred owned-fetch mark, keeping the queue deduplicated and
 /// bounded at every insertion point — the initial record, the header-drain
 /// deferral, and the post-resolve requeue all share this tail.
@@ -248,8 +254,9 @@ struct SchedulerState {
     owned_body_fetches: Vec<(PeerSource, Hash256)>,
     /// Exact connections that answered an outstanding body request with
     /// `notfound`, so the released body is replanned elsewhere instead of
-    /// being asked of the same connection again. Bounded by the window's
-    /// pending budget and by [`requests::BODY_UNAVAILABLE_RETRY`].
+    /// being asked of the same connection again. Retention-bounded by
+    /// [`requests::BODY_UNAVAILABLE_RETRY`] with a safety ceiling, and
+    /// independent of the window's pending budget.
     body_unavailable: requests::UnavailableBodies,
     /// Chain-sync eviction state for every connection that has not yet shown
     /// it can bring us to the tip. Keyed by exact connection identity, so a
@@ -421,7 +428,7 @@ impl BlockSync {
                 stager: BlockStager::new(budget),
                 header_request_owner: None,
                 owned_body_fetches: Vec::new(),
-                body_unavailable: requests::UnavailableBodies::new(budget.max_pending_blocks),
+                body_unavailable: requests::UnavailableBodies::new(),
                 chain_sync: hashbrown::HashMap::new(),
                 headers_sync: hashbrown::HashMap::new(),
                 stale_tip: StaleTipState::default(),
@@ -443,7 +450,7 @@ impl BlockSync {
             stager: BlockStager::new(budget),
             header_request_owner: None,
             owned_body_fetches: Vec::new(),
-            body_unavailable: requests::UnavailableBodies::new(budget.max_pending_blocks),
+            body_unavailable: requests::UnavailableBodies::new(),
             chain_sync: hashbrown::HashMap::new(),
             headers_sync: hashbrown::HashMap::new(),
             stale_tip: StaleTipState::default(),
@@ -543,11 +550,15 @@ impl BlockSync {
     ///   invalid, the header passes the contextual rules header admission
     ///   applies against that parent (required nBits, median time past,
     ///   timewarp, future time, version), and it either carries more work
-    ///   than the applied chain or answers a body fetch `source` owns. This
-    ///   matches Core, which runs its contextual header checks before
-    ///   reconstruction. With the required nBits enforced, forging such a
-    ///   header costs a block at the chain's difficulty, and replaying an
-    ///   old one fails the work test.
+    ///   than the applied chain and sits at most
+    ///   [`COMPACT_RECONSTRUCTION_MAX_AHEAD`] blocks above the applied tip,
+    ///   or answers a body fetch `source` owns.
+    ///   This matches Core, which runs its contextual header checks before
+    ///   reconstruction and scans only blocks that close to its active tip.
+    ///   With the required nBits enforced, forging such a header costs a
+    ///   block at the chain's difficulty, replaying an old one fails the work
+    ///   test, and a header already held far above the applied tip earns no
+    ///   scan.
     /// INVARIANT: the tree read is released before the scheduler lock is
     ///   taken, keeping the `tree -> scheduler` order without nesting.
     ///
@@ -565,7 +576,7 @@ impl BlockSync {
         if bitcoin_rs_chain::validate_pow(header, hash, network).is_err() {
             return false;
         }
-        let candidate_work = {
+        let (candidate_work, candidate_height) = {
             let tree = self.chain.block_tree();
             let invalid = |id: NodeId| {
                 tree.node(id)
@@ -602,12 +613,15 @@ impl BlockSync {
             let Ok(parent) = tree.node(parent_id) else {
                 return false;
             };
-            parent.chainwork + bitcoin_rs_chain::block_work(header)
+            (
+                parent.chainwork + bitcoin_rs_chain::block_work(header),
+                parent.height.saturating_add(1),
+            )
         };
-        let extends_applied = self
-            .chain
-            .applied_tip()
-            .is_none_or(|tip| candidate_work > tip.chainwork);
+        let extends_applied = self.chain.applied_tip().is_none_or(|tip| {
+            candidate_work > tip.chainwork
+                && candidate_height <= tip.height.saturating_add(COMPACT_RECONSTRUCTION_MAX_AHEAD)
+        });
         extends_applied || self.owns_body_fetch(source, hash)
     }
 

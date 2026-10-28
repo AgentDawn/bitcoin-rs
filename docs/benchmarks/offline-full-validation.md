@@ -31,10 +31,18 @@ One `offline-full-validation-config-v1` document binds every arm:
   height (`hash`, `offset`, `payload_length`). Heights are contiguous. The
   packed records must consume the archive exactly.
 - **Pinned corpus**: after config load, the campaign copies archive and
-  manifest into a private campaign directory, re-hashes both, and
-  chmod's them `0o400`. Every arm reads those pins. Before and after every
-  child, the controller re-hashes both pins and checks device, inode, size,
-  and mtime. A same-user child that chmod's and rewrites a pin fails closed.
+  manifest to the literal custody paths `<root>/custody/archive` and
+  `<root>/custody/manifest` (where `<root>` is the `<temporary>/arms`
+  directory `main()` creates inside its `TemporaryDirectory` with
+  `prefix="offline-full-validation-"` under the `--output` parent),
+  re-hashes both, and chmod's them `0o400`. Every arm reads those pins via
+  the `{corpus_path}` / `{manifest_path}` placeholders. Before and after
+  every child, the controller re-hashes both pins and checks device, inode,
+  size, and mtime. A same-user child that chmod's and rewrites a pin fails
+  closed. The two pins persist across all 14 arms and are re-hashed before and
+  after every child, but they are transient working copies, not retained
+  artifacts: when the campaign finishes, `TemporaryDirectory` removes the whole
+  tree and only the result JSON published to `--output` survives.
 - **Posture**: `assume_valid` must be false. `txindex`, `blockfilterindex`,
   and `coinstatsindex` must be off. Cache policy is the closed set
   `process-cold/page-cache-unspecified`. The sibling MuHash comparator
@@ -49,9 +57,14 @@ One `offline-full-validation-config-v1` document binds every arm:
   exit. `reopen` then runs an untimed reopen command against the same data
   directory and requires the same certified state.
 - **Binaries**: SHA-256 pinned. `command[0]` is the `{binary}` placeholder.
-  The controller copies the pinned program into a private arm directory,
-  verifies the copy, strips owner-write (`0o500`), and re-hashes immediately
-  before every spawn. Placeholders are `{binary}`, `{data_dir}`,
+  The controller copies the pinned program to `<root>/<NN>-<role>/node-under-test`
+  (one verified copy per arm, 14 total, `00-core/node-under-test` through
+  `13-candidate/node-under-test`), verifies the copy, strips owner-write
+  (`0o500`), and re-hashes immediately before every spawn. Each copy persists
+  through its arm timed phase and, in reopen mode, the untimed reopen phase
+  (which reuses and re-hashes the same copy). Like the custody pins,
+  these 14 copies are transient: 16 file copies live under the temporary
+  root during the campaign and none is retained. Placeholders are `{binary}`, `{data_dir}`,
   `{corpus_path}`, `{manifest_path}`, `{state_path}`. The timed command
   must carry a known assume-valid-off token (`-assumevalid=0`,
   `--assume-valid-height=0`, or the two-token form with `0`) and must not

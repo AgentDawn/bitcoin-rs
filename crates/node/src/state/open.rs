@@ -26,6 +26,7 @@ use bitcoin_rs_chainstate::verify::{
 };
 use bitcoin_rs_consensus::{ScriptExecutionCache, ValidationEngine};
 use bitcoin_rs_index::block_log::BlockLog;
+use bitcoin_rs_mempool::BodyInterest;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolLimits;
 use bitcoin_rs_p2p::download_window::FAST_OUTBOUND_PEER_TARGET;
@@ -170,6 +171,11 @@ impl NodeState {
             let _ = &zmq_endpoints;
             Arc::new(crate::NoOpZmqPublisher)
         };
+        // C6 composition: fresh worker-owned seed cell per open; no generation
+        // counter because all holders are created together per open and dropped
+        // together. Linearizability: one lock orders cell pointer moves; no
+        // lock held across open/reads/commits. Idempotent: offer stores only
+        // into `Wanted`, first stored tip wins.
         let InitialChainstate {
             utxo: mut utxo_set,
             coin_stats: initial_coin_stats,
@@ -177,6 +183,7 @@ impl NodeState {
             applied_tip: restored_applied_tip,
             resume_source,
             journal_bootstrap,
+            script_live_seed,
         } = prepare_initial_chainstate(
             &config.data_dir,
             config.network,
@@ -317,8 +324,36 @@ impl NodeState {
             history: storage.bounded_history(),
             role: bitcoin_rs_chainstate::ChainstateRole::Ordinary,
         });
-        let derived_index_open_spec =
-            build_derived_index_open_spec(&config, txindex_cache_bytes, epoch, &data_dir_guard)?;
+        // C6: shared seed cell iff an index spec will exist and ScriptLive is
+        // enabled. The worker owns demand; publisher/control/spec share the
+        // same `Arc`. Watermark-present leave-alone is owned by the worker's
+        // first `finish_reconcile_pass` (`rest()`); open always arms `Wanted`
+        // so post-start offers land even before the first pass.
+        let seed_offer: Option<bitcoin_rs_utxo::SeedOfferCell> =
+            if !derived_index_capabilities(&config).is_empty()
+                && config.indexes.script_index.is_enabled()
+            {
+                Some(std::sync::Arc::new(bitcoin_rs_utxo::SeedSlot::new()))
+            } else {
+                None
+            };
+        let derived_index_open_spec = build_derived_index_open_spec(
+            &config,
+            txindex_cache_bytes,
+            epoch,
+            &data_dir_guard,
+            seed_offer.clone(),
+        )?;
+        // C6 startup token: the recovery fd is already verified, so offer it
+        // directly without reopening. No artifact plus no watermark arms demand
+        // for later publication/import offers; a watermark-present node still
+        // arms demand here and the worker drops it on its first pass.
+        if let Some(cell) = seed_offer.as_ref() {
+            cell.want();
+            if let Some(artifact) = script_live_seed {
+                let _ = cell.offer(artifact);
+            }
+        }
         let derived_index_parts = match derived_index_open_spec {
             Some(mut spec) => {
                 spec.utxo = Some(bitcoin_rs_utxo::UtxoReader::new(Arc::clone(&utxo)));
@@ -450,7 +485,7 @@ impl NodeState {
             let mining_leg: Arc<dyn bitcoin_rs_mempool::MempoolObserver> = cloned_mining;
             Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
                 Arc::clone(&mempool),
-                Some(mining_leg),
+                Some((mining_leg, BodyInterest::Metadata)),
                 config.validation.engine,
                 script_cache,
             ))
@@ -478,7 +513,11 @@ impl NodeState {
                 .as_ref()
                 .map_or(0, |tip| tip.height),
         ));
-        chainstate.configure_checkpointing(&config.data_dir, Arc::clone(&durable_tip_height))?;
+        chainstate.configure_checkpointing(
+            &config.data_dir,
+            Arc::clone(&durable_tip_height),
+            seed_offer.clone(),
+        )?;
         // Before anything reads the chainstate, let alone serves or syncs it.
         // A committed-but-unpublished gap (crash between the head batch and
         // publication) is replayed from the durable bodies the head
@@ -576,17 +615,23 @@ impl NodeState {
             tracing::info!(status = "disabled", "mempool snapshot persistence disabled");
         }
         if zmq_publisher.wants_notifications() {
+            let interest = if zmq_publisher.wants_rawtx() {
+                BodyInterest::Bodies
+            } else {
+                BodyInterest::Metadata
+            };
             mempool_gateway
                 .attach_observer_leg(
                     "sequence",
                     Arc::new(bitcoin_rs_rpc::zmq::MempoolSequenceObserver::new(
                         Arc::clone(&zmq_publisher),
                     )),
+                    interest,
                 )
                 .map_err(anyhow::Error::msg)?;
         } else if let Some(observer) = mempool_observer.cloned() {
             mempool_gateway
-                .attach_observer_leg("test", observer)
+                .attach_observer_leg("test", observer, BodyInterest::Bodies)
                 .map_err(anyhow::Error::msg)?;
         }
         // One chain-owned latch for the whole process: the chainstate builds
@@ -639,6 +684,7 @@ impl NodeState {
             followers.clone(),
             config.data_dir.clone(),
             config.network,
+            seed_offer,
         ));
         // Recovery and snapshot activation have settled the applied tip, and
         // nothing serves yet. Refuse to build on recent blocks whose bodies or

@@ -1,6 +1,6 @@
 //! Node configuration DTOs, resolution, and validation.
 
-use crate::options::{ChainstateJournalOverrides, UserConfig};
+use crate::options::{ChainstateJournalOverrides, UserConfig, check_index_bundle_path};
 use anyhow::Result;
 use bitcoin_rs_chainstate::{ChainstateJournalConfig, ValidationMode};
 use bitcoin_rs_consensus::ValidationEngine;
@@ -57,14 +57,10 @@ impl ScriptIndexMode {
 
     /// Derived-index capabilities this mode and txindex jointly enable.
     ///
-    /// PRE: none.
-    /// POST: one of `NONE`, `TX_LOOKUP`, `SCRIPT_LIVE`, `TX_LOOKUP_SCRIPT_LIVE`,
-    /// `TX_AND_SCRIPTS`. Full always includes `TxLookup` regardless of txindex (Esplora
+    /// Full always includes `TxLookup` regardless of txindex (Esplora
     /// prevout and fee rendering needs exact historical transactions); the
     /// RPC-visible `derived_index_query` gate still requires an explicit
     /// `--txindex`.
-    /// INVARIANT: the match is exhaustive over `(bool, Self)`; an
-    /// unreachable combination is not spellable from `crates/node`.
     #[must_use]
     pub const fn enabled_capabilities(self, txindex: bool) -> IndexCapabilities {
         match (txindex, self) {
@@ -182,6 +178,12 @@ pub struct IndexConfig {
     /// Optional basic compact-filter index; disabled by default.
     pub blockfilterindex: bool,
     pub script_index: ScriptIndexMode,
+    /// One-shot startup restore of a portable index bundle from this
+    /// directory. Never set by default; excludes [`Self::bundle_export`].
+    pub bundle_import: Option<PathBuf>,
+    /// One-shot startup export of a portable index bundle into this
+    /// directory. Never set by default; excludes [`Self::bundle_import`].
+    pub bundle_export: Option<PathBuf>,
 }
 
 /// Resolved observability configuration.
@@ -331,6 +333,8 @@ impl NodeConfig {
                     .indexes
                     .script_index
                     .unwrap_or(ScriptIndexMode::Disabled),
+                bundle_import: settings.indexes.bundle_import.clone(),
+                bundle_export: settings.indexes.bundle_export.clone(),
             },
             observability: ObservabilityConfig {
                 log_level: settings
@@ -433,16 +437,19 @@ impl NodeConfig {
              support is not compiled in (enable the `kernel` feature)",
             self.validation.engine
         );
+        self.validate_index_bundle()?;
         self.validate_p2p_network()?;
+        self.p2p.overlay.validate()?;
         bitcoin_rs_rpc::zmq::validate_endpoint_configs(&self.notifications.zmq)?;
         self.validate_chainstate_journal()?;
         Ok(())
     }
 
-    /// Validates chainstate journal sizing constraints.
+    /// Validates chainstate journal retention bounds.
     ///
-    /// Split out of [`NodeConfig::validate`] for the line budget only;
-    /// checks and errors moved verbatim.
+    /// PRE: none; this reads only resolved fields and opens no path.
+    /// POST: journal retention counters are internally consistent and positive
+    /// where rotation depends on them.
     fn validate_chainstate_journal(&self) -> Result<()> {
         let journal = &self.chainstate_journal;
         anyhow::ensure!(
@@ -564,6 +571,33 @@ impl NodeConfig {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validates the portable index bundle request.
+    ///
+    /// PRE: none; this reads only resolved fields and opens no path.
+    /// POST: at most one nonempty bundle directory is set, and it is set only
+    /// when the transaction index it moves is enabled.
+    /// INVARIANT: the bundle is an explicit one-shot operator request, so a
+    /// request this node cannot honor fails before any worker starts instead
+    /// of being dropped.
+    fn validate_index_bundle(&self) -> Result<()> {
+        let indexes = &self.indexes;
+        anyhow::ensure!(
+            indexes.bundle_import.is_none() || indexes.bundle_export.is_none(),
+            "--index-bundle-import and --index-bundle-export are mutually exclusive"
+        );
+        for (flag, dir) in [
+            ("--index-bundle-import", &indexes.bundle_import),
+            ("--index-bundle-export", &indexes.bundle_export),
+        ] {
+            let Some(dir) = dir else {
+                continue;
+            };
+            check_index_bundle_path(dir).map_err(|error| anyhow::anyhow!("{flag}: {error}"))?;
+            anyhow::ensure!(indexes.txindex, "{flag} requires --txindex");
         }
         Ok(())
     }

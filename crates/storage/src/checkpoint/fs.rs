@@ -151,25 +151,6 @@ impl CheckpointRoot {
         self.dir.rename(from, &self.dir, to)
     }
 
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    ))]
-    pub(crate) fn rename_noreplace(&self, from: &str, to: &str) -> io::Result<()> {
-        check_confined_endpoint(from)?;
-        check_confined_endpoint(to)?;
-        rustix::fs::renameat_with(
-            self.dir(),
-            from,
-            self.dir(),
-            to,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(Into::into)
-    }
-
     pub(crate) fn sync(&self) -> io::Result<()> {
         sync_dir(&self.dir)
     }
@@ -201,6 +182,49 @@ impl CheckpointRoot {
     }
 }
 
+/// Whether [`rename_noreplace`] is available on this target. Callers that do
+/// expensive work before publishing consult it first so they can refuse early.
+pub const HAS_ATOMIC_NOREPLACE_RENAME: bool = cfg!(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+));
+
+/// Renames `from` to `to` inside `dir` in one filesystem step that fails with
+/// [`io::ErrorKind::AlreadyExists`] instead of replacing an existing `to`.
+///
+/// A prior existence check cannot provide this: another process can create
+/// `to` between the check and the rename and lose its file. Both names stay
+/// confined to `dir`: absolute paths, parent components, and separators are
+/// refused before the rename.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+pub fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
+    check_confined_endpoint(from)?;
+    check_confined_endpoint(to)?;
+    rustix::fs::renameat_with(dir, from, dir, to, rustix::fs::RenameFlags::NOREPLACE)
+        .map_err(Into::into)
+}
+
+/// Platforms without an atomic no-replace rename refuse rather than replace.
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+pub fn rename_noreplace(_dir: &Dir, _from: &str, _to: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this platform has no atomic no-replace rename",
+    ))
+}
+
 /// Creates a new regular file without following symlinks.
 pub fn create_file(dir: &Dir, name: &str) -> io::Result<File> {
     let mut options = OpenOptions::new();
@@ -218,7 +242,7 @@ pub fn create_file(dir: &Dir, name: &str) -> io::Result<File> {
 /// Open nonblocking without following symlinks, then require the opened
 /// inode to be a regular file. `O_NONBLOCK` is a no-op for regular files,
 /// so `NotFound` and other I/O error kinds propagate unchanged.
-pub(crate) fn open_file(dir: &Dir, name: &str) -> io::Result<File> {
+pub fn open_file(dir: &Dir, name: &str) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No).nonblock(true);
     let file = dir.open_with(name, &options)?;
