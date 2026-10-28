@@ -2062,5 +2062,169 @@ class IndexedParity(unittest.TestCase):
                 writer.finish(io.BytesIO())
 
 
+class OfflineScanHardening(unittest.TestCase):
+    def test_iter_frames_accepts_zero_padded_tail(self) -> None:
+        for tail in (b"\x00" * 8, b"\x00" * 63, b"\x00" * 4096):
+            with self.subTest(tail=len(tail)):
+                frames = list(corpus.iter_frames(io.BytesIO(_GOLDEN_ARCHIVE + tail)))
+                self.assertEqual([payload for _, payload in frames], list(_LINKED))
+
+    def test_iter_frames_rejects_nonzero_bytes_after_zero_padding(self) -> None:
+        evil = _GOLDEN_ARCHIVE + b"\x00" * 16 + b"\x01"
+        with self.assertRaisesRegex(ContractError, "trim the file"):
+            list(corpus.iter_frames(io.BytesIO(evil)))
+
+    def test_iter_frames_offset_zero_mismatch_fails_closed_on_obfuscation(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ContractError, "XOR-obfuscated"):
+            list(corpus.iter_frames(io.BytesIO(b"\x01\x02\x03\x04\x05\x06\x07\x08")))
+
+    def test_hash_file_refuses_symlink_without_following_it(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "target.dat"
+            target.write_bytes(b"victim-bytes")
+            link = root / "blk00000.dat"
+            os.symlink(target, link)
+            with self.assertRaisesRegex(ContractError, "must not be a symlink"):
+                corpus._hash_file(link)
+            self.assertEqual(target.read_bytes(), b"victim-bytes")
+
+    def test_build_index_refuses_symlinked_source(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            stash = root / "stashed.bin"
+            target = source_dir / "blk00001.dat"
+            stash.write_bytes(target.read_bytes())
+            target.unlink()
+            os.symlink(stash, target)
+            with self.assertRaisesRegex(ContractError, "must not be a symlink"):
+                corpus.build_index_from_scan(
+                    freeze, FIX_CORPUS, source_dir, root / "evil.index"
+                )
+            self.assertFalse((root / "evil.index").exists())
+
+    def test_verify_index_refuses_symlinked_source(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, index_path)
+            stash = root / "stashed.bin"
+            target = source_dir / "blk00001.dat"
+            stash.write_bytes(target.read_bytes())
+            target.unlink()
+            os.symlink(stash, target)
+            with self.assertRaisesRegex(ContractError, "must not be a symlink"):
+                corpus.verify_index(freeze, index_path, source_dir)
+
+    def test_build_index_rejects_source_mutated_mid_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            real_append = corpus.IndexWriter.append
+
+            def mutating_append(self, payload, at, expected_hash=None):
+                result = real_append(self, payload, at, expected_hash=expected_hash)
+                if self._count == 3:
+                    victim = source_dir / "blk00001.dat"
+                    victim.write_bytes(victim.read_bytes() + b"\x00")
+                return result
+
+            with (
+                mock.patch.object(corpus.IndexWriter, "append", mutating_append),
+                self.assertRaisesRegex(ContractError, "changed during the scan"),
+            ):
+                corpus.build_index_from_scan(freeze, FIX_CORPUS, source_dir, index_path)
+            self.assertFalse(index_path.exists())
+
+    def test_build_archive_from_index_matches_packed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            freeze = _fixture_freeze(root)
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            index_summary = corpus.build_index_from_scan(
+                freeze, FIX_CORPUS, source_dir, index_path
+            )
+            packed = _packed_from_payloads(root, freeze, _IDX_LINKED)
+            archive_path = root / "repacked.dat"
+            manifest_path = root / "repacked.manifest"
+            built = corpus.build_archive_from_index(
+                freeze, index_path, source_dir, archive_path, manifest_path
+            )
+            self.assertEqual(archive_path.read_bytes(), packed)
+            self.assertEqual(built.archive_sha256, index_summary.logical_sha256)
+            self.assertEqual(built.archive_size, index_summary.logical_size)
+            manifest_doc = json.loads(manifest_path.read_bytes().decode("utf-8"))
+            self.assertEqual(
+                manifest_doc["archive"]["sha256"], index_summary.logical_sha256
+            )
+            self.assertEqual(
+                manifest_doc["archive"]["size"], index_summary.logical_size
+            )
+            with (
+                archive_path.open("rb") as archive_fh,
+                manifest_path.open("rb") as manifest_fh,
+                (root / "repacked.spool").open("w+b") as spool_fh,
+            ):
+                product = corpus.verify_archive(
+                    freeze, archive_fh, manifest_fh, entries=spool_fh
+                )
+            self.assertEqual(product.corpus_id, FIX_CORPUS)
+
+    def test_build_archive_cli_packs_verified_index(self) -> None:
+        with _isolated_products() as root:
+            freeze = corpus.load_freeze()
+            source_dir = _write_idx_sources(root)
+            index_path = root / "canon.index"
+            archive_path = root / "cli.dat"
+            manifest_path = root / "cli.manifest"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    corpus.main(
+                        [
+                            "build-index",
+                            "--corpus-id",
+                            FIX_CORPUS,
+                            "--source-dir",
+                            str(source_dir),
+                            "--index",
+                            str(index_path),
+                        ]
+                    ),
+                    0,
+                )
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                self.assertEqual(
+                    corpus.main(
+                        [
+                            "build-archive",
+                            "--index",
+                            str(index_path),
+                            "--source-dir",
+                            str(source_dir),
+                            "--archive",
+                            str(archive_path),
+                            "--manifest",
+                            str(manifest_path),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertIn(_sha256_hex(archive_path.read_bytes()), buffer.getvalue())
+            self.assertEqual(
+                archive_path.read_bytes(),
+                _packed_from_payloads(root, freeze, _IDX_LINKED),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
