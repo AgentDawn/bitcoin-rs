@@ -265,15 +265,6 @@ fn serve_connection(
                 last_progress = Instant::now();
             }
 
-            // A block-record reservation is only consumed by a `BlockFound`
-            // event. Wait for capacity instead of feeding a solved block with
-            // no permit: dropping the event would close the connection without
-            // submitting or retaining the block.
-            let Some(block_permit) = ledger.try_reserve_block_slot() else {
-                thread::sleep(SOCKET_POLL_INTERVAL);
-                continue;
-            };
-            let mut block_permit = Some(block_permit);
             if buffered_input.is_none() {
                 let read_len = connection.read_hint().clamp(1, MAX_FEED_LEN);
                 match stream.read(&mut input[..read_len]) {
@@ -297,6 +288,15 @@ fn serve_connection(
                 }
             }
 
+            // Reserve only after a frame is buffered. A quiet socket must not
+            // hold one of the bounded block-record slots while it sleeps, and
+            // a solved block must not be fed without a reservation: dropping
+            // either would strand capacity or lose the block.
+            let Some(block_permit) = ledger.try_reserve_block_slot() else {
+                thread::sleep(SOCKET_POLL_INTERVAL);
+                continue;
+            };
+            let mut block_permit = Some(block_permit);
             let length = buffered_input
                 .take()
                 .ok_or_else(|| anyhow!("SV2 buffered input length is missing"))?;
