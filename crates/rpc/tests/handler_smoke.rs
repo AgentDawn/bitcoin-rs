@@ -396,6 +396,20 @@ impl ChainControl for RecordingChainControl {
         }
     }
 
+    // No snapshot exporter is wired into this fixture.
+    fn dump_txoutset(
+        &self,
+        _path: &std::path::Path,
+        _cancellation: &bitcoin_rs_chain::LatchReader,
+    ) -> Result<
+        bitcoin_rs_rpc::context::SnapshotExport,
+        bitcoin_rs_rpc::context::SnapshotControlError,
+    > {
+        Err(bitcoin_rs_rpc::context::SnapshotControlError::Unavailable(
+            "snapshot export is not attached to this fixture".to_owned(),
+        ))
+    }
+
     // No block verifier is wired, so the chain cannot be declared verified.
     fn verify_chain(
         &self,
