@@ -6,7 +6,11 @@ gates for the windowed block apply and its durable group commit (ENG-91, issue
 generates, never here (`HPA-08`, `HPA-12`).
 
 Status: `planned_not_executed`. No arm has run under this protocol, so no
-cell, ratio or percentile is on this page. Rules shared by all cells are in
+cell, ratio or percentile is on this page. The diagnostic spans (section 2)
+and the replay harness (section 3) are proposed, not implemented: no Rust
+source emits `transition_held_us` or `flush_wait_us`, and
+`crates/node/benches/sync_pipeline.rs` has no `--window-attribution` mode.
+Until both land, neither arm can run. Rules shared by all cells are in
 [README.md](README.md); the attribution method is
 [`docs/contracts/hot-path-attribution.md`](../contracts/hot-path-attribution.md).
 
@@ -16,18 +20,18 @@ cell, ratio or percentile is on this page. Rules shared by all cells are in
 |---|---|
 | Baseline pipeline | `apply_window_admitted` in `crates/chainstate/src/window.rs`: `prove_window` proves the whole window, then the sequential per-block loop stages blocks into a `WindowGroup` and flushes at 64 blocks or 8 MiB, all under one chain transition. |
 | Candidate S-A | Not implemented. The tree has no `prove_chunk` and no scoped worker thread. Nothing here adopts it. |
-| Diagnostic spans | `transition_held_us` and `flush_wait_us` exist (section 2). |
+| Diagnostic spans | Not implemented. `transition_held_us` and `flush_wait_us` are proposed (section 2); the existing `durable_head: group commit` debug event in `crates/chainstate/src/window.rs` carries only `sync_us` and `commit_us`. |
 | Existing series | `node.sync.apply_idle_seconds` and `node.sync.download_blocked_by_apply_seconds` exist in `crates/p2p/src/download_window.rs`. |
-| Replay harness | `crates/node/benches/sync_pipeline.rs`, `--window-attribution` (section 3). |
-| Candidate arm | Defined so it can run once S-A exists. Until then only the control arm is measurable, and no control-against-candidate comparison may be written. |
+| Replay harness | Not implemented. `crates/node/benches/sync_pipeline.rs` has no `--window-attribution` branch; section 3 specifies the proposed mode. |
+| Candidate arm | Defined so it can run once S-A exists. The control arm is blocked until the spans and harness exist, and no control-against-candidate comparison may be written. |
 
 Out-of-transition pipelines (S-B) and verify-only lock release (S-C) stay
 rejected: tip identity alone cannot fence `replace_from`, header-gate changes,
 reorg and script-cache takes.
 
-## 2. Diagnostic spans
+## 2. Diagnostic spans (proposed)
 
-Both spans use `quanta::Instant` and `tracing::debug!`. They create no metric
+Neither span exists yet. As specified, both spans use `quanta::Instant` and `tracing::debug!`. They create no metric
 family, change no lock scope and never feed a decision.
 
 | Span | Acquire or start | Release or end | Emitted |
@@ -40,7 +44,10 @@ flush` is a development diagnostic beside `durable_head: group commit`, whose
 `sync_us` and `commit_us` are sub-intervals of the same wait. The spans are
 reported side by side and never added (`HPA-12`).
 
-## 3. Replay harness
+## 3. Replay harness (proposed)
+
+This section specifies a mode that does not exist yet; the command below fails
+until it is implemented.
 
 ### 3.1 Invocation
 
@@ -139,7 +146,8 @@ names custody only; the artifact digest proves the programs differ.
 Run each scenario alternately, control then candidate, three times
 (`A-B-A-B-A-B`). With no candidate in the tree, run the control arm three times
 per scenario: the runs set the stability and the host noise floor, and no
-comparison is produced.
+comparison is produced. Both are blocked until the spans and the harness of
+sections 2 and 3 are implemented.
 
 ## 5. Gates for the replay (`HPA-13`)
 
