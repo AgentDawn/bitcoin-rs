@@ -5,6 +5,7 @@ use anyhow::Result;
 use bitcoin_rs_chainstate::{ChainstateJournalConfig, ValidationMode};
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_index::IndexCapabilities;
+use bitcoin_rs_p2p::PeerNetwork;
 use bitcoin_rs_p2p::endpoint::{ClassifiedEndpoint, classify_endpoint};
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_storage::StorageBackend;
@@ -133,7 +134,7 @@ pub struct StorageConfig {
 #[derive(Clone, Debug)]
 pub struct P2pConfig {
     /// Opt-in Tor and IVNP I2P routing.
-    pub overlay: bitcoin_rs_p2p::OverlayConfig,
+    pub overlay: bitcoin_rs_p2p::overlay::OverlayConfig,
     /// P2P message-start bytes.
     pub magic: [u8; 4],
     /// P2P listener bind addresses.
@@ -296,7 +297,7 @@ impl NodeConfig {
                 prune_target_mb: settings.storage.prune_target_mb.unwrap_or(0),
             },
             p2p: P2pConfig {
-                overlay: bitcoin_rs_p2p::OverlayConfig {
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
                     proxy: settings.p2p.proxy,
                     onion_proxy: settings.p2p.onion_proxy,
                     onlynet: settings.p2p.onlynet.clone().unwrap_or_default(),
@@ -452,28 +453,14 @@ impl NodeConfig {
              support is not compiled in (enable the `kernel` feature)",
             self.validation.engine
         );
-        self.validate_overlay()?;
         anyhow::ensure!(
             !self.p2p.relay_offers.stale_tip_prefers_blocks
                 || self.p2p.relay_offers.stale_tip_relay,
             "--p2p-stale-tip-prefers-blocks requires --p2p-stale-tip-relay"
         );
         self.validate_index_bundle()?;
+        self.validate_p2p_network()?;
         self.p2p.overlay.validate()?;
-        if self.p2p.magic != self.network.magic() {
-            anyhow::ensure!(
-                self.network == Network::Mainnet,
-                "P2P magic overrides currently require --network mainnet"
-            );
-            anyhow::ensure!(
-                !self.p2p.connect.is_empty(),
-                "P2P magic overrides require at least one --connect peer"
-            );
-            anyhow::ensure!(
-                !self.p2p.dns_seeds_enabled,
-                "P2P magic overrides require --dns-seeds-enabled=false"
-            );
-        }
         bitcoin_rs_rpc::zmq::validate_endpoint_configs(&self.notifications.zmq)?;
         self.validate_chainstate_journal()?;
         Ok(())
@@ -513,6 +500,32 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Validates P2P network identity and overlay/privacy routing.
+    ///
+    /// Split out of [`NodeConfig::validate`] for the line budget only;
+    /// checks and errors moved verbatim: the overlay transport constraints
+    /// (routes for overlay targets, no local DNS under a privacy route),
+    /// then the magic-override requirements (mainnet, a `--connect` peer,
+    /// DNS seeds off).
+    fn validate_p2p_network(&self) -> Result<()> {
+        self.validate_overlay()?;
+        if self.p2p.magic != self.network.magic() {
+            anyhow::ensure!(
+                self.network == Network::Mainnet,
+                "P2P magic overrides currently require --network mainnet"
+            );
+            anyhow::ensure!(
+                !self.p2p.connect.is_empty(),
+                "P2P magic overrides require at least one --connect peer"
+            );
+            anyhow::ensure!(
+                !self.p2p.dns_seeds_enabled,
+                "P2P magic overrides require --dns-seeds-enabled=false"
+            );
+        }
+        Ok(())
+    }
+
     /// Validates cross-field overlay transport constraints.
     ///
     /// Overlay targets require their routes: an onion target without
@@ -537,20 +550,20 @@ impl NodeConfig {
         anyhow::ensure!(
             !overlay
                 .onlynet
-                .contains(&bitcoin_rs_p2p::PeerNetwork::Onion)
+                .contains(&PeerNetwork::Onion)
                 || onion_route,
-            "--onlynet=onion requires an onion route (--onion or --proxy)"
+            "--onlynet=onion requires an onion route (--onion-proxy or --proxy)"
         );
         anyhow::ensure!(
             !overlay
                 .onlynet
-                .contains(&bitcoin_rs_p2p::PeerNetwork::I2p)
+                .contains(&PeerNetwork::I2p)
                 || overlay.i2p_sam.is_some(),
-            "--onlynet=i2p requires an I2P SAM bridge (--i2psam)"
+            "--onlynet=i2p requires an I2P SAM bridge (--i2p-sam)"
         );
         anyhow::ensure!(
             !overlay.i2p_accept || overlay.i2p_sam.is_some(),
-            "--i2pacceptincoming requires an I2P SAM bridge (--i2psam)"
+            "--i2p-accept requires an I2P SAM bridge (--i2p-sam)"
         );
         for target in &self.p2p.connect {
             match classify_endpoint(target) {
@@ -562,13 +575,13 @@ impl NodeConfig {
                 }) => {
                     anyhow::ensure!(
                         onion_route,
-                        "--connect onion target requires an onion route (--onion or --proxy)"
+                        "--connect onion target requires an onion route (--onion-proxy or --proxy)"
                     );
                 }
                 ClassifiedEndpoint::Valid(bitcoin_rs_primitives::PeerEndpoint::I2p { .. }) => {
                     anyhow::ensure!(
                         overlay.i2p_sam.is_some(),
-                        "--connect I2P target requires an I2P SAM bridge (--i2psam)"
+                        "--connect I2P target requires an I2P SAM bridge (--i2p-sam)"
                     );
                 }
                 ClassifiedEndpoint::Valid(bitcoin_rs_primitives::PeerEndpoint::Ip(..)) => {}
@@ -933,3 +946,29 @@ impl RuntimeInputs {
 #[cfg(test)]
 #[path = "../tests/unit/config/tests.rs"]
 mod tests;
+
+/// Regression: the shared Bitcoin service port follows the winning network on
+/// every selection, so Tor and I2P can never diverge onto separate ports.
+#[cfg(test)]
+mod shared_service_port_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_service_port_is_the_network_default_p2p_port_on_every_network() {
+        for selection in [
+            NetworkSelection::Mainnet,
+            NetworkSelection::Testnet3,
+            NetworkSelection::Testnet4,
+            NetworkSelection::Signet,
+            NetworkSelection::Regtest,
+            NetworkSelection::Drynet4,
+        ] {
+            let config = NodeConfig::default_for_network(selection.consensus_network());
+            assert_eq!(
+                config.p2p.overlay.port,
+                selection.consensus_network().default_p2p_port(),
+                "shared Bitcoin service port must follow {selection:?}",
+            );
+        }
+    }
+}

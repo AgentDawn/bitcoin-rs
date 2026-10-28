@@ -465,6 +465,17 @@ impl PeerTable {
         }
     }
 
+    /// Publish info for an unidentified session (accept-only anonymous path):
+    /// the anonymous key derives from the lease, so only that connection
+    /// can publish or be resolved through it.
+    pub fn publish_info_unidentified(&self, lease: &PeerLease, info: PeerInfo) -> bool {
+        self.publish_info(
+            PeerRemote::AnonymousTor(lease.connection_id()),
+            lease,
+            info,
+        )
+    }
+
     /// Publishes handshake metadata for the connection `lease` refers to.
     pub fn publish_info(
         &self,
@@ -481,15 +492,6 @@ impl PeerTable {
             }
             _ => false,
         }
-    }
-
-    /// Publish info for an unidentified session (accept-only anonymous path).
-    pub fn publish_info_unidentified(&self, lease: &PeerLease, info: PeerInfo) -> bool {
-        self.publish_info(
-            PeerRemote::AnonymousTor(lease.connection_id()),
-            lease,
-            info,
-        )
     }
 
     /// Records that the live connection accepted `tip_hash` and raises its
@@ -808,6 +810,7 @@ impl PeerTable {
 
     /// Reports whether the live published connection at `addr` requested
     /// compact-block relay.
+    #[cfg(test)]
     pub(crate) fn compact_relay_of(&self, addr: impl Into<PeerRemote>) -> bool {
         let addr = addr.into();
         let entries = self.entries.read();
@@ -991,7 +994,6 @@ impl PeerTable {
             Self::retain_traffic(entries, &removed);
         }
     }
-
     /// Removes and cancels anonymous Tor inbound connections belonging to `epoch`.
     ///
     /// Leaves IP connections, I2P connections, outbound Tor connections, and
@@ -1109,6 +1111,26 @@ impl PeerTable {
             .get(&addr)
             .filter(|entry| !entry.lease.is_cancelled())
             .map(|entry| entry.lease.clone())
+    }
+
+    /// Clones the lease for the exact connection named by `token`, whether
+    /// endpoint-identified or anonymous.
+    ///
+    /// Read-only: never registers and never affects capacity. Returns `None`
+    /// when the named connection is not live, is cancelled, or is not the
+    /// exact connection the token names.
+    #[must_use]
+    pub(crate) fn lease_for_token(
+        &self,
+        token: bitcoin_rs_mempool::PeerToken,
+    ) -> Option<PeerLease> {
+        self.entries.read().iter().find_map(|(key, entry)| {
+            if entry.lease.is_cancelled() {
+                return None;
+            }
+            let current = entry.lease.source(key.endpoint());
+            (bitcoin_rs_mempool::PeerToken::from(current) == token).then(|| entry.lease.clone())
+        })
     }
 
     /// Number of live connections, including those still handshaking.
@@ -1377,6 +1399,7 @@ impl PeerTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin_rs_primitives::PeerEndpoint;
 
     #[test]
     fn retiring_an_epoch_wakes_its_leases_without_cancelling_a_replacement() {
@@ -2604,6 +2627,45 @@ mod tests {
             table.outbound_role_counts(),
             (2, 1),
             "two automatic full-relay and one automatic block-relay connection"
+        );
+    }
+
+    #[test]
+    fn overlay_identity_remote_never_uses_proxy_ip() {
+        use crate::connection::PeerRemote;
+        use crate::PeerEndpoint;
+        let loopback =
+            PeerEndpoint::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let anon_id = crate::ConnectionId::for_test_raw(123);
+        let anon = PeerRemote::AnonymousTor(anon_id);
+        assert_eq!(
+            PeerRemote::from_endpoint(None, anon_id),
+            PeerRemote::AnonymousTor(anon_id),
+            "None endpoint is anonymous, never the forwarder socket"
+        );
+        assert_eq!(anon.endpoint(), None);
+        assert_ne!(
+            anon,
+            PeerRemote::Endpoint(loopback),
+            "no proxy IP enters session identity"
+        );
+        let tor = PeerEndpoint::TorV3 {
+            key: [7u8; 32],
+            port: 8333,
+        };
+        assert_eq!(
+            PeerRemote::from_endpoint(Some(tor), anon_id),
+            PeerRemote::Endpoint(tor),
+            "identified Tor keeps its typed endpoint"
+        );
+        let i2p = PeerEndpoint::I2p {
+            hash: [9u8; 32],
+            port: 7656,
+        };
+        assert_eq!(
+            PeerRemote::from_endpoint(Some(i2p), anon_id),
+            PeerRemote::Endpoint(i2p),
+            "SAM-attested I2P keeps its typed endpoint"
         );
     }
 }

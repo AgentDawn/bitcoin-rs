@@ -558,7 +558,7 @@ pub struct NetworkHandles {
     pub local_services: u64,
     /// Resolved overlay transport configuration, reported (configured,
     /// never probed) by `getnetworkinfo`.
-    pub overlay: bitcoin_rs_p2p::OverlayConfig,
+    pub overlay: bitcoin_rs_p2p::overlay::OverlayConfig,
 }
 
 /// Mining capability handles.
@@ -769,7 +769,7 @@ impl Default for NetworkHandles {
             peer_table: p2p.table(),
             p2p,
             local_services: 0x09,
-            overlay: bitcoin_rs_p2p::OverlayConfig::default(),
+            overlay: bitcoin_rs_p2p::overlay::OverlayConfig::default(),
         }
     }
 }
@@ -2103,7 +2103,7 @@ mod tests {
                 peer_table: p2p.table(),
                 p2p: Arc::clone(&p2p),
                 local_services: 0x09,
-                overlay: bitcoin_rs_p2p::OverlayConfig::default(),
+                overlay: bitcoin_rs_p2p::overlay::OverlayConfig::default(),
             },
             ..ContextHandles::default()
         });

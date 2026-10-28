@@ -14,7 +14,6 @@ use std::{
     str::FromStr,
 };
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest, Sha3_256};
 
 /// Logical identity of one peer.
@@ -90,13 +89,21 @@ impl fmt::Display for NetworkLabel {
 
 impl PeerEndpoint {
     /// BIP155 network id: 1 `IPv4`, 2 `IPv6`, 4 `TorV3`, 5 `I2P`.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) reports 1; it is the same
+    /// IPv4 peer over a v6 socket, matching `AddrMan` canonical handling
+    /// downstream.
     #[must_use]
     pub const fn network_id(self) -> u8 {
         match self {
-            Self::Ip(addr) => match addr {
-                SocketAddr::V4(_) => 1,
-                SocketAddr::V6(_) => 2,
-            },
+            Self::Ip(SocketAddr::V4(_)) => 1,
+            Self::Ip(SocketAddr::V6(addr)) => {
+                if addr.ip().to_ipv4_mapped().is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             Self::TorV3 { .. } => 4,
             Self::I2p { .. } => 5,
         }
@@ -122,11 +129,19 @@ impl PeerEndpoint {
     }
 
     /// Network classification.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) classifies as [`NetworkLabel::Ipv4`].
     #[must_use]
     pub const fn net(self) -> NetworkLabel {
         match self {
             Self::Ip(SocketAddr::V4(_)) => NetworkLabel::Ipv4,
-            Self::Ip(SocketAddr::V6(_)) => NetworkLabel::Ipv6,
+            Self::Ip(SocketAddr::V6(addr)) => {
+                if addr.ip().to_ipv4_mapped().is_some() {
+                    NetworkLabel::Ipv4
+                } else {
+                    NetworkLabel::Ipv6
+                }
+            }
             Self::TorV3 { .. } => NetworkLabel::Onion,
             Self::I2p { .. } => NetworkLabel::I2p,
         }
@@ -177,22 +192,38 @@ impl EndpointHost {
     }
 
     /// Network classification.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) classifies as [`NetworkLabel::Ipv4`].
     #[must_use]
     pub const fn net(self) -> NetworkLabel {
         match self {
             Self::Ip(IpAddr::V4(_)) => NetworkLabel::Ipv4,
-            Self::Ip(IpAddr::V6(_)) => NetworkLabel::Ipv6,
+            Self::Ip(IpAddr::V6(ip)) => {
+                if ip.to_ipv4_mapped().is_some() {
+                    NetworkLabel::Ipv4
+                } else {
+                    NetworkLabel::Ipv6
+                }
+            }
             Self::TorV3 { .. } => NetworkLabel::Onion,
             Self::I2p { .. } => NetworkLabel::I2p,
         }
     }
 
     /// BIP155 network id of the host family.
+    ///
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) reports 1.
     #[must_use]
     pub const fn network_id(self) -> u8 {
         match self {
             Self::Ip(IpAddr::V4(_)) => 1,
-            Self::Ip(IpAddr::V6(_)) => 2,
+            Self::Ip(IpAddr::V6(ip)) => {
+                if ip.to_ipv4_mapped().is_some() {
+                    1
+                } else {
+                    2
+                }
+            }
             Self::TorV3 { .. } => 4,
             Self::I2p { .. } => 5,
         }
@@ -206,6 +237,62 @@ impl fmt::Display for EndpointHost {
             Self::TorV3 { key } => write!(f, "{}.onion", PeerEndpoint::tor_onion_hostname(key)),
             Self::I2p { hash } => write!(f, "{}.b32.i2p", PeerEndpoint::i2p_b32_hostname(hash)),
         }
+    }
+}
+
+impl EndpointHost {
+    /// Parse a port-free host: an IP literal, a 56-character Tor v3
+    /// `<payload>.onion` name, or a 52-character `<hash>.b32.i2p` name.
+    /// Overlay names are validated locally (checksum included).
+    #[must_use]
+    pub fn parse_host(text: &str) -> Option<Self> {
+        if let Ok(ip) = text.parse::<IpAddr>() {
+            return Some(Self::Ip(ip));
+        }
+        if let Some(onion) = text.strip_suffix(".onion") {
+            if onion.len() != 56 {
+                return None;
+            }
+            let payload = base32_decode(onion)?;
+            let key = tor_v3_key_from_payload(&payload)?;
+            return Some(Self::TorV3 { key });
+        }
+        if let Some(b32) = text.strip_suffix(".b32.i2p") {
+            if b32.len() != 52 {
+                return None;
+            }
+            let payload = base32_decode(b32)?;
+            if payload.len() != 32 {
+                return None;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&payload);
+            return Some(Self::I2p { hash });
+        }
+        None
+    }
+}
+
+impl serde::Serialize for EndpointHost {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EndpointHost {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Host;
+        impl serde::de::Visitor<'_> for Host {
+            type Value = EndpointHost;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an IP, <56>.onion or <52>.b32.i2p host")
+            }
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<EndpointHost, E> {
+                EndpointHost::parse_host(text)
+                    .ok_or_else(|| serde::de::Error::custom("invalid overlay host"))
+            }
+        }
+        deserializer.deserialize_str(Host)
     }
 }
 
@@ -225,95 +312,10 @@ impl fmt::Display for PeerEndpoint {
         }
     }
 }
-
-
-impl PeerEndpoint {
-    /// Logical remote identity, without port.
-    #[must_use]
-    pub const fn address(self) -> PeerAddress {
-        match self {
-            Self::Ip(socket) => PeerAddress::Ip(socket.ip()),
-            Self::TorV3 { key, .. } => PeerAddress::Onion(key),
-            Self::I2p { hash, .. } => PeerAddress::I2p(hash),
-        }
-    }
-
-    /// Construct an endpoint from its logical identity and port.
-    #[must_use]
-    pub fn new(address: impl Into<PeerAddress>, port: u16) -> Self {
-        match address.into() {
-            PeerAddress::Ip(ip) => Self::Ip(SocketAddr::new(ip, port)),
-            PeerAddress::Onion(key) => Self::TorV3 { key, port },
-            PeerAddress::I2p(hash) => Self::I2p { hash, port },
-        }
-    }
-
-    /// Direct TCP address, only for IP destinations.
-    #[must_use]
-    pub fn socket_addr(self) -> Option<SocketAddr> {
-        self.as_ip()
-    }
-
-    /// Canonical IP identity with native IPv6 socket scope retained.
-    #[must_use]
-    pub fn to_canonical(self) -> Self {
-        match self {
-            Self::Ip(addr) => {
-                let canonical = addr.ip().to_canonical();
-                if canonical == addr.ip() {
-                    self
-                } else {
-                    Self::Ip(SocketAddr::new(canonical, addr.port()))
-                }
-            }
-            other => other,
-        }
-    }
-
-    /// Whether this is an IPv4 destination.
-    #[must_use]
-    pub const fn is_ipv4(&self) -> bool {
-        matches!(self, Self::Ip(SocketAddr::V4(_)))
-    }
-
-    /// Whether this is an IPv6 destination.
-    #[must_use]
-    pub const fn is_ipv6(&self) -> bool {
-        matches!(self, Self::Ip(SocketAddr::V6(_)))
-    }
-}
-
-impl<T> From<(T, u16)> for PeerEndpoint
-where
-    SocketAddr: From<(T, u16)>,
-{
-    fn from(value: (T, u16)) -> Self {
-        Self::Ip(SocketAddr::from(value))
-    }
-}
-
-impl FromStr for PeerEndpoint {
-    type Err = &'static str;
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Ok(socket) = value.parse::<SocketAddr>() {
-            return Ok(Self::Ip(socket));
-        }
-        let (host, port) = value
-            .rsplit_once(':')
-            .ok_or("destination requires a port")?;
-        if host.contains(':') {
-            return Err("IPv6 endpoints require brackets");
-        }
-        let port = port.parse().map_err(|_| "invalid destination port")?;
-        Ok(match host.parse::<PeerAddress>()? {
-            PeerAddress::Ip(ip) => Self::Ip(SocketAddr::new(ip, port)),
-            PeerAddress::Onion(key) => Self::TorV3 { key, port },
-            PeerAddress::I2p(hash) => Self::I2p { hash, port },
-        })
-    }
-}
 /// Network used by a logical peer destination.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PeerNetwork {
     /// IPv4 TCP.
@@ -334,6 +336,19 @@ impl PeerNetwork {
             Self::Ipv6 => "ipv6",
             Self::Onion => "onion",
             Self::I2p => "i2p",
+        }
+    }
+}
+
+impl FromStr for PeerNetwork {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "ipv4" => Ok(Self::Ipv4),
+            "ipv6" => Ok(Self::Ipv6),
+            "onion" => Ok(Self::Onion),
+            "i2p" => Ok(Self::I2p),
+            _ => Err("expected ipv4, ipv6, onion, or i2p"),
         }
     }
 }
@@ -416,30 +431,92 @@ impl PeerAddress {
         self.ip().is_some_and(|ip| ip.is_multicast())
     }
 }
+
 impl From<IpAddr> for PeerAddress {
     fn from(ip: IpAddr) -> Self {
         Self::Ip(ip)
     }
 }
 
-fn onion_bytes(key: &[u8; 32]) -> [u8; 35] {
-    let mut bytes = [0; 35];
-    bytes[..32].copy_from_slice(key);
-    bytes[34] = 3;
-    let mut digest = Sha3_256::new();
-    digest.update(b".onion checksum");
-    digest.update(key);
-    digest.update([3]);
-    bytes[32..34].copy_from_slice(&digest.finalize()[..2]);
-    bytes
+impl From<EndpointHost> for PeerAddress {
+    fn from(host: EndpointHost) -> Self {
+        match host {
+            EndpointHost::Ip(ip) => Self::Ip(ip),
+            EndpointHost::TorV3 { key } => Self::Onion(key),
+            EndpointHost::I2p { hash } => Self::I2p(hash),
+        }
+    }
 }
+
 impl fmt::Display for PeerAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ip(ip) => ip.fmt(f),
-            Self::Onion(key) => write!(f, "{}.onion", base32_encode(&onion_bytes(key))),
+            Self::Onion(key) => write!(f, "{}.onion", base32_encode(&tor_v3_payload(key))),
             Self::I2p(hash) => write!(f, "{}.b32.i2p", base32_encode(hash)),
         }
+    }
+}
+
+impl PeerEndpoint {
+    /// Construct an endpoint from its logical identity and port.
+    ///
+    /// Adapter over the canonical enum identity: IP pairs become socket
+    /// endpoints, overlay keys become keyed endpoints on `port`.
+    #[must_use]
+    pub fn new(address: impl Into<PeerAddress>, port: u16) -> Self {
+        match address.into() {
+            PeerAddress::Ip(ip) => Self::Ip(SocketAddr::new(ip, port)),
+            PeerAddress::Onion(key) => Self::TorV3 { key, port },
+            PeerAddress::I2p(hash) => Self::I2p { hash, port },
+        }
+    }
+
+    /// Logical remote identity, without port.
+    #[must_use]
+    pub fn address(self) -> PeerAddress {
+        match self {
+            Self::Ip(addr) => PeerAddress::Ip(addr.ip()),
+            Self::TorV3 { key, .. } => PeerAddress::Onion(key),
+            Self::I2p { hash, .. } => PeerAddress::I2p(hash),
+        }
+    }
+
+    /// Direct TCP address, only for IP destinations.
+    #[must_use]
+    pub fn socket_addr(self) -> Option<SocketAddr> {
+        self.as_ip()
+    }
+
+    /// Canonical IP identity with native IPv6 socket scope retained.
+    #[must_use]
+    pub fn to_canonical(self) -> Self {
+        if self.address().to_canonical() == self.address() {
+            self
+        } else {
+            Self::new(self.address().to_canonical(), self.port())
+        }
+    }
+
+    /// Whether this is an IPv4 destination.
+    #[must_use]
+    pub fn is_ipv4(&self) -> bool {
+        matches!(self, Self::Ip(SocketAddr::V4(_)))
+    }
+
+    /// Whether this is an IPv6 destination.
+    #[must_use]
+    pub fn is_ipv6(&self) -> bool {
+        matches!(self, Self::Ip(SocketAddr::V6(_)))
+    }
+}
+
+impl<T> From<(T, u16)> for PeerEndpoint
+where
+    SocketAddr: From<(T, u16)>,
+{
+    fn from(value: (T, u16)) -> Self {
+        Self::from(SocketAddr::from(value))
     }
 }
 
@@ -454,80 +531,71 @@ impl FromStr for PeerAddress {
             if name.len() != 56 {
                 return Err("only Tor v3 destinations are supported");
             }
-            let raw = base32_decode(name).ok_or("invalid base32 destination")?;
-            if raw.len() != 35 {
-                return Err("invalid destination length or padding");
-            }
-            let mut bytes = [0; 35];
-            bytes.copy_from_slice(&raw);
-            let mut key = [0; 32];
-            key.copy_from_slice(&bytes[..32]);
-            if bytes != onion_bytes(&key) {
-                return Err("invalid Tor v3 checksum or version");
-            }
+            let payload = base32_decode(name).ok_or("invalid base32 destination")?;
+            let key =
+                tor_v3_key_from_payload(&payload).ok_or("invalid Tor v3 checksum or version")?;
             return Ok(Self::Onion(key));
         }
         if let Some(name) = text.strip_suffix(".b32.i2p") {
             if name.len() != 52 {
                 return Err("invalid I2P base32 destination length");
             }
-            let hash = base32_decode(name).ok_or("invalid base32 destination")?;
-            if hash.len() != 32 {
-                return Err("invalid destination length or padding");
+            let payload = base32_decode(name).ok_or("invalid base32 destination")?;
+            if payload.len() != 32 {
+                return Err("invalid I2P base32 destination length");
             }
-            let mut out = [0; 32];
-            out.copy_from_slice(&hash);
-            return Ok(Self::I2p(out));
+            let mut hash = [0; 32];
+            hash.copy_from_slice(&payload);
+            return Ok(Self::I2p(hash));
         }
         Err("expected IP, Tor v3, or I2P base32 destination")
     }
 }
-impl Serialize for PeerEndpoint {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-impl<'de> Deserialize<'de> for PeerEndpoint {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let endpoint: Self = String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)?;
-        Ok(endpoint)
-    }
-}
-impl Serialize for PeerAddress {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-impl<'de> Deserialize<'de> for PeerAddress {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let address: Self = String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)?;
-        Ok(address)
-    }
-}
 
-
-
-
-impl FromStr for PeerNetwork {
+impl FromStr for PeerEndpoint {
     type Err = &'static str;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "ipv4" => Ok(Self::Ipv4),
-            "ipv6" => Ok(Self::Ipv6),
-            "onion" => Ok(Self::Onion),
-            "i2p" => Ok(Self::I2p),
-            _ => Err("expected ipv4, ipv6, onion, or i2p"),
+        if let Ok(socket) = value.parse::<SocketAddr>() {
+            return Ok(Self::from(socket));
         }
+        let (host, port) = value
+            .rsplit_once(':')
+            .ok_or("destination requires a port")?;
+        if host.contains(':') {
+            return Err("IPv6 endpoints require brackets");
+        }
+        Ok(Self::new(
+            host.parse::<PeerAddress>()?,
+            port.parse().map_err(|_| "invalid destination port")?,
+        ))
     }
 }
 
-#[cfg(test)]
-#[expect(clippy::expect_used)]
-mod tests;
+impl serde::Serialize for PeerEndpoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PeerEndpoint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for PeerAddress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PeerAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 /// 35-byte Tor v3 payload: key || checksum(2) || version(0x03).
 #[must_use]
@@ -627,7 +695,7 @@ pub fn base32_decode(text: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod enum_api_tests {
+mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -683,6 +751,24 @@ mod enum_api_tests {
     }
 
     #[test]
+    fn mapped_ipv6_classifies_as_ipv4() {
+        let mapped = PeerEndpoint::Ip(SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()),
+            8333,
+        ));
+        assert_eq!(mapped.network_id(), 1);
+        assert_eq!(mapped.net(), NetworkLabel::Ipv4);
+        assert_eq!(mapped.host().network_id(), 1);
+        assert_eq!(mapped.host().net(), NetworkLabel::Ipv4);
+        // Genuine IPv6 keeps its classification on both projections.
+        let v6 = PeerEndpoint::Ip(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8333));
+        assert_eq!(v6.network_id(), 2);
+        assert_eq!(v6.net(), NetworkLabel::Ipv6);
+        assert_eq!(v6.host().network_id(), 2);
+        assert_eq!(v6.host().net(), NetworkLabel::Ipv6);
+    }
+
+    #[test]
     fn base32_rejects_invalid() {
         assert_eq!(base32_decode("ABC"), None); // uppercase
         assert_eq!(base32_decode("ab="), None); // padding / bad char
@@ -692,3 +778,7 @@ mod enum_api_tests {
         assert_eq!(base32_decode("ac"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "endpoint/tests.rs"]
+mod endpoint_main_tests;

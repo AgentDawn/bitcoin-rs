@@ -1,4 +1,5 @@
 """Bounded loopback recorder for SOCKS5 and SAM 3.3. One concern only."""
+
 import argparse
 import asyncio
 import hashlib
@@ -8,7 +9,7 @@ import re
 import signal
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, TypeVar
 
 
 class SocksRecord(TypedDict, total=False):
@@ -34,9 +35,14 @@ class SamRecord(TypedDict, total=False):
     error: str
 
 
-type SamCommand = Literal["hello", "session_create", "naming_lookup", "stream_connect", "stream_accept"]
-type SamPhase = Literal["root", "stream"]
-type Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Coroutine[None, None, None]]
+SamCommand = Literal[
+    "hello", "session_create", "naming_lookup", "stream_connect", "stream_accept"
+]
+SamPhase = Literal["root", "stream"]
+Handler = Callable[
+    [asyncio.StreamReader, asyncio.StreamWriter], Coroutine[None, None, None]
+]
+T = TypeVar("T")
 
 # One handshake step (connect, a command, a reply, a drain) waits at most IO_TIMEOUT. The reply to
 # SESSION CREATE is the one exception: the node's whole root budget. HANDSHAKE_TIMEOUT bounds a
@@ -62,7 +68,12 @@ SECRET_KEYS = ("DESTINATION", "PASSWORD")
 SAM_VERSION = re.compile(r"[0-9]{1,3}\.[0-9]{1,3}")
 SOCKS_ADDRESS_SIZE = {1: 4, 4: 16}
 # Failures that are connection evidence. Their messages never carry peer data.
-EXPECTED = (OSError, RuntimeError, asyncio.IncompleteReadError, asyncio.LimitOverrunError)
+EXPECTED = (
+    OSError,
+    RuntimeError,
+    asyncio.IncompleteReadError,
+    asyncio.LimitOverrunError,
+)
 # Fresh-root readiness ordinal: incremented once per validated SESSION CREATE OK
 # (SESSION STATUS RESULT=OK, exact token match) and flushed as one stable log
 # line. Each recorder process holds its own counter starting at 0, so the A-side
@@ -120,7 +131,11 @@ def redact_sam_tokens(tokens: list[str]) -> str:
 def observe_command(sam: SamRecord, command: bytes) -> SamCommand | None:
     """Record the redacted line of a command the launcher requires; return its kind."""
     tokens = sam_tokens(command.decode("utf-8", "replace"))
-    kind = SAM_COMMANDS.get((tokens[0].upper(), tokens[1].upper())) if len(tokens) > 1 else None
+    kind = (
+        SAM_COMMANDS.get((tokens[0].upper(), tokens[1].upper()))
+        if len(tokens) > 1
+        else None
+    )
     if kind is not None:
         sam[kind] = redact_sam_tokens(tokens)[:MAX_OBSERVED]
     return kind
@@ -150,7 +165,7 @@ def record_negotiated_version(sam: SamRecord, reply: bytes) -> None:
         sam["negotiated_version"] = version
 
 
-async def bounded[T](awaitable: Awaitable[T], timeout: float, what: str) -> T:
+async def bounded(awaitable: Awaitable[T], timeout: float, what: str) -> T:
     try:
         async with asyncio.timeout(timeout):
             return await awaitable
@@ -162,7 +177,9 @@ async def read_exact(reader: asyncio.StreamReader, count: int, what: str) -> byt
     return await bounded(reader.readexactly(count), IO_TIMEOUT, what)
 
 
-async def read_line(reader: asyncio.StreamReader, timeout: float | None, what: str) -> bytes | None:
+async def read_line(
+    reader: asyncio.StreamReader, timeout: float | None, what: str
+) -> bytes | None:
     """One newline-terminated line; None for a clean EOF between lines. No deadline when idle."""
     line = reader.readuntil(b"\n")
     try:
@@ -185,7 +202,9 @@ async def close_all(*writers: asyncio.StreamWriter | None) -> str | None:
         writer.close()
     try:
         async with asyncio.timeout(CLOSE_TIMEOUT):
-            results = await asyncio.gather(*(writer.wait_closed() for writer in live), return_exceptions=True)
+            results = await asyncio.gather(
+                *(writer.wait_closed() for writer in live), return_exceptions=True
+            )
     except TimeoutError:
         for writer in live:
             writer.transport.abort()
@@ -251,7 +270,9 @@ async def forward_socks_auth(
     user = await read_exact(client_reader, head[1], "socks auth")
     password_length = await read_exact(client_reader, 1, "socks auth")
     password = await read_exact(client_reader, password_length[0], "socks auth")
-    await send(upstream_writer, head + user + password_length + password, "socks auth write")
+    await send(
+        upstream_writer, head + user + password_length + password, "socks auth write"
+    )
     status = await read_exact(reader, 2, "socks auth status")
     await send(client_writer, status, "socks auth status write")
     if status[1] != 0:
@@ -303,7 +324,9 @@ async def handle_socks(
     upstream_writer: asyncio.StreamWriter | None = None
     try:
         reader, upstream_writer = await bounded(
-            asyncio.open_connection(target_host, target_port), IO_TIMEOUT, "socks proxy connect"
+            asyncio.open_connection(target_host, target_port),
+            IO_TIMEOUT,
+            "socks proxy connect",
         )
         record = await bounded(
             socks_handshake(client_reader, client_writer, reader, upstream_writer),
@@ -313,7 +336,9 @@ async def handle_socks(
         if record is not None:
             records.append(record)
             if record.get("reply_code") == 0:
-                await first_to_end(pump(client_reader, upstream_writer), pump(reader, client_writer))
+                await first_to_end(
+                    pump(client_reader, upstream_writer), pump(reader, client_writer)
+                )
     except* EXPECTED as group:
         records.extend({"error": describe(err)} for err in leaves(group))
     finally:
@@ -338,16 +363,25 @@ async def negotiate_sam(
         kind = observe_command(sam, command)
         await send(upstream_writer, command, "sam command write")
         reply = await read_line(
-            reader, SESSION_CREATE_TIMEOUT if kind == "session_create" else IO_TIMEOUT, "sam reply"
+            reader,
+            SESSION_CREATE_TIMEOUT if kind == "session_create" else IO_TIMEOUT,
+            "sam reply",
         )
         if reply is None:
             raise RuntimeError("sam bridge closed before replying")
         await send(client_writer, reply, "sam reply write")
         if kind == "hello":
             record_negotiated_version(sam, reply)
-        elif kind == "session_create" and reply_fields(reply, "SESSION STATUS").get("RESULT") == "OK":
+        elif (
+            kind == "session_create"
+            and reply_fields(reply, "SESSION STATUS").get("RESULT") == "OK"
+        ):
             _SESSION_CREATE_OK_ORDINAL += 1
-            print(f"sam_session_create_ok ordinal={_SESSION_CREATE_OK_ORDINAL}", file=sys.stderr, flush=True)
+            print(
+                f"sam_session_create_ok ordinal={_SESSION_CREATE_OK_ORDINAL}",
+                file=sys.stderr,
+                flush=True,
+            )
             return "root"
         elif kind in ("stream_connect", "stream_accept"):
             ok = reply_fields(reply, "STREAM STATUS").get("RESULT") == "OK"
@@ -355,7 +389,9 @@ async def negotiate_sam(
 
 
 async def observe_commands(
-    client_reader: asyncio.StreamReader, upstream_writer: asyncio.StreamWriter, sam: SamRecord
+    client_reader: asyncio.StreamReader,
+    upstream_writer: asyncio.StreamWriter,
+    sam: SamRecord,
 ) -> None:
     """Session root: record and forward each later command; the wait for the next has no deadline."""
     while (command := await read_line(client_reader, None, "sam command")) is not None:
@@ -373,7 +409,9 @@ async def handle_sam(
     upstream_writer: asyncio.StreamWriter | None = None
     try:
         reader, upstream_writer = await bounded(
-            asyncio.open_connection(target_host, target_port, limit=MAX_LINE), IO_TIMEOUT, "sam bridge connect"
+            asyncio.open_connection(target_host, target_port, limit=MAX_LINE),
+            IO_TIMEOUT,
+            "sam bridge connect",
         )
         phase = await bounded(
             negotiate_sam(client_reader, client_writer, reader, upstream_writer, sam),
@@ -381,9 +419,14 @@ async def handle_sam(
             "sam handshake",
         )
         if phase == "stream":
-            await first_to_end(pump(client_reader, upstream_writer), pump(reader, client_writer))
+            await first_to_end(
+                pump(client_reader, upstream_writer), pump(reader, client_writer)
+            )
         elif phase == "root":
-            await first_to_end(observe_commands(client_reader, upstream_writer, sam), pump(reader, client_writer))
+            await first_to_end(
+                observe_commands(client_reader, upstream_writer, sam),
+                pump(reader, client_writer),
+            )
     except* EXPECTED as group:
         for err in leaves(group):
             note_sam_error(sam, describe(err))
@@ -439,7 +482,11 @@ async def amain(args: argparse.Namespace) -> int:
                         handlers,
                         stop,
                         lambda r, w: handle_socks(
-                            r, w, str(args.socks_target_host), int(args.socks_target_port), socks_records
+                            r,
+                            w,
+                            str(args.socks_target_host),
+                            int(args.socks_target_port),
+                            socks_records,
                         ),
                         lambda message: socks_records.append({"error": message}),
                     ),
@@ -455,7 +502,11 @@ async def amain(args: argparse.Namespace) -> int:
                         handlers,
                         stop,
                         lambda r, w: handle_sam(
-                            r, w, str(args.sam_target_host), int(args.sam_target_port), sam_record
+                            r,
+                            w,
+                            str(args.sam_target_host),
+                            int(args.sam_target_port),
+                            sam_record,
                         ),
                         lambda message: note_sam_error(sam_record, message),
                     ),
@@ -478,7 +529,9 @@ async def amain(args: argparse.Namespace) -> int:
     return 0
 
 
-def write_snapshot(output: str, done: str, socks_records: list[SocksRecord], sam_record: SamRecord) -> None:
+def write_snapshot(
+    output: str, done: str, socks_records: list[SocksRecord], sam_record: SamRecord
+) -> None:
     snapshot = {"socks": socks_records, "sam": sam_record}
     raw = json.dumps(snapshot, indent=2).encode("utf-8")
     tmp_output = f"{output}.tmp"

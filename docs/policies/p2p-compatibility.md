@@ -408,6 +408,10 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
    version. Only after release may a breaking change increment the version with
    an explicit compatibility decision; release itself needs no increment.
 
+   Actual Core group/placement evidence includes 224 ASMap rows and official
+   Tried236/New795 anchors. These are specific algorithm/persistence checks
+   against the canonical v1 format, not full peer-lifecycle parity; no
+   historical migration fixtures exist.
    The canonical object has `format`, `version`, `magic` (four P2P magic bytes),
    `secret` (32 bytes), `records`, `asmap_id` (null or 32 bytes), and `anchors`.
    The trailing 32 bytes are SHA256 of the exact UTF-8 JSON payload. Endpoint

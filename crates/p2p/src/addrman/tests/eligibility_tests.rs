@@ -17,7 +17,7 @@ fn ordinary_selection_uses_existing_service_contract_for_new_and_tried() {
             (1033, u64::MAX, true),
         ] {
             let book = book();
-            book.learn_peer(addr(2).address(), &[(target(), services, EPOCH)], EPOCH);
+            book.learn_peer(crate::PeerRemote::Endpoint(addr(2)), &[(target(), services, EPOCH)], EPOCH);
             if tried {
                 book.succeeded(target(), services, EPOCH + 1);
             }
@@ -42,7 +42,7 @@ fn ordinary_selection_uses_existing_service_contract_for_new_and_tried() {
 #[test]
 fn current_services_are_rechecked_after_unlocked_policy_callback() {
     let book = book();
-    book.learn_peer(addr(2).address(), &[(target(), 9, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(2)), &[(target(), 9, EPOCH)], EPOCH);
     assert_eq!(
         book.select(&[], &[], EPOCH, u64::MAX, |endpoint| {
             assert!(book.state.try_lock().is_some());
@@ -63,7 +63,7 @@ fn current_services_are_rechecked_after_unlocked_policy_callback() {
 #[test]
 fn accepted_version_service_update_is_metadata_only_canonical_and_idempotent() {
     let book = book();
-    book.learn_peer(addr(2).address(), &[(target(), 9, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(2)), &[(target(), 9, EPOCH)], EPOCH);
     book.attempted(target(), true, EPOCH + 1);
     let (before, revision, last_good) = {
         let manager = book.state.lock();
@@ -117,6 +117,12 @@ fn accepted_version_service_update_is_metadata_only_canonical_and_idempotent() {
 fn only_unknown_dns_services_keep_native_bootstrap_exception() {
     for source in [
         Source::dns("seed"),
+        Source::Overlay(
+            "fivcukrkfivcukrkfivcukrkfivcukrkfivcukrkfivcukrkfivjcrid.onion:8334"
+                .parse::<PeerEndpoint>()
+                .expect("overlay")
+                .address(),
+        ),
         Source::Ip(
             addr(2)
                 .address()
@@ -159,10 +165,10 @@ fn only_unknown_dns_services_keep_native_bootstrap_exception() {
 #[test]
 fn later_gossip_service_upgrade_uses_the_single_current_field() {
     let book = book();
-    book.learn_peer(addr(2).address(), &[(target(), 1, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(2)), &[(target(), 1, EPOCH)], EPOCH);
     book.succeeded(target(), 1, EPOCH + 1);
     assert!(!book.ordinary_services_eligible(target(), u64::MAX));
-    book.learn_peer(addr(3).address(), &[(target(), 8, EPOCH + 2)], EPOCH + 2);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(3)), &[(target(), 8, EPOCH + 2)], EPOCH + 2);
     assert!(book.ordinary_services_eligible(target(), u64::MAX));
     assert_eq!(
         book.select(&[], &[], EPOCH + 2, u64::MAX, |_| true),

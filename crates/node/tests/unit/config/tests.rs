@@ -199,7 +199,16 @@ fn overlay_targets_without_routes_are_rejected() -> anyhow::Result<()> {
     );
     assert!(config.p2p.overlay.i2p_accept);
     assert_eq!(config.p2p.overlay.onlynet.len(), 2);
-    assert!(!config.p2p.overlay.identity_dir.as_os_str().is_empty());
+    assert!(
+        !config.p2p.overlay.identity_dir.as_os_str().is_empty(),
+        "inbound overlay services require an identity directory"
+    );
+    assert_eq!(
+        config.p2p.overlay.port,
+        NetworkSelection::Mainnet
+            .consensus_network()
+            .default_p2p_port()
+    );
     Ok(())
 }
 
@@ -295,11 +304,35 @@ fn malformed_i2p_with_routes_configured_rejects_target_not_missing_route() -> an
     let valid_config = super::resolve(&[&routes_layer, &valid_user_config])?;
     assert_eq!(valid_config.p2p.connect, vec![good_i2p]);
 
+    // Explicit I2P port 0 (unspecified/default service port) validates
+    // under identical route config and classifies as I2P port 0.
+    let zero_port_i2p = format!("{}.b32.i2p:0", "a".repeat(52));
+    let zero_port_user_config = UserConfig {
+        p2p: P2pOverrides {
+            connect: Some(vec![zero_port_i2p.clone()]),
+            ..P2pOverrides::default()
+        },
+        ..UserConfig::default()
+    };
+    let zero_port_config = super::resolve(&[&routes_layer, &zero_port_user_config])?;
+    assert_eq!(zero_port_config.p2p.connect, vec![zero_port_i2p.clone()]);
+    assert_eq!(
+        bitcoin_rs_p2p::endpoint::classify_endpoint(&zero_port_i2p),
+        bitcoin_rs_p2p::endpoint::ClassifiedEndpoint::Valid(
+            bitcoin_rs_primitives::PeerEndpoint::I2p {
+                hash: [0u8; 32],
+                port: 0,
+            }
+        )
+    );
+
+    // An absent port is still malformed: port 0 must be explicit (`:0`).
+    // Short/long payloads, non-numeric ports, and invalid payloads stay
+    // rejected as well.
     let malformed_i2p_targets = [
         format!("{}.b32.i2p:8333", "a".repeat(51)),
         format!("{}.b32.i2p:8333", "a".repeat(53)),
         format!("{}.b32.i2p", "a".repeat(52)),
-        format!("{}.b32.i2p:0", "a".repeat(52)),
         format!("{}.b32.i2p:notaport", "a".repeat(52)),
         "invalid.b32.i2p:8333".to_owned(),
     ];

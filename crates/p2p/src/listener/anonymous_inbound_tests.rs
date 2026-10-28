@@ -15,9 +15,9 @@ fn anonymous_admission_uses_capacity_without_learning_or_loopback_privilege() {
         crossbeam_channel::unbounded().0,
     );
     shared.overlay = Arc::new(crate::overlay::OverlayTransport::new(Arc::new(
-        crate::OverlayConfig {
+        crate::overlay::OverlayConfig {
             onion_proxy: Some("127.0.0.1:9050".parse().expect("proxy")),
-            ..crate::OverlayConfig::default()
+            ..crate::overlay::OverlayConfig::default()
         },
     )));
     shared.max_inbound = 2;

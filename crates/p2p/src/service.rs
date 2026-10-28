@@ -72,6 +72,7 @@ const MAX_PARKED_DIALS: usize = 64;
 pub struct P2pServiceConfig {
     /// Addresses on which inbound P2P connections are accepted.
     pub listen_addrs: Vec<std::net::SocketAddr>,
+
     /// Network message-start bytes.
     pub magic: Magic,
     /// Auxiliary peer-book base/legacy path. The owner adds the P2P magic to
@@ -123,7 +124,7 @@ pub struct P2pServiceConfig {
     /// Overlay transports (Tor/I2P): proxies, Tor control, SAM bridge,
     /// key persistence paths, and the onlynet restriction. Default
     /// disables every overlay.
-    pub overlay: crate::OverlayConfig,
+    pub overlay: crate::overlay::OverlayConfig,
 }
 
 impl Default for P2pServiceConfig {
@@ -147,7 +148,7 @@ impl Default for P2pServiceConfig {
             local_services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
             v2_transport: false,
             relay_offers: crate::RelayOffers::default(),
-            overlay: crate::OverlayConfig::default(),
+            overlay: crate::overlay::OverlayConfig::default(),
         }
     }
 }
@@ -395,7 +396,7 @@ pub struct BannedReader {
     inner: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     discouraged: Arc<Mutex<crate::discouragement::DiscouragedPeers>>,
     protected: Arc<[crate::IpSubnet]>,
-    routing: Arc<crate::OverlayConfig>,
+    routing: Arc<crate::overlay::OverlayConfig>,
 }
 
 impl BannedReader {
@@ -415,7 +416,7 @@ impl BannedReader {
                 crate::discouragement::DiscouragedPeers::default(),
             )),
             protected: protected.into(),
-            routing: Arc::new(crate::OverlayConfig::default()),
+            routing: Arc::new(crate::overlay::OverlayConfig::default()),
         }
     }
 
@@ -974,6 +975,7 @@ impl P2pService {
             self.address_book
                 .remember_anchors(&demonstrated, crate::addrman::now());
         }
+
         self.peer_table
             .set_network_active(&self.network_active, false);
         self.address_book
@@ -1102,7 +1104,7 @@ impl P2pService {
 
     /// Resolved overlay transport configuration for this service.
     #[must_use]
-    pub fn overlay_config(&self) -> &crate::OverlayConfig {
+    pub fn overlay_config(&self) -> &crate::overlay::OverlayConfig {
         &self.config.overlay
     }
 
@@ -2910,7 +2912,7 @@ mod tests {
         for n in 1..100 {
             let addr = PeerEndpoint::from(([8, n, 1, 1], 8333));
             book.learn_dns("seed", &[addr], 10_000);
-            book.learn_peer(addr.address(), &[(addr, 9, 10_000)], 10_000);
+            book.learn_peer(crate::PeerRemote::Endpoint(addr), &[(addr, 9, 10_000)], 10_000);
         }
         (
             AddressMaintenance {
@@ -3215,7 +3217,7 @@ mod tests {
             maintenance.address_book.learn_dns("seed", &[addr], now);
             maintenance
                 .address_book
-                .learn_peer(addr.address(), &[(addr, 9, now)], now);
+                .learn_peer(crate::PeerRemote::Endpoint(addr), &[(addr, 9, now)], now);
         }
         assert!(
             maintenance
@@ -4021,6 +4023,32 @@ mod tests {
             lease.is_cancelled(),
             "shutdown must cancel live sessions"
         );
+        let restored =
+            crate::addrman::AddressBook::open(Some(path), Magic::REGTEST.to_bytes(), true, None);
+        assert_eq!(restored.take_restart_anchors(now), vec![addr]);
+    }
+
+    #[test]
+    fn shutdown_captures_anchors_before_cancelling_worker_leases() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("peers.dat");
+        let service = P2pService::new(
+            P2pServiceConfig {
+                address_book_path: Some(path.clone()),
+                magic: Magic::REGTEST,
+                allow_local_addresses: true,
+                ..P2pServiceConfig::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333)).into();
+        let now = crate::addrman::now();
+        service.address_book.learn_dns("fixture", &[addr], now);
+        service.address_book.succeeded(addr, 9, now);
+        let lease = register_ready_block_peer(&service.peer_table, addr);
+        *service.workers.lock() = Some(Workers::default());
+        service.shutdown();
+        assert!(lease.is_cancelled(), "workers cancel every lease");
         let restored =
             crate::addrman::AddressBook::open(Some(path), Magic::REGTEST.to_bytes(), true, None);
         assert_eq!(restored.take_restart_anchors(now), vec![addr]);
@@ -5007,9 +5035,9 @@ mod tests {
     fn i2p_service(bridge: SocketAddr) -> P2pService {
         P2pService::new(
             P2pServiceConfig {
-                overlay: crate::OverlayConfig {
+                overlay: crate::overlay::OverlayConfig {
                     i2p_sam: Some(bridge),
-                    ..crate::OverlayConfig::default()
+                    ..crate::overlay::OverlayConfig::default()
                 },
                 ..P2pServiceConfig::default()
             },

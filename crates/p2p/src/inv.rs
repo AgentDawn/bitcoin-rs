@@ -355,6 +355,39 @@ mod tests {
     }
 
     #[test]
+    fn missing_parents_serve_unidentified_inbound_through_own_lease() {
+        let table = PeerTable::new();
+        let (sender, receiver) = crate::test_support::message_channel_bounded(2);
+        let lease = PeerLease::new_inbound(sender);
+        let source: PeerToken = lease.source(None).into();
+        assert!(source.addr.is_none());
+        table.register_unidentified(lease.clone());
+        // A second live anonymous session must not receive this lease's request.
+        let (other_sender, other_receiver) = crate::test_support::message_channel_bounded(2);
+        let other = PeerLease::new_inbound(other_sender);
+        let other_source: PeerToken = other.source(None).into();
+        assert!(other_source.addr.is_none());
+        assert_ne!(other_source.connection_id, source.connection_id);
+        table.register_unidentified(other.clone());
+
+        assert!(request_missing_parents(
+            &table,
+            source,
+            &[parent(1), parent(1)],
+        ));
+        let expected = Message::GetData(vec![Inventory::Transaction(
+            bitcoin::Txid::from_byte_array(*parent(1).as_bytes()),
+        )]);
+        assert!(matches!(receiver.try_recv(), Ok(message) if message == expected));
+        assert!(other_receiver.try_recv().is_err());
+        assert!(!request_missing_parents(&table, source, &[]));
+        assert!(receiver.try_recv().is_err());
+        assert!(other_receiver.try_recv().is_err());
+        assert!(!lease.is_cancelled());
+        assert!(!other.is_cancelled());
+    }
+
+    #[test]
     fn missing_parents_resolve_unidentified_sessions() {
         let table = PeerTable::new();
         let (sender, receiver) = crate::test_support::message_channel_bounded(2);

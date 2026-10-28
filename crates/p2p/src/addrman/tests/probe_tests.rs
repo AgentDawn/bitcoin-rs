@@ -72,7 +72,7 @@ fn make_tried_clears_all_refs_demotes_and_removes_only_colliding_new_reference()
                 add_ref(&mut manager, victim, &source(2), EPOCH);
             }
             manager.stored.anchors.push(Anchor {
-                addr: target(),
+                endpoint: target(),
                 confirmed_at: EPOCH - 10,
             });
         }
@@ -84,7 +84,7 @@ fn make_tried_clears_all_refs_demotes_and_removes_only_colliding_new_reference()
         assert_eq!(refs(&manager, target()), 1);
         assert_eq!(refs(&manager, victim), victim_refs - 1);
         assert_eq!(
-            manager.stored.anchors[0].addr,
+            manager.stored.anchors[0].endpoint,
             target(),
             "demotion retains anchor identity"
         );
@@ -197,7 +197,7 @@ fn anchors_consume_durably_and_return_original_metadata_only_before_dispatch() {
     assert_eq!(
         manager.stored.anchors,
         [Anchor {
-            addr: addr(2),
+            endpoint: addr(2),
             confirmed_at: EPOCH
         }]
     );
@@ -227,7 +227,7 @@ fn failed_anchor_consumption_exposes_no_claims_and_newer_confirmation_wins_retur
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            addr: target(),
+            endpoint: target(),
             confirmed_at: EPOCH
         }]
     );
@@ -240,7 +240,7 @@ fn failed_anchor_consumption_exposes_no_claims_and_newer_confirmation_wins_retur
             .stored
             .anchors,
         [Anchor {
-            addr: target(),
+            endpoint: target(),
             confirmed_at: EPOCH
         }]
     );
@@ -254,7 +254,7 @@ fn failed_anchor_consumption_exposes_no_claims_and_newer_confirmation_wins_retur
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            addr: target(),
+            endpoint: target(),
             confirmed_at: EPOCH + 100
         }]
     );
@@ -278,11 +278,10 @@ fn manager_from_collision_snapshot(row: &serde_json::Value) -> Manager {
         }
         manager.stored.records.push(Candidate {
             creation_id: u64::try_from(manager.stored.records.len()).expect("creation ID"),
-            addr: entry["endpoint"]
+            endpoint: entry["endpoint"]
                 .as_str()
                 .expect("endpoint")
-                .parse()
-                .expect("address"),
+                .parse_endpoint(),
             services: Some(9),
             source: Source::Ip(
                 entry["primary_source"]
@@ -312,8 +311,7 @@ fn manager_from_collision_snapshot(row: &serde_json::Value) -> Manager {
             row["second_challenger"]["endpoint"]
                 .as_str()
                 .expect("second")
-                .parse()
-                .expect("address"),
+                .parse_endpoint(),
         );
     }
     manager.last_good = row["last_good"].as_u64().expect("good");
@@ -342,14 +340,13 @@ fn assert_collision_snapshot(manager: &Manager, row: &serde_json::Value) {
         if entry.is_null() {
             continue;
         }
-        let addr: PeerEndpoint = entry["endpoint"]
+        let endpoint: PeerEndpoint = entry["endpoint"]
             .as_str()
             .expect("endpoint")
-            .parse()
-            .expect("address");
+            .parse_endpoint();
         let actual = manager
             .by_addr
-            .get(&addr)
+            .get(&endpoint)
             .map(|index| &manager.stored.records[*index]);
         assert_eq!(
             actual.is_some(),
@@ -387,7 +384,7 @@ fn assert_collision_snapshot(manager: &Manager, row: &serde_json::Value) {
             .map(|bucket| {
                 vec![
                     usize::from(*bucket),
-                    manager.new_slot(addr, usize::from(*bucket)) % 64,
+                    manager.new_slot(endpoint, usize::from(*bucket)) % 64,
                 ]
             })
             .collect();
@@ -423,7 +420,7 @@ fn collision_transitions_match_actual_core_snapshots() {
             .stored
             .records
             .iter()
-            .map(|entry| entry.addr)
+            .map(|entry| entry.endpoint)
             .collect();
         manager.resolve_collisions(&HashSet::new(), &allowed, EPOCH);
         assert_collision_snapshot(&manager, after);
@@ -450,20 +447,16 @@ fn collision_queue_counts_challengers_and_caps_ten_even_for_one_incumbent() {
         .take(11)
         .enumerate()
     {
-        let addr: PeerEndpoint = endpoint
-            .as_str()
-            .expect("endpoint")
-            .parse()
-            .expect("address");
+        let endpoint: PeerEndpoint = endpoint.as_str().expect("endpoint").parse_endpoint();
         assert!(manager.learn(
-            addr,
+            endpoint,
             Some(9),
             source(u8::try_from(index + 2).expect("source")),
             EPOCH - 100_000,
             EPOCH,
             0
         ));
-        assert!(!manager.good(addr, true, EPOCH - 30));
+        assert!(!manager.good(endpoint, true, EPOCH - 30));
         let expected = rows
             .iter()
             .find(|row| row["case"] == format!("queue-add-{}", index + 1))
@@ -533,7 +526,61 @@ fn successful_connected_challenger_can_promote_without_losing_pending_identity()
 }
 
 #[test]
+fn current_anchors_obey_configured_map_and_orphan_shape_barriers() {
+    let directory = tempfile::tempdir().expect("directory");
+    let base = directory.path().join("peers.dat");
+    let path = network_path(&base, [1; 4]);
+    let book = AddressBook::open(Some(base.clone()), [1; 4], false, None);
+    book.learn_dns("seed", &[target(), addr(2)], EPOCH);
+    book.succeeded(target(), 9, EPOCH);
+    book.succeeded(addr(2), 9, EPOCH);
+    book.remember_anchors(&[target(), addr(2)], EPOCH);
+    book.save();
+    let current = fs::read(&path).expect("current");
+    let map = directory.path().join("map.raw");
+    fs::write(&map, b"invalid map").expect("invalid map");
+    let invalid = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
+    assert!(!invalid.state.lock().writable);
+    assert_eq!(
+        invalid.take_restart_anchors(EPOCH + 10),
+        Vec::<PeerEndpoint>::new()
+    );
+    assert_eq!(invalid.state.lock().stored.anchors.len(), 2);
+    invalid.save();
+    assert_eq!(fs::read(&path).expect("preserved"), current);
+    assert_eq!(
+        fs::read_dir(directory.path()).expect("directory").count(),
+        2,
+        "invalid map creates no backup"
+    );
+    fs::write(
+        &map,
+        include_bytes!("../../../tests/data/asmap-linked-ipv4-core-v31.1.raw"),
+    )
+    .expect("restore map");
+    let restored = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
+    assert!(restored.state.lock().writable);
+    assert_eq!(restored.state.lock().stored.anchors.len(), 2);
+    assert_indexes(&restored.state.lock());
+    restored.save();
+    let prefix = AddressBook::open(Some(base.clone()), [1; 4], false, None);
+    assert!(prefix.state.lock().writable);
+    assert_eq!(prefix.state.lock().stored.anchors.len(), 2);
+    assert_indexes(&prefix.state.lock());
+    prefix.save();
+    let current = fs::read(&path).expect("current");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&current[..current.len() - 32]).expect("JSON");
+    value["anchors"] = serde_json::json!([{"addr":"9.9.9.9:8333","confirmed_at":EPOCH}]);
+    let malformed = fixture_bytes(&value);
+    fs::write(&path, &malformed).expect("orphan anchor");
+    let rejected = AddressBook::open(Some(base), [1; 4], false, None);
+    assert!(!rejected.state.lock().writable);
+    rejected.save();
+    assert_eq!(fs::read(path).expect("rejected preserved"), malformed);
+}
 
+#[test]
 fn anchor_reservation_precedes_publication_and_failed_commit_rolls_it_back() {
     let directory = tempfile::tempdir().expect("directory");
     let base = directory.path().join("peers.dat");
@@ -562,7 +609,7 @@ fn anchor_reservation_precedes_publication_and_failed_commit_rolls_it_back() {
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            addr: target(),
+            endpoint: target(),
             confirmed_at: EPOCH
         }]
     );
@@ -574,7 +621,7 @@ fn anchor_reservation_precedes_publication_and_failed_commit_rolls_it_back() {
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            addr: target(),
+            endpoint: target(),
             confirmed_at: EPOCH
         }],
         "preexisting dial cannot consume an unused anchor"
@@ -599,7 +646,7 @@ fn collision_resolution_uses_creation_order_not_reversed_good_order() {
         .stored
         .records
         .iter()
-        .map(|entry| entry.addr)
+        .map(|entry| entry.endpoint)
         .collect();
     manager.resolve_collisions(&HashSet::new(), &allowed, EPOCH);
     assert!(manager.stored.records[manager.by_addr[&challenger()]].tried);
@@ -622,7 +669,7 @@ fn feelers_use_advertised_address_database_services_without_inventing_dns_bits()
         book.select(&[], &[], EPOCH, u64::MAX, |_| true),
         Some(target())
     );
-    book.learn_peer(addr(2).address(), &[(target(), 1, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(2)), &[(target(), 1, EPOCH)], EPOCH);
     assert_eq!(book.feeler(&[], &[], EPOCH, |_| true), Some(target()));
     book.state.lock().stored.records[0].services = Some(1024);
     assert_eq!(book.feeler(&[], &[], EPOCH, |_| true), Some(target()));
@@ -686,7 +733,7 @@ fn returned_anchor_releases_same_as_group_and_rejection_preserves_other_purposes
     assert_eq!(
         book.state.lock().stored.anchors,
         [Anchor {
-            addr: anchor,
+            endpoint: anchor,
             confirmed_at: EPOCH
         }]
     );
