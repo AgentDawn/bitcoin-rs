@@ -433,6 +433,15 @@ impl ShareTarget {
         Self::from_le_bytes(bytes)
     }
 
+    /// Builds the network target of compact `bits`; zero and negative
+    /// encodings are rejected.
+    pub fn from_compact(bits: CompactTarget) -> Result<Self, JobError> {
+        // Single consensus decode lives in the chain crate; reuse it so the
+        // pool can never diverge from header validation.
+        let value = bitcoin_rs_chain::compact_to_target(bits);
+        Self::from_le_bytes(value.to_le_bytes())
+    }
+
     /// Builds the target of integer pool difficulty `difficulty`; see
     /// [`Self::from_pool_difficulty_ratio`].
     pub fn from_pool_difficulty(difficulty: u64) -> Result<Self, JobError> {
@@ -1567,6 +1576,22 @@ impl JobBook {
             Vec::with_capacity(extranonce.session.len() + extranonce.rolled.len());
         full_extranonce.extend_from_slice(extranonce.session);
         full_extranonce.extend_from_slice(extranonce.rolled);
+        // A network-valid block from a harder channel target must not be
+        // credited at the channel target: cap fallback-block work at the
+        // network target when the channel target was not met. The judging
+        // target stays the channel target; only accounting work is capped.
+        // Linearizability: validation is under the single `JobBook` borrow.
+        // Snapshot isolation: the ledger credits `AcceptedShare.work`
+        // idempotently by header hash. Causally, a block never credits more
+        // than the network work that made it valid.
+        let credited_work = if is_block && !target.meets(raw_hash) {
+            match ShareTarget::from_compact(job.candidate.bits) {
+                Ok(network) => network.work(),
+                Err(_) => target.work(),
+            }
+        } else {
+            target.work()
+        };
         let accepted = AcceptedShare {
             session: share.session,
             job: share.job,
@@ -1576,7 +1601,7 @@ impl JobBook {
             previous_block_hash: BlockHash::from(job.candidate.previous_block_hash),
             extranonce: full_extranonce,
             target: *target,
-            work: target.work(),
+            work: credited_work,
             class: if is_block {
                 ShareClass::Block
             } else {

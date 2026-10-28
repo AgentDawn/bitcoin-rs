@@ -403,7 +403,12 @@ fn block_candidate_passes_consensus_and_reproduces_the_share() -> TestResult {
         .sum();
     assert_eq!(paid, fx.candidate.coinbase_value);
     assert!(found.block.weight() <= fx.candidate.max_weight);
-    assert_eq!(found.share.work, target.work());
+    // The difficulty-1 channel target is almost certainly harder than this
+    // regtest block hash, so the block is a fallback: the judging target stays
+    // the channel target while accounting work is capped at the network.
+    let network = ShareTarget::from_compact(fx.job.bits())?;
+    assert_eq!(found.share.target, target);
+    assert_eq!(found.share.work, network.work());
     assert_eq!(found.share.height, 100);
     assert_eq!(found.share.job, fx.job.id());
 
@@ -546,6 +551,36 @@ fn share_classes_and_target_boundaries() -> TestResult {
         matches!(verdict, ShareOutcome::Block(_)),
         "network target takes precedence over the share target"
     );
+    Ok(())
+}
+
+#[test]
+fn fallback_block_work_is_capped_at_the_network_target() -> TestResult {
+    let mut fx = fixture(config(), 100, 3)?;
+    let network = ShareTarget::from_compact(fx.job.bits())?;
+    let harder = ShareTarget::from_le_bytes(tiny_target_bytes())?;
+    // Any network-valid hash is far above the value-1 channel target, so the
+    // block is a fallback: it meets the network but not the channel.
+    let mut block_nonce = None;
+    for candidate in nonces(&fx.session, &fx.job, true, 5)? {
+        let hash = header_hash(&fx.session, &fx.job, candidate)?;
+        if !harder.meets(hash) {
+            block_nonce = Some((candidate, hash));
+            break;
+        }
+    }
+    let (nonce, hash) = block_nonce.ok_or("a fallback block nonce exists")?;
+    assert!(compact_is_met_by(fx.job.bits(), hash));
+    assert!(!harder.meets(hash));
+    let ShareOutcome::Block(found) = fx
+        .book
+        .validate(&submit_for(&fx.session, &fx.job, nonce), &harder)?
+    else {
+        return Err("a network-valid hash from a harder channel target is a block".into());
+    };
+    assert_eq!(found.share.target, harder);
+    assert_eq!(found.share.work, network.work());
+    assert_ne!(found.share.work, harder.work());
     Ok(())
 }
 
