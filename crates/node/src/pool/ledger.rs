@@ -546,18 +546,28 @@ impl LedgerHost {
                 Err(error) => break Some(error),
             }
         };
-        // Ledger compute and commit run without holding `StableRead`: the
-        // ledger write transaction can stall on storage I/O while chain
-        // transitions wait. Chain reads use the lock-free `RawChainView`;
-        // both `reconcile_*` entry points are idempotent, so a tip move
-        // mid-reconcile is repaired by converging on the next attempt.
+        // One stable snapshot across observe and commit: holding `StableRead`
+        // excludes authoritative transitions while `RawChainView` (lock-free,
+        // never re-locks `StableRead`) observes and while the ledger write
+        // transactions commit, so a reorg cannot slip between validation and
+        // commit to permanently fail a payout. The checked reconciles still
+        // validate the generation inside their write transactions as
+        // defense-in-depth for callers without the guard. Snapshot isolation:
+        // a commit only applies observations taken under one generation.
+        // Linearizability of the ledger itself comes from its write
+        // serialization; callers stay idempotent, so a deferred reconcile is
+        // retried.
+        let _stable = chain.stable.lock();
         let mut attempts = 0;
         let reconcile_result = loop {
             let before = chain.tip_generation();
             let observation = RawChainView(chain);
+            let aborted = || !tip_unchanged(&before, &chain.tip_generation());
             let result: Result<(), pool_ledger::LedgerError> = (|| {
-                self.ledger.reconcile_rounds(&observation)?;
-                self.ledger.reconcile_payouts(&observation)?;
+                self.ledger
+                    .reconcile_rounds_checked(&observation, &aborted)?;
+                self.ledger
+                    .reconcile_payouts_checked(&observation, &aborted)?;
                 Ok(())
             })();
             let after = chain.tip_generation();

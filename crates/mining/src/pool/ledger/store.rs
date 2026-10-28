@@ -741,6 +741,18 @@ impl Ledger {
         &self,
         chain: &dyn ChainView,
     ) -> Result<RoundReconcileReport, LedgerError> {
+        self.reconcile_rounds_checked(chain, &|| false)
+    }
+
+    /// Same as [`Self::reconcile_rounds`], but `abort` is evaluated inside the
+    /// write transaction before any observation is applied. A mid-reconcile
+    /// chain transition defers the whole batch, keeping torn views from
+    /// fixing rewards or orphaning rounds.
+    pub fn reconcile_rounds_checked(
+        &self,
+        chain: &dyn ChainView,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<RoundReconcileReport, LedgerError> {
         let open = self.open_round_list()?;
         let mut report = RoundReconcileReport::default();
         if open.is_empty() {
@@ -771,6 +783,9 @@ impl Ledger {
             });
         }
         let txn = self.db.begin_write()?;
+        if abort() {
+            return Ok(RoundReconcileReport::default());
+        }
         let mut dirty = false;
         {
             let tables = Tables::open(&txn)?;
@@ -1321,6 +1336,22 @@ impl Ledger {
         &self,
         chain: &dyn ChainView,
     ) -> Result<Vec<BatchTransition>, LedgerError> {
+        self.reconcile_payouts_checked(chain, &|| false)
+    }
+
+    /// Same as [`Self::reconcile_payouts`], but `abort` is evaluated inside the
+    /// write transaction before any decision is applied. When it reports a
+    /// chain transition mid-reconcile, observations may span a reorg, so the
+    /// call commits nothing and reports no transitions: the next reconcile
+    /// converges. This keeps a torn view from permanently failing a payout.
+    /// Snapshot isolation: a commit only applies observations taken under one
+    /// generation. Linearizability is not needed; callers are idempotent, so a
+    /// deferred reconcile is retried.
+    pub fn reconcile_payouts_checked(
+        &self,
+        chain: &dyn ChainView,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Vec<BatchTransition>, LedgerError> {
         let active = self.active_batches()?;
         let mut observations = Vec::new();
         let mut tip: Option<u32> = None;
@@ -1343,6 +1374,13 @@ impl Ledger {
         }
         let tip = tip.unwrap_or(0);
         let txn = self.db.begin_write()?;
+        // Validate the chain generation inside the write transaction before
+        // applying `Fail`: a transition after observation means the batch view
+        // may span a reorg. Defer (drop the write transaction, commit nothing)
+        // rather than permanently releasing the reservation on a torn view.
+        if abort() {
+            return Ok(Vec::new());
+        }
         let mut dirty = false;
         {
             let tables = Tables::open(&txn)?;

@@ -2357,6 +2357,67 @@ fn a_batch_fails_only_when_every_signed_transaction_is_conclusively_double_spent
 }
 
 #[test]
+fn a_mid_reconcile_chain_transition_defers_a_permanent_fail() {
+    // A reorg between observation and commit must not permanently fail a
+    // payout on a torn view: the checked reconcile validates the generation
+    // inside the write transaction and commits nothing when it moved.
+    let fund = funded(0, 1_000_001);
+    let batch = prepared(&fund);
+    let first = pay_tx(
+        &batch,
+        &[outpoint(0xA1, 0), outpoint(0xA2, 0)],
+        Some(40_000),
+    );
+    let second = pay_tx(
+        &batch,
+        &[outpoint(0xA2, 0), outpoint(0xA3, 0)],
+        Some(30_000),
+    );
+    fund.ledger
+        .record_signed(&receipt(&batch, &first))
+        .fixture("first");
+    fund.ledger
+        .record_signed(&receipt(&batch, &second))
+        .fixture("second");
+    let thief = hash(0xEE);
+    fund.chain.set_block(104, hash(0xC1));
+    for outpoint in [outpoint(0xA1, 0), outpoint(0xA3, 0)] {
+        fund.chain.set_spend(
+            outpoint,
+            ConfirmedSpend {
+                spender_txid: thief,
+                block_hash: hash(0xC1),
+                height: 104,
+            },
+        );
+    }
+    fund.chain.set_tip(105);
+    // Simulate a chain transition after observation: defer, commit nothing.
+    assert_eq!(
+        fund.ledger
+            .reconcile_payouts_checked(&fund.chain, &|| true)
+            .fixture("deferred"),
+        Vec::new()
+    );
+    let still = fund.ledger.batch(&batch.id).fixture("batch").fixture("exists");
+    assert_eq!(still.state, BatchState::ExternallySigned);
+    // Same observations without a transition fail exactly once.
+    let transitions = fund
+        .ledger
+        .reconcile_payouts_checked(&fund.chain, &|| false)
+        .fixture("failed");
+    assert_eq!(
+        transitions,
+        vec![BatchTransition {
+            batch_id: batch.id,
+            from: BatchState::ExternallySigned,
+            to: BatchState::Failed
+        }]
+    );
+    fund.ledger.check_invariants().fixture("invariants");
+}
+
+#[test]
 fn cancelling_a_prepared_batch_releases_the_reservation_but_never_after_signing() {
     let fund = funded(0, 1_000_001);
     let batch = prepared(&fund);
