@@ -1599,6 +1599,14 @@ fn permanently_refused_buffer_never_wedges_the_drain() {
         drained.contains("\"id\":101"),
         "the dropped head still answers its waiter: {drained:?}"
     );
+    assert!(
+        drained.contains("\"error\":[22,\"Duplicate share\",null]"),
+        "the refused head reports failure, not success: {drained:?}"
+    );
+    assert!(
+        !drained.contains("\"error\":null"),
+        "a permanently refused share must not report success: {drained:?}"
+    );
 
     miner.ledger.admit_again();
     let response = miner.submit(102, &job, second);

@@ -1009,6 +1009,46 @@ impl SessionState {
         }
     }
 
+    /// Reports a deferred share the ledger permanently refused. The drain
+    /// dropped the poisoned head to keep later shares flowing, but the waiter
+    /// must report failure with the same duplicate rejection as an inline
+    /// refusal, emitting no `ShareAccepted` instead of `result:true`.
+    fn emit_deferred_rejected(&self, response: &DeferredResponse, out: &mut Vec<u8>) {
+        if response.has_id {
+            emit_line(
+                out,
+                &encode_reject(&response.id, &errors::DUPLICATE_SHARE_ERROR),
+            );
+        }
+    }
+
+    /// Settles one deferred waiter. Returns the waiter when its completion is
+    /// still outstanding; otherwise emits its verdict and returns `None`.
+    fn settle_deferred(
+        &self,
+        response: DeferredResponse,
+        session: Option<SessionId>,
+        out: &mut Vec<u8>,
+    ) -> Option<DeferredResponse> {
+        if !response.completion.is_complete() {
+            return Some(response);
+        }
+        if response.completion.is_rejected() {
+            self.emit_deferred_rejected(&response, out);
+            return None;
+        }
+        let session = session?;
+        let credited = Credited {
+            hash: response.hash,
+            class: response.class,
+            completion: response.completion,
+            block: response.block,
+        };
+        let reply = response.has_id.then_some(&response.id);
+        self.emit_credited(reply, session, &credited, out);
+        None
+    }
+
     /// Sends pending difficulty and the newest job this session has not seen.
     fn poll(&mut self, out: &mut Vec<u8>) -> Flow {
         self.poll_hint = false;
@@ -1017,19 +1057,8 @@ impl SessionState {
         let session = self.lease.as_ref().map(|lease| lease.session.id());
         let mut pending = Vec::with_capacity(self.deferred.len());
         for response in std::mem::take(&mut self.deferred) {
-            if response.completion.is_complete() {
-                if let Some(session) = session {
-                    let credited = Credited {
-                        hash: response.hash,
-                        class: response.class,
-                        completion: response.completion,
-                        block: response.block,
-                    };
-                    let reply = response.has_id.then_some(&response.id);
-                    self.emit_credited(reply, session, &credited, out);
-                }
-            } else {
-                pending.push(response);
+            if let Some(waiter) = self.settle_deferred(response, session, out) {
+                pending.push(waiter);
             }
         }
         self.deferred = pending;

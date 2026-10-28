@@ -130,6 +130,7 @@ enum Pending {
 
 pub(super) struct Completion {
     remaining: AtomicUsize,
+    rejected: AtomicBool,
 }
 
 /// Debug shows only the outstanding count; a completion carries no secrets.
@@ -138,6 +139,7 @@ impl fmt::Debug for Completion {
         formatter
             .debug_struct("Completion")
             .field("remaining", &self.remaining.load(Ordering::Acquire))
+            .field("rejected", &self.rejected.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -146,6 +148,7 @@ impl Completion {
     fn new(items: usize) -> Self {
         Self {
             remaining: AtomicUsize::new(items),
+            rejected: AtomicBool::new(false),
         }
     }
 
@@ -157,8 +160,17 @@ impl Completion {
             });
     }
 
+    fn record_rejected(&self) {
+        self.rejected.store(true, Ordering::Release);
+        self.record();
+    }
+
     pub(super) fn is_complete(&self) -> bool {
         self.remaining.load(Ordering::Acquire) == 0
+    }
+
+    pub(super) fn is_rejected(&self) -> bool {
+        self.rejected.load(Ordering::Acquire)
     }
 }
 
@@ -595,8 +607,13 @@ impl PoolCore {
             let mut succeeded = false;
             for attempt in 0..self.ledger_attempts {
                 match self.attempt_item(&item) {
-                    Ok(_) => {
+                    Ok(RecordOutcome::Recorded | RecordOutcome::AlreadyRecorded) => {
                         item.completion().record();
+                        succeeded = true;
+                        break;
+                    }
+                    Ok(RecordOutcome::Rejected) => {
+                        item.completion().record_rejected();
                         succeeded = true;
                         break;
                     }
