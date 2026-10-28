@@ -2787,7 +2787,7 @@ mod tests {
         for n in 1..100 {
             let addr = PeerEndpoint::from(([8, n, 1, 1], 8333));
             book.learn_dns("seed", &[addr], 10_000);
-            book.learn_peer(addr.address(), &[(addr, 9, 10_000)], 10_000);
+            book.learn_peer(crate::PeerRemote::Endpoint(addr), &[(addr, 9, 10_000)], 10_000);
         }
         (
             AddressMaintenance {
@@ -3088,7 +3088,7 @@ mod tests {
             maintenance.address_book.learn_dns("seed", &[addr], now);
             maintenance
                 .address_book
-                .learn_peer(addr.address(), &[(addr, 9, now)], now);
+                .learn_peer(crate::PeerRemote::Endpoint(addr), &[(addr, 9, now)], now);
         }
         assert!(
             maintenance

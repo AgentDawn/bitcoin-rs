@@ -2758,10 +2758,8 @@ fn learn_addresses(
     *last_refill = last_refill.saturating_add(refill.saturating_mul(10));
     let count = addresses.len().min(usize::try_from(*budget).unwrap_or(0));
     *budget = budget.saturating_sub(u64::try_from(count).unwrap_or(0));
-    if let Some(book) = &shared.address_book
-        && let Some(endpoint) = peer_addr.endpoint()
-    {
-        book.learn_peer(endpoint.address(), &addresses[..count], now);
+    if let Some(book) = &shared.address_book {
+        book.learn_peer(peer_addr, &addresses[..count], now);
     }
 }
 
@@ -5458,7 +5456,7 @@ mod feeler_tests {
             let book =
                 crate::addrman::AddressBook::open(Some(base), shared.magic.to_bytes(), true, None);
             book.learn_peer(
-                address.ip(),
+                crate::PeerRemote::Endpoint(address.into()),
                 &[(address.into(), 9, unix_time_secs())],
                 unix_time_secs(),
             );
@@ -5660,7 +5658,7 @@ mod feeler_tests {
         );
         let book = crate::addrman::AddressBook::open(None, shared.magic.to_bytes(), true, None);
         book.learn_peer(
-            address.ip(),
+            crate::PeerRemote::Endpoint(address.into()),
             &[(address.into(), 1, unix_time_secs())],
             unix_time_secs(),
         );
@@ -5718,7 +5716,7 @@ mod discouragement_tests {
             if self.update_at.is_some_and(|at| self.bytes.position() >= at) {
                 self.update_at = None;
                 self.book.learn_peer(
-                    self.addr.address(),
+                    crate::PeerRemote::Endpoint(self.addr),
                     &[(self.addr, 1024, unix_time_secs())],
                     unix_time_secs(),
                 );
@@ -5751,7 +5749,7 @@ mod discouragement_tests {
                 None,
             );
             book.learn_peer(
-                address.address(),
+                crate::PeerRemote::Endpoint(address),
                 &[(address, 9, unix_time_secs())],
                 unix_time_secs(),
             );

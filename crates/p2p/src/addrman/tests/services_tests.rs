@@ -87,15 +87,15 @@ fn incoming_known_gossip_and_unknown_dns_merge_without_losing_observation() {
     let book = book();
     book.learn_dns("seed", &[target()], EPOCH);
     let revision = book.state.lock().revision;
-    book.learn_peer(addr(2).address(), &[(target(), 0, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(2)), &[(target(), 0, EPOCH)], EPOCH);
     assert_eq!(book.state.lock().stored.records[0].services, None);
     assert_eq!(
         book.state.lock().revision,
         revision,
         "zero-bit gossip and same-time ref refusal add no new information"
     );
-    book.learn_peer(addr(3).address(), &[(target(), 1, EPOCH)], EPOCH);
-    book.learn_peer(addr(4).address(), &[(target(), 8, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(3)), &[(target(), 1, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(4)), &[(target(), 8, EPOCH)], EPOCH);
     assert_eq!(book.state.lock().stored.records[0].services, Some(9));
     book.learn_dns("seed", &[target()], EPOCH + 7200);
     assert_eq!(book.state.lock().stored.records[0].services, Some(9));
@@ -108,7 +108,7 @@ fn incoming_known_gossip_and_unknown_dns_merge_without_losing_observation() {
         "unknown incoming advertisement still refreshes known peer time"
     );
     let ip_origin = addr(5);
-    book.learn_peer(addr(6).address(), &[(ip_origin, 9, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(6)), &[(ip_origin, 9, EPOCH)], EPOCH);
     book.succeeded(ip_origin, 9, EPOCH + 1);
     book.learn_dns("seed", &[ip_origin], EPOCH + 14_400);
     let manager = book.state.lock();
@@ -198,7 +198,7 @@ fn zero_gossip_preserves_unknown_dns_bootstrap_but_version_zero_is_known() {
     book.state.lock().stored.secret = [1; 32];
     book.learn_dns("seed", &[target()], EPOCH);
     let revision = book.state.lock().revision;
-    book.learn_peer(addr(2).address(), &[(target(), 0, EPOCH)], EPOCH);
+    book.learn_peer(crate::PeerRemote::Endpoint(addr(2)), &[(target(), 0, EPOCH)], EPOCH);
     assert_eq!(book.state.lock().stored.records[0].services, None);
     assert_eq!(book.state.lock().revision, revision);
     assert_eq!(
@@ -213,7 +213,7 @@ fn zero_gossip_preserves_unknown_dns_bootstrap_but_version_zero_is_known() {
     let restored = AddressBook::open(Some(base.clone()), [1; 4], false, None);
     restored.learn_dns("seed", &[target()], EPOCH + 7200);
     restored.learn_peer(
-        addr(3).address(),
+        crate::PeerRemote::Endpoint(addr(3)),
         &[(target(), 0, EPOCH + 7200)],
         EPOCH + 7200,
     );
@@ -224,7 +224,7 @@ fn zero_gossip_preserves_unknown_dns_bootstrap_but_version_zero_is_known() {
     restored.set_services(target(), 0);
     assert_eq!(restored.state.lock().revision, revision + 1);
     restored.learn_peer(
-        addr(3).address(),
+        crate::PeerRemote::Endpoint(addr(3)),
         &[(target(), 0, EPOCH + 7200)],
         EPOCH + 7200,
     );
@@ -237,7 +237,7 @@ fn zero_gossip_preserves_unknown_dns_bootstrap_but_version_zero_is_known() {
     assert!(!restored.ordinary_services_eligible(target(), u64::MAX));
     let fresh = addr(9);
     restored.learn_peer(
-        addr(7).address(),
+        crate::PeerRemote::Endpoint(addr(7)),
         &[(fresh, 0, EPOCH + 14_400)],
         EPOCH + 14_400,
     );

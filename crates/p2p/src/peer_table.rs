@@ -2535,4 +2535,43 @@ mod tests {
             "two automatic full-relay and one automatic block-relay connection"
         );
     }
+
+    #[test]
+    fn overlay_identity_remote_never_uses_proxy_ip() {
+        use crate::connection::PeerRemote;
+        use crate::PeerEndpoint;
+        let loopback =
+            PeerEndpoint::Ip(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let anon_id = crate::ConnectionId::for_test_raw(123);
+        let anon = PeerRemote::AnonymousTor(anon_id);
+        assert_eq!(
+            PeerRemote::from_endpoint(None, anon_id),
+            PeerRemote::AnonymousTor(anon_id),
+            "None endpoint is anonymous, never the forwarder socket"
+        );
+        assert_eq!(anon.endpoint(), None);
+        assert_ne!(
+            anon,
+            PeerRemote::Endpoint(loopback),
+            "no proxy IP enters session identity"
+        );
+        let tor = PeerEndpoint::TorV3 {
+            key: [7u8; 32],
+            port: 8333,
+        };
+        assert_eq!(
+            PeerRemote::from_endpoint(Some(tor), anon_id),
+            PeerRemote::Endpoint(tor),
+            "identified Tor keeps its typed endpoint"
+        );
+        let i2p = PeerEndpoint::I2p {
+            hash: [9u8; 32],
+            port: 7656,
+        };
+        assert_eq!(
+            PeerRemote::from_endpoint(Some(i2p), anon_id),
+            PeerRemote::Endpoint(i2p),
+            "SAM-attested I2P keeps its typed endpoint"
+        );
+    }
 }

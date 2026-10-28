@@ -966,11 +966,17 @@ impl AddressBook {
     }
     pub(crate) fn learn_peer(
         &self,
-        source: impl Into<crate::PeerAddress>,
+        source: crate::PeerRemote,
         addresses: &[(PeerEndpoint, u64, u64)],
         now: u64,
     ) {
-        let source = source.into();
+        // Anonymous Tor inbound has no dialable address: its loopback
+        // forwarder/proxy socket is never a source. Return early so no
+        // proxy/loopback IP enters `Source` or the bucket groups.
+        let source = match source {
+            crate::PeerRemote::AnonymousTor(_) => return,
+            crate::PeerRemote::Endpoint(endpoint) => endpoint.address(),
+        };
         let mut manager = self.state.lock();
         for &(addr, services, seen) in addresses.iter().take(MAX_GOSSIP) {
             manager.learn(
