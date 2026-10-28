@@ -719,7 +719,9 @@ impl P2pService {
         shared = shared.with_shared_outbound(&self.shared_outbound);
 
         let worker_shutdown = self.worker_shutdown.lock().clone();
-        let mut listeners = self.overlay.start(&shared, &worker_shutdown)?;
+        workers
+            .listeners
+            .extend(self.overlay.start(&shared, &worker_shutdown)?);
         for (listener_addr, listener) in bound_listeners {
             let shutdown = Arc::clone(&workers.shutdown);
             let shared = shared.clone();
@@ -2405,6 +2407,35 @@ mod tests {
             .expect("empty listen set starts");
         service.shutdown();
         service.join().expect("clean join");
+    }
+
+    #[test]
+    fn overlay_workers_are_retained_for_join_and_rollback() {
+        let dir = tempfile::tempdir().expect("identity dir");
+        let mut config = P2pServiceConfig::default();
+        config.overlay.onion_proxy = Some(SocketAddr::from(([127, 0, 0, 1], 19051)));
+        config.overlay.tor_control = Some(SocketAddr::from(([127, 0, 0, 1], 19052)));
+        config.overlay.identity_dir = dir.path().to_path_buf();
+        let service = P2pService::new(config, Arc::new(AtomicBool::new(false)));
+        service
+            .start(
+                None,
+                None,
+                &idle_ready(),
+                crate::listener::ListenerExtras::default(),
+            )
+            .expect("overlay start succeeds");
+        {
+            let workers = service.workers.lock();
+            let workers = workers.as_ref().expect("workers installed");
+            assert_eq!(
+                workers.listeners.len(),
+                1,
+                "overlay.start handles must be retained for rollback and join"
+            );
+        }
+        service.shutdown();
+        service.join().expect("join waits for overlay teardown");
     }
 
     #[test]
