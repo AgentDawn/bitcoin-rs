@@ -179,7 +179,6 @@ pub fn run_offline_import(
 
     let node = crate::state::NodeState::open(config, None)?;
     let chainstate = node.chainstate();
-    let followers = node.chain_followers();
 
     let already = chainstate.applied_tip_snapshot();
     let skip = match already.as_ref() {
@@ -237,11 +236,11 @@ pub fn run_offline_import(
         }
         payloads.push(payload);
         if payloads.len() >= 128 {
-            connect_batch(&chainstate, &followers, &mut payloads)?;
+            connect_batch(&node, &mut payloads)?;
         }
     }
     if !payloads.is_empty() {
-        connect_batch(&chainstate, &followers, &mut payloads)?;
+        connect_batch(&node, &mut payloads)?;
     }
     let trailing = {
         let mut one = [0u8; 1];
@@ -331,20 +330,59 @@ fn read_record(
     Ok(FramedRecord { framed, payload })
 }
 
+/// Connects one batch of archive blocks, relieving journal retention pressure
+/// inline.
+///
+/// The foreground import runs no maintenance worker, so a retention-limit
+/// refusal would otherwise abort the whole import even though the refused
+/// block committed nothing and the tip is unchanged. On a
+/// [`bitcoin_rs_chainstate::ApplyError::JournalBackpressure`] refusal
+/// carrying a retention limit, this publishes one synchronous clean
+/// checkpoint — the same foreground publication the import performs at the
+/// end, which compacts the journal — and retries the uncommitted block
+/// exactly once. Any other failure, a skipped publication (no applied tip to
+/// checkpoint), or a second refusal propagates.
+///
+/// Reruns stay idempotent by tip comparison: neither the refused attempt nor
+/// the checkpoint moves the applied tip, so a restart resumes from the same
+/// durable state.
 fn connect_batch(
-    chainstate: &bitcoin_rs_chainstate::Chainstate,
-    followers: &crate::ChainFollowers,
+    node: &crate::state::NodeState,
     batch: &mut Vec<bitcoin_rs_primitives::BlockPayload>,
 ) -> Result<()> {
+    let chainstate = node.chainstate();
+    let followers = node.chain_followers();
     for payload in batch.drain(..) {
-        followers
-            .apply_connect(chainstate, &payload)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "connect at block {} failed: {error}",
-                    payload.block().block_hash()
+        let hash = payload.block().block_hash();
+        if let Err(error) = followers.apply_connect(&chainstate, &payload) {
+            let retention_limited = matches!(
+                &error,
+                crate::ConnectMutationError::NotCommitted(
+                    bitcoin_rs_chainstate::ApplyError::JournalBackpressure(inner)
+                ) if matches!(
+                    inner.as_ref(),
+                    bitcoin_rs_storage::chainstate_journal::JournalWriterError::RetentionLimit { .. }
                 )
+            );
+            if !retention_limited {
+                bail!("connect at block {hash} failed: {error}");
+            }
+            let generation = node.publish_checkpoint().with_context(|| {
+                format!("journal backpressure relief checkpoint failed at block {hash}")
             })?;
+            if generation.is_none() {
+                bail!(
+                    "journal backpressure relief checkpoint skipped at block {hash}: no applied tip"
+                );
+            }
+            tracing::info!(
+                %hash,
+                "compacted the chainstate journal during offline import; retrying the refused block"
+            );
+            followers
+                .apply_connect(&chainstate, &payload)
+                .map_err(|error| anyhow::anyhow!("connect at block {hash} failed: {error}"))?;
+        }
     }
     Ok(())
 }
@@ -781,6 +819,81 @@ mod tests {
         };
         write_state(&path, &state).expect("first write");
         assert!(write_state(&path, &state).is_err());
+    }
+
+    #[test]
+    fn connect_batch_relieve_journal_retention_pressure() {
+        use bitcoin_rs_chain::regtest_fixture;
+
+        // The foreground import runs no maintenance worker, so retention
+        // pressure must be relieved inline: a batch connect that the journal
+        // refuses publishes one synchronous checkpoint (compacting the
+        // journal, including the pressure below) and retries the uncommitted
+        // block once. Without the relief this second connect would abort the
+        // import exactly like the proved refusal below.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config =
+            crate::NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
+        config.data_dir = dir.path().join("backpressure-node");
+        config.p2p.listen.clear();
+        config.chainstate_journal.max_journal_mib = 1;
+        config.chainstate_journal.rotate_mib = 1;
+
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let state = crate::state::NodeState::open(config.clone(), None).expect("open node");
+        let genesis_tip = state
+            .apply_block(&bitcoin_rs_primitives::BlockPayload::from_local(
+                genesis.clone(),
+            ))
+            .expect("genesis");
+        state.publish_checkpoint().expect("baseline checkpoint");
+
+        // Inflate the measured journal size past the retention budget: the
+        // next apply is refused before any tip mutation while the pressure
+        // stands. The relief checkpoint compacts every superseded segment,
+        // so this same file is gone before the retry runs.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(
+                config
+                    .data_dir
+                    .join("chainstate-journal/segment-9999999999.log"),
+            )
+            .expect("pressure file")
+            .set_len(1024 * 1024)
+            .expect("pressure size");
+
+        let child =
+            regtest_fixture::mined_regtest_child_at(genesis.block_hash(), 1).expect("mine child");
+        assert!(
+            matches!(
+                state.apply_block(&bitcoin_rs_primitives::BlockPayload::from_local(
+                    child.clone()
+                )),
+                Err(crate::ConnectMutationError::NotCommitted(
+                    bitcoin_rs_chainstate::ApplyError::JournalBackpressure(_)
+                ))
+            ),
+            "the fixture must prove retention pressure refuses the child"
+        );
+
+        let mut batch = vec![bitcoin_rs_primitives::BlockPayload::from_local(child)];
+        connect_batch(&state, &mut batch).expect("relief retries the refused block");
+        assert!(
+            batch.is_empty(),
+            "the batch drains even through the relief path"
+        );
+        let tip = state
+            .chainstate()
+            .applied_tip_snapshot()
+            .expect("relief must commit the child");
+        assert_ne!(
+            tip.as_ref(),
+            &genesis_tip,
+            "the tip must advance past genesis"
+        );
+        assert_eq!(tip.height, 1, "the retried child commits at height 1");
     }
 
     fn corpus_manifest_bytes(network: &str, magic: &str) -> Vec<u8> {
