@@ -210,7 +210,7 @@ impl MempoolGateway {
         for (index, tx) in txs.iter().enumerate() {
             let row = match self.submit_package_attempt(
                 core::slice::from_ref(tx),
-                LocalOrigin::Rpc,
+                AdmissionOrigin::from(LocalOrigin::Rpc),
                 max_rate,
                 |_| time,
                 chain,
@@ -242,7 +242,7 @@ impl MempoolGateway {
             let pending: Vec<_> = reconsider.iter().map(|&index| txs[index].clone()).collect();
             match self.submit_package_attempt(
                 &pending,
-                LocalOrigin::Rpc,
+                AdmissionOrigin::from(LocalOrigin::Rpc),
                 max_rate,
                 |_| time,
                 chain,
@@ -320,35 +320,14 @@ impl MempoolGateway {
         time: impl Fn(&Tx) -> u64,
         chain: &dyn AdmissionChain,
     ) -> Result<MutationResult, SubmitError> {
-        let attempt = self.submit_package_attempt(
+        crate::package::check_structure(txs)?;
+        self.submit_package_atomic(
             txs,
-            origin,
+            AdmissionOrigin::from(origin),
             max_rate,
             time,
             chain,
-            AdmissionMode::PackageSubmit,
-        )?;
-        if let Some(error) = attempt.error {
-            return Err(error);
-        }
-        Ok(attempt.mutation)
-    }
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one stamped package preparation/commit owner serves native and RPC submission"
-    )]
-    fn submit_package_attempt(
-        &self,
-        txs: &[Tx],
-        origin: LocalOrigin,
-        max_rate: Option<u64>,
-        time: impl Fn(&Tx) -> u64,
-        chain: &dyn AdmissionChain,
-        mode: AdmissionMode,
-    ) -> Result<PackageAttempt, SubmitError> {
-        crate::package::check_structure(txs)?;
-        self.submit_package_atomic(txs, AdmissionOrigin::from(origin), max_rate, time, chain)
+        )
     }
 
     /// Atomically submits a BIP331 ancestor package relayed by `source`: the
