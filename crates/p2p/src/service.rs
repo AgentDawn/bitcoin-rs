@@ -231,7 +231,6 @@ struct Workers {
     outbound: Option<JoinHandle<()>>,
     bootstrap: Option<JoinHandle<()>>,
     overlay_threads: Vec<JoinHandle<()>>,
-    sam_session: Option<Arc<crate::sam::SamSession>>,
 }
 
 impl Default for Workers {
@@ -243,7 +242,6 @@ impl Default for Workers {
             outbound: None,
             bootstrap: None,
             overlay_threads: Vec::new(),
-            sam_session: None,
         }
     }
 }
@@ -257,7 +255,6 @@ impl Workers {
             outbound: None,
             bootstrap: None,
             overlay_threads: Vec::new(),
-            sam_session: None,
         }
     }
 
@@ -265,9 +262,6 @@ impl Workers {
         self.session_cancel.store(true, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         peer_table.cancel_all();
-        if let Some(session) = &self.sam_session {
-            session.close();
-        }
         addresses.lock().clear();
     }
 
@@ -1375,7 +1369,7 @@ fn bootstrap_fixed_peer_endpoints<R, I>(
             break 'endpoints;
         }
         // Typed endpoints dial without any DNS: an onion/I2P fixed peer
-        // reaches `connect_peer_stream` and fails transport-unavailable
+        // reaches `OverlayTransport::connect` and fails transport-unavailable
         // there, never a system-DNS lookup or a direct-TCP fallback.
         // Malformed overlay names are rejected locally and MUST NOT fall
         // through to system DNS resolution.
