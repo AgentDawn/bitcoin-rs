@@ -420,7 +420,6 @@ impl NodeState {
                 },
                 v2_transport: config.p2p.v2_transport,
                 relay_offers: config.p2p.relay_offers,
-                overlay: config.p2p.overlay.clone(),
                 ..bitcoin_rs_p2p::P2pServiceConfig::default()
             },
             chainstate.shutdown_reader(),

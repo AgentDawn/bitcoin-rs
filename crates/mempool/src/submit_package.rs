@@ -436,9 +436,6 @@ mod tests {
     struct Seen(parking_lot::Mutex<Vec<MutationEnvelope>>);
 
     impl MempoolObserver for Seen {
-        fn wants_accepted_transactions(&self) -> bool {
-            false
-        }
         fn on_mutation(&self, envelope: &MutationEnvelope) {
             self.0.lock().push(envelope.clone());
         }
@@ -532,7 +529,7 @@ mod tests {
                 min_relay_fee_sat_per_kvb: min_relay,
                 ..MempoolLimits::default()
             }))),
-            observer,
+            observer.map(|observer| (observer, crate::BodyInterest::Metadata)),
             ValidationEngine::Native,
             None,
         )
