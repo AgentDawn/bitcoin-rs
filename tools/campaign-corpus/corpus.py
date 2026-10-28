@@ -239,18 +239,52 @@ def _read_exact(source: BinaryIO, count: int, what: str) -> bytes:
     return b"".join(chunks)
 
 
+def _require_zero_tail(source: BinaryIO, offset: int) -> None:
+    """Consume zero-padding past `offset`; refuse when non-zero bytes follow.
+
+    Core preallocates blk files with zeros. Padding is legal only as an
+    all-zero tail: any non-zero byte after the first all-zero header means
+    the file was over-trimmed or spliced, never a clean EOF.
+    """
+    while True:
+        chunk = source.read(1 << 20)
+        if not chunk:
+            return
+        if chunk.strip(b"\x00"):
+            raise ContractError(
+                f"Core blk tail has non-zero bytes after zero padding at offset"
+                f" {offset}: trim the file to the last frame end"
+            )
+
+
 def iter_frames(
     source: BinaryIO, magic: bytes = MAINNET_MAGIC
 ) -> Iterator[tuple[FrameMeta, bytes]]:
-    """Stream Core-framed payloads. Clean EOF is legal only between frames."""
+    """Stream Core-framed payloads. Clean EOF is legal only between frames.
+
+    A trailing all-zero region is Core blk preallocation padding, not a
+    frame: an 8-byte all-zero header followed only by zero bytes ends the
+    stream. Raw blk files are never XOR-obfuscated; a magic mismatch at
+    offset 0 fails closed instead of attempting de-obfuscation.
+    """
     offset = 0
     while True:
         head = source.read(1)
         if not head:
             return
         header = head + _read_exact(source, HEADER_LEN - 1, "Core frame header")
+        if header == b"\x00" * HEADER_LEN:
+            _require_zero_tail(source, offset)
+            return
         if header[:4] != magic:
-            raise ContractError("Core frame magic mismatch")
+            if offset == 0:
+                raise ContractError(
+                    "Core frame magic mismatch at offset 0: not a raw"
+                    " blkNNNNN.dat record (raw blk files are never"
+                    " XOR-obfuscated; do not point at an obfuscated store"
+                    " or LevelDB directory)"
+                )
+            raise ContractError(f"Core frame magic mismatch at offset {offset}")
         length = struct.unpack_from("<I", header, 4)[0]
         if length > MAX_PAYLOAD:
             raise ContractError("Core frame payload exceeds the consensus maximum")
