@@ -1995,7 +1995,10 @@ def _run_writer(
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     archive_scratch = _unique_scratch(archive_path)
     manifest_scratch = _unique_scratch(manifest_path)
-    spool_scratch = _unique_scratch(archive_path)
+    # The spool never commits, but it gets its own scratch namespace
+    # (`.spool.tmp.*`) instead of sharing the archive's, so the three live
+    # scratch paths are pairwise distinct by construction, not just by UUID.
+    spool_scratch = _unique_scratch(archive_path.parent / "spool")
     try:
         with (
             open(archive_scratch, "xb") as archive_fh,

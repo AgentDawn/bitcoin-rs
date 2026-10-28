@@ -348,7 +348,7 @@ impl<'a> BodyReader<'a> {
     }
 }
 
-fn decode(bytes: &[u8], expected_len: u32) -> Located {
+pub(super) fn decode(bytes: &[u8], expected_len: u32) -> Located {
     if usize::try_from(expected_len) != Ok(bytes.len()) {
         return Located::Mismatch;
     }

@@ -24,6 +24,50 @@ struct ScanResponse {
     scan: PrefixScan,
 }
 
+/// Pages a fake's staged rows like the storage seam: sorted, deduplicated,
+/// seekable, and bounded with first-row-always-returned accounting.
+fn fake_family_page(
+    scans: &[ScanResponse],
+    cf: ColumnFamily,
+    start_after: Option<&[u8]>,
+    limit: PrefixScanLimit,
+) -> Result<crate::TxIndexPage, IndexError> {
+    let mut rows: Vec<_> = scans
+        .iter()
+        .filter(|response| response.cf == cf)
+        .flat_map(|response| response.scan.rows.iter().cloned())
+        .collect();
+    rows.sort();
+    rows.dedup_by(|left, right| left.0 == right.0);
+    let mut page = Vec::new();
+    let mut bytes = 0_usize;
+    for (key, value) in rows {
+        if start_after.is_some_and(|cursor| key.as_slice() <= cursor) {
+            continue;
+        }
+        let row_bytes = key.len() + value.len();
+        if page.len() >= limit.max_rows
+            || (!page.is_empty() && bytes.saturating_add(row_bytes) > limit.max_bytes)
+        {
+            return Ok(crate::TxIndexPage {
+                rows: page,
+                complete: false,
+            });
+        }
+        bytes = bytes.saturating_add(row_bytes);
+        if key.len() != crate::HASH_PREFIX_ROW_SIZE {
+            return Err(IndexError::InvalidPrefixRowLength { len: key.len() });
+        }
+        let row = zerocopy::FromBytes::read_from_bytes(&key)
+            .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
+        page.push(TxIndexScanRow { row, value });
+    }
+    Ok(crate::TxIndexPage {
+        rows: page,
+        complete: true,
+    })
+}
+
 #[derive(Clone)]
 struct QuerySnapshot {
     watermark: IndexWatermark,
@@ -82,30 +126,16 @@ impl TxIndexSnapshot for QuerySnapshot {
         Ok(Some(self.watermark))
     }
 
-    fn for_each_row(
+    fn scan_family_page(
         &self,
         family: crate::TxIndexFamily,
-        visit: &mut crate::index::RowVisitor<'_>,
-    ) -> Result<(), IndexError> {
+        start_after: Option<&[u8]>,
+        limit: PrefixScanLimit,
+    ) -> Result<crate::TxIndexPage, IndexError> {
         let cf = match family {
             crate::TxIndexFamily::TxConfirmed => ColumnFamily::TxConfirmed,
         };
-        let mut rows: Vec<_> = self
-            .scans
-            .iter()
-            .filter(|response| response.cf == cf)
-            .flat_map(|response| response.scan.rows.iter().cloned())
-            .collect();
-        rows.sort();
-        rows.dedup_by(|left, right| left.0 == right.0);
-        for (key, value) in rows {
-            let row = zerocopy::FromBytes::read_from_bytes(&key)
-                .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
-            if visit(row, &value)?.is_break() {
-                break;
-            }
-        }
-        Ok(())
+        fake_family_page(&self.scans, cf, start_after, limit)
     }
 
     fn transaction_rows(
@@ -1378,30 +1408,16 @@ impl TxIndexSnapshot for HistoricalSnapshot {
         }
     }
 
-    fn for_each_row(
+    fn scan_family_page(
         &self,
         family: crate::TxIndexFamily,
-        visit: &mut crate::index::RowVisitor<'_>,
-    ) -> Result<(), IndexError> {
+        start_after: Option<&[u8]>,
+        limit: PrefixScanLimit,
+    ) -> Result<crate::TxIndexPage, IndexError> {
         let cf = match family {
             crate::TxIndexFamily::TxConfirmed => ColumnFamily::TxConfirmed,
         };
-        let mut rows: Vec<_> = self
-            .scans
-            .iter()
-            .filter(|response| response.cf == cf)
-            .flat_map(|response| response.scan.rows.iter().cloned())
-            .collect();
-        rows.sort();
-        rows.dedup_by(|left, right| left.0 == right.0);
-        for (key, value) in rows {
-            let row = zerocopy::FromBytes::read_from_bytes(&key)
-                .map_err(|_| IndexError::InvalidPrefixRowLength { len: key.len() })?;
-            if visit(row, &value)?.is_break() {
-                break;
-            }
-        }
-        Ok(())
+        fake_family_page(&self.scans, cf, start_after, limit)
     }
 
     fn transaction_rows(

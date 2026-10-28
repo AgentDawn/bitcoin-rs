@@ -30,7 +30,7 @@ use super::artifact::{
     ARTIFACT_VERSION, ArtifactHeader, CANCEL_POLL_RECORDS, HEADER_LEN, ReadFault, RecordReader,
     RowAssembler, TxLookupRecord, into_digest, open_hashed,
 };
-use super::chain::{BaseCount, ChainBase, Located};
+use super::chain::{BaseCount, ChainBase, Located, decode};
 use super::manifest::{
     BundleFamily, IndexBundleManifestV1, MANIFEST_FILE, MAX_MANIFEST_BYTES, ValidatedManifest,
 };
@@ -130,17 +130,23 @@ pub(crate) fn reset_interrupted_import(
     if watermarks.tx_lookup.is_some() {
         return Ok(false);
     }
-    let mut leftover = false;
-    reader
-        .snapshot()?
-        .for_each_row(TxIndexFamily::TxConfirmed, &mut |_, _| {
-            leftover = true;
-            Ok(ControlFlow::Break(()))
-        })?;
-    if leftover {
-        writer.reset_capabilities(IndexCapabilities::TX_LOOKUP)?;
+    // One bounded row decides the probe: any `TxConfirmed` row without a
+    // watermark is leftover from an interrupted import. The old
+    // whole-family visitor materialized the family on some backends just
+    // to answer this existence check.
+    let probe = reader.snapshot()?.scan_family_page(
+        TxIndexFamily::TxConfirmed,
+        None,
+        bitcoin_rs_storage::PrefixScanLimit {
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        },
+    )?;
+    if probe.rows.is_empty() {
+        return Ok(false);
     }
-    Ok(leftover)
+    writer.reset_capabilities(IndexCapabilities::TX_LOOKUP)?;
+    Ok(true)
 }
 
 fn read_manifest(path: &Path) -> Result<IndexBundleManifestV1, IndexBundleError> {
@@ -227,6 +233,18 @@ enum LocatorOutcome {
     Withheld(Withheld),
 }
 
+/// One receiver block held across locator checks: its whole body plus the
+/// top-level transaction spans parsed from it once, so per-record checks
+/// scan spans instead of re-parsing the whole block for every position.
+struct CachedBlock {
+    height: u32,
+    hash: Hash256,
+    body: Vec<u8>,
+    /// `(offset, byte length)` of every top-level transaction, in order.
+    /// `None` until the first locator use parses the cached body.
+    spans: Option<Vec<(u32, u32)>>,
+}
+
 /// Locator verification that rides the validating pass. The first terminal
 /// outcome sticks; later records are not looked up.
 ///
@@ -240,7 +258,7 @@ struct LocatorCheck<'a> {
     chain: &'a ChainBase,
     tree: &'a BlockTreeReader,
     source: &'a dyn BlockBodySource,
-    cached: Option<(u32, Hash256, Vec<u8>)>,
+    cached: Option<CachedBlock>,
     /// Positions the bundle carries per height, for the completeness check.
     counts: HashMap<u32, u64>,
     outcome: LocatorOutcome,
@@ -278,6 +296,62 @@ impl LocatorCheck<'_> {
         Ok(())
     }
 
+    /// Top-level transaction spans of the block `(height, hash)`, parsing
+    /// the cached body once; `None` when the body is absent or pruned.
+    ///
+    /// Bundle records arrive ordered by transaction id prefix, not block
+    /// height, so consecutive records of one block rarely follow each other.
+    /// Without this cache every position re-parsed the whole block; now the
+    /// first position of a block parses once and the rest scan spans.
+    fn boundaries(
+        &mut self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<&[(u32, u32)]>, IndexBundleError> {
+        if self
+            .cached
+            .as_ref()
+            .is_none_or(|cached| cached.height != height || cached.hash != hash)
+        {
+            match self.source.block_body(height, BlockHash::from(hash)) {
+                Ok(Some(body)) => {
+                    self.cached = Some(CachedBlock {
+                        height,
+                        hash,
+                        body,
+                        spans: None,
+                    });
+                }
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    return Err(IndexBundleError::BodyRead {
+                        height,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        let Some(cached) = self.cached.as_mut() else {
+            return Ok(None);
+        };
+        if cached.spans.is_none() {
+            let parsed = ParsedBlock::parse_exact(&cached.body).map_err(|error| {
+                IndexBundleError::BodyRead {
+                    height,
+                    reason: format!("block does not parse: {error}"),
+                }
+            })?;
+            cached.spans = Some(
+                parsed
+                    .transaction_spans()
+                    .iter()
+                    .map(|span| (span.start(), span.len()))
+                    .collect(),
+            );
+        }
+        Ok(cached.spans.as_deref())
+    }
+
     /// Resolves `position` to the top-level transaction at that exact span.
     ///
     /// A ranged read that merely decodes is not enough: the offset and length
@@ -290,40 +364,26 @@ impl LocatorCheck<'_> {
         hash: Hash256,
         position: TxPosition,
     ) -> Result<Located, IndexBundleError> {
-        let hit = self
-            .cached
-            .as_ref()
-            .is_some_and(|(held_height, held_hash, _)| {
-                *held_height == height && *held_hash == hash
-            });
-        if !hit {
-            match self.source.block_body(height, BlockHash::from(hash)) {
-                Ok(Some(body)) => self.cached = Some((height, hash, body)),
-                Ok(None) => return Ok(Located::BodyMissing),
-                Err(error) => {
-                    return Err(IndexBundleError::BodyRead {
-                        height,
-                        reason: error.to_string(),
-                    });
-                }
-            }
+        let wanted = (position.offset(), position.byte_len());
+        let present = match self.boundaries(height, hash)? {
+            Some(spans) => spans
+                .iter()
+                .any(|&(start, len)| is_top_level_span(position, start, len)),
+            None => return Ok(Located::BodyMissing),
+        };
+        if !present {
+            return Ok(Located::Mismatch);
         }
         let body = self
             .cached
             .as_ref()
-            .map_or(&[][..], |(_, _, body)| body.as_slice());
-        let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
-                height,
-                reason: format!("block does not parse: {error}"),
-            })?;
-        for tx in parsed.transactions() {
-            let span = tx.span();
-            if is_top_level_span(position, span.start(), span.len()) {
-                return Ok(Located::Found(tx.materialize()));
-            }
-        }
-        Ok(Located::Mismatch)
+            .map_or(&[][..], |cached| cached.body.as_slice());
+        let (offset, len) = wanted;
+        let slice = usize::try_from(offset)
+            .ok()
+            .zip(usize::try_from(len).ok())
+            .and_then(|(start, len)| body.get(start..start.checked_add(len)?));
+        Ok(slice.map_or(Located::Mismatch, |bytes| decode(bytes, len)))
     }
 
     /// Compares all transactions in the covered range.
@@ -381,34 +441,19 @@ impl LocatorCheck<'_> {
                 }
             });
         }
-        let hit = self
-            .cached
-            .as_ref()
-            .is_some_and(|(held_height, held_hash, _)| {
-                *held_height == height && *held_hash == hash
-            });
-        if !hit {
-            match self.source.block_body(height, BlockHash::from(hash)) {
-                Ok(Some(body)) => self.cached = Some((height, hash, body)),
-                Ok(None) => return Ok(None),
-                Err(error) => {
-                    return Err(IndexBundleError::BodyRead {
-                        height,
-                        reason: error.to_string(),
-                    });
+        // A parsed block answers from its spans without re-parsing; a block
+        // the locator pass has not parsed yet parses once here, like before.
+        // `transaction_spans` has one entry per parsed transaction, so its
+        // length is the block's transaction count.
+        match self.boundaries(height, hash)? {
+            Some(spans) => u64::try_from(spans.len()).map(Some).map_err(|_| {
+                IndexBundleError::BodyRead {
+                    height,
+                    reason: "the transaction count does not fit u64".to_owned(),
                 }
-            }
+            }),
+            None => Ok(None),
         }
-        let body = self
-            .cached
-            .as_ref()
-            .map_or(&[][..], |(_, _, body)| body.as_slice());
-        let parsed =
-            ParsedBlock::parse_exact(body).map_err(|error| IndexBundleError::BodyRead {
-                height,
-                reason: format!("block does not parse: {error}"),
-            })?;
-        Ok(Some(u64::try_from(parsed.tx_count()).unwrap_or(u64::MAX)))
     }
 }
 
