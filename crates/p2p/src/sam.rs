@@ -1953,9 +1953,14 @@ pub(crate) fn write_key_file(path: &Path, contents: &str) -> io::Result<()> {
     let _ = std::fs::remove_file(&temp_path);
     drop(cleanup);
 
-    // Sync parent directory to ensure directory entry is durable.
-    let dir = std::fs::File::open(parent)?;
-    dir.sync_all()?;
+    // Sync parent directory to ensure directory entry is durable. The
+    // storage helper supplies the directory flags Windows requires.
+    let parent = Some(parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    bitcoin_rs_storage::checkpoint::fs::sync_dir(
+        &bitcoin_rs_storage::checkpoint::fs::open_data_dir(parent)?,
+    )?;
 
     Ok(())
 }
