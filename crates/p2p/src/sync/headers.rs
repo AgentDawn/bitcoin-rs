@@ -21,7 +21,6 @@ use super::peers::shared_active_height;
 use super::peers::sync_peer_candidate;
 use super::requests::COMPACT_RELAY_NEAR_TIP_BLOCKS;
 use super::{BlockSync, SchedulerState};
-use super::{MAX_DEFERRED_OWNED_FETCHES, defer_owned_body_fetch};
 use crate::InboundHeaders;
 use crate::Message;
 use crate::PeerSource;
@@ -63,7 +62,6 @@ impl BlockSync {
             headers,
             source,
             wire_response,
-            body_fetch_owned,
         }) = self.inbound_headers_rx.try_recv()
         {
             if source.is_some_and(|source| !self.peer_table.is_current(source)) {
@@ -100,12 +98,9 @@ impl BlockSync {
                     self.peer_table
                         .note_announced_tip(source, tip_hash, active_height);
                     credit_refresh_needed = true;
-                    if wire_response && !body_fetch_owned {
+                    if wire_response {
                         direct_fetch.push((source, tip_hash));
                     }
-                }
-                if body_fetch_owned {
-                    self.note_owned_body_fetch(source, headers.last());
                 }
                 continue;
             }
@@ -118,9 +113,6 @@ impl BlockSync {
             let Some(admission) =
                 self.route_headers_batch(&headers, source, wire_response, batch_len)
             else {
-                if body_fetch_owned {
-                    self.note_owned_body_fetch(source, headers.last());
-                }
                 continue;
             };
             match admission {
@@ -132,7 +124,7 @@ impl BlockSync {
                     if let (Some(tip_hash), Some(source)) = (announced_tip, source) {
                         self.peer_table
                             .note_announced_tip(source, tip_hash, active_height);
-                        if wire_response && !body_fetch_owned {
+                        if wire_response {
                             direct_fetch.push((source, tip_hash));
                         }
                     }
@@ -210,9 +202,6 @@ impl BlockSync {
                     // silently losing the announcement.
                     self.request_ancestry_after_refusal(source, &error);
                 }
-            }
-            if body_fetch_owned {
-                self.note_owned_body_fetch(source, headers.last());
             }
         }
         if credit_refresh_needed {
@@ -484,109 +473,106 @@ impl BlockSync {
             .is_none_or(|tip| tip.chainwork < minimum_work)
     }
 
-    /// Records a body fetch the window does not own — the compact outcome
-    /// that forwarded this header already issued a `getblocktxn` or a
-    /// fallback `getdata` for the tip body — as pending under `source`, so
-    /// `next_peer_request` does not schedule a duplicate getdata for the
-    /// freshly admitted tip. A tip that has not attached yet is retained in
-    /// `SchedulerState::owned_body_fetches` and resolved once ancestry
-    /// admits it; without retention a gap batch would let the window
-    /// schedule a second fetch in parallel with the pending compact one.
-    fn note_owned_body_fetch(
-        &self,
-        source: Option<PeerSource>,
-        header: Option<&bitcoin_rs_primitives::Header>,
-    ) {
-        let (Some(source), Some(header)) = (source, header) else {
-            return;
-        };
-        // A stale source names a dead connection: its compact fetch died
-        // with it, and marking the body pending under that address would
-        // suppress scheduling from the live replacement until expiry.
-        if !self.peer_table.is_current(source) {
-            return;
-        }
-        let hash = Hash256::from(header.compute_hash());
-        let height = {
-            let tree = self.chain.block_tree();
-            tree.lookup(hash)
-                .and_then(|id| tree.node(id).ok().map(|node| node.height))
-        };
-        let mut scheduler = self.scheduler.lock();
-        let Some(height) = height else {
-            defer_owned_body_fetch(&mut scheduler, source, hash);
-            return;
-        };
-        let SchedulerState { window, stager, .. } = &mut *scheduler;
-        if !window.mark_owned_fetch(stager, source, hash, height, Instant::now()) {
-            defer_owned_body_fetch(&mut scheduler, source, hash);
-        }
-    }
-
     /// Resolves deferred owned-fetch marks now that this drain may have
     /// admitted the ancestry their tips were waiting on.
+    ///
+    /// PRE: runs on the sync thread, outside every lock.
+    /// POST: a mark whose header is in the tree and whose connection is
+    ///   current becomes a window pending (or stays a mark when the window
+    ///   refuses it, or another connection already owns the hash); a mark
+    ///   whose connection left is dropped; a mark whose header is unknown
+    ///   stays.
+    /// INVARIANT: a mark is the proof of a matched outstanding request, so
+    ///   it never leaves the scheduler while it resolves. The tree and peer
+    ///   table reads run on a snapshot outside the scheduler lock. Each
+    ///   install holds exact-source peer authority across the scheduler lock
+    ///   and rechecks its mark under the same lock hold that installs it:
+    ///   a mark released since the snapshot (the exact owner's `notfound`, a
+    ///   session sweep, an eviction) installs nothing, so a stale snapshot
+    ///   can never re-create a request the owner already declined. A
+    ///   `notfound` that lands anywhere in the resolve therefore finds the
+    ///   mark or, after the install, the window pending it became.
     pub(super) fn resolve_owned_body_fetches(&self) {
-        let deferred = {
-            let mut scheduler = self.scheduler.lock();
+        let snapshot = {
+            let scheduler = self.scheduler.lock();
             if scheduler.owned_body_fetches.is_empty() {
                 return;
             }
-            std::mem::take(&mut scheduler.owned_body_fetches)
+            scheduler.owned_body_fetches.clone()
         };
-        let mut unresolved = Vec::with_capacity(deferred.len());
-        let mut resolved = Vec::with_capacity(deferred.len());
+        let mut dead = Vec::new();
+        let mut resolved = Vec::with_capacity(snapshot.len());
         {
             let tree = self.chain.block_tree();
-            for (source, hash) in deferred {
+            for (source, hash) in snapshot {
                 // A stale source names a dead connection: its fetch died
                 // with it, so the mark must neither settle a staged body's
                 // gate nor mark it pending under the dead owner.
                 if !self.peer_table.is_current(source) {
+                    dead.push((source, hash));
                     continue;
                 }
                 let height = tree
                     .lookup(hash)
                     .and_then(|id| tree.node(id).ok().map(|node| node.height));
-                match height {
-                    Some(height) => resolved.push((source, hash, height)),
-                    None => unresolved.push((source, hash)),
+                if let Some(height) = height {
+                    resolved.push((source, hash, height));
                 }
             }
         }
-        let mut scheduler = self.scheduler.lock();
-        let now = Instant::now();
-        let SchedulerState {
-            window,
-            stager,
-            owned_body_fetches,
-            ..
-        } = &mut *scheduler;
+        self.scheduler
+            .lock()
+            .owned_body_fetches
+            .retain(|mark| !dead.contains(mark));
         for (source, hash, height) in resolved {
+            self.install_resolved_owned_body_fetch(source, hash, height);
+        }
+    }
+
+    /// Publishes a resolved snapshot only while its exact connection and its
+    /// authoritative deferred mark are both still live. Lock order is peer
+    /// table then scheduler, matching request publication and `notfound`.
+    pub(super) fn install_resolved_owned_body_fetch(
+        &self,
+        source: PeerSource,
+        hash: Hash256,
+        height: u32,
+    ) {
+        let current = self.peer_table.with_current(source, || {
+            let mut scheduler = self.scheduler.lock();
+            let SchedulerState {
+                window,
+                stager,
+                owned_body_fetches,
+                ..
+            } = &mut *scheduler;
+            // Recheck under the lock that installs: a mark released since the
+            // snapshot is gone and must not become a pending request.
+            let Some(index) = owned_body_fetches
+                .iter()
+                .position(|mark| *mark == (source, hash))
+            else {
+                return;
+            };
             // A refusal leaves the fetch in flight: keep the deferred mark so
             // the delivered body still classifies as requested. So does a
             // hash already pending under a different owner — `mark_owned_fetch`
             // resolves it without recording this owner, and dropping the mark
             // would disown the second connection's in-flight fetch.
-            if !window.mark_owned_fetch(stager, source, hash, height, now)
-                || window
+            let installed = window.mark_owned_fetch(stager, source, hash, height, Instant::now())
+                && window
                     .pending_owner(&hash)
-                    .is_some_and(|owner| owner != source)
-            {
-                unresolved.push((source, hash));
+                    .is_none_or(|owner| owner == source);
+            if installed {
+                owned_body_fetches.remove(index);
             }
+        });
+        if !current {
+            self.scheduler
+                .lock()
+                .owned_body_fetches
+                .retain(|mark| *mark != (source, hash));
         }
-        // Unresolved marks predate anything recorded during this resolve:
-        // they merge back ahead of the queue in their original order, and the
-        // cap then drops the newest marks — the same oldest-first policy
-        // `defer_owned_body_fetch` applies.
-        let mut merged = unresolved;
-        for mark in owned_body_fetches.drain(..) {
-            if !merged.contains(&mark) {
-                merged.push(mark);
-            }
-        }
-        merged.truncate(MAX_DEFERRED_OWNED_FETCHES);
-        *owned_body_fetches = merged;
     }
 
     /// `(announced_tip, active_height)` when every header in `headers` is

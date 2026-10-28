@@ -2424,6 +2424,9 @@ mod tests {
     {
         struct Observer(AtomicUsize);
         impl crate::MempoolObserver for Observer {
+            fn wants_accepted_transactions(&self) -> bool {
+                false
+            }
             fn on_mutation(&self, _: &crate::MutationEnvelope) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
@@ -2997,6 +3000,9 @@ mod tests {
     struct ReorgRecording(Mutex<Vec<(Txid, AdmissionOrigin)>>);
 
     impl crate::MempoolObserver for ReorgRecording {
+        fn wants_accepted_transactions(&self) -> bool {
+            false
+        }
         fn on_mutation(&self, envelope: &crate::MutationEnvelope) {
             let mut seen = self.0.lock();
             for change in &envelope.result.changes {
@@ -3015,6 +3021,9 @@ mod tests {
     struct ReorgBatchLog(Mutex<Vec<ReorgBatch>>);
 
     impl crate::MempoolObserver for ReorgBatchLog {
+        fn wants_accepted_transactions(&self) -> bool {
+            false
+        }
         fn on_mutation(&self, envelope: &crate::MutationEnvelope) {
             let mut seen = self.0.lock();
             seen.push((

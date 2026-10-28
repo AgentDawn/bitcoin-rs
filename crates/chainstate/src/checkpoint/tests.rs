@@ -195,3 +195,6 @@ mod tip_transitions;
 
 #[cfg(test)]
 mod headers_validation;
+
+#[cfg(test)]
+mod side_branches;
