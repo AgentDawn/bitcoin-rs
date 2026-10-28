@@ -18,7 +18,7 @@ use bitcoin_rs_mining::pool::{BlockStatus, PoolCore, RecordOutcome};
 use bitcoin_rs_mining::pool::ledger::MinerId;
 
 use super::authority;
-use super::ledger::{BlockRecordOutcome, BlockRecordPermit, LedgerHost};
+use super::ledger::{BlockRecordOutcome, BlockRecordPermit, DeferredCharge, LedgerHost};
 use crate::config::PoolConfig;
 
 const CERTIFICATE_VALIDITY: Duration = Duration::new(86_400, 0);
@@ -42,6 +42,15 @@ struct DeferredBlock {
     pending: PendingBlock,
     submission: BlockSubmission,
     attempts: u32,
+    /// Reservation kept charged to the shared block-record capacity until this
+    /// waiter is removed. `Permit` transfers the `Durable` slot; `Queued`
+    /// shares the compact queue slot via per-entry `SeqCst` state with
+    /// exactly-once release. Every retained waiter carries a charge, so the
+    /// `MAX_PENDING_BLOCK_RECORDS` bound caps deferred recovery; dropping
+    /// (connection close, settle, error) releases via RAII so eight slots
+    /// cannot strand. Linearizable capacity; snapshot-isolated ledger;
+    /// at-least-once delivery against the idempotent block-hash consumer.
+    charge: DeferredCharge,
 }
 
 /// Bounded re-submissions retained per deferred block before the ledger
@@ -536,7 +545,7 @@ fn handle_events(
                 // dropping it. Only success is deferred; node rejections
                 // answer immediately below.
                 match permit.record_or_enqueue(account, found, &receipt) {
-                    BlockRecordOutcome::Durable => {
+                    (BlockRecordOutcome::Durable, charge) => {
                         if matches!(
                             &submission,
                             Ok(submitted)
@@ -546,16 +555,26 @@ fn handle_events(
                                 return Err(anyhow!("SV2 block lost its submission"));
                             };
                             let hash = found.share.hash;
+                            // `Durable`+`Undetermined` transfers its slot via
+                            // `charge`; dropping the waiter releases it. Shed
+                            // past capacity instead of growing unbounded.
+                            let Some(charge) = charge else {
+                                return Err(anyhow!(
+                                    "SV2 durable recovery has no reservation"
+                                ));
+                            };
                             deferred.push(DeferredBlock {
                                 hash,
                                 pending,
                                 submission: submitted,
                                 attempts: 0,
+                                charge,
                             });
                             continue;
                         }
+                        debug_assert!(charge.is_none());
                     }
-                    BlockRecordOutcome::Queued => {
+                    (BlockRecordOutcome::Queued, charge) => {
                         if matches!(
                             &submission,
                             Ok(submitted)
@@ -570,16 +589,25 @@ fn handle_events(
                                 return Err(anyhow!("SV2 block lost its submission"));
                             };
                             let hash = found.share.hash;
+                            // `Queued` shares its compact slot via per-entry
+                            // state; dropping the waiter releases exactly once.
+                            // Shed past capacity instead of retaining uncharged.
+                            let Some(charge) = charge else {
+                                return Err(anyhow!(
+                                    "SV2 queued recovery has no reservation"
+                                ));
+                            };
                             deferred.push(DeferredBlock {
                                 hash,
                                 pending,
                                 submission: submitted,
                                 attempts: 0,
+                                charge,
                             });
                             continue;
                         }
                     }
-                    BlockRecordOutcome::Unrecordable => {
+                    (BlockRecordOutcome::Unrecordable, _) => {
                         return Err(anyhow!(
                             "SV2 block cannot be represented by the durable ledger"
                         ));
@@ -591,17 +619,16 @@ fn handle_events(
                         connection.confirm_block(&submission)?;
                     }
                     BlockStatus::Undetermined => {
-                        // Fallback retention: every `Undetermined` should already
-                        // be deferred above, but never confirm an unapplied
-                        // block. Retain for bounded recovery instead.
-                        let hash = found.share.hash;
-                        deferred.push(DeferredBlock {
-                            hash,
-                            pending,
-                            submission,
-                            attempts: 0,
-                        });
-                        continue;
+                        // Every `Undetermined` is deferred above with a charge
+                        // before `continue`; reaching here means the permit
+                        // was consumed without retention, which would leave a
+                        // full `PendingBlock` uncharged. Fail closed instead of
+                        // growing unbounded: never confirm an unapplied block.
+                        // Linearizable capacity; at-least-once delivery stays
+                        // idempotent on retry.
+                        return Err(anyhow!(
+                            "SV2 Undetermined block lost its reservation"
+                        ));
                     }
                     BlockStatus::Rejected if submission.receipt().is_stale_parent() => {
                         connection

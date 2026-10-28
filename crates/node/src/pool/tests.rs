@@ -340,6 +340,78 @@ fn block_record_reservations_are_bounded_and_released(open: OpenStore) -> TestRe
     Ok(())
 }
 
+fn durable_undetermined_keeps_reservation_until_waiter_removed(
+    open: OpenStore,
+) -> TestResult {
+    // An `Undetermined` submission releases no capacity when its record is
+    // already durable: the full waiter stays charged to the shared
+    // `MAX_PENDING_BLOCK_RECORDS` budget until removed. Fill capacity with
+    // deferred charges, assert admission fails, drop one, and re-admit.
+    // Linearizable capacity; snapshot-isolated ledger; at-least-once delivery
+    // stays idempotent on the block hash.
+    use super::ledger::{BlockRecordOutcome, DeferredCharge};
+    use bitcoin_rs_mining::pool::BlockStatus;
+
+    let directory = tempfile::tempdir()?;
+    let host = Arc::new(registered_host(open, directory.path(), EPOCH)?);
+    let mut charges = Vec::new();
+    for index in 0..8 {
+        let mut found = found_block()?;
+        let lane = u32::try_from(index).map_err(|_| "lane exceeds u32")?;
+        found.share.header.nonce = found.share.header.nonce.wrapping_add(lane);
+        found.share.hash = found.share.header.compute_hash();
+        found.block.header = found.share.header;
+        let receipt = BlockReceipt {
+            hash: found.share.hash,
+            height: found.share.height,
+            previous_block_hash: found.share.previous_block_hash,
+            coinbase_txid: found.coinbase_txid,
+            coinbase_value: found.coinbase_value,
+            session: found.share.session,
+            job: found.share.job,
+            result: BlockValidationResult::Inconclusive,
+        };
+        assert_eq!(
+            receipt.status(),
+            BlockStatus::Undetermined,
+            "test receipt must stay Undetermined"
+        );
+        let permit = host
+            .try_reserve_block_slot()
+            .ok_or("slot refused below capacity")?;
+        let (outcome, charge) =
+            permit.record_or_enqueue(MinerId(42), &found, &Ok(receipt));
+        assert!(
+            matches!(outcome, BlockRecordOutcome::Durable),
+            "good block must record durably"
+        );
+        let charge = charge.ok_or("durable Undetermined must retain its charge")?;
+        assert!(
+            matches!(charge, DeferredCharge::Permit(_)),
+            "durable waiter must transfer its permit"
+        );
+        charges.push(charge);
+        assert!(
+            host.ledger()
+                .round_for_block(&Hash256::from(found.share.hash).to_le_bytes())?
+                .is_some(),
+            "durable record must exist"
+        );
+    }
+    assert!(
+        host.try_reserve_block_slot().is_none(),
+        "eight deferred charges must exhaust shared capacity"
+    );
+    let dropped = charges.pop().ok_or("eight charges expected")?;
+    drop(dropped);
+    assert!(
+        host.try_reserve_block_slot().is_some(),
+        "dropping one waiter must re-admit capacity"
+    );
+    drop(charges);
+    Ok(())
+}
+
 #[test]
 fn protocol_admissions_share_total_capacity_and_release_it_on_drop() -> TestResult {
     let shared = Arc::new(
@@ -408,6 +480,11 @@ macro_rules! backend_tests {
             #[test]
             fn block_record_capacity_is_bounded_and_permit_drop_releases_it() -> TestResult {
                 block_record_reservations_are_bounded_and_released(open)
+            }
+
+            #[test]
+            fn durable_undetermined_keeps_shared_reservation_until_waiter_removed() -> TestResult {
+                durable_undetermined_keeps_reservation_until_waiter_removed(open)
             }
 
             #[test]

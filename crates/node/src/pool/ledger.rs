@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU8, Ordering},
+};
 
 use bitcoin_rs_chainstate::Chainstate;
 use bitcoin_rs_index::{DerivedIndexQuery, ScriptIndexQuery};
@@ -15,8 +18,8 @@ use bitcoin_rs_mining::pool::ledger::{
 };
 use bitcoin_rs_mining::pool::stratum::sv1::{AccountResolver, AuthDenied, Password};
 use bitcoin_rs_mining::pool::{
-    AcceptedShare, BlockReceipt, FoundBlock, LedgerUnavailable, RecordOutcome, ShareLedger,
-    WorkerIdentity,
+    AcceptedShare, BlockReceipt, BlockStatus, FoundBlock, LedgerUnavailable, RecordOutcome,
+    ShareLedger, WorkerIdentity,
 };
 
 /// Node-backed observation of the fully applied chain.
@@ -302,10 +305,30 @@ const MAX_PENDING_BLOCK_RECORDS: usize = 8;
 const MAX_BLOCK_RECORD_BYTES: usize = 4_000_000;
 const MAX_PENDING_BLOCK_BYTES: usize = MAX_PENDING_BLOCK_RECORDS * MAX_BLOCK_RECORD_BYTES;
 
+/// Per-entry ownership for one shared queue slot:
+/// `0 = QUEUED_ALIVE` (queue owns, waiter alive),
+/// `1 = QUEUED_GONE` (queue owns, waiter dropped before transfer),
+/// `2 = WAITER_OWNS` (drain transferred, waiter owns),
+/// `3 = RELEASED` (terminal, exactly once).
+/// Transitions use `SeqCst` CAS so drain and waiter-drop agree on the single
+/// releaser without holding `pending_blocks` across ledger I/O.
+const RECOVERY_QUEUED_ALIVE: u8 = 0;
+const RECOVERY_QUEUED_GONE: u8 = 1;
+const RECOVERY_WAITER_OWNS: u8 = 2;
+const RECOVERY_RELEASED: u8 = 3;
+
+#[derive(Clone)]
 struct PendingBlockRecord {
     hash: bitcoin_rs_primitives::BlockHash,
     block: LedgerBlockFound,
     bytes: usize,
+    /// Shared with the deferred waiter when this queued entry defers success.
+    /// `None` for queued entries with no waiter (e.g. rejected verdicts).
+    recovery: Option<Arc<AtomicU8>>,
+    /// Unique per-push identity so the drain commits the exact peeked entry:
+    /// `Arc::ptr_eq` proves identity while duplicate hashes would compare
+    /// equal. Linearizable pop; a new `Arc` per push never recycles identity.
+    token: Arc<()>,
 }
 
 #[derive(Default)]
@@ -313,6 +336,70 @@ struct PendingBlockRecords {
     reserved: usize,
     bytes: usize,
     queue: VecDeque<PendingBlockRecord>,
+}
+
+/// RAII hold for a `Queued` waiter sharing its compact queue slot.
+///
+/// Shares one reservation with the compact queue entry via `recovery` state:
+/// `0 = QUEUED_ALIVE`, `1 = QUEUED_GONE`, `2 = WAITER_OWNS`, `3 = RELEASED`.
+/// Drop CAS `0->1` (drain will release normally) or `2->3` with release
+/// (drain transferred). Every early-return and connection-drop path drops its
+/// `DeferredBlock`, so the hold cannot leak and eight slots cannot strand.
+/// State uses `SeqCst` so drain and drop agree on the single releaser; the
+/// single `pending_blocks` lock guards only `reserved`/`bytes`/`queue`.
+pub(crate) struct QueuedRecoveryHold {
+    host: Arc<LedgerHost>,
+    state: Arc<AtomicU8>,
+}
+
+impl Drop for QueuedRecoveryHold {
+    fn drop(&mut self) {
+        // Mark gone so a later drain releases normally (linearizable handoff).
+        if self
+            .state
+            .compare_exchange(
+                RECOVERY_QUEUED_ALIVE,
+                RECOVERY_QUEUED_GONE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        // Drain transferred the slot: release exactly once here.
+        if self
+            .state
+            .compare_exchange(
+                RECOVERY_WAITER_OWNS,
+                RECOVERY_RELEASED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            let mut pending = self
+                .host
+                .pending_blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.reserved = pending.reserved.saturating_sub(1);
+            pending.bytes = pending
+                .bytes
+                .saturating_sub(MAX_BLOCK_RECORD_BYTES);
+        }
+    }
+}
+
+/// Charge retained for a deferred full-candidate waiter until removal.
+/// Snapshot isolation holds per ledger commit; capacity is linearizable under
+/// the single `pending_blocks` lock; delivery is at-least-once against the
+/// idempotent ledger consumer keyed on the block hash.
+pub(crate) enum DeferredCharge {
+    /// `Durable`+`Undetermined`: the original reservation, transferred.
+    Permit(BlockRecordPermit),
+    /// `Queued`+deferred: shares the compact queue slot via per-entry state.
+    Queued(QueuedRecoveryHold),
 }
 
 /// Result of consuming a pre-submission durable-record reservation.
@@ -343,32 +430,92 @@ impl BlockRecordPermit {
         account: MinerId,
         block: &FoundBlock,
         submission: &Result<BlockReceipt, bitcoin_rs_mining::MiningControlError>,
-    ) -> BlockRecordOutcome {
+    ) -> (BlockRecordOutcome, Option<DeferredCharge>) {
         let host = Arc::clone(&self.host);
         self.armed = false;
+        let bytes = self.bytes;
+        let undetermined =
+            matches!(submission, Ok(receipt) if receipt.status() == BlockStatus::Undetermined);
+        // `Queued` defers success for `Applied` as well as `Undetermined`:
+        // the socket holds `SubmitShares.Success` until the compact record is
+        // durable. Those waiters share the queue slot via the recovery set so
+        // the drain transfers (not releases) it.
+        let queued_defers = matches!(
+            submission,
+            Ok(receipt) if matches!(
+                receipt.status(),
+                BlockStatus::Applied | BlockStatus::Undetermined
+            )
+        );
         let recorded_directly = host
             .record_submitted_block(account, block, submission)
             .is_ok();
         if recorded_directly || matches!(host.found_block_recorded(block.share.hash), Ok(true)) {
-            host.release_block_reservation(self.bytes);
-            return BlockRecordOutcome::Durable;
+            if undetermined {
+                // An `Undetermined` verdict is always deferred, even when the
+                // record is already durable: journal backpressure leaves the
+                // block unapplied, so immediate success would be false. The
+                // deferred waiter retains the full candidate, so keep its
+                // reservation charged to the shared capacity until the waiter
+                // is removed instead of releasing it here.
+                let permit = BlockRecordPermit {
+                    host,
+                    bytes,
+                    armed: true,
+                };
+                return (
+                    BlockRecordOutcome::Durable,
+                    Some(DeferredCharge::Permit(permit)),
+                );
+            }
+            host.release_block_reservation(bytes);
+            return (BlockRecordOutcome::Durable, None);
         }
         let hash = block.share.hash;
         let Some(ledger_block) = ledger_block(host.run_epoch, account, block).ok() else {
-            host.release_block_reservation(self.bytes);
-            return BlockRecordOutcome::Unrecordable;
+            host.release_block_reservation(bytes);
+            return (BlockRecordOutcome::Unrecordable, None);
         };
-        let mut pending = host
-            .pending_blocks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(pending.reserved <= MAX_PENDING_BLOCK_RECORDS);
-        pending.queue.push_back(PendingBlockRecord {
-            hash,
-            block: ledger_block,
-            bytes: self.bytes,
-        });
-        BlockRecordOutcome::Queued
+        if queued_defers {
+            let state = Arc::new(AtomicU8::new(RECOVERY_QUEUED_ALIVE));
+            {
+                let mut pending = host
+                    .pending_blocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                debug_assert!(pending.reserved <= MAX_PENDING_BLOCK_RECORDS);
+                pending.queue.push_back(PendingBlockRecord {
+                    hash,
+                    block: ledger_block,
+                    bytes,
+                    recovery: Some(Arc::clone(&state)),
+                    token: Arc::new(()),
+                });
+            }
+            let hold = QueuedRecoveryHold {
+                host,
+                state,
+            };
+            return (
+                BlockRecordOutcome::Queued,
+                Some(DeferredCharge::Queued(hold)),
+            );
+        }
+        {
+            let mut pending = host
+                .pending_blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            debug_assert!(pending.reserved <= MAX_PENDING_BLOCK_RECORDS);
+            pending.queue.push_back(PendingBlockRecord {
+                hash,
+                block: ledger_block,
+                bytes,
+                recovery: None,
+                token: Arc::new(()),
+            });
+        }
+        (BlockRecordOutcome::Queued, None)
     }
 }
 
@@ -490,14 +637,19 @@ impl LedgerHost {
     }
 
     pub(crate) fn drain_one_block_record(&self) -> Result<bool, pool_ledger::LedgerError> {
-        let pending_record = {
-            let mut pending = self
+        // Peek without popping so the queue still owns the slot across ledger
+        // I/O: `pending_blocks` is never held across I/O, and the per-entry
+        // `SeqCst` state (not queue membership) decides the single releaser.
+        // Linearizable capacity under the single lock; ledger commits use
+        // snapshot isolation and stay idempotent on the block hash.
+        let peeked = {
+            let pending = self
                 .pending_blocks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.queue.pop_front()
+            pending.queue.front().cloned()
         };
-        let Some(record) = pending_record else {
+        let Some(record) = peeked else {
             return Ok(false);
         };
         let result = match self.found_block_recorded(record.hash) {
@@ -505,21 +657,75 @@ impl LedgerHost {
             Ok(false) => self.ledger.record_found_block(&record.block).map(|_| ()),
             Err(error) => Err(error),
         };
+        if result.is_err() {
+            // Leave the front in place for retry; no pop/push churn and no
+            // counter change. Exactly-once does not exist: the ledger consumer
+            // stays idempotent on the block hash.
+            return result.map(|()| true);
+        }
         let mut pending = self
             .pending_blocks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match result {
-            Ok(()) => {
+        // Another drain may have committed our peeked front while we did I/O:
+        // its commit already decided counters, so do not double-release here.
+        // Compare unique token identity, not hash: duplicate queued hashes
+        // would compare equal while `Arc::ptr_eq` proves the exact entry.
+        // A fresh `Arc` per push never recycles, so A->B->A cannot compare
+        // equal. Linearizable pop under the single lock.
+        let front_matches = pending.queue.front().is_some_and(|front| {
+            front.hash == record.hash && Arc::ptr_eq(&front.token, &record.token)
+        });
+        if !front_matches {
+            return Ok(true);
+        }
+        if let Some(state) = record.recovery.as_ref() {
+            // Waiter alive: transfer the slot (keep charged, pop only).
+            if state
+                .compare_exchange(
+                    RECOVERY_QUEUED_ALIVE,
+                    RECOVERY_WAITER_OWNS,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                pending.queue.pop_front();
+                return Ok(true);
+            }
+            // Waiter dropped before transfer: release normally exactly once.
+            if state
+                .compare_exchange(
+                    RECOVERY_QUEUED_GONE,
+                    RECOVERY_RELEASED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                let popped = pending.queue.pop_front();
+                debug_assert!(popped.is_some_and(|entry| entry.hash == record.hash));
                 pending.bytes = pending.bytes.saturating_sub(record.bytes);
                 pending.reserved = pending.reserved.saturating_sub(1);
-                Ok(true)
+                return Ok(true);
             }
-            Err(error) => {
-                pending.queue.push_front(record);
-                Err(error)
-            }
+            // `WAITER_OWNS` already transferred the charge to the waiter and
+            // `RELEASED` already released it: touching counters again would
+            // double-release one slot. This state is impossible with the exact
+            // token check above (a fresh `Arc` per push never recycles), so
+            // surface it instead of popping. No pop and no counter change;
+            // snapshot-isolated ledger work stays idempotent on retry.
+            // Linearizability needs the exact token owner; idempotence needs
+            // no double commit.
+            return Err(pool_ledger::LedgerError::Invariant(
+                "block recovery state already decided".into(),
+            ));
         }
+        let popped = pending.queue.pop_front();
+        debug_assert!(popped.is_some_and(|entry| entry.hash == record.hash));
+        pending.bytes = pending.bytes.saturating_sub(record.bytes);
+        pending.reserved = pending.reserved.saturating_sub(1);
+        Ok(true)
     }
 
     /// Resolves a decimal account id only when its payout script was explicitly registered.
