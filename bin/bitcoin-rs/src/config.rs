@@ -543,7 +543,6 @@ onion=127.0.0.1:9051
 dnsseed=0
 proxyrandomize=1
 torcontrol=127.0.0.1:9052
-torpassword=secret
 i2psam=127.0.0.1:7656
 i2pacceptincoming=1
 onlynet=onion,i2p
@@ -565,7 +564,7 @@ onlynet=onion,i2p
         );
         assert_eq!(
             conf_with_overlays.p2p.overlay.tor_cookie.as_deref(),
-            Some(std::path::Path::new("secret"))
+            None
         );
         assert_eq!(
             conf_with_overlays.p2p.overlay.i2p_sam,
