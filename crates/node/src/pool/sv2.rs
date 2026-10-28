@@ -104,6 +104,7 @@ pub(crate) struct Sv2Service {
     cancel: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    worker_panicked: Arc<AtomicBool>,
 }
 
 impl Sv2Service {
@@ -139,15 +140,21 @@ impl Sv2Service {
                 ACCEPT_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
             );
         }
+        let mut panicked = self.worker_panicked.load(Ordering::Acquire);
         for connection in self
             .connections
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)
         {
-            connection
-                .join()
-                .map_err(|_| anyhow!("SV2 connection thread panicked"))?;
+            if connection.join().is_err() {
+                panicked = true;
+                self.worker_panicked.store(true, Ordering::Release);
+                tracing::warn!("SV2 connection thread panicked");
+            }
+        }
+        if panicked {
+            return Err(anyhow!("SV2 connection thread panicked"));
         }
         Ok(())
     }
@@ -195,6 +202,8 @@ pub(crate) fn start(
     let connections = Arc::new(Mutex::new(Vec::new()));
     let thread_connections = Arc::clone(&connections);
     let thread_cancel = Arc::clone(&cancel);
+    let worker_panicked = Arc::new(AtomicBool::new(false));
+    let thread_panicked = Arc::clone(&worker_panicked);
     let initial_target = config.share_target;
 
     let listener_thread = thread::Builder::new()
@@ -203,7 +212,7 @@ pub(crate) fn start(
             while !thread_cancel.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
-                        reap_finished(&thread_connections);
+                        reap_finished(&thread_connections, &thread_panicked);
                         let Ok(permit) = limiter.try_admit(peer.ip()) else {
                             drop(stream);
                             continue;
@@ -274,6 +283,7 @@ pub(crate) fn start(
         cancel,
         listener: Some(listener_thread),
         connections,
+        worker_panicked,
     })
 }
 
@@ -619,7 +629,7 @@ fn handle_events(
     Ok(())
 }
 
-fn reap_finished(connections: &Mutex<Vec<JoinHandle<()>>>) {
+fn reap_finished(connections: &Mutex<Vec<JoinHandle<()>>>, worker_panicked: &AtomicBool) {
     let mut connections = connections
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -628,6 +638,7 @@ fn reap_finished(connections: &Mutex<Vec<JoinHandle<()>>>) {
         if connections[index].is_finished() {
             let handle = connections.swap_remove(index);
             if handle.join().is_err() {
+                worker_panicked.store(true, Ordering::Release);
                 tracing::warn!("SV2 connection thread panicked");
             }
         } else {
@@ -1330,6 +1341,105 @@ mod tests {
         assert_eq!(host.node_submissions(), 2, "deferred retry re-queries node state");
         let confirmed = host.miner.open(&host.connection.take_transmit())?;
         assert!(has(&confirmed, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS));
+        Ok(())
+    }
+
+    #[test]
+    fn reaped_worker_panic_propagates_through_stop_join() -> TestResult {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        // A listener-loop reap must not discard the panic: the service flag
+        // retains it so shutdown still fails after joining the rest, matching
+        // SV1's `sessions_panicked`.
+        let connections: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let worker_panicked = Arc::new(AtomicBool::new(false));
+        connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::thread::spawn(|| panic!("reaped SV2 worker boom")));
+        while !connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .all(|handle| handle.is_finished())
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        super::reap_finished(&connections, &worker_panicked);
+        assert!(
+            worker_panicked.load(Ordering::Acquire),
+            "reap retains the worker panic"
+        );
+        assert!(
+            connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "reaped handle leaves no join for stop_join"
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut service = super::Sv2Service {
+            cancel,
+            listener: None,
+            connections,
+            worker_panicked,
+        };
+        let error = service
+            .stop_join(Instant::now() + Duration::from_secs(5))
+            .expect_err("reaped panic must fail shutdown");
+        assert!(
+            error.to_string().contains("panicked"),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_join_joins_remaining_workers_after_panic() -> TestResult {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        let connections: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let worker_panicked = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.push(std::thread::spawn(|| panic!("stop_join SV2 worker boom")));
+            guard.push(std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+            }));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut service = super::Sv2Service {
+            cancel,
+            listener: None,
+            connections: Arc::clone(&connections),
+            worker_panicked: Arc::clone(&worker_panicked),
+        };
+        let error = service
+            .stop_join(Instant::now() + Duration::from_secs(5))
+            .expect_err("worker panic must fail shutdown");
+        assert!(
+            error.to_string().contains("panicked"),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            worker_panicked.load(Ordering::Acquire),
+            "panic flag survives shutdown"
+        );
+        assert!(
+            connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "stop_join joins every remaining worker"
+        );
         Ok(())
     }
 }
