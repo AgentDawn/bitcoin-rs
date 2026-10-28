@@ -43,10 +43,15 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         spent_scripts: &dyn SpentCoinScripts,
     ) -> Result<PreparedBlock, IndexError>;
     /// Seeds the live view from a caller-fenced authoritative coin stream.
+    ///
+    /// `cancelled` is polled at entry, every 4,096 emitted rows, and before
+    /// the final watermark commit; a trip returns
+    /// [`IndexError::Cancelled`] with no watermark stamped.
     fn seed_script_live_stream(
         &self,
         produce: &mut ScriptLiveSeedProduce<'_>,
         tip: IndexWatermark,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<usize, IndexError>;
     /// Imports verified portable `TxLookup` rows through bounded fenced commits,
     /// stamping `base` and `floor` only in the final commit.
@@ -142,8 +147,10 @@ where
         &self,
         produce: &mut ScriptLiveSeedProduce<'_>,
         tip: IndexWatermark,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<usize, IndexError> {
-        self.write().seed_script_live_stream(produce, tip)
+        self.write()
+            .seed_script_live_stream(produce, tip, cancelled)
     }
 
     fn import_tx_lookup_stream(

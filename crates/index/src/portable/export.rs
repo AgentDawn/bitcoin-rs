@@ -15,7 +15,7 @@
 
 use super::artifact::{
     ARTIFACT_VERSION, ArtifactHeader, CANCEL_POLL_RECORDS, HEADER_LEN, IO_BUFFER_BYTES, hash_file,
-    positions_are_valid, write_record,
+    write_record,
 };
 use super::chain::{BodyReader, ChainBase, Located};
 use super::manifest::{
@@ -25,8 +25,10 @@ use super::{
     BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, MAX_RESTORE_POSITIONS, io_error,
     sync_dir,
 };
-use crate::types::{HASH_PREFIX_ROW_SIZE, HashPrefixRow, TxPosition, TxPositionValue};
-use crate::{IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily};
+use crate::types::{HASH_PREFIX_ROW_SIZE, HashPrefixRow, TxPosition, TxPositionValue, positions_are_valid};
+use crate::{
+    IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexSnapshot,
+};
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
 use std::cmp::Reverse;
@@ -36,10 +38,9 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use zerocopy::IntoBytes;
 
-/// Rows per export page. Export streams the family through bounded pages,
-/// each read through a short-lived snapshot, so export memory stays flat in
-/// family size on every backend instead of materializing the whole family
-/// before emitting rows.
+/// Rows per export page. Export streams the family through bounded pages
+/// over one snapshot, so export memory stays flat in family size on every
+/// backend instead of materializing the whole family before emitting rows.
 const EXPORT_PAGE_ROWS: usize = 1_024;
 /// Cap on returned key-plus-value bytes per page after the first row.
 const EXPORT_PAGE_BYTES: usize = 1 << 20;
@@ -49,6 +50,60 @@ fn export_page_limit() -> PrefixScanLimit {
     PrefixScanLimit {
         max_rows: EXPORT_PAGE_ROWS,
         max_bytes: EXPORT_PAGE_BYTES,
+    }
+}
+
+/// Streams every `TxConfirmed` row of one snapshot in stored-key order
+/// through bounded pages, calling `emit` once per row.
+///
+/// Cancellation is polled every [`CANCEL_POLL_RECORDS`] visited rows.
+/// Pages concatenate to the family's stored order; a page scan that
+/// returns an empty incomplete page can make no progress, so it refuses
+/// rather than loops.
+#[expect(
+    clippy::type_complexity,
+    reason = "the page emitter signature is the streaming interface; an alias would hide the output contract"
+)]
+fn stream_family_pages(
+    snapshot: &dyn TxIndexSnapshot,
+    limit: PrefixScanLimit,
+    cancelled: &dyn Fn() -> bool,
+    emit: &mut dyn FnMut(HashPrefixRow, &[u8]) -> Result<(u64, u64), IndexBundleError>,
+) -> Result<(u64, u64), IndexBundleError> {
+    let mut start_after: Option<Vec<u8>> = None;
+    let mut visited = 0_u64;
+    let mut totals = (0_u64, 0_u64);
+    loop {
+        let page =
+            snapshot.scan_family_page(TxIndexFamily::TxConfirmed, start_after.as_deref(), limit)?;
+        let mut last_key: Option<Vec<u8>> = None;
+        for scan_row in page.rows {
+            visited += 1;
+            if visited.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
+                return Err(IndexBundleError::Cancelled);
+            }
+            let (records, bytes) = emit(scan_row.row, &scan_row.value)?;
+            totals.0 += records;
+            totals.1 += bytes;
+            last_key = Some(scan_row.row.to_db_row().to_vec());
+        }
+        if page.complete {
+            return Ok(totals);
+        }
+        let Some(last) = last_key else {
+            // A conforming page scan always returns its first row while rows
+            // remain; without one there is no cursor to advance.
+            return Err(IndexError::from(StorageError::InvalidOperation(
+                "export page scan returned an empty incomplete page",
+            ))
+            .into());
+        };
+        // Stored keys are fixed-width: the suffixed key is the least key
+        // strictly above the page, so the next page resumes without overlap
+        // or gap.
+        let mut next = last;
+        next.push(0);
+        start_after = Some(next);
     }
 }
 
@@ -918,10 +973,15 @@ impl RowExporter<'_> {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test fixtures prove their own bounds")]
 mod tests {
     use super::*;
+    use crate::types::ScriptHash;
+    use crate::{ScriptLiveScan, TxIndexPage, TxIndexScan, TxIndexScanRow};
+    use bitcoin_rs_primitives::{OutPoint, Txid};
     use std::cell::Cell;
     use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1007,6 +1067,227 @@ mod tests {
         );
         assert_eq!(calls(), 2, "the failed fsync is not retried");
         Ok(())
+    }
+
+    /// Small page size over a multi-page family: pages concatenate in
+    /// stored-key order with no overlap, gap, or repeat.
+    #[test]
+    fn paged_stream_preserves_row_order_across_small_pages() {
+        let fake = PagedFake::new(25);
+        let expected: Vec<[u8; 12]> = fake.rows.iter().map(|(row, _)| row.to_db_row()).collect();
+        assert!(
+            expected.windows(2).all(|pair| pair[0] < pair[1]),
+            "fixture keys strictly increase"
+        );
+        let limit = PrefixScanLimit {
+            max_rows: 7,
+            max_bytes: usize::MAX,
+        };
+        let mut seen = Vec::new();
+        let (records, bytes) = stream_family_pages(&fake, limit, &|| false, &mut |row, value| {
+            seen.push(row.to_db_row());
+            let bytes = u64::try_from(value.len()).expect("test row value fits u64");
+            Ok((1, bytes))
+        })
+        .expect("paged stream completes");
+        assert_eq!(seen, expected, "pages concatenate in stored-key order");
+        assert_eq!(records, 25);
+        assert_eq!(bytes, 25);
+        assert!(
+            fake.pages.load(Ordering::SeqCst) > 1,
+            "the small page size forced multiple pages"
+        );
+    }
+
+    /// Cancellation trips mid-stream: the poll fires every
+    /// `CANCEL_POLL_RECORDS` visited rows even across page boundaries.
+    #[test]
+    fn paged_stream_stops_at_cancellation() {
+        let fake = PagedFake::new(5_000);
+        let emitted = Cell::new(0_usize);
+        let stop = Cell::new(false);
+        let result = stream_family_pages(
+            &fake,
+            PrefixScanLimit {
+                max_rows: 7,
+                max_bytes: usize::MAX,
+            },
+            &|| stop.get(),
+            &mut |_, _| {
+                emitted.set(emitted.get() + 1);
+                if emitted.get() == 100 {
+                    stop.set(true);
+                }
+                Ok((1, 0))
+            },
+        );
+        assert!(
+            matches!(result, Err(IndexBundleError::Cancelled)),
+            "cancellation aborts the page loop"
+        );
+        assert!(
+            fake.pages.load(Ordering::SeqCst) > 1,
+            "cancellation fired after several small pages"
+        );
+    }
+
+    /// An empty family completes with no rows and no error.
+    #[test]
+    fn paged_stream_accepts_an_empty_family() {
+        let fake = PagedFake::new(0);
+        let (records, bytes) = stream_family_pages(
+            &fake,
+            PrefixScanLimit {
+                max_rows: 7,
+                max_bytes: usize::MAX,
+            },
+            &|| false,
+            &mut |_, _| Ok((1, 0)),
+        )
+        .expect("an empty family completes");
+        assert_eq!((records, bytes), (0, 0));
+        assert_eq!(fake.pages.load(Ordering::SeqCst), 1);
+    }
+
+    /// A page that returns no rows without completing can make no
+    /// progress: the loop refuses instead of spinning.
+    #[test]
+    fn paged_stream_refuses_a_page_that_makes_no_progress() {
+        let fake = PagedFake {
+            rows: Vec::new(),
+            pages: AtomicUsize::new(0),
+            stuck: true,
+        };
+        let result = stream_family_pages(
+            &fake,
+            PrefixScanLimit {
+                max_rows: 7,
+                max_bytes: usize::MAX,
+            },
+            &|| false,
+            &mut |_, _| Ok((1, 0)),
+        );
+        assert!(
+            matches!(result, Err(IndexBundleError::Index(_))),
+            "an empty incomplete page is a seam error, not a spin"
+        );
+    }
+
+    /// In-memory `TxIndexSnapshot` that honors a page limit exactly like the
+    /// storage seam: key order, first row always returned, byte accounting
+    /// after it. Row lookups are never served: the page loop under test
+    /// never calls them, and calling one is an explicit typed error rather
+    /// than a panic.
+    struct PagedFake {
+        rows: Vec<(HashPrefixRow, Vec<u8>)>,
+        pages: AtomicUsize,
+        stuck: bool,
+    }
+
+    impl PagedFake {
+        fn new(count: usize) -> Self {
+            let mut rows = Vec::with_capacity(count);
+            for index in 0..count {
+                let prefix = u64::try_from(index)
+                    .expect("test row count fits u64")
+                    .to_be_bytes();
+                let height = u32::try_from(index % 3).expect("test height residue fits u32");
+                rows.push((HashPrefixRow::new(prefix, height), vec![0xA5]));
+            }
+            Self {
+                rows,
+                pages: AtomicUsize::new(0),
+                stuck: false,
+            }
+        }
+
+        fn lookup_error() -> IndexError {
+            IndexError::from(StorageError::InvalidOperation(
+                "the paged export test never calls row lookups",
+            ))
+        }
+    }
+
+    impl TxIndexSnapshot for PagedFake {
+        fn capability_watermark(
+            &self,
+            _capability: IndexCapability,
+        ) -> Result<Option<IndexWatermark>, IndexError> {
+            Ok(None)
+        }
+
+        fn scan_family_page(
+            &self,
+            _family: TxIndexFamily,
+            start_after: Option<&[u8]>,
+            limit: PrefixScanLimit,
+        ) -> Result<TxIndexPage, IndexError> {
+            self.pages.fetch_add(1, Ordering::SeqCst);
+            if self.stuck {
+                return Ok(TxIndexPage {
+                    rows: Vec::new(),
+                    complete: false,
+                });
+            }
+            let mut rows = Vec::new();
+            let mut bytes = 0_usize;
+            for (row, value) in &self.rows {
+                let key = row.to_db_row();
+                if start_after.is_some_and(|cursor| key.as_slice() <= cursor) {
+                    continue;
+                }
+                let row_bytes = key.len() + value.len();
+                if rows.len() >= limit.max_rows
+                    || (!rows.is_empty() && bytes.saturating_add(row_bytes) > limit.max_bytes)
+                {
+                    return Ok(TxIndexPage {
+                        rows,
+                        complete: false,
+                    });
+                }
+                bytes = bytes.saturating_add(row_bytes);
+                rows.push(TxIndexScanRow {
+                    row: *row,
+                    value: value.clone(),
+                });
+            }
+            Ok(TxIndexPage {
+                rows,
+                complete: true,
+            })
+        }
+
+        fn transaction_rows(
+            &self,
+            _txid: &Txid,
+            _limit: PrefixScanLimit,
+        ) -> Result<TxIndexScan, IndexError> {
+            Err(Self::lookup_error())
+        }
+
+        fn funding_rows(
+            &self,
+            _scripthash: ScriptHash,
+            _limit: PrefixScanLimit,
+        ) -> Result<TxIndexScan, IndexError> {
+            Err(Self::lookup_error())
+        }
+
+        fn spending_rows(
+            &self,
+            _outpoint: &OutPoint,
+            _limit: PrefixScanLimit,
+        ) -> Result<TxIndexScan, IndexError> {
+            Err(Self::lookup_error())
+        }
+
+        fn live_rows(
+            &self,
+            _scripthash: ScriptHash,
+            _limit: PrefixScanLimit,
+        ) -> Result<ScriptLiveScan, IndexError> {
+            Err(Self::lookup_error())
+        }
     }
 
     #[test]

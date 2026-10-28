@@ -298,7 +298,7 @@ const QUERY_SCAN_COUNT_LIMIT: usize = 4_096;
 
 const QUERY_BODY_READ_LIMIT: usize = 4_096;
 
-pub(crate) const MAX_SERIALIZED_BLOCK_BYTES: usize = 4_000_000;
+pub(crate) const MAX_SERIALIZED_BLOCK_BYTES: usize = crate::types::MAX_POSITION_END_BYTES;
 
 /// Writer-side batch limits.
 ///
