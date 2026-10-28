@@ -563,7 +563,9 @@ pub fn write_core_v2<W: Write + ?Sized>(
                 if outputs.is_empty() {
                     continue;
                 }
-                outputs.sort_unstable_by_key(|output| output.vout);
+                outputs.sort_unstable_by(|left, right| {
+                    crate::compress::cmp_core_varint_key(left.vout, right.vout)
+                });
 
                 let group_count =
                     u64::try_from(outputs.len()).map_err(|_| SnapshotError::LimitExceeded {
@@ -972,9 +974,13 @@ impl<'a, R: Read> Decoder<'a, R> {
                     height,
                 ));
             }
-            // Core's disk-key order is not a numeric-vout contract. Sorting
-            // also detects duplicates without hashing untrusted indices.
-            outputs.sort_unstable_by_key(|output| output.vout);
+            // Core's coins-DB cursor order is bytewise VARINT-key order, not
+            // numeric vout order. Sorting by the VARINT key feeds the shared
+            // commitment in cursor order and still detects duplicates without
+            // hashing untrusted indices.
+            outputs.sort_unstable_by(|left, right| {
+                crate::compress::cmp_core_varint_key(left.vout, right.vout)
+            });
             for pair in outputs.windows(2) {
                 if pair[0].vout == pair[1].vout {
                     return Err(SnapshotError::DuplicateOutpoint { vout: pair[0].vout });

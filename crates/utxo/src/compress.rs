@@ -3,6 +3,8 @@
 //! Two encodings, chosen because both are pure per-output transforms with no
 //! cross-output invariant to violate:
 
+use core::cmp::Ordering;
+
 use crate::UtxoError;
 use bitcoin_rs_primitives::Amount;
 
@@ -158,6 +160,46 @@ pub(crate) fn write_core_varint(mut value: u64, out: &mut Vec<u8>) {
     for i in (0..len).rev() {
         out.push(buf[i]);
     }
+}
+
+/// Encodes `value` as Core's subtract-one MSB VARINT into a fixed buffer.
+///
+/// Allocation-free mirror of [`write_core_varint`] so ordering can compare
+/// keys without a heap push per comparison.
+#[inline]
+pub(crate) fn encode_core_varint_array(mut value: u64) -> ([u8; 10], usize) {
+    let mut reversed = [0_u8; 10];
+    let mut len = 0;
+    loop {
+        reversed[len] = u8::try_from(value & 0x7f).unwrap_or(0) | if len == 0 { 0 } else { 0x80 };
+        len += 1;
+        if value <= 0x7f {
+            break;
+        }
+        value = (value >> 7) - 1;
+    }
+    let mut out = [0_u8; 10];
+    for i in 0..len {
+        out[i] = reversed[len - 1 - i];
+    }
+    (out, len)
+}
+
+/// Compares two vouts by Core's coins-DB key order: bytewise order of the
+/// subtract-one MSB VARINT encodings, which is the LevelDB cursor order that
+/// defines Core's `HASH_SERIALIZED` commitment and dumptxoutset group order.
+///
+/// This is NOT numeric order across a width transition: 2-byte max 16,511
+/// encodes `[0xFF, 0x7F]` while 3-byte min 16,512 encodes
+/// `[0x80, 0x80, 0x00]`, so bytewise 16,511 sorts AFTER 16,512. Within one
+/// width the orders agree. No encoding is a prefix of another, so plain
+/// lexicographic byte comparison is the cursor order; length-first would be
+/// numeric order and is wrong here.
+#[inline]
+pub(crate) fn cmp_core_varint_key(left: u32, right: u32) -> Ordering {
+    let (left_bytes, left_len) = encode_core_varint_array(u64::from(left));
+    let (right_bytes, right_len) = encode_core_varint_array(u64::from(right));
+    left_bytes[..left_len].cmp(&right_bytes[..right_len])
 }
 
 /// Compresses a scriptPubKey into Bitcoin Core's snapshot format.

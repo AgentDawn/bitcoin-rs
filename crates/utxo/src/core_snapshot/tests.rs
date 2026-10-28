@@ -1028,3 +1028,109 @@ fn writer_preserves_invalid_height_precedence_over_varint_overflow() {
         other => panic!("expected InvalidHeight error, got {other:?}"),
     }
 }
+
+#[test]
+fn varint_key_order_spans_width_transition_at_16512() {
+    use core::cmp::Ordering;
+
+    use crate::compress::cmp_core_varint_key;
+    use crate::snapshot::SerializedUtxoHasher;
+
+    // Width boundaries of Core's subtract-one MSB VARINT.
+    assert_eq!(core_varint(16_511), vec![0xFF, 0x7F]);
+    assert_eq!(core_varint(16_512), vec![0x80, 0x80, 0x00]);
+    // Bytewise cursor order inverts numeric order across the transition.
+    assert_eq!(cmp_core_varint_key(16_512, 16_511), Ordering::Less);
+    assert_eq!(cmp_core_varint_key(16_511, 16_512), Ordering::Greater);
+    // Within one width numeric and key order agree.
+    assert_eq!(cmp_core_varint_key(0, 127), Ordering::Less);
+    assert_eq!(cmp_core_varint_key(128, 16_511), Ordering::Less);
+    assert_eq!(cmp_core_varint_key(16_512, 16_513), Ordering::Less);
+    assert_eq!(cmp_core_varint_key(5, 5), Ordering::Equal);
+
+    // Decoder stages file-numeric order into cursor order and commits there.
+    let bytes = group(7, &[16_511, 16_512]);
+    let (records, hash) = Decoder::new(&mut Cursor::new(bytes), 100_000)
+        .coins(2, 200, SnapshotLimits::default())
+        .expect("staged records");
+    assert_eq!(
+        records[0]
+            .outputs()
+            .map(|output| output.vout)
+            .collect::<Vec<_>>(),
+        vec![16_512, 16_511]
+    );
+    let txid_bytes = Hash256::from_le_bytes(&[7; 32]).to_le_bytes();
+    let staged: Vec<_> = records[0].outputs().collect();
+    let mut varint_feed = SerializedUtxoHasher::new();
+    for output in &staged {
+        varint_feed
+            .add(txid_bytes, *output, Some(200))
+            .expect("varint feed");
+    }
+    assert_eq!(varint_feed.finish(), hash);
+    let mut numeric_feed = SerializedUtxoHasher::new();
+    for output in staged.iter().rev() {
+        numeric_feed
+            .add(txid_bytes, *output, Some(200))
+            .expect("numeric feed");
+    }
+    assert_ne!(
+        numeric_feed.finish(),
+        hash,
+        "the transition must distinguish cursor order from numeric order"
+    );
+
+    // Writer emits cursor order; the file, the report and a re-decode agree.
+    let set = crate::UtxoSet::new();
+    let txid = Hash256::from_le_bytes(&[7; 32]);
+    let low = OwnedUtxoOut::new(16_511, 5_000_000_000, vec![0x51], true, 1);
+    let high = OwnedUtxoOut::new(16_512, 5_000_000_000, vec![0x51], true, 1);
+    let record = UtxoRecord::from_owned_outputs(txid, &[low, high]).expect("record");
+    set.insert_snapshot_record(record);
+    let base_hash = Hash256::from_le_bytes(&[0x77; 32]);
+    let mut written = Vec::new();
+    let report = set
+        .with_stable_view(|view| {
+            write_core_v2(
+                view,
+                Network::Regtest,
+                base_hash,
+                200,
+                2,
+                &mut written,
+                &|| false,
+            )
+        })
+        .expect("write succeeds");
+    // First emitted vout is 16,512 in CompactSize (FD 80 40), not 16,511.
+    assert_eq!(written[84..87], [0xFD, 0x80, 0x40]);
+    let mut cursor = Cursor::new(&written);
+    let mut decoder = Decoder::new(&mut cursor, u64::try_from(written.len()).expect("fit"));
+    decoder.metadata().expect("header");
+    let (emitted, emitted_hash) = decoder
+        .coins(2, 200, SnapshotLimits::default())
+        .expect("re-decode");
+    assert_eq!(
+        emitted[0]
+            .outputs()
+            .map(|output| output.vout)
+            .collect::<Vec<_>>(),
+        vec![16_512, 16_511]
+    );
+    assert_eq!(emitted_hash, report.txoutset_hash);
+    assert_eq!(emitted_hash, hash);
+    set.with_stable_view(|view| {
+        assert_eq!(view.hash_serialized_3().expect("stable-view hash"), hash);
+    });
+
+    // Duplicate detection survives the new order in both duplicate positions.
+    assert!(matches!(
+        body(&group(7, &[16_511, 16_511]), 2),
+        Err(SnapshotError::DuplicateOutpoint { vout: 16_511 })
+    ));
+    assert!(matches!(
+        body(&group(7, &[16_512, 16_511, 16_512]), 3),
+        Err(SnapshotError::DuplicateOutpoint { vout: 16_512 })
+    ));
+}
