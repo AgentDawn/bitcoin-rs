@@ -4,6 +4,7 @@ use bitcoin_rs_primitives::PeerAddress;
 use std::collections::VecDeque;
 use std::net::IpAddr;
 
+use bitcoin_rs_primitives::{EndpointHost, PeerEndpoint};
 use std::time::{Duration, Instant, SystemTime};
 
 use hashbrown::{HashMap, HashSet};
@@ -70,7 +71,7 @@ pub struct AutomaticPeerPolicy {
     pub(crate) discouraged: HashSet<PeerAddress>,
     pub(crate) protected: std::sync::Arc<[crate::IpSubnet]>,
     pub(crate) now: SystemTime,
-    pub(crate) routing: std::sync::Arc<crate::OverlayConfig>,
+    pub(crate) routing: std::sync::Arc<crate::overlay::OverlayConfig>,
 }
 
 impl AutomaticPeerPolicy {
@@ -86,6 +87,37 @@ impl AutomaticPeerPolicy {
                 || ip
                     .ip()
                     .is_some_and(|ip| self.protected.iter().any(|subnet| subnet.contains(ip))))
+    }
+
+    /// Whether automatic dialing may use `endpoint`. Manual bans are
+    /// IP-only; overlay hosts are discouraged by their port-free host.
+    /// This is the routing-gate-free form used at the connection boundary,
+    /// where `onlynet` was already enforced at dial time.
+    #[must_use]
+    pub fn allows_endpoint(&self, endpoint: PeerEndpoint) -> bool {
+        match endpoint {
+            PeerEndpoint::Ip(socket) => {
+                let ip = crate::netgroup::canonical_ip(socket.ip());
+                !crate::subnet::is_banned(&self.banned, ip, self.now)
+                    && (!self
+                        .discouraged
+                        .contains(&PeerAddress::from(crate::EndpointHost::Ip(ip)))
+                        || self.protected.iter().any(|subnet| subnet.contains(ip)))
+            }
+            PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => {
+                !self
+                    .discouraged
+                    .contains(&PeerAddress::from(endpoint.host()))
+            }
+        }
+    }
+}
+
+/// Whether an endpoint is local; overlay endpoints are never local.
+pub(crate) fn is_local_endpoint(endpoint: PeerEndpoint) -> bool {
+    match endpoint {
+        PeerEndpoint::Ip(socket) => is_local(socket.ip()),
+        PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => false,
     }
 }
 

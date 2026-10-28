@@ -3,9 +3,9 @@
 #
 # Starts a private Tor net (loopback ControlPort plus SOCKS) and a private
 # i2pd mesh (seven routers, netid 77, distinct 127.0.77.x), then two regtest bitcoin-rs nodes: one
-# publishing an onion service (--onion, --torcontrol) and accepting I2P
-# (--i2psam, --i2pacceptincoming), one dialing over the proxies
-# (--proxy, --i2psam). Proves handshake, headers/blocks in both
+# publishing an onion service (--onion-proxy, --tor-control) and accepting I2P
+# (--i2p-sam, --i2p-accept), one dialing over the proxies
+# (--proxy, --onion-proxy, --i2p-sam). Proves handshake, headers/blocks in both
 # directions over onion and I2P, inbound accepts, and restart identity
 # reuse (onion service key and I2P destination keys persist across
 # restarts). Records an evidence JSON (schema
@@ -14,11 +14,12 @@
 # network prerequisite fails the run (the caller reports BLOCKED).
 #
 # usage: run-p2p-overlay-interop.sh --tor-command <command>
-#            --tor-gencert-command <command> --i2pd-command <path>
+#            --tor-gencert-command <command> --tor-gencert-sha256 <hex> --i2pd-command <path>
 #            [--bitcoin-rs-command <command>] [--workdir <dir>]
 #            [--evidence <path>] [--timeout-seconds <n>] [--keep]
 #
-# Pinned externals: Tor 0.4.9.14 release; official i2pd 3.0.0 release.
+# Pinned externals: Tor 0.4.9.14 release (tor binary); tor-gencert by operator-supplied
+# SHA-256 digest (--tor-gencert-sha256; tor-gencert has no --version flag); official i2pd 3.0.0 release.
 # Any prerequisite mismatch or missing metadata
 # fails closed (non-zero exit).
 #
@@ -39,11 +40,12 @@ umask 077
 
 usage() {
   printf '%s\n' \
-    "usage: run-p2p-overlay-interop.sh --tor-command <command> --tor-gencert-command <command> --i2pd-command <path> [--bitcoin-rs-command <command>] [--workdir <dir>] [--evidence <path>] [--timeout-seconds <n>] [--keep]" \
+    "usage: run-p2p-overlay-interop.sh --tor-command <command> --tor-gencert-command <command> --tor-gencert-sha256 <hex> --i2pd-command <path> [--bitcoin-rs-command <command>] [--workdir <dir>] [--evidence <path>] [--timeout-seconds <n>] [--keep]" \
     "" \
     "Required:" \
     "  --tor-command <cmd>       Tor binary (pinned to release 0.4.9.14)" \
-    "  --tor-gencert-command <cmd> tor-gencert binary (same 0.4.9.14 release as --tor-command)" \
+    "  --tor-gencert-command <cmd> tor-gencert binary (must match --tor-gencert-sha256; tor-gencert has no --version flag)" \
+    "  --tor-gencert-sha256 <hex> Expected SHA-256 of the tor-gencert binary (64 hex chars; fail-closed on mismatch)" \
     "  --i2pd-command <path>      Path to i2pd binary (pinned to official release 3.0.0; supply the binary path, additional arguments are not parsed)" \
     "" \
     "Optional:" \
@@ -58,6 +60,7 @@ usage() {
 TOR_COMMAND=""
 I2PD_COMMAND=""
 TOR_GENCERT_COMMAND=""
+TOR_GENCERT_SHA256=""
 BITCOIN_RS_COMMAND="target/debug/bitcoin-rs"
 WORKDIR=""
 AUTO_WORKDIR=0
@@ -75,6 +78,11 @@ while (($# > 0)); do
     --tor-gencert-command)
       [[ $# -ge 2 ]] || { echo "error: --tor-gencert-command requires an argument" >&2; usage >&2; exit 2; }
       TOR_GENCERT_COMMAND=$2
+      shift 2
+      ;;
+    --tor-gencert-sha256)
+      [[ $# -ge 2 ]] || { echo "error: --tor-gencert-sha256 requires an argument" >&2; usage >&2; exit 2; }
+      TOR_GENCERT_SHA256=$2
       shift 2
       ;;
     --i2pd-command)
@@ -118,8 +126,13 @@ while (($# > 0)); do
   esac
 done
 
-if [[ -z "${TOR_COMMAND}" || -z "${TOR_GENCERT_COMMAND}" || -z "${I2PD_COMMAND}" ]]; then
-  echo "error: --tor-command, --tor-gencert-command, and --i2pd-command are required" >&2
+if [[ -z "${TOR_COMMAND}" || -z "${TOR_GENCERT_COMMAND}" || -z "${TOR_GENCERT_SHA256}" || -z "${I2PD_COMMAND}" ]]; then
+  echo "error: --tor-command, --tor-gencert-command, --tor-gencert-sha256, and --i2pd-command are required" >&2
+  usage >&2
+  exit 2
+fi
+if [[ ! "${TOR_GENCERT_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "error: --tor-gencert-sha256 must be 64 hex characters" >&2
   usage >&2
   exit 2
 fi
@@ -491,6 +504,10 @@ if [[ ! -x "${TOR_GENCERT_BIN}" ]]; then
   exit 1
 fi
 TOR_GENCERT_SHA=$(sha256sum "${TOR_GENCERT_BIN}" | awk '{print $1}')
+if [[ "${TOR_GENCERT_SHA,,}" != "${TOR_GENCERT_SHA256,,}" ]]; then
+  echo "error: tor-gencert pin mismatch: binary sha256 ${TOR_GENCERT_SHA} != pinned ${TOR_GENCERT_SHA256}" >&2
+  exit 1
+fi
 
 # 3. bitcoin-rs binary check
 RS_BIN="${BITCOIN_RS_COMMAND%% *}"
@@ -576,6 +593,8 @@ R1_SAM_PORT="$(printf '%s' "${FIXTURE_I2PD_PORTS}" | python3 -c 'import sys; pri
 
 cleanup() {
   local status=$?
+  local evidence_in_workdir
+  local _evidence_abs
   # Stop every child still owned, which covers every early exit: SIGTERM all
   # through validated handles, wait up to 5 s, SIGKILL the survivors through the
   # same handles, wait up to 5 s more. A child that cannot be shown to have
@@ -589,7 +608,17 @@ cleanup() {
   fi
   # Clean up workdir only on success, only if automatically created and
   # --keep not set. Failed runs always retain the workdir for diagnosis.
-  if ((status == 0)) && [[ "${AUTO_WORKDIR}" -eq 1 && "${KEEP}" -eq 0 && -z "${!OWNED[*]}" ]]; then
+  # The evidence JSON is the proof of a PASS: when it lives inside the workdir
+  # (the default <workdir>/evidence.json or any explicit --evidence under it),
+  # deleting the workdir would delete the proof, so success must keep it.
+  evidence_in_workdir=0
+  if [[ -n "${EVIDENCE:-}" && -n "${WORKDIR:-}" ]]; then
+    _evidence_abs=$(realpath -m -- "${EVIDENCE}" 2>/dev/null || true)
+    if [[ "${_evidence_abs}" == "${WORKDIR}" || "${_evidence_abs}" == "${WORKDIR}/"* ]]; then
+      evidence_in_workdir=1
+    fi
+  fi
+  if ((status == 0)) && [[ "${AUTO_WORKDIR}" -eq 1 && "${KEEP}" -eq 0 && -z "${!OWNED[*]}" ]] && ((evidence_in_workdir == 0)); then
     rm -rf -- "${WORKDIR:?workdir unset}"
   elif [[ -n "${WORKDIR:-}" ]]; then
     echo "workdir kept: ${WORKDIR}"
@@ -771,6 +800,7 @@ start_node() { # <datadir> <rpc> <p2p> <log> [extra...]
     --rpc-user "${RPC_USER}" \
     --rpc-password "${RPC_PASSWORD}" \
     --p2p-listen "127.0.0.1:${p2p}" \
+    --dns-seeds-enabled=false \
     --log-level info \
     "$@" >"${log}" 2>&1 &
   own_child "$!" "bitcoin-rs (${log##*/})" || exit 1
@@ -1018,10 +1048,10 @@ wait_tor_bootstrap
 
 echo "==> starting node A (onion service + i2p accept)"
 start_node "${A_DATADIR}" "${A_RPC_PORT}" "${A_P2P_PORT}" "${A_LOG}" \
-  --onion "127.0.0.1:${TOR_SOCKS_PORT}" \
-  --torcontrol "127.0.0.1:${TOR_CONTROL_PORT}" \
-  --i2psam "127.0.0.1:${REC_SAM_PORT_A}" \
-  --i2pacceptincoming
+  --onion-proxy "127.0.0.1:${TOR_SOCKS_PORT}" \
+  --tor-control "127.0.0.1:${TOR_CONTROL_PORT}" \
+  --i2p-sam "127.0.0.1:${REC_SAM_PORT_A}" \
+  --i2p-accept
 A_PID=$!
 
 echo "==> waiting for node A overlay services"
@@ -1041,8 +1071,10 @@ echo "==> node A onion: ${ONION_A}"
 echo "==> node A i2p: ${I2P_A}"
 
 # Verify private key files exist and have mode 0600 on disk
-ONION_KEY_FILE="${A_DATADIR}/onion_v3_private_key"
-I2P_KEY_FILE="${A_DATADIR}/i2p_private_key"
+# Live transport persists JSON-enveloped keys under the regtest identity dir
+# overlay-fabfb5da (crates/node/src/config.rs, crates/p2p/src/overlay.rs).
+ONION_KEY_FILE="${A_DATADIR}/overlay-fabfb5da/onion.key"
+I2P_KEY_FILE="${A_DATADIR}/overlay-fabfb5da/i2p.key"
 [[ -f "${ONION_KEY_FILE}" ]] || { echo "error: onion private key file missing: ${ONION_KEY_FILE}" >&2; exit 1; }
 [[ -f "${I2P_KEY_FILE}" ]] || { echo "error: i2p private key file missing: ${I2P_KEY_FILE}" >&2; exit 1; }
 
@@ -1066,7 +1098,8 @@ poll_height "${A_RPC_PORT}" 5 "node A mining"
 echo "==> starting node B (proxy dialer)"
 start_node "${B_DATADIR}" "${B_RPC_PORT}" "${B_P2P_PORT}" "${B_LOG}" \
   --proxy "127.0.0.1:${TOR_SOCKS_PORT_B}" \
-  --i2psam "127.0.0.1:${REC_SAM_PORT_B}" \
+  --onion-proxy "127.0.0.1:${TOR_SOCKS_PORT_B}" \
+  --i2p-sam "127.0.0.1:${REC_SAM_PORT_B}" \
   --v2transport=false
 poll_height "${B_RPC_PORT}" 0 "node B rpc"
 
@@ -1248,10 +1281,10 @@ printf '%s\n' "sam_create_baseline=${SAM_CREATE_BASELINE} channel=recorder-A" >>
 
 echo "==> Restarting Node A with preserved data directory"
 start_node "${A_DATADIR}" "${A_RPC_PORT}" "${A_P2P_PORT}" "${A_LOG2}" \
-  --onion "127.0.0.1:${TOR_SOCKS_PORT}" \
-  --torcontrol "127.0.0.1:${TOR_CONTROL_PORT}" \
-  --i2psam "127.0.0.1:${REC_SAM_PORT_A}" \
-  --i2pacceptincoming
+  --onion-proxy "127.0.0.1:${TOR_SOCKS_PORT}" \
+  --tor-control "127.0.0.1:${TOR_CONTROL_PORT}" \
+  --i2p-sam "127.0.0.1:${REC_SAM_PORT_A}" \
+  --i2p-accept
 A_PID=$!
 
 poll_height "${A_RPC_PORT}" 14 "node A restart height"
@@ -1545,12 +1578,18 @@ HEIGHT_A=$(rs_result "${A_RPC_PORT}" getblockcount)
 HEIGHT_B=$(rs_result "${B_RPC_PORT}" getblockcount)
 
 I2P_FULL_SHA=$(python3 - "${I2P_KEY_FILE}" "${I2P_A}" <<'PY'
-import base64, hashlib, sys
+import base64, hashlib, json, sys
 try:
     with open(sys.argv[1]) as fh:
-        fields = fh.read().split()
+        stored = json.load(fh)
 except OSError as error:
     sys.exit(f"error: i2p key file unreadable: {type(error).__name__}")
+except ValueError:
+    sys.exit("error: i2p key file is not JSON")
+try:
+    fields = stored["key"].split()
+except (KeyError, AttributeError):
+    sys.exit("error: i2p key file lacks key envelope")
 if not fields:
     sys.exit("error: i2p key file is empty")
 try:
@@ -1604,6 +1643,7 @@ evidence = {
         "version_raw": "${TOR_FIRST_LINE}",
         "release_verified": ("${TOR_OBSERVED_VERSION}" == "0.4.9.14"),
         "gencert_sha256": "${TOR_GENCERT_SHA}",
+        "gencert_sha256_pinned": True,
         "private_fixture": {"authorities": 3, "relays": 3, "testing_network": True},
         "public_bootstrap": False,
         "socks_atyp": socks_entry["atyp"],

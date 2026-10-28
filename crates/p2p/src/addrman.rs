@@ -29,6 +29,8 @@ const MAX_GOSSIP: usize = 32;
 const GOSSIP_CACHE_TTL: Duration = Duration::from_hours(24);
 const MAX_TEMP_ATTEMPTS: usize = 8;
 // Frozen until the first official release; pre-release layouts are not migrated.
+// The canonical v1 record shape is owned here; PR #1684 must adopt this same
+// shape (FORMAT plus SCHEMA_VERSION) before its merge.
 const SCHEMA_VERSION: u32 = 1;
 const FORMAT: &str = "bitcoin-rs-addrman";
 const MAX_COLLISIONS: usize = 10;
@@ -38,6 +40,30 @@ const MAX_ANCHORS: usize = 2;
 const ANCHOR_AGE: u64 = 7 * 24 * 60 * 60;
 // min GetChance=.01*.66^8; at zero-based proposal44 its product with1.2^44>1.
 const MAX_SELECTION_PROPOSALS: usize = 45;
+
+fn serialize_endpoint<S: serde::Serializer>(
+    endpoint: &PeerEndpoint,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::format_endpoint(*endpoint))
+}
+fn deserialize_endpoint<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<PeerEndpoint, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    crate::parse_endpoint(&text).ok_or_else(|| serde::de::Error::custom("invalid endpoint"))
+}
+fn endpoint_group(groups: &NetGroups, endpoint: PeerEndpoint) -> Vec<u8> {
+    match endpoint {
+        PeerEndpoint::Ip(socket) => groups.group(socket.ip()),
+        PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => {
+            crate::endpoint::overlay_netgroup(endpoint.host()).unwrap_or_else(|| vec![0])
+        }
+    }
+}
+fn endpoint_ip(endpoint: PeerEndpoint) -> Option<IpAddr> {
+    endpoint.as_ip().map(|socket| socket.ip())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -71,7 +97,12 @@ impl Source {
 struct Candidate {
     #[serde(skip)]
     creation_id: u64,
-    addr: PeerEndpoint,
+    #[serde(
+        rename = "addr",
+        serialize_with = "serialize_endpoint",
+        deserialize_with = "deserialize_endpoint"
+    )]
+    endpoint: PeerEndpoint,
     #[serde(deserialize_with = "required_services")]
     services: Option<u64>,
     source: Source,
@@ -123,7 +154,12 @@ impl Candidate {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Anchor {
-    addr: PeerEndpoint,
+    #[serde(
+        rename = "addr",
+        serialize_with = "serialize_endpoint",
+        deserialize_with = "deserialize_endpoint"
+    )]
+    endpoint: PeerEndpoint,
     confirmed_at: u64,
 }
 
@@ -169,7 +205,11 @@ struct Manager {
     saved_revision: u64,
     published: bool,
     gossip_cursor: usize,
-    gossip_cache: Option<(Instant, Vec<bitcoin::p2p::address::AddrV2Message>)>,
+    /// Shared gossip selection backing both wire projections: the raw
+    /// rows picked on the last rotation, cached until `GOSSIP_CACHE_TTL`.
+    /// [`AddressBook::gossip`] projects IP rows as legacy `addr`;
+    /// [`AddressBook::gossip_addrv2`] projects enabled transports as `addrv2`.
+    gossip_cache: Option<(Instant, Vec<GossipRow>)>,
     addrv2_cursor: usize,
     addrv2_cache: Option<(
         Instant,
@@ -179,6 +219,16 @@ struct Manager {
     )>,
     pending: HashMap<PeerEndpoint, PendingClaim>,
     collisions: Vec<PeerEndpoint>,
+}
+
+/// One transport-neutral gossip row: the shared selection both wire
+/// projections filter. Raw endpoint identity is kept so each reply can
+/// project without re-rotating the cursor.
+#[derive(Clone, Copy, Debug)]
+struct GossipRow {
+    endpoint: PeerEndpoint,
+    last_seen: u32,
+    services: u64,
 }
 
 pub(crate) struct AddressBook {
@@ -301,14 +351,14 @@ impl Manager {
         self.new.fill(EMPTY_SLOT);
         self.tried.fill(EMPTY_SLOT);
         for (index, entry) in self.stored.records.iter().enumerate() {
-            self.by_addr.insert(entry.addr, index);
+            self.by_addr.insert(entry.endpoint, index);
             let id = u32::try_from(index).unwrap_or(EMPTY_SLOT);
             if entry.tried {
-                let slot = self.tried_slot(entry.addr);
+                let slot = self.tried_slot(entry.endpoint);
                 self.tried[slot] = id;
             } else {
                 for bucket in &entry.new_buckets {
-                    let slot = self.new_slot(entry.addr, usize::from(*bucket));
+                    let slot = self.new_slot(entry.endpoint, usize::from(*bucket));
                     self.new[slot] = id;
                 }
             }
@@ -318,13 +368,13 @@ impl Manager {
         debug_assert!(
             !self.stored.records[index].tried && self.stored.records[index].new_buckets.is_empty()
         );
-        let addr = self.stored.records[index].addr;
+        let addr = self.stored.records[index].endpoint;
         self.by_addr.remove(&addr);
         self.collisions.retain(|candidate| *candidate != addr);
-        self.stored.anchors.retain(|anchor| anchor.addr != addr);
+        self.stored.anchors.retain(|anchor| anchor.endpoint != addr);
         self.stored.records.swap_remove(index);
         if let Some(moved) = self.stored.records.get(index) {
-            let addr = moved.addr;
+            let addr = moved.endpoint;
             let tried = moved.tried;
             let buckets = moved.new_buckets.clone();
             self.by_addr.insert(addr, index);
@@ -365,7 +415,7 @@ impl Manager {
         }
         let slot = self.tried_slot(addr);
         let incumbent = (self.tried[slot] != EMPTY_SLOT).then(|| {
-            self.stored.records[usize::try_from(self.tried[slot]).unwrap_or_default()].addr
+            self.stored.records[usize::try_from(self.tried[slot]).unwrap_or_default()].endpoint
         });
         let demotion = incumbent.map(|old| {
             let entry = &self.stored.records[self.by_addr[&old]];
@@ -407,18 +457,18 @@ impl Manager {
         let old = &self.stored.records[usize::try_from(incumbent).unwrap_or_default()];
         let bucket = new_bucket(
             &self.stored.secret,
-            old.addr,
+            old.endpoint,
             &old.source.group(&self.groups),
             &self.groups,
         );
-        let victim = self.new[self.new_slot(old.addr, bucket)];
+        let victim = self.new[self.new_slot(old.endpoint, bucket)];
         if victim == EMPTY_SLOT {
             return false;
         }
         let victim = &self.stored.records[usize::try_from(victim).unwrap_or_default()];
-        victim.addr != addr
+        victim.endpoint != addr
             && victim.new_buckets.len() == 1
-            && self.pending.contains_key(&victim.addr)
+            && self.pending.contains_key(&victim.endpoint)
     }
     fn restore_anchors(&mut self, anchors: Vec<Anchor>, now: u64) {
         let before = self.stored.anchors.clone();
@@ -427,7 +477,7 @@ impl Manager {
                 || now.saturating_sub(anchor.confirmed_at) > ANCHOR_AGE
                 || self
                     .by_addr
-                    .get(&anchor.addr)
+                    .get(&anchor.endpoint)
                     .is_none_or(|index| self.stored.records[*index].last_success == 0)
             {
                 continue;
@@ -436,7 +486,7 @@ impl Manager {
                 .stored
                 .anchors
                 .iter_mut()
-                .find(|entry| entry.addr == anchor.addr)
+                .find(|entry| entry.endpoint == anchor.endpoint)
             {
                 if existing.confirmed_at < anchor.confirmed_at {
                     *existing = anchor;
@@ -445,7 +495,7 @@ impl Manager {
                 self.stored.anchors.push(anchor);
             }
         }
-        self.stored.anchors.sort_by_key(|anchor| anchor.addr);
+        self.stored.anchors.sort_by_key(|anchor| anchor.endpoint);
         if self.stored.anchors != before {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -518,9 +568,9 @@ impl Manager {
                     self.collisions.retain(|candidate| *candidate != addr);
                     continue;
                 }
-                if protected.contains(&old.addr)
-                    || self.pending.contains_key(&old.addr)
-                    || !allowed.contains(&old.addr)
+                if protected.contains(&old.endpoint)
+                    || self.pending.contains_key(&old.endpoint)
+                    || !allowed.contains(&old.endpoint)
                 {
                     continue;
                 }
@@ -554,7 +604,7 @@ impl Manager {
         time_penalty: u64,
     ) -> bool {
         let addr = canonical(addr);
-        if services.is_none() && matches!(source, Source::Ip(_))
+        if services.is_none() && matches!(source, Source::Ip(_) | Source::Overlay(_))
             || !routable(addr, self.allow_local)
             || seen > now.saturating_add(FUTURE_SKEW_SECS)
             || now.saturating_sub(seen) > STALE_SECS
@@ -605,11 +655,11 @@ impl Manager {
         let occupant = self.new[slot];
         if occupant != EMPTY_SLOT {
             let old = &self.stored.records[usize::try_from(occupant).unwrap_or_default()];
-            if old.addr == addr {
+            if old.endpoint == addr {
                 return false;
             }
             let final_pending =
-                old.new_buckets.len() == 1 && self.pending.contains_key(&old.addr);
+                old.new_buckets.len() == 1 && self.pending.contains_key(&old.endpoint);
             if final_pending || !(old.terrible(now) || old.new_buckets.len() > 1 && refs == 0) {
                 return false;
             }
@@ -635,7 +685,7 @@ impl Manager {
             let index = self.stored.records.len();
             self.stored.records.push(Candidate {
                 creation_id: self.next_creation_id,
-                addr,
+                endpoint: addr,
                 services,
                 source,
                 last_seen: seen.saturating_sub(time_penalty),
@@ -670,7 +720,7 @@ impl Manager {
                 continue;
             }
             if entry.tried {
-                tried_buckets[tried_bucket(&self.stored.secret, entry.addr, &self.groups)] =
+                tried_buckets[tried_bucket(&self.stored.secret, entry.endpoint, &self.groups)] =
                     true;
             } else {
                 for bucket in &entry.new_buckets {
@@ -717,7 +767,7 @@ impl Manager {
             let entry = &self.stored.records[id];
             let draw = f64::from(self.rng.gen_range(0..(1_u32 << 30)));
             if draw < factor * entry.chance(now) * f64::from(1_u32 << 30) {
-                return Some(entry.addr);
+                return Some(entry.endpoint);
             }
             factor *= 1.2;
         }
@@ -731,7 +781,7 @@ pub(crate) fn canonical(addr: PeerEndpoint) -> PeerEndpoint {
 }
 
 fn routable(addr: PeerEndpoint, allow_local: bool) -> bool {
-    if addr.port() == 0 || addr.address().is_unspecified() || addr.address().is_multicast() {
+    if addr.port() == 0 && !matches!(addr.address(), crate::PeerAddress::I2p(_)) || addr.address().is_unspecified() || addr.address().is_multicast() {
         return false;
     }
     match addr.address() {
@@ -802,10 +852,12 @@ impl AddressBook {
                     if stored
                         .records
                         .iter()
-                        .all(|entry| routable(entry.addr, allow_local))
+                        .all(|entry| routable(entry.endpoint, allow_local))
                     {
                         manager.stored = stored;
                         manager.published = scoped_source;
+                        // Rebucketing here is a current-format runtime invariant
+                        // (ASMap change), never a historical schema migration.
                         let rebucket = manager.stored.asmap_id != manager.groups.identity();
                         if rebucket {
                             manager.rebucket();
@@ -814,7 +866,8 @@ impl AddressBook {
                         } else {
                             manager.install_indexes();
                         }
-                        // Collision state is empty on restart; IDs remain runtime-only.
+                        // Collision state is empty on restart, so persisted record
+                        // order establishes fresh runtime IDs without a disk field.
                         for (index, entry) in manager.stored.records.iter_mut().enumerate() {
                             entry.creation_id = u64::try_from(index).unwrap_or(u64::MAX);
                         }
@@ -894,11 +947,11 @@ impl AddressBook {
             if entry.terrible(now) {
                 continue;
             }
-            if !crate::endpoint::addrv2_gossip_enabled(entry.addr, tor, i2p) {
+            if !crate::endpoint::addrv2_gossip_enabled(entry.endpoint, tor, i2p) {
                 continue;
             }
             gossip.push(crate::endpoint::endpoint_to_addrv2(
-                entry.addr,
+                entry.endpoint,
                 u32::try_from(entry.last_seen).unwrap_or(u32::MAX),
                 bitcoin::p2p::ServiceFlags::from(entry.services.unwrap_or(0)),
             ));
@@ -944,11 +997,17 @@ impl AddressBook {
     }
     pub(crate) fn learn_peer(
         &self,
-        source: impl Into<crate::PeerAddress>,
+        source: crate::PeerRemote,
         addresses: &[(PeerEndpoint, u64, u64)],
         now: u64,
     ) {
-        let source = source.into();
+        // Anonymous Tor inbound has no dialable address: its loopback
+        // forwarder/proxy socket is never a source. Return early so no
+        // proxy/loopback IP enters `Source` or the bucket groups.
+        let source = match source {
+            crate::PeerRemote::AnonymousTor(_) => return,
+            crate::PeerRemote::Endpoint(endpoint) => endpoint.address(),
+        };
         let mut manager = self.state.lock();
         for &(addr, services, seen) in addresses.iter().take(MAX_GOSSIP) {
             manager.learn(
@@ -981,7 +1040,7 @@ impl AddressBook {
                 .stored
                 .records
                 .iter()
-                .map(|entry| entry.addr)
+                .map(|entry| entry.endpoint)
                 .collect()
         };
         let allowed: HashSet<_> = addresses
@@ -1007,10 +1066,10 @@ impl AddressBook {
             .iter()
             .map(|entry| {
                 entry.ordinary_services_eligible(best_block_depth)
-                    && allowed.contains(&entry.addr)
-                    && !connected.contains(&entry.addr)
-                    && !manager.pending.contains_key(&entry.addr)
-                    && !groups.contains(&manager.groups.group(entry.addr.address()))
+                    && allowed.contains(&entry.endpoint)
+                    && !connected.contains(&entry.endpoint)
+                    && !manager.pending.contains_key(&entry.endpoint)
+                    && !groups.contains(&manager.groups.group(entry.endpoint.address()))
             })
             .collect();
         manager.select(&eligible, now)
@@ -1191,7 +1250,8 @@ impl AddressBook {
             }
         }
     }
-    /// Record an accepted VERSION's current service claim without certifying
+    /// Record an accepted VERSION's current service claim (peer handshake version,
+    /// unrelated to the on-disk schema) without certifying
     /// success, promoting membership or changing any health timestamp.
     pub(crate) fn set_services(&self, addr: PeerEndpoint, services: u64) {
         self.state.lock().set_services(canonical(addr), services);
@@ -1221,7 +1281,7 @@ impl AddressBook {
                 if incumbent != EMPTY_SLOT {
                     addresses.insert(
                         manager.stored.records[usize::try_from(incumbent).unwrap_or_default()]
-                            .addr,
+                            .endpoint,
                     );
                 }
             }
@@ -1256,7 +1316,7 @@ impl AddressBook {
                 .stored
                 .records
                 .iter()
-                .map(|entry| entry.addr)
+                .map(|entry| entry.endpoint)
                 .collect()
         }; // Release the state lock before invoking policy callbacks.
         let allowed: HashSet<_> = addresses
@@ -1282,7 +1342,7 @@ impl AddressBook {
             let incumbent = manager.tried[slot];
             if incumbent != EMPTY_SLOT {
                 let addr =
-                    manager.stored.records[usize::try_from(incumbent).unwrap_or_default()].addr;
+                    manager.stored.records[usize::try_from(incumbent).unwrap_or_default()].endpoint;
                 if connected.contains(&addr.address()) {
                     manager.good(addr, true, now);
                 } else if manager.stored.records[usize::try_from(incumbent).unwrap_or_default()]
@@ -1305,9 +1365,9 @@ impl AddressBook {
             .map(|entry| {
                 !entry.tried
                     && entry.services.unwrap_or(0) & useful_services != 0
-                    && allowed.contains(&entry.addr)
-                    && !active.contains(&entry.addr)
-                    && !manager.pending.contains_key(&entry.addr)
+                    && allowed.contains(&entry.endpoint)
+                    && !active.contains(&entry.endpoint)
+                    && !manager.pending.contains_key(&entry.endpoint)
             })
             .collect();
         manager.select(&eligible, now)
@@ -1323,7 +1383,7 @@ impl AddressBook {
                     .stored
                     .records
                     .iter()
-                    .any(|entry| entry.addr == *addr && entry.last_success != 0)
+                    .any(|entry| entry.endpoint == *addr && entry.last_success != 0)
             })
             .collect();
         addresses.sort_unstable();
@@ -1337,11 +1397,11 @@ impl AddressBook {
                     .anchors
                     .iter()
                     .find(|anchor| {
-                        anchor.addr == addr && now.saturating_sub(anchor.confirmed_at) < 3600
+                        anchor.endpoint == addr && now.saturating_sub(anchor.confirmed_at) < 3600
                     })
                     .cloned()
                     .unwrap_or(Anchor {
-                        addr,
+                        endpoint: addr,
                         confirmed_at: now,
                     })
             })
@@ -1368,14 +1428,14 @@ impl AddressBook {
                     && now.saturating_sub(anchor.confirmed_at) <= ANCHOR_AGE
                     && manager
                         .by_addr
-                        .get(&anchor.addr)
+                        .get(&anchor.endpoint)
                         .is_some_and(|index| manager.stored.records[*index].last_success != 0);
                 if !eligible {
                     changed = true;
                     continue;
                 }
                 if let std::collections::hash_map::Entry::Vacant(entry) =
-                    manager.pending.entry(anchor.addr)
+                    manager.pending.entry(anchor.endpoint)
                 {
                     entry.insert(PendingClaim::AnchorReservation(anchor.clone()));
                     reserved.push(anchor);
@@ -1394,10 +1454,10 @@ impl AddressBook {
         let mut manager = self.state.lock();
         if persistent && manager.saved_revision < revision {
             for anchor in &reserved {
-                if manager.pending.get(&anchor.addr)
+                if manager.pending.get(&anchor.endpoint)
                     == Some(&PendingClaim::AnchorReservation(anchor.clone()))
                 {
-                    manager.pending.remove(&anchor.addr);
+                    manager.pending.remove(&anchor.endpoint);
                 }
             }
             // Failed consumption never transfers or discards original metadata.
@@ -1407,9 +1467,9 @@ impl AddressBook {
         reserved
             .into_iter()
             .filter_map(|anchor| {
-                (manager.pending.get(&anchor.addr)
+                (manager.pending.get(&anchor.endpoint)
                     == Some(&PendingClaim::AnchorReservation(anchor.clone())))
-                .then_some(anchor.addr)
+                .then_some(anchor.endpoint)
             })
             .collect()
     }
@@ -1461,14 +1521,29 @@ impl AddressBook {
     }
     fn gossip_at(&self, now: u64, tick: Instant) -> Vec<bitcoin::p2p::address::AddrV2Message> {
         let mut manager = self.state.lock();
-        if let Some((expires, response)) = &manager.gossip_cache {
+        Self::shared_rows(&mut manager, now, tick)
+            .into_iter()
+            .map(|row| {
+                crate::endpoint::endpoint_to_addrv2(
+                    row.endpoint,
+                    row.last_seen,
+                    bitcoin::p2p::ServiceFlags::from(row.services),
+                )
+            })
+            .collect()
+    }
+    /// Single rotating selection backing both wire projections. The cursor
+    /// advances only on a cache miss; cache hits project the stored rows
+    /// without touching rotation. Holds one state lock; callers project.
+    fn shared_rows(manager: &mut Manager, now: u64, tick: Instant) -> Vec<GossipRow> {
+        if let Some((expires, rows)) = &manager.gossip_cache {
             if tick < *expires {
-                return response.clone();
+                return rows.clone();
             }
         }
         let len = manager.stored.records.len();
         let start = manager.gossip_cursor.checked_rem(len).unwrap_or_default();
-        let mut gossip = Vec::with_capacity(MAX_GOSSIP.min(len));
+        let mut rows = Vec::with_capacity(MAX_GOSSIP.min(len));
         for offset in 0..len {
             let index = (start + offset) % len;
             manager.gossip_cursor = (index + 1) % len;
@@ -1476,24 +1551,17 @@ impl AddressBook {
             if entry.terrible(now) {
                 continue;
             }
-            let addr = match entry.addr.address() {
-                crate::PeerAddress::Ip(IpAddr::V4(ip)) => bitcoin::p2p::address::AddrV2::Ipv4(ip),
-                crate::PeerAddress::Ip(IpAddr::V6(ip)) => bitcoin::p2p::address::AddrV2::Ipv6(ip),
-                crate::PeerAddress::Onion(key) => bitcoin::p2p::address::AddrV2::TorV3(key),
-                crate::PeerAddress::I2p(hash) => bitcoin::p2p::address::AddrV2::I2p(hash),
-            };
-            gossip.push(bitcoin::p2p::address::AddrV2Message {
-                time: u32::try_from(entry.last_seen).unwrap_or(u32::MAX),
-                services: bitcoin::p2p::ServiceFlags::from(entry.services.unwrap_or(0)),
-                addr,
-                port: entry.addr.port(),
+            rows.push(GossipRow {
+                endpoint: entry.endpoint,
+                last_seen: u32::try_from(entry.last_seen).unwrap_or(u32::MAX),
+                services: entry.services.unwrap_or(0),
             });
-            if gossip.len() == MAX_GOSSIP {
+            if rows.len() == MAX_GOSSIP {
                 break;
             }
         }
-        manager.gossip_cache = Some((tick + GOSSIP_CACHE_TTL, gossip.clone()));
-        gossip
+        manager.gossip_cache = Some((tick + GOSSIP_CACHE_TTL, rows.clone()));
+        rows
     }
     pub(crate) fn save(&self) {
         let _publication = self.publication.lock();
@@ -1644,12 +1712,12 @@ fn validate_anchors(stored: &Stored) -> io::Result<()> {
         return Err(invalid("too many anchors"));
     }
     for anchor in &stored.anchors {
-        if canonical(anchor.addr) != anchor.addr
-            || !anchors.insert(anchor.addr)
+        if canonical(anchor.endpoint) != anchor.endpoint
+            || !anchors.insert(anchor.endpoint)
             || !stored
                 .records
                 .iter()
-                .any(|entry| entry.addr == anchor.addr && entry.last_success != 0)
+                .any(|entry| entry.endpoint == anchor.endpoint && entry.last_success != 0)
         {
             return Err(invalid("invalid anchor subset"));
         }
@@ -1672,11 +1740,11 @@ fn validate_current(
     let mut slots = HashSet::new();
     let mut tried_count = 0;
     for entry in &stored.records {
-        if !routable(entry.addr, allow_local)
-            || canonical(entry.addr) != entry.addr
+        if !routable(entry.endpoint, allow_local)
+            || canonical(entry.endpoint) != entry.endpoint
             || matches!(&entry.source, Source::Overlay(address)
                 if !matches!(address, crate::PeerAddress::Onion(_) | crate::PeerAddress::I2p(_)))
-            || !endpoints.insert(entry.addr)
+            || !endpoints.insert(entry.endpoint)
             || entry.services.is_none() && !entry.allows_unknown_services()
             || entry.new_buckets.len() > MAX_NEW_REFS
             || entry.tried && (entry.last_success == 0 || !entry.new_buckets.is_empty())
@@ -1692,8 +1760,8 @@ fn validate_current(
             // A changed map cannot reproduce the old Tried slots. Validate all
             // map-independent structure, then rebucket at open.
             if let Some(groups) = groups {
-                let bucket = tried_bucket(&stored.secret, entry.addr, groups);
-                let position = bucket_position(&stored.secret, entry.addr, false, bucket);
+                let bucket = tried_bucket(&stored.secret, entry.endpoint, groups);
+                let position = bucket_position(&stored.secret, entry.endpoint, false, bucket);
                 if !slots.insert((false, bucket, position)) {
                     return Err(invalid("Tried bucket collision"));
                 }
@@ -1707,7 +1775,7 @@ fn validate_current(
                     || !slots.insert((
                         true,
                         bucket,
-                        bucket_position(&stored.secret, entry.addr, true, bucket),
+                        bucket_position(&stored.secret, entry.endpoint, true, bucket),
                     ))
                 {
                     return Err(invalid("invalid/colliding New reference"));
@@ -1756,11 +1824,10 @@ fn read_book(
         return Err(invalid("address book checksum"));
     }
     let header: Header = serde_json::from_slice(&bytes[..payload_len]).map_err(io::Error::other)?;
-    if magic.is_some_and(|magic| magic != header.magic) {
-        return Err(invalid("address book network"));
-    }
     // Only the checked envelope identifies disposable development snapshots.
     // Their records are never decoded or converted into the current schema.
+    // Identification runs before scope: a cross-network pre-release file is
+    // preserved and superseded, never misreported as a network refusal.
     if header.format.is_none() && (1..=9).contains(&header.version) {
         return Ok(Some(Loaded {
             stored: None,
@@ -1768,6 +1835,10 @@ fn read_book(
             bytes,
         }));
     }
+    if magic.is_some_and(|magic| magic != header.magic) {
+        return Err(invalid("address book network"));
+    }
+
     if header.format.as_deref() != Some(FORMAT) || header.version != SCHEMA_VERSION {
         return Err(invalid("unsupported address book format/version"));
     }
@@ -1840,7 +1911,7 @@ impl Manager {
             (
                 std::cmp::Reverse(entry.tried),
                 std::cmp::Reverse(entry.last_success),
-                entry.addr,
+                entry.endpoint,
             )
         });
         self.by_addr.clear();
@@ -1849,21 +1920,21 @@ impl Manager {
         let mut demoted = 0;
         for mut entry in records {
             entry.new_buckets.clear();
-            let tried_slot = self.tried_slot(entry.addr);
+            let tried_slot = self.tried_slot(entry.endpoint);
             if entry.tried && self.tried[tried_slot] == EMPTY_SLOT {
                 let index = self.stored.records.len();
                 self.tried[tried_slot] = u32::try_from(index).unwrap_or(EMPTY_SLOT);
-                self.by_addr.insert(entry.addr, index);
+                self.by_addr.insert(entry.endpoint, index);
                 self.stored.records.push(entry);
                 continue;
             }
             let bucket = new_bucket(
                 &self.stored.secret,
-                entry.addr,
+                entry.endpoint,
                 &entry.source.group(&self.groups),
                 &self.groups,
             );
-            let slot = self.new_slot(entry.addr, bucket);
+            let slot = self.new_slot(entry.endpoint, bucket);
             if self.new[slot] != EMPTY_SLOT {
                 continue;
             }
@@ -1874,12 +1945,12 @@ impl Manager {
             entry.new_buckets = vec![u16::try_from(bucket).unwrap_or_default()];
             let index = self.stored.records.len();
             self.new[slot] = u32::try_from(index).unwrap_or(EMPTY_SLOT);
-            self.by_addr.insert(entry.addr, index);
+            self.by_addr.insert(entry.endpoint, index);
             self.stored.records.push(entry);
         }
         self.stored
             .anchors
-            .retain(|anchor| self.by_addr.contains_key(&anchor.addr));
+            .retain(|anchor| self.by_addr.contains_key(&anchor.endpoint));
         tracing::info!(
             before,
             retained = self.stored.records.len(),

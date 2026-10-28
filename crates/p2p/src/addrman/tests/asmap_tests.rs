@@ -135,7 +135,46 @@ fn incoming_source_asn_controls_corroboration_without_rewriting_primary_source()
 }
 
 #[test]
-fn asmap_change_rebuckets_and_current_map_restart_keeps_all_refs() {
+fn failed_configured_map_preserves_original_without_backup() {
+    for malformed in [false, true] {
+        let directory = tempfile::tempdir().expect("directory");
+        let base = directory.path().join("peers.dat");
+        let path = network_path(&base, [1; 4]);
+        let seed = AddressBook::open(Some(base.clone()), [1; 4], false, None);
+        seed.learn_dns("seed", &[target()], EPOCH);
+        seed.save();
+        let original = fs::read(&path).expect("canonical original");
+        let map = directory.path().join("asmap.raw");
+        if malformed {
+            fs::write(&map, b"invalid").expect("malformed map");
+        }
+        let fallback = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
+        assert!(!fallback.state.lock().writable);
+        assert_eq!(fallback.len(), 1);
+        fallback.learn_dns("unpersisted", &[addr(13)], EPOCH);
+        fallback.save();
+        assert_eq!(fs::read(&path).expect("preserved"), original);
+        assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
+        fs::write(&map, QUOTA_MAP).expect("restored map");
+        let restored = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
+        assert!(restored.state.lock().writable);
+        assert_eq!(restored.len(), 1);
+        assert!(restored.state.lock().stored.asmap_id.is_some());
+        assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
+        restored.save();
+        let rebucketed = fs::read(&path).expect("rebucketed");
+        assert_ne!(rebucketed, original);
+        fs::remove_file(&map).expect("map unavailable again");
+        let fallback = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
+        assert!(!fallback.state.lock().writable);
+        fallback.save();
+        assert_eq!(fs::read(&path).expect("rebucketed retained"), rebucketed);
+        assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
+    }
+}
+
+#[test]
+fn asmap_change_rebuckets_without_backup_and_restart_keeps_refs() {
     let directory = tempfile::tempdir().expect("directory");
     let base = directory.path().join("peers.dat");
     let map = map_file(directory.path(), QUOTA_MAP);
@@ -172,20 +211,29 @@ fn asmap_change_rebuckets_and_current_map_restart_keeps_all_refs() {
         assert_eq!(refs(&manager, target()), 8);
     }
     book.save();
-
+    let path = network_path(&base, [1; 4]);
+    let original = fs::read(&path).expect("canonical original");
     let restored = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
     assert_eq!(refs(&restored.state.lock(), target()), 8);
     assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
     fs::write(&map, crate::netgroup::LINKED_ASMAP).expect("changed valid map");
     let changed = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
+    assert!(changed.state.lock().writable);
     assert_eq!(refs(&changed.state.lock(), target()), 1);
     assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
     changed.save();
+    let rebucketed = fs::read(&path).expect("rebucketed");
+    assert_ne!(rebucketed, original);
+    let again = AddressBook::open(Some(base.clone()), [1; 4], false, Some(&map));
+    assert_eq!(refs(&again.state.lock(), target()), 1);
+    assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
+    assert_indexes(&again.state.lock());
     let prefix = AddressBook::open(Some(base), [1; 4], false, None);
     assert!(
         prefix.state.lock().writable,
         "intentional map omission permits current-format rebucketing"
     );
     assert_eq!(prefix.state.lock().stored.asmap_id, None);
+    assert_eq!(backups(directory.path()), Vec::<PathBuf>::new());
     assert_indexes(&prefix.state.lock());
 }

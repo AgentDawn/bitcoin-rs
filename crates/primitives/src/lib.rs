@@ -12,7 +12,7 @@ pub mod chain_constants {
 
 /// Native consensus encoding and decoding for protocol types.
 pub mod encode;
-/// Logical peer network destinations.
+/// Typed logical peer endpoint identity (IP, Tor v3, I2P) and network destinations.
 pub mod endpoint;
 pub use endpoint::{EndpointHost, NetworkLabel, PeerAddress, PeerEndpoint, PeerNetwork};
 /// Fixed-width 256-bit hash type.

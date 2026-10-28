@@ -146,7 +146,10 @@ fn superseded_session_gets_no_probe_and_cannot_send_getheaders() -> TestResult {
     let old_source = current_source(&peers, peer);
 
     let (replacement_tx, replacement_rx) = crate::test_support::message_channel();
-    peers.register(peer, PeerLease::new(replacement_tx));
+    peers.register(
+        peer,
+        PeerLease::new(replacement_tx),
+    );
 
     sync.tick();
 

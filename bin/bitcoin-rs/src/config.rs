@@ -181,13 +181,14 @@ fn user_config_from_toml(path: &Path) -> Result<UserConfig> {
 fn user_config_from_bitcoin_conf(path: &Path, network: Network) -> Result<[UserConfig; 2]> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read bitcoin.conf {}", path.display()))?;
-    Ok(parse_for_network(&text, network))
+    parse_for_network(&text, network)
 }
 
-fn parse_for_network(text: &str, network: Network) -> [UserConfig; 2] {
+fn parse_for_network(text: &str, network: Network) -> Result<[UserConfig; 2]> {
     let mut global = UserConfig::default();
     let mut selected = UserConfig::default();
     let mut current_section_selected = None;
+    let mut errors = Vec::new();
 
     for raw_line in text.lines() {
         let line = strip_inline_comment(raw_line).trim();
@@ -203,14 +204,25 @@ fn parse_for_network(text: &str, network: Network) -> [UserConfig; 2] {
         };
         let key = raw_key.trim().trim_start_matches('-');
         let value = raw_value.trim();
-        match current_section_selected {
+        let outcome = match current_section_selected {
             None => apply_core_key(&mut global, key, value),
             Some(true) => apply_core_key(&mut selected, key, value),
-            Some(false) => {}
+            Some(false) => Ok(()),
+        };
+        if let Err(error) = outcome {
+            errors.push(error);
         }
     }
 
-    [global, selected]
+    if errors.is_empty() {
+        Ok([global, selected])
+    } else {
+        Err(anyhow::anyhow!(
+            "invalid bitcoin.conf value{}: {}",
+            if errors.len() == 1 { "" } else { "s" },
+            errors.join("; ")
+        ))
+    }
 }
 
 /// Expands the option table into the `bitcoin.conf` key map: one arm per row
@@ -252,20 +264,20 @@ macro_rules! emit_core_conf {
             )*
         }
     ) => {
-        fn apply_core_key(layer: &mut UserConfig, key: &str, value: &str) {
+        fn apply_core_key(layer: &mut UserConfig, key: &str, value: &str) -> Result<(), String> {
             if apply_core_exception(layer, key, value) {
-                return;
+                return Ok(());
             }
             match key {
                 $(
-                    $( $fckey => CoreValue::apply(value, &mut layer.$fid), )?
+                    $( $fckey => CoreValue::apply(key, value, &mut layer.$fid), )?
                 )*
                 $(
                     $(
-                        $( $gckey => CoreValue::apply(value, &mut layer.$gid.$rfield), )?
+                        $( $gckey => CoreValue::apply(key, value, &mut layer.$gid.$rfield), )?
                     )*
                 )*
-                _ => {}
+                _ => Ok(()),
             }
         }
     };
@@ -280,67 +292,103 @@ bitcoin_rs_node::option_rows!(emit_core_conf);
 /// boolean key carries no parseable value.
 /// INVARIANT: each impl matches Bitcoin Core's reading of its key type: a
 /// string or path is taken verbatim, a number is taken only when it parses,
-/// and a boolean takes Core's truth words and false words.
+/// and a boolean takes Core's truth words and false words. Overlay routing
+/// keys (`proxy=`, `onion=`, `torcontrol` aside, `onlynet=`) fail instead of
+/// degrading silently: a mis-typed proxy or network restriction must never
+/// become direct, unrestricted dialing.
 trait CoreValue {
-    fn apply(value: &str, slot: &mut Self);
+    fn apply(key: &str, value: &str, slot: &mut Self) -> Result<(), String>;
 }
 
 impl CoreValue for Option<bool> {
-    fn apply(value: &str, slot: &mut Self) {
+    fn apply(_key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
         *slot = parse_core_bool(value);
+        Ok(())
     }
 }
 
 impl CoreValue for Option<u64> {
-    fn apply(value: &str, slot: &mut Self) {
+    fn apply(_key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
         if let Ok(number) = value.parse() {
             *slot = Some(number);
         }
+        Ok(())
     }
 }
 
 impl CoreValue for Option<String> {
-    fn apply(value: &str, slot: &mut Self) {
+    fn apply(_key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
         *slot = Some(value.to_owned());
+        Ok(())
     }
 }
 
 impl CoreValue for Option<PathBuf> {
-    fn apply(value: &str, slot: &mut Self) {
+    fn apply(_key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
         *slot = Some(PathBuf::from(value));
+        Ok(())
     }
 }
 
 impl CoreValue for Option<SocketAddr> {
-    fn apply(value: &str, slot: &mut Self) {
-        if let Ok(addr) = value.parse() {
-            *slot = Some(addr);
+    fn apply(key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
+        match value.parse() {
+            Ok(addr) => {
+                *slot = Some(addr);
+                Ok(())
+            }
+            Err(_) => Err(format!("{key}={value:?} is not a valid socket address")),
         }
     }
 }
 
 impl CoreValue for Option<Vec<bitcoin_rs_node::options::NetworkLabel>> {
-    fn apply(value: &str, slot: &mut Self) {
-        let entries = slot.get_or_insert_with(Vec::new);
+    fn apply(key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
+        let mut parsed = Vec::new();
         for item in value.split(',') {
-            if let Ok(label) = bitcoin_rs_node::options::parse_network_label(item.trim()) {
-                if !entries.contains(&label) {
-                    entries.push(label);
+            match bitcoin_rs_node::options::parse_network_label(item.trim()) {
+                Ok(label) => {
+                    if !parsed.contains(&label) {
+                        parsed.push(label);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!("{key}={value:?} names an unknown network"));
                 }
             }
         }
+        let entries = slot.get_or_insert_with(Vec::new);
+        for label in parsed {
+            if !entries.contains(&label) {
+                entries.push(label);
+            }
+        }
+        Ok(())
     }
 }
+
 impl CoreValue for Option<Vec<bitcoin_rs_node::options::PeerNetwork>> {
-    fn apply(value: &str, slot: &mut Self) {
-        let entries = slot.get_or_insert_with(Vec::new);
+    fn apply(key: &str, value: &str, slot: &mut Self) -> Result<(), String> {
+        let mut parsed = Vec::new();
         for item in value.split(',') {
-            if let Ok(network) = bitcoin_rs_node::options::parse_peer_network(item.trim()) {
-                if !entries.contains(&network) {
-                    entries.push(network);
+            match bitcoin_rs_node::options::parse_peer_network(item.trim()) {
+                Ok(label) => {
+                    if !parsed.contains(&label) {
+                        parsed.push(label);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!("{key}={value:?} names an unknown network"));
                 }
             }
         }
+        let entries = slot.get_or_insert_with(Vec::new);
+        for label in parsed {
+            if !entries.contains(&label) {
+                entries.push(label);
+            }
+        }
+        Ok(())
     }
 }
 /// Sets the one Core key that no table row can express: `listen` is a boolean
@@ -401,7 +449,8 @@ mod tests {
 -rpcpassword=regtest-pass
 ",
             Network::Regtest,
-        );
+        )
+        .unwrap_or_else(|error| panic!("valid fixture parses: {error}"));
         let layer_refs: Vec<_> = layers.iter().collect();
         let config = resolve(&layer_refs).unwrap_or_else(|error| panic!("layer resolves: {error}"));
         assert_eq!(config.storage.prune_target_mb, 900);
@@ -422,7 +471,8 @@ rpccookiefile=/tmp/.cookie
 listen=0
 ",
             Network::Regtest,
-        );
+        )
+        .unwrap_or_else(|error| panic!("valid fixture parses: {error}"));
         let global = &layers[0];
         assert_eq!(global.storage.dbcache_mb, Some(450));
         assert_eq!(global.storage.prune_target_mb, Some(550));
@@ -440,7 +490,8 @@ listen=0
     /// A number the file states in a form Core cannot read sets nothing.
     #[test]
     fn an_unparseable_core_number_sets_nothing() {
-        let layers = parse_for_network("dbcache=large\nrest=maybe\n", Network::Regtest);
+        let layers = parse_for_network("dbcache=large\nrest=maybe\n", Network::Regtest)
+            .unwrap_or_else(|error| panic!("non-routing keys stay lenient: {error}"));
         assert_eq!(layers[0].storage.dbcache_mb, None);
         assert_eq!(layers[0].rpc.rest, None);
     }
@@ -512,6 +563,10 @@ onlynet=onion,i2p
             Some(SocketAddr::from(([127, 0, 0, 1], 9052)))
         );
         assert_eq!(
+            conf_with_overlays.p2p.overlay.tor_cookie.as_deref(),
+            None
+        );
+        assert_eq!(
             conf_with_overlays.p2p.overlay.i2p_sam,
             Some(SocketAddr::from(([127, 0, 0, 1], 7656)))
         );
@@ -524,6 +579,30 @@ onlynet=onion,i2p
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn bitcoin_conf_malformed_proxy_names_the_key() {
+        let error = match load_conf("proxy=localhost:9050\n", Network::Mainnet) {
+            Ok(_) => panic!("a hostname proxy must not degrade to direct dialing"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("proxy"),
+            "refusal names the key: {error}"
+        );
+    }
+
+    #[test]
+    fn bitcoin_conf_malformed_onlynet_names_the_key() {
+        let error = match load_conf("onlynet=onnion\n", Network::Mainnet) {
+            Ok(_) => panic!("a mis-typed onlynet must not degrade to unrestricted dialing"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("onlynet"),
+            "refusal names the key: {error}"
+        );
     }
 
     #[test]
@@ -708,7 +787,8 @@ index-bundle-import=/srv/in
 indexbundleexport=/srv/out
 ",
             Network::Regtest,
-        );
+        )
+        .expect("fixture parses");
         for layer in &layers {
             assert_eq!(layer.indexes.bundle_import, None);
             assert_eq!(layer.indexes.bundle_export, None);

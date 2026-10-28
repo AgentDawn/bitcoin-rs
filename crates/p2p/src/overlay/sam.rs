@@ -394,9 +394,9 @@ mod tests {
                     io::ErrorKind::WouldBlock
                 );
             });
-            let transport = OverlayTransport::new(Arc::new(crate::OverlayConfig {
+            let transport = OverlayTransport::new(Arc::new(crate::overlay::OverlayConfig {
                 i2p_sam: Some(address),
-                ..crate::OverlayConfig::default()
+                ..crate::overlay::OverlayConfig::default()
             }));
             let alive = Arc::new(AtomicBool::new(true));
             *transport.sam.write() = Some(Session {
@@ -451,9 +451,9 @@ mod tests {
                     io::ErrorKind::WouldBlock
                 );
             });
-            let transport = OverlayTransport::new(Arc::new(crate::OverlayConfig {
+            let transport = OverlayTransport::new(Arc::new(crate::overlay::OverlayConfig {
                 i2p_sam: Some(address),
-                ..crate::OverlayConfig::default()
+                ..crate::overlay::OverlayConfig::default()
             }));
             let endpoint = PeerEndpoint::new(PeerAddress::I2p([1; 32]), 8333);
             *transport.sam.write() = Some(Session {
@@ -475,10 +475,10 @@ mod tests {
     fn advertised_i2p_address_belongs_to_a_live_accepting_session() {
         let local = PeerEndpoint::new(PeerAddress::I2p([7; 32]), 8333);
         for accept in [false, true] {
-            let transport = OverlayTransport::new(Arc::new(crate::OverlayConfig {
+            let transport = OverlayTransport::new(Arc::new(crate::overlay::OverlayConfig {
                 i2p_accept: accept,
                 i2p_sam: Some("127.0.0.1:7656".parse().expect("SAM socket")),
-                ..crate::OverlayConfig::default()
+                ..crate::overlay::OverlayConfig::default()
             }));
             let table = crate::PeerTable::new();
             let state = || {
@@ -545,9 +545,9 @@ mod tests {
                 }
             }
         });
-        let transport = Arc::new(OverlayTransport::new(Arc::new(crate::OverlayConfig {
+        let transport = Arc::new(OverlayTransport::new(Arc::new(crate::overlay::OverlayConfig {
             i2p_sam: Some(address),
-            ..crate::OverlayConfig::default()
+            ..crate::overlay::OverlayConfig::default()
         })));
         let old = Arc::new(AtomicBool::new(true));
         *transport.sam.write() = Some(Session {
@@ -632,9 +632,9 @@ mod tests {
                 0
             );
         });
-        let transport = OverlayTransport::new(Arc::new(crate::OverlayConfig {
+        let transport = OverlayTransport::new(Arc::new(crate::overlay::OverlayConfig {
             i2p_sam: Some(address),
-            ..crate::OverlayConfig::default()
+            ..crate::overlay::OverlayConfig::default()
         }));
         *transport.sam.write() = Some(Session {
             id: "fixture".to_owned(),

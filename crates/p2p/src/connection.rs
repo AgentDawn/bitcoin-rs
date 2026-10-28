@@ -67,11 +67,31 @@ impl PeerRemote {
     }
 
     /// Network carrying this connection, independent of proxy sockets.
-    pub const fn network(self) -> crate::PeerNetwork {
+    pub fn network(self) -> crate::PeerNetwork {
         match self {
             Self::Endpoint(endpoint) => endpoint.address().network(),
             Self::AnonymousTor(_) => crate::PeerNetwork::Onion,
         }
+    }
+
+    /// Mint from an optional logical endpoint and its connection.
+    /// `None` (unidentified Tor inbound) becomes `AnonymousTor` and never
+    /// carries the loopback forwarder/proxy socket as identity.
+    #[must_use]
+    pub const fn from_endpoint(
+        endpoint: Option<PeerEndpoint>,
+        connection_id: ConnectionId,
+    ) -> Self {
+        match endpoint {
+            Some(endpoint) => Self::Endpoint(endpoint),
+            None => Self::AnonymousTor(connection_id),
+        }
+    }
+
+    /// Mint from a `PeerSource` token.
+    #[must_use]
+    pub fn from_source(source: PeerSource) -> Self {
+        Self::from_endpoint(source.endpoint(), source.connection_id())
     }
 }
 

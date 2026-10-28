@@ -124,11 +124,11 @@ pub fn classify_endpoint(text: &str) -> ClassifiedEndpoint {
     let Ok(port) = port_str.parse::<u16>() else {
         return ClassifiedEndpoint::InvalidOverlay;
     };
-    if port == 0 {
-        return ClassifiedEndpoint::InvalidOverlay;
-    }
 
     if let Some(onion) = host.strip_suffix(".onion") {
+        if port == 0 {
+            return ClassifiedEndpoint::InvalidOverlay;
+        }
         if onion.len() != 56 {
             return ClassifiedEndpoint::InvalidOverlay;
         }
@@ -189,7 +189,9 @@ pub fn format_endpoint(endpoint: PeerEndpoint) -> String {
 #[must_use]
 pub fn endpoint_from_addrv2(message: &AddrV2Message) -> Option<PeerEndpoint> {
     let port = message.port;
-    if port == 0 {
+    // I2P SAM accepts port 0 (unspecified/default service port); every
+    // other network still requires a nonzero port.
+    if port == 0 && !matches!(message.addr, AddrV2::I2p(_)) {
         return None;
     }
     match message.addr {
@@ -238,16 +240,17 @@ pub const fn addrv2_gossip_enabled(
     }
 }
 
-/// Core internal netgroup for an endpoint host (not the BIP155 tag).
+/// Canonical `AddrMan` netgroup for an endpoint host (not the BIP155 tag).
 ///
 /// IP uses the existing prefix/ASMap grouping via
 /// [`crate::netgroup::NetGroups`] at call sites; overlay groups are
-/// `[3, key[0]|0x0f]` / `[4, hash[0]|0x0f]` with `nBits = 4`.
+/// `[4, key[0]|0x0f]` / `[5, hash[0]|0x0f]` with `nBits = 4`, matching the
+/// canonical v1 schema that PR #1684 must adopt before its merge.
 #[must_use]
 pub fn overlay_netgroup(host: EndpointHost) -> Option<Vec<u8>> {
     match host {
-        EndpointHost::TorV3 { key } => Some(vec![3, key[0] | 0x0f]),
-        EndpointHost::I2p { hash } => Some(vec![4, hash[0] | 0x0f]),
+        EndpointHost::TorV3 { key } => Some(vec![4, key[0] | 0x0f]),
+        EndpointHost::I2p { hash } => Some(vec![5, hash[0] | 0x0f]),
         EndpointHost::Ip(_) => None,
     }
 }
@@ -684,6 +687,64 @@ mod tests {
     }
 
     #[test]
+    fn i2p_port_zero_is_valid_but_tor_and_ip_are_not() {
+        // I2P SAM accepts port 0 (unspecified/default service port).
+        let i2p_zero = format!("{}.b32.i2p:0", "a".repeat(52));
+        assert_eq!(
+            classify_endpoint(&i2p_zero),
+            ClassifiedEndpoint::Valid(PeerEndpoint::I2p {
+                hash: [0u8; 32],
+                port: 0
+            })
+        );
+        assert_eq!(
+            parse_endpoint(&i2p_zero),
+            Some(PeerEndpoint::I2p {
+                hash: [0u8; 32],
+                port: 0
+            })
+        );
+
+        // Tor v3 and IP still require a nonzero port.
+        let tor_zero = format_endpoint(tor_endpoint()).replace("8333", "0");
+        assert_eq!(
+            classify_endpoint(&tor_zero),
+            ClassifiedEndpoint::InvalidOverlay
+        );
+        assert_eq!(parse_endpoint(&tor_zero), None);
+        assert_eq!(parse_endpoint("127.0.0.1:0"), None);
+    }
+
+    #[test]
+    fn addrv2_accepts_i2p_port_zero_only() {
+        let i2p_zero = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::I2p([7u8; 32]),
+            port: 0,
+        };
+        assert_eq!(
+            endpoint_from_addrv2(&i2p_zero),
+            Some(PeerEndpoint::I2p {
+                hash: [7u8; 32],
+                port: 0
+            })
+        );
+        // Every other network with port 0 is still rejected.
+        for addr in [AddrV2::Ipv4(Ipv4Addr::LOCALHOST), AddrV2::TorV3([3u8; 32])] {
+            assert_eq!(
+                endpoint_from_addrv2(&AddrV2Message {
+                    time: 1,
+                    services: ServiceFlags::NETWORK,
+                    addr,
+                    port: 0,
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn addrv2_round_trip_and_rejections() {
         for endpoint in [
             PeerEndpoint::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333)),
@@ -845,11 +906,11 @@ mod tests {
     fn overlay_netgroup_vectors() {
         assert_eq!(
             overlay_netgroup(EndpointHost::TorV3 { key: [0x21u8; 32] }),
-            Some(vec![3, 0x2f])
+            Some(vec![4, 0x2f])
         );
         assert_eq!(
             overlay_netgroup(EndpointHost::I2p { hash: [0x30u8; 32] }),
-            Some(vec![4, 0x3f])
+            Some(vec![5, 0x3f])
         );
         assert_eq!(
             overlay_netgroup(EndpointHost::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST))),

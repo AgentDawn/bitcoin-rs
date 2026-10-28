@@ -452,7 +452,11 @@ fn historical_notfound_only_peer_is_not_polled_and_is_retried_after_the_interval
         drain_getdata_items(&rx).is_empty(),
         "no wake-up-paced getdata/notfound loop against the only peer"
     );
-    assert!(harness.peers.is_connected(addr));
+    assert!(
+        harness
+            .peers
+            .is_connected(addr)
+    );
 
     // Once the interval has passed the peer is asked exactly once more.
     let aged = Instant::now()

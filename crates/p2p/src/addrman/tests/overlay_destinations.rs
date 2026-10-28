@@ -6,7 +6,11 @@ fn ip_source_disguised_as_overlay_is_rejected_without_rewriting_the_book() {
     let base = directory.path().join("peers.dat");
     let path = network_path(&base, [1; 4]);
     let book = AddressBook::open(Some(base.clone()), [1; 4], false, None);
-    book.learn_peer(addr(2).address(), &[(addr(1), 9, EPOCH)], EPOCH);
+    book.learn_peer(
+        crate::PeerRemote::Endpoint(addr(2)),
+        &[(addr(1), 9, EPOCH)],
+        EPOCH,
+    );
     book.save();
     let original = fs::read(&path).expect("valid book");
     let mut value = serde_json::to_value(&book.state.lock().stored).expect("state");
@@ -36,14 +40,18 @@ fn overlay_self_announcements_keep_the_advertised_time() {
         let book = AddressBook::open(None, [1; 4], false, None);
         let own = PeerEndpoint::new(address, 8333);
         let other = PeerEndpoint::new(crate::PeerAddress::Onion([5; 32]), 8333);
-        book.learn_peer(address, &[(own, 9, EPOCH), (other, 9, EPOCH)], EPOCH);
+        book.learn_peer(
+            crate::PeerRemote::Endpoint(PeerEndpoint::new(address, 8333)),
+            &[(own, 9, EPOCH), (other, 9, EPOCH)],
+            EPOCH,
+        );
         let state = book.state.lock();
         let seen = |endpoint| {
             state
                 .stored
                 .records
                 .iter()
-                .find(|entry| entry.addr == endpoint)
+                .find(|entry| entry.endpoint == endpoint)
                 .expect("learned endpoint")
                 .last_seen
         };
@@ -60,7 +68,7 @@ fn overlay_endpoints_sources_and_anchors_survive_restart_and_addrv2_gossip() {
     let onion = PeerEndpoint::new(crate::PeerAddress::Onion([1; 32]), 8333);
     let i2p = PeerEndpoint::new(crate::PeerAddress::I2p([2; 32]), 8333);
     book.learn_peer(
-        onion.address(),
+        crate::PeerRemote::Endpoint(onion),
         &[(onion, 9, EPOCH), (i2p, 9, EPOCH)],
         EPOCH,
     );
