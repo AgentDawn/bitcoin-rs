@@ -451,7 +451,7 @@ fn registered_inbound(
 ) -> (PeerSource, crate::test_support::MessageReceiver) {
     let (sender, receiver) = crate::test_support::message_channel_bounded(32);
     let lease = crate::PeerLease::new_inbound(sender);
-    let addr = ([127, 0, 0, 1], port).into();
+    let addr: crate::PeerEndpoint = ([127, 0, 0, 1], port).into();
     table.register(addr, lease.clone());
     let version = crate::handshake::version_message(
         1,
@@ -464,7 +464,8 @@ fn registered_inbound(
         &lease,
         crate::PeerInfo::inbound_from_version(
             addr,
-            addr,
+            addr.socket_addr()
+                .unwrap_or_else(|| panic!("expected IP fixture")),
             &version,
             0,
             0,
