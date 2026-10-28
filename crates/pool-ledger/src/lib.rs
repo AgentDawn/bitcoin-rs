@@ -36,6 +36,10 @@ pub type Hash32 = [u8; 32];
 pub const MAX_MONEY_SAT: u64 = 2_100_000_000_000_000;
 /// Longest accepted extranonce (`session || rolled`), in bytes.
 pub const MAX_EXTRANONCE_LEN: usize = 64;
+/// Fixed-width prefix of [`ShareCredit::tuple_key`]: job, account, nonce, version, ntime.
+const SHARE_TUPLE_FIXED_LEN: usize = 8 + 8 + 4 + 4 + 4;
+/// Longest [`ShareCredit::tuple_key`] a valid share can produce.
+pub(crate) const MAX_SHARE_TUPLE_LEN: usize = SHARE_TUPLE_FIXED_LEN + MAX_EXTRANONCE_LEN;
 /// Longest accepted script, in bytes (the consensus script size limit).
 pub const MAX_SCRIPT_LEN: usize = 10_000;
 /// Largest raw transaction accepted from a signer, in bytes.
@@ -134,7 +138,7 @@ impl ShareCredit {
     /// only in version or ntime are distinct shares, never a conflicting reuse.
     #[must_use]
     pub fn tuple_key(&self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(28 + self.extranonce.len());
+        let mut key = Vec::with_capacity(SHARE_TUPLE_FIXED_LEN + self.extranonce.len());
         key.extend_from_slice(&self.job.to_be_bytes());
         key.extend_from_slice(&self.account.0.to_be_bytes());
         key.extend_from_slice(&self.nonce.to_be_bytes());

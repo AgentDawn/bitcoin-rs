@@ -22,7 +22,7 @@ use crate::codec::{Dec, Enc};
 use crate::{
     AuditKind, AuditRecord, Balance, BatchState, BatchTransition, BlockFound, BlockRecorded,
     CancelBasis, ChainView, Closure, Confirmation, ExternalSigner, Hash32, LedgerError,
-    MAX_BATCH_OUTPUTS, MAX_EXTRANONCE_LEN, MAX_MONEY_SAT, MAX_SCRIPT_LEN, MinerId,
+    MAX_BATCH_OUTPUTS, MAX_MONEY_SAT, MAX_SCRIPT_LEN, MAX_SHARE_TUPLE_LEN, MinerId,
     ObservedCoinbase, OutPoint, PayoutBatch, PayoutOutput, PayoutPolicy, PayoutReceipt,
     PayoutRequest, PoolConfig, ReceiptError, Round, RoundState, RoundTransition, ShareCredit,
     ShareReceipt, SignedTx, TxStatus, WindowAccumulator, compute_batch_id, parse_transaction,
@@ -2322,7 +2322,7 @@ fn decode_hash_entry(bytes: &[u8]) -> Result<(u64, u128, Vec<u8>), LedgerError> 
     let mut dec = Dec::new(bytes);
     let seq = dec.u64()?;
     let work = dec.u128()?;
-    let tuple = dec.bytes(MAX_EXTRANONCE_LEN + 20)?.to_vec();
+    let tuple = dec.bytes(MAX_SHARE_TUPLE_LEN)?.to_vec();
     dec.finish()?;
     Ok((seq, work, tuple))
 }

@@ -1056,6 +1056,32 @@ fn shares_are_idempotent_by_header_hash_and_unique_by_identity() {
 }
 
 #[test]
+fn maximum_length_extranonce_shares_stay_readable() {
+    let (_dir, ledger) = plain_ledger(100);
+    let mut longest = share(1, 1, 1, 10);
+    longest.extranonce = vec![0xAB; MAX_EXTRANONCE_LEN];
+    assert_eq!(
+        ledger.record_share(&longest).fixture("credit"),
+        ShareReceipt::Credited { seq: 0 }
+    );
+    assert_eq!(
+        ledger.share_by_hash(&longest.header_hash).fixture("lookup"),
+        Some((0, 10))
+    );
+    assert_eq!(
+        ledger.record_share(&longest).fixture("replay"),
+        ShareReceipt::Duplicate { seq: 0 }
+    );
+    let mut same_identity = longest.clone();
+    same_identity.header_hash = hash(0xEE);
+    assert!(matches!(
+        ledger.record_share(&same_identity).err(),
+        Some(LedgerError::ShareIdentityConflict { seq: 0 })
+    ));
+    ledger.check_invariants().fixture("invariants");
+}
+
+#[test]
 fn window_boundaries_are_exact_in_work_units() {
     for (window, expected) in [
         (100u128, vec![(2u64, 40u128), (3, 60)]),
