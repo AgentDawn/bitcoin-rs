@@ -509,7 +509,8 @@ fn is_ipv6_tcp_endpoint(endpoint: &str) -> bool {
     host.contains(':') && tail.starts_with(':') && tail.len() > 1
 }
 
-/// Publishes committed admissions as `rawtx` and Core `sequence` `A`/`R` events.
+/// Publishes committed admissions as `hashtx`, `rawtx`, and Core `sequence`
+/// `A` events, and removals as `sequence` `R` events.
 ///
 /// Install on the [`bitcoin_rs_mempool::MempoolGateway`] observer slot when
 /// ZMQ notifications are configured. Raw bodies are retained only for `rawtx`.
@@ -548,6 +549,9 @@ impl bitcoin_rs_mempool::MempoolObserver for MempoolSequenceObserver {
             let txid = Txid(change.txid);
             match change.outcome {
                 bitcoin_rs_mempool::MutationOutcome::Accepted => {
+                    // Core's `TransactionAddedToMempool` notifies `hashtx`
+                    // and `rawtx` for every admission, then `sequence` `A`.
+                    self.publisher.publish_hashtx(txid);
                     if self.publisher.wants_rawtx()
                         && let Some((_, tx)) = envelope
                             .accepted_transactions
@@ -974,6 +978,7 @@ mod manifest_tests {
         sequence_bodies: parking_lot::Mutex<Vec<Vec<u8>>>,
         capture_rawtx: bool,
         raw_bodies: parking_lot::Mutex<Vec<Vec<u8>>>,
+        hashtx: parking_lot::Mutex<Vec<Txid>>,
     }
 
     impl core::fmt::Debug for RecordingPublisher {
@@ -996,7 +1001,9 @@ mod manifest_tests {
             Vec::new()
         }
         fn publish_hashblock(&self, _hash: Hash256) {}
-        fn publish_hashtx(&self, _txid: Txid) {}
+        fn publish_hashtx(&self, txid: Txid) {
+            self.hashtx.lock().push(txid);
+        }
         fn publish_rawblock(&self, _bytes: &[u8]) {}
         fn publish_rawtx(&self, bytes: &[u8]) {
             self.raw_bodies.lock().push(bytes.to_vec());
@@ -1225,6 +1232,11 @@ mod manifest_tests {
                 consensus_bytes(first.as_ref()),
                 consensus_bytes(second.as_ref()),
             ]
+        );
+        assert_eq!(
+            *publisher.hashtx.lock(),
+            vec![first.txid(), second.txid()],
+            "every admission notifies hashtx, as Core does"
         );
         assert_eq!(
             *publisher.sequence_bodies.lock(),
