@@ -536,6 +536,70 @@ fn foreign_p2pkh_key_falls_back_instead_of_changing_signer() {
 }
 
 #[test]
+fn lossy_input_shapes_fall_back_to_uncompressed_envelope() {
+    // Each shape carries bytes the compressed rebuild cannot reproduce, so
+    // the round trip must still restore the exact transaction.
+    let signer = Signer::new(7);
+    let stranger = Signer::new(19);
+
+    // P2PKH spend that also carries a witness item.
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2pkh_script(signer.pubkey_hash()),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let mut tx = spend_of(&prev_tx, Script::new(), Witness::new());
+    let digest = SighashCache::new(&tx)
+        .legacy_signature_hash(0, prevout.script_pubkey.as_bytes(), 1)
+        .unwrap();
+    let sig_item = signer.ecdsa_item(digest, false);
+    let mut script_sig = super::push_data(&sig_item);
+    script_sig.extend_from_slice(&super::push_data(&signer.compressed_pubkey()));
+    tx.inputs[0].script_sig = Script::from_bytes(script_sig);
+    tx.inputs[0].witness = Witness::from_stack(vec![vec![0x2a]]);
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 3);
+    roundtrip(&tx, &mut resolver, true);
+
+    // P2WPKH spend whose witness key does not hash to the prevout.
+    let prevout = TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: p2wpkh_script(signer.pubkey_hash()),
+    };
+    let prev_tx = funding_tx(prevout.clone());
+    let mut tx = spend_of(&prev_tx, Script::new(), Witness::new());
+    let digest = SighashCache::new(&tx)
+        .segwit_v0_signature_hash_raw(
+            0,
+            p2pkh_script(signer.pubkey_hash()).as_bytes(),
+            prevout.value,
+            1,
+        )
+        .unwrap();
+    let sig_item = signer.ecdsa_item(digest, false);
+    tx.inputs[0].witness = Witness::from_stack(vec![sig_item, stranger.compressed_pubkey()]);
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 0);
+    roundtrip(&tx, &mut resolver, true);
+
+    // P2TR key-path spend that also carries scriptSig bytes.
+    let mut script = vec![0x51, 0x20];
+    script.extend_from_slice(&[3_u8; 32]);
+    let prev_tx = funding_tx(TxOut {
+        value: Amount::from_sat(50_000),
+        script_pubkey: Script::from_bytes(script),
+    });
+    let tx = spend_of(
+        &prev_tx,
+        Script::from_bytes(vec![0x01, 0x2a]),
+        Witness::from_stack(vec![vec![4_u8; 64]]),
+    );
+    let mut resolver = MapResolver::default();
+    resolver.register_tx(100, &prev_tx, 0);
+    roundtrip(&tx, &mut resolver, true);
+}
+
+#[test]
 fn nonminimal_p2pkh_pushes_fall_back_to_uncompressed_envelope() {
     // Non-minimal PUSHDATA spellings carry the same payloads but rebuild
     // to different bytes via `push_data` on decompress, so they must not

@@ -756,6 +756,10 @@ fn compressed_signature(input: &TxIn, kind: &PrevoutKind) -> Option<CompressedSi
             }
         }
         PrevoutKind::P2pkh(expected) => {
+            // Decompression rebuilds an empty witness for this input.
+            if !input.witness.is_empty() {
+                return None;
+            }
             let script = input.script_sig.as_bytes();
             let (sig_item, pos) = read_push(script, 0)?;
             let (pubkey, end) = read_push(script, pos)?;
@@ -787,12 +791,14 @@ fn compressed_signature(input: &TxIn, kind: &PrevoutKind) -> Option<CompressedSi
             }
             ecdsa_compressed(sig_item)
         }
-        PrevoutKind::P2wpkh(_) => {
+        PrevoutKind::P2wpkh(expected) => {
             if !input.script_sig.is_empty() || input.witness.len() != 2 {
                 return None;
             }
+            // Decompression recovers the key committed by the prevout, so
+            // only that exact key may be dropped from the witness.
             let pubkey = input.witness.get(1)?;
-            if pubkey.len() != 33 {
+            if pubkey.len() != 33 || hash160_20(pubkey) != *expected {
                 return None;
             }
             ecdsa_compressed(input.witness.first()?)
