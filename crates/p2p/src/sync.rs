@@ -248,8 +248,9 @@ struct SchedulerState {
     owned_body_fetches: Vec<(PeerSource, Hash256)>,
     /// Exact connections that answered an outstanding body request with
     /// `notfound`, so the released body is replanned elsewhere instead of
-    /// being asked of the same connection again. Bounded by the window's
-    /// pending budget and by [`requests::BODY_UNAVAILABLE_RETRY`].
+    /// being asked of the same connection again. Retention-bounded by
+    /// [`requests::BODY_UNAVAILABLE_RETRY`] with a safety ceiling, and
+    /// independent of the window's pending budget.
     body_unavailable: requests::UnavailableBodies,
     /// Chain-sync eviction state for every connection that has not yet shown
     /// it can bring us to the tip. Keyed by exact connection identity, so a
@@ -421,7 +422,7 @@ impl BlockSync {
                 stager: BlockStager::new(budget),
                 header_request_owner: None,
                 owned_body_fetches: Vec::new(),
-                body_unavailable: requests::UnavailableBodies::new(budget.max_pending_blocks),
+                body_unavailable: requests::UnavailableBodies::new(),
                 chain_sync: hashbrown::HashMap::new(),
                 headers_sync: hashbrown::HashMap::new(),
                 stale_tip: StaleTipState::default(),
@@ -443,7 +444,7 @@ impl BlockSync {
             stager: BlockStager::new(budget),
             header_request_owner: None,
             owned_body_fetches: Vec::new(),
-            body_unavailable: requests::UnavailableBodies::new(budget.max_pending_blocks),
+            body_unavailable: requests::UnavailableBodies::new(),
             chain_sync: hashbrown::HashMap::new(),
             headers_sync: hashbrown::HashMap::new(),
             stale_tip: StaleTipState::default(),
