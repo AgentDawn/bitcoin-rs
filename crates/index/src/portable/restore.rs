@@ -409,14 +409,6 @@ impl LocatorCheck<'_> {
     }
 }
 
-/// Reports whether `position` equals the top-level transaction span
-/// `[start, start + len)`. Offsets inside a transaction (an embedded
-/// serialization in a script or witness) and overlapping or truncated spans
-/// never match, even when the bytes there decode to a transaction.
-fn is_top_level_span(position: TxPosition, start: u32, len: u32) -> bool {
-    position.offset() == start && position.byte_len() == len
-}
-
 /// Reports the first height where the bundle's position count differs from
 /// the chain's transaction count, or `None` when the height is complete.
 fn incomplete_at(
