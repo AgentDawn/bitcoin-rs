@@ -1596,6 +1596,60 @@ fn a_reorg_after_maturity_reverses_the_credits_and_re_credits_when_the_block_ret
 }
 
 #[test]
+fn canonical_depth_loss_below_maturity_demotes_to_immature() {
+    let fund = funded(0, 1_000_001);
+    assert_eq!(
+        fund.ledger
+            .round_for_block(&fund.block.share.header_hash)
+            .fixture("round")
+            .fixture("exists")
+            .state,
+        RoundState::Matured
+    );
+    // A lower-height higher-work reorg retains the rewarded block at height
+    // 100 but shortens the tip from 102 to 101, dropping depth from 3 to 2
+    // below the configured maturity of 3. The round must not stay payable.
+    fund.chain.set_tip(101);
+    let report = fund.ledger.reconcile_rounds(&fund.chain).fixture("shorter tip");
+    assert_eq!(report.transitions.len(), 1);
+    let transition = report.transitions[0];
+    assert_eq!(
+        (transition.from, transition.to),
+        (RoundState::Matured, RoundState::Immature)
+    );
+    assert_eq!(
+        (transition.reversed_sat, transition.deficit_created_sat),
+        (1_000_001, 0)
+    );
+    for account in 1..=3 {
+        assert_eq!(
+            fund.ledger.balance(MinerId(account)).fixture("balance"),
+            Balance::default(),
+            "demoted credits leave nothing payable"
+        );
+    }
+    fund.ledger
+        .check_invariants()
+        .fixture("invariants after demotion");
+
+    // A deeper tip matures the same round again with the same allocations.
+    fund.chain.set_tip(102);
+    let report = fund.ledger.reconcile_rounds(&fund.chain).fixture("deeper tip");
+    assert_eq!(report.transitions.len(), 1);
+    assert_eq!(report.transitions[0].from, RoundState::Immature);
+    assert_eq!(report.transitions[0].to, RoundState::Matured);
+    assert_eq!(report.transitions[0].credited_sat, 1_000_001);
+    assert_eq!(
+        fund.ledger
+            .balance(MinerId(1))
+            .fixture("balance")
+            .available_sat,
+        500_001
+    );
+    fund.ledger.check_invariants().fixture("invariants after re-mature");
+}
+
+#[test]
 fn reversing_credits_that_were_already_reserved_creates_an_explicit_deficit() {
     let fund = funded(0, 1_000_001);
     let batch = prepared(&fund);

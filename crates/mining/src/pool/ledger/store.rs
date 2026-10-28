@@ -2133,7 +2133,28 @@ fn apply_round_observation(
                 [reversed, deficit, 1],
             )?;
         }
-        (RoundState::Matured, _) | (_, Canon::Unknown) => {}
+        (RoundState::Matured, Canon::Canonical) => {
+            // A lower-height higher-work reorg can retain the rewarded block
+            // while reducing its depth below maturity. The round must not
+            // stay Matured and payable: recheck maturity, reverse credits
+            // with the deficit-preserving accounting, and return to Immature
+            // so a deeper tip can mature it again.
+            if depth < u64::from(config.coinbase_maturity) {
+                let (reversed, deficit) = reverse_round_credits(tables, round.id)?;
+                reversed_sat = reversed;
+                deficit_created_sat = deficit;
+                round.state = RoundState::Immature;
+                append_audit(
+                    tables,
+                    AuditKind::RoundOrphaned,
+                    round.id,
+                    &round.block_hash,
+                    &ZERO_HASH,
+                    [reversed, deficit, 1],
+                )?;
+            }
+        }
+        (_, Canon::Unknown) => {}
         (_, Canon::Displaced) => {
             if from != RoundState::Orphaned {
                 round.state = RoundState::Orphaned;
