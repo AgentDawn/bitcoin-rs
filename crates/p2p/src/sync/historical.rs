@@ -170,20 +170,21 @@ impl BlockSync {
             let Some(request) = request else {
                 continue;
             };
-            // A plan that names a body `source` already answered `notfound`
-            // for is dropped whole, exactly as the foreground path does: the
-            // lock is the scheduler's, taken after the historical lock is
-            // released, and nothing was marked, so a later pass plans the
-            // same blocks again for another peer, or for this one once the
-            // retry interval has passed.
-            if self
-                .scheduler
-                .lock()
-                .body_unavailable
-                .refuses_request(&request, now)
-            {
+            // Entries `source` already answered `notfound` for are excluded
+            // from its batch instead of dropping the batch whole, exactly as
+            // the foreground path does: the lock is the scheduler's, taken
+            // after the historical lock is released, and nothing was marked,
+            // so the surviving entries are marked below while an excluded
+            // hash stays re-plannable for another peer — or for this one once
+            // the retry interval has passed. An all-excluded plan sends
+            // nothing, leaving the cursor for the next pass.
+            let Some(request) = ({
+                let scheduler = self.scheduler.lock();
+                let owner = request.owner();
+                request.excluding(|hash| scheduler.body_unavailable.refuses(owner, hash, now))
+            }) else {
                 continue;
-            }
+            };
             let inventory = request
                 .entries()
                 .map(|(_, hash)| {

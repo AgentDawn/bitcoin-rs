@@ -10,7 +10,6 @@ use super::telemetry::metric_count;
 use crate::Message;
 use crate::connection::PeerSource;
 use crate::download_window::BlockDownloadPolicy;
-use crate::download_window::PeerRequest;
 use crate::download_window::SyncPeer;
 use crate::download_window::statically_fanout_eligible;
 use crate::download_window::{peer_can_serve_height, servable_floor, serves_requested_height};
@@ -91,15 +90,6 @@ impl UnavailableBodies {
         self.answered
             .get(&(source, hash))
             .is_some_and(|answered_at| Self::live(*answered_at, now))
-    }
-
-    /// Whether any entry of `request` names a body its owner answered
-    /// `notfound` for. One hash probe per entry.
-    pub(super) fn refuses_request(&self, request: &PeerRequest, now: Instant) -> bool {
-        !self.answered.is_empty()
-            && request
-                .entries()
-                .any(|(_, hash)| self.refuses(request.owner(), hash, now))
     }
 
     /// Forgets `source`'s answer for `hash`: it delivered the body, so the
@@ -390,12 +380,16 @@ impl BlockSync {
         }
         let servable_floor = servable_floor(&info, &policy);
         let tree = self.chain.block_tree();
-        // A plan that names a body `source` already answered `notfound` for
-        // is dropped whole: nothing was marked, so the ordinary scheduler
-        // plans the same blocks again, for the next peer this tick or for
-        // `source` once the retry interval has passed. Nothing waits on the
-        // refused peer and no message goes out, so a peer that lacks a body
-        // is never polled for it at wake-up pace.
+        // Entries `source` already answered `notfound` for are excluded from
+        // its batch instead of dropping the batch whole, so one missing body
+        // no longer blocks the bodies `source` can serve — and a missing
+        // body no longer blocks the rest of the batch from another peer that
+        // holds it. The carried frontier clamps to the lowest excluded
+        // height, so nothing excluded strands below the window cursor; the
+        // next peer this tick replans it, or `source` does once the retry
+        // interval has passed. Nothing waits on the refused peer and no
+        // message goes out for a body it lacks, so a peer is never polled
+        // for it at wake-up pace.
         let request = {
             let mut scheduler = self.scheduler.lock();
             let SchedulerState {
@@ -416,7 +410,11 @@ impl BlockSync {
                     &tree,
                     now,
                 )
-                .filter(|request| !body_unavailable.refuses_request(request, now))
+                .and_then(|request| {
+                    let owner = request.owner();
+                    let unavailable = &*body_unavailable;
+                    request.excluding(|hash| unavailable.refuses(owner, hash, now))
+                })
         };
         drop(tree);
         let Some(request) = request else {
