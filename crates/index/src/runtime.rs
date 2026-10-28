@@ -882,5 +882,4 @@ mod supervisor_tests;
 mod recovery_tests;
 
 #[cfg(all(test, feature = "fjall"))]
-#[expect(clippy::expect_used, clippy::panic)]
-mod seed_paused_tests;
+mod tests;
