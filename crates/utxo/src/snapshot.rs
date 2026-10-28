@@ -1,4 +1,4 @@
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
 
 use bitcoin_rs_primitives::{Hash256, OutPoint, Txid, varint};
 use bitcoin_rs_storage::checkpoint::CheckpointReference;
@@ -16,6 +16,9 @@ use crate::{
 const SNAPSHOT_MAGIC: u32 = 0x55_54_58_4f;
 const SNAPSHOT_WRITE_VERSION: u32 = 4;
 const MUHASH_TRAILER_LEN: usize = 384;
+/// Bounded read buffer for raw seed traversal: large enough to coalesce the
+/// decoder's per-field reads, small enough to stay flat in snapshot size.
+const SEED_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C, packed)]
@@ -830,7 +833,12 @@ impl VerifiedSnapshotArtifact {
             .byte_len()
             .checked_add(1)
             .ok_or(RawSeedError::Integrity)?;
-        let mut capped = Read::by_ref(&mut self.file).take(limit);
+        // Bounded buffering for the record, output-header, and script reads
+        // below: the decoder issues one small read per field, so millions of
+        // outputs would otherwise become millions of tiny file reads. The
+        // buffer sits under the same descriptor, length cap, and digest check.
+        let mut buffered = BufReader::with_capacity(SEED_READ_BUFFER_BYTES, &mut self.file);
+        let mut capped = buffered.by_ref().take(limit);
         let mut tee = TeeReader::new(&mut capped);
         let stream = read_raw_snapshot_stream(&mut tee, emit)?;
         let (digest, len) = tee.finish();

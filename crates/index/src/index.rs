@@ -19,10 +19,9 @@ pub use filters::BasicFilter;
 pub use prepared::{PreparedBatch, PreparedBatchLimits, PreparedBlock};
 pub use reader::Indexer;
 pub use rows::IndexRowCounts;
-#[cfg(test)]
-pub(crate) use snapshot::RowVisitor;
 pub use snapshot::{
-    IndexReader, ScriptLiveScan, TxIndexFamily, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    IndexReader, ScriptLiveScan, TxIndexFamily, TxIndexPage, TxIndexScan, TxIndexScanRow,
+    TxIndexSnapshot,
 };
 pub use state::{ConsumerCursorUpdate, IndexWriteFence};
 pub use write::IndexWriter;

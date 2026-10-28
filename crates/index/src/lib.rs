@@ -33,7 +33,7 @@ pub use index::{
     BasicFilter, ConsumerCursorUpdate, IndexCapabilities, IndexCapability, IndexError, IndexReader,
     IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriteFence, IndexWriter, Indexer,
     MAX_LIVE_SCRIPT_SIZE, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptLiveScan,
-    SpentCoinScripts, TxIndexFamily, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    SpentCoinScripts, TxIndexFamily, TxIndexPage, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
 };
 pub use query_api::{
     CompactFilterQuery, DerivedIndexInfo, DerivedIndexQuery, RollbackWarningSource,

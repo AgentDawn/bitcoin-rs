@@ -129,17 +129,23 @@ pub(crate) fn reset_interrupted_import(
     if watermarks.tx_lookup.is_some() {
         return Ok(false);
     }
-    let mut leftover = false;
-    reader
-        .snapshot()?
-        .for_each_row(TxIndexFamily::TxConfirmed, &mut |_, _| {
-            leftover = true;
-            Ok(ControlFlow::Break(()))
-        })?;
-    if leftover {
-        writer.reset_capabilities(IndexCapabilities::TX_LOOKUP)?;
+    // One bounded row decides the probe: any `TxConfirmed` row without a
+    // watermark is leftover from an interrupted import. The old
+    // whole-family visitor materialized the family on some backends just
+    // to answer this existence check.
+    let probe = reader.snapshot()?.scan_family_page(
+        TxIndexFamily::TxConfirmed,
+        None,
+        bitcoin_rs_storage::PrefixScanLimit {
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        },
+    )?;
+    if probe.rows.is_empty() {
+        return Ok(false);
     }
-    Ok(leftover)
+    writer.reset_capabilities(IndexCapabilities::TX_LOOKUP)?;
+    Ok(true)
 }
 
 fn read_manifest(path: &Path) -> Result<IndexBundleManifestV1, IndexBundleError> {

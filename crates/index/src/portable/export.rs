@@ -23,12 +23,30 @@ use super::manifest::{
 };
 use super::{BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, io_error, sync_dir};
 use crate::types::{HashPrefixRow, TxPosition, TxPositionValue};
-use crate::{IndexCapability, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexSnapshot};
+use crate::{
+    IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexScanRow,
+    TxIndexSnapshot,
+};
 use bitcoin_rs_chain::BlockBodySource;
+use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
-use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+
+/// Rows per export page. Export streams the family through bounded pages
+/// over one snapshot, so export memory stays flat in family size on every
+/// backend instead of materializing the whole family before emitting rows.
+const EXPORT_PAGE_ROWS: usize = 1_024;
+/// Cap on returned key-plus-value bytes per page after the first row.
+const EXPORT_PAGE_BYTES: usize = 1 << 20;
+
+/// Limit for one export page scan.
+fn export_page_limit() -> PrefixScanLimit {
+    PrefixScanLimit {
+        max_rows: EXPORT_PAGE_ROWS,
+        max_bytes: EXPORT_PAGE_BYTES,
+    }
+}
 
 /// Directory fsync used by a [`Publication`].
 type SyncDir = fn(&Path) -> Result<(), IndexBundleError>;
@@ -333,65 +351,124 @@ struct RowExporter<'a> {
     path: &'a Path,
 }
 
+/// One page row resolved against its block, held for stored-order emission.
+struct StagedRow {
+    height: u32,
+    /// `(txid, position)` pairs sorted by id then position.
+    located: Vec<([u8; 32], TxPosition)>,
+}
+
 impl RowExporter<'_> {
-    /// Visits every row of `snapshot` once and returns
-    /// `(records, payload bytes)`. Cancellation is polled every
-    /// [`CANCEL_POLL_RECORDS`] rows.
+    /// Streams every row of `snapshot` once, in stored-key order, and
+    /// returns `(records, payload bytes)`.
+    ///
+    /// Rows stream through bounded snapshot pages, so no family-sized copy
+    /// is made on any backend. Cancellation is polled every
+    /// [`CANCEL_POLL_RECORDS`] resolved rows.
     fn stream(
         &mut self,
         snapshot: &dyn TxIndexSnapshot,
         out: &mut impl Write,
     ) -> Result<(u64, u64), IndexBundleError> {
+        // `host` is itself a shared reference, so copying the cancellation
+        // probe out ends the borrow of `self` immediately.
+        let cancelled = self.host.cancelled;
+        let limit = export_page_limit();
+        let mut start_after: Option<Vec<u8>> = None;
         let mut visited = 0_u64;
         let mut totals = (0_u64, 0_u64);
-        let mut failure: Option<IndexBundleError> = None;
-        snapshot.for_each_row(TxIndexFamily::TxConfirmed, &mut |row, value| {
-            visited += 1;
-            if visited.is_multiple_of(CANCEL_POLL_RECORDS) && (self.host.cancelled)() {
-                failure = Some(IndexBundleError::Cancelled);
-                return Ok(ControlFlow::Break(()));
+        loop {
+            let page = snapshot.scan_family_page(
+                TxIndexFamily::TxConfirmed,
+                start_after.as_deref(),
+                limit,
+            )?;
+            let (records, bytes) = self.export_page(&page.rows, out, &mut visited, cancelled)?;
+            totals.0 += records;
+            totals.1 += bytes;
+            if page.complete {
+                return Ok(totals);
             }
-            match self.export_row(row, value, out) {
-                Ok((records, bytes)) => {
-                    totals.0 += records;
-                    totals.1 += bytes;
-                    Ok(ControlFlow::Continue(()))
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    Ok(ControlFlow::Break(()))
-                }
-            }
-        })?;
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(totals),
+            let Some(last) = page.rows.last() else {
+                // A conforming page scan always returns its first row while
+                // rows remain; without one there is no cursor to advance.
+                return Err(IndexError::from(StorageError::InvalidOperation(
+                    "export page scan returned an empty incomplete page",
+                ))
+                .into());
+            };
+            // Stored keys are fixed-width: the suffixed key is the least key
+            // strictly above the page, so the next page resumes without
+            // overlap or gap.
+            let mut next = last.row.to_db_row().to_vec();
+            next.push(0);
+            start_after = Some(next);
         }
     }
 
-    /// Writes one record per distinct transaction id filed under `row`.
-    fn export_row(
+    /// Resolves one page grouped by block, then emits records in the page's
+    /// stored order.
+    ///
+    /// Export visits rows in transaction-id order while bodies are keyed by
+    /// block, so resolving in stored order reloads and reparses one body per
+    /// row. Resolving each bounded page in height order instead keeps the
+    /// one-block parsed image resident across the page's same-block rows;
+    /// emission still follows stored order, so the artifact keeps its
+    /// strictly ascending record order.
+    fn export_page(
         &mut self,
-        row: HashPrefixRow,
-        value: &[u8],
+        rows: &[TxIndexScanRow],
+        out: &mut impl Write,
+        visited: &mut u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(u64, u64), IndexBundleError> {
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by_key(|&index| rows[index].row.height());
+        let mut staged: Vec<(usize, StagedRow)> = Vec::with_capacity(rows.len());
+        for index in order {
+            *visited += 1;
+            if visited.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
+                return Err(IndexBundleError::Cancelled);
+            }
+            let scan_row = &rows[index];
+            self.locate(scan_row.row, &scan_row.value)?;
+            staged.push((
+                index,
+                StagedRow {
+                    height: scan_row.row.height(),
+                    located: std::mem::take(&mut self.located),
+                },
+            ));
+        }
+        staged.sort_by_key(|(index, _)| *index);
+        let (mut records, mut bytes) = (0_u64, 0_u64);
+        for (_, staged) in &staged {
+            let (row_records, row_bytes) = self.emit_row(staged.height, &staged.located, out)?;
+            records += row_records;
+            bytes += row_bytes;
+        }
+        Ok((records, bytes))
+    }
+
+    /// Writes one record per distinct transaction id in `located`, which must
+    /// already be sorted by id then position.
+    fn emit_row(
+        &mut self,
+        height: u32,
+        located: &[([u8; 32], TxPosition)],
         out: &mut impl Write,
     ) -> Result<(u64, u64), IndexBundleError> {
-        self.locate(row, value)?;
-        let height = row.height();
         let (mut records, mut bytes) = (0_u64, 0_u64);
         let mut index = 0;
-        while index < self.located.len() {
-            let txid = self.located[index].0;
-            let run = self.located[index..]
+        while index < located.len() {
+            let txid = located[index].0;
+            let run = located[index..]
                 .iter()
                 .take_while(|(candidate, _)| *candidate == txid)
                 .count();
             self.positions.clear();
-            self.positions.extend(
-                self.located[index..index + run]
-                    .iter()
-                    .map(|(_, position)| *position),
-            );
+            self.positions
+                .extend(located[index..index + run].iter().map(|(_, position)| *position));
             bytes += write_record(out, &txid, height, &self.positions)
                 .map_err(|error| io_error(self.path, error))?;
             records += 1;
