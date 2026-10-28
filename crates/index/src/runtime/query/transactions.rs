@@ -5,6 +5,7 @@ use super::{
     PrefixBound, QueryBudget, ReadPrefix, Tx, TxIndexSnapshot, TxPosition, TxPositionValue,
     TxQueryError, TxUnavailableCause, Txid, deserialize,
 };
+use crate::types::positions_are_valid;
 use bitcoin_rs_primitives::BlockHash;
 
 impl DerivedIndexQueryEngine {
@@ -100,22 +101,7 @@ impl DerivedIndexQueryEngine {
     }
 
     pub(super) fn validated_positions(value: &[u8]) -> Option<&[TxPosition]> {
-        let positions = TxPositionValue::decode(value)?;
-        let mut previous: Option<TxPosition> = None;
-        for &position in positions {
-            let end = position.end()?;
-            if position.byte_len() == 0
-                || usize::try_from(end).ok()? > MAX_SERIALIZED_BLOCK_BYTES
-                || previous.is_some_and(|prior| {
-                    position.offset() <= prior.offset()
-                        || position.offset() < prior.end().unwrap_or(u32::MAX)
-                })
-            {
-                return None;
-            }
-            previous = Some(position);
-        }
-        Some(positions)
+        TxPositionValue::decode(value).filter(|positions| positions_are_valid(positions))
     }
 
     pub(super) fn resolve_positioned_transaction(
