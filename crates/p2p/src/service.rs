@@ -1065,17 +1065,19 @@ impl P2pService {
         // and its overlay startup polls this counter, so this is what lets
         // it abort instead of making this call wait out its budget.
         self.stop_requests.fetch_add(1, Ordering::AcqRel);
+        // Capture restart anchors before cancellation: `anchor_peers` skips
+        // cancelled leases, so a later capture would always be empty.
+        let demonstrated = anchor_peers(&self.peer_table, &self.address_book);
+        if !demonstrated.is_empty() {
+            self.address_book
+                .remember_anchors(&demonstrated, crate::addrman::now());
+        }
         if let Some(workers) = self.workers.lock().as_mut() {
             workers.cancel(&self.peer_table, &self.overlay_addresses);
         }
         self.worker_shutdown.lock().store(true, Ordering::Release);
         self.session_cancel.lock().store(true, Ordering::Release);
         self.overlay_addresses.lock().clear();
-        let demonstrated = anchor_peers(&self.peer_table, &self.address_book);
-        if !demonstrated.is_empty() {
-            self.address_book
-                .remember_anchors(&demonstrated, crate::addrman::now());
-        }
         self.peer_table
             .set_network_active(&self.network_active, false);
         self.address_book
@@ -4322,6 +4324,32 @@ mod tests {
         let _lease = register_ready_block_peer(&service.peer_table, addr);
         assert!(service.workers.lock().is_none());
         service.shutdown();
+        let restored =
+            crate::addrman::AddressBook::open(Some(path), Magic::REGTEST.to_bytes(), true, None);
+        assert_eq!(restored.take_restart_anchors(now), vec![addr]);
+    }
+
+    #[test]
+    fn shutdown_captures_anchors_before_cancelling_worker_leases() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("peers.dat");
+        let service = P2pService::new(
+            P2pServiceConfig {
+                address_book_path: Some(path.clone()),
+                magic: Magic::REGTEST,
+                allow_local_addresses: true,
+                ..P2pServiceConfig::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8333)).into();
+        let now = crate::addrman::now();
+        service.address_book.learn_dns("fixture", &[addr], now);
+        service.address_book.succeeded(addr, 9, now);
+        let lease = register_ready_block_peer(&service.peer_table, addr);
+        *service.workers.lock() = Some(Workers::default());
+        service.shutdown();
+        assert!(lease.is_cancelled(), "workers cancel every lease");
         let restored =
             crate::addrman::AddressBook::open(Some(path), Magic::REGTEST.to_bytes(), true, None);
         assert_eq!(restored.take_restart_anchors(now), vec![addr]);
