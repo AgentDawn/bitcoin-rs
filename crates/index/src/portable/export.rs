@@ -475,12 +475,24 @@ fn read_framed(
 /// runs merge [`SORT_MERGE_FAN_IN`] at a time until one sorted file remains;
 /// the file is rewritten in place and left at its start. Anonymous temp files
 /// back the runs, so cancelling or failing the export removes every staging
-/// byte with the file handles.
-fn external_sort(file: &mut File, key_len: usize, path: &Path) -> Result<(), IndexBundleError> {
+/// byte with the file handles. Cancellation is polled every
+/// [`CANCEL_POLL_RECORDS`] records during run generation and merging, and
+/// once per bounded copy chunk, so a large sort stops promptly instead of
+/// running to completion after shutdown.
+fn external_sort(
+    file: &mut File,
+    key_len: usize,
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), IndexBundleError> {
     let failed = move |error: io::Error| io_error(path, error);
+    if cancelled() {
+        return Err(IndexBundleError::Cancelled);
+    }
     file.seek(SeekFrom::Start(0)).map_err(failed)?;
     let mut runs: Vec<File> = Vec::new();
     let mut at_end = false;
+    let mut read = 0_u64;
     while !at_end {
         let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut chunk_bytes = 0_usize;
@@ -491,6 +503,10 @@ fn external_sort(file: &mut File, key_len: usize, path: &Path) -> Result<(), Ind
                     break;
                 }
                 Some((key, payload)) => {
+                    read = read.saturating_add(1);
+                    if read.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
+                        return Err(IndexBundleError::Cancelled);
+                    }
                     chunk_bytes = chunk_bytes
                         .saturating_add(key.len())
                         .saturating_add(8)
@@ -502,9 +518,17 @@ fn external_sort(file: &mut File, key_len: usize, path: &Path) -> Result<(), Ind
         if chunk.is_empty() {
             break;
         }
+        if cancelled() {
+            return Err(IndexBundleError::Cancelled);
+        }
         chunk.sort_by(|left, right| left.0.cmp(&right.0));
         let mut run = tempfile::tempfile().map_err(failed)?;
+        let mut written = 0_u64;
         for (key, payload) in &chunk {
+            written = written.saturating_add(1);
+            if written.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
+                return Err(IndexBundleError::Cancelled);
+            }
             write_framed(&mut run, key, payload).map_err(failed)?;
         }
         run.seek(SeekFrom::Start(0)).map_err(failed)?;
@@ -513,8 +537,11 @@ fn external_sort(file: &mut File, key_len: usize, path: &Path) -> Result<(), Ind
     while runs.len() > 1 {
         let mut merged: Vec<File> = Vec::with_capacity(runs.len().div_ceil(SORT_MERGE_FAN_IN));
         for group in runs.chunks_mut(SORT_MERGE_FAN_IN) {
+            if cancelled() {
+                return Err(IndexBundleError::Cancelled);
+            }
             let mut out = tempfile::tempfile().map_err(failed)?;
-            merge_runs(group, &mut out, key_len, path)?;
+            merge_runs(group, &mut out, key_len, path, cancelled)?;
             out.seek(SeekFrom::Start(0)).map_err(failed)?;
             merged.push(out);
         }
@@ -524,21 +551,56 @@ fn external_sort(file: &mut File, key_len: usize, path: &Path) -> Result<(), Ind
     file.set_len(0).map_err(failed)?;
     if let Some(mut run) = runs.pop() {
         run.seek(SeekFrom::Start(0)).map_err(failed)?;
-        io::copy(&mut run, &mut *file).map_err(failed)?;
+        copy_sort_run(&mut run, &mut *file, path, cancelled)?;
     }
     file.seek(SeekFrom::Start(0)).map_err(failed)?;
     Ok(())
 }
 
+/// Copies one sorted run back into `file` in bounded chunks, polling
+/// cancellation once per chunk so a large single-run copy cannot block
+/// shutdown after the record passes already polled.
+fn copy_sort_run(
+    run: &mut File,
+    file: &mut File,
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), IndexBundleError> {
+    let failed = move |error: io::Error| io_error(path, error);
+    if cancelled() {
+        return Err(IndexBundleError::Cancelled);
+    }
+    let mut buf = [0_u8; IO_BUFFER_BYTES];
+    loop {
+        let n = run.read(&mut buf).map_err(failed)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(failed)?;
+        if cancelled() {
+            return Err(IndexBundleError::Cancelled);
+        }
+    }
+    Ok(())
+}
+
 /// Merges one group of sorted runs into `out`, holding one head entry and
 /// one open file per run.
+///
+/// Cancellation is polled every [`CANCEL_POLL_RECORDS`] merged records, so a
+/// large merge stops promptly instead of running to completion after
+/// shutdown.
 fn merge_runs(
     runs: &mut [File],
     out: &mut File,
     key_len: usize,
     path: &Path,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), IndexBundleError> {
     let failed = move |error: io::Error| io_error(path, error);
+    if cancelled() {
+        return Err(IndexBundleError::Cancelled);
+    }
     let mut readers: Vec<BufReader<&mut File>> = runs.iter_mut().map(BufReader::new).collect();
     let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> = Vec::with_capacity(readers.len());
     for reader in readers.iter_mut() {
@@ -550,6 +612,7 @@ fn merge_runs(
             heap.push(Reverse((key.clone(), index)));
         }
     }
+    let mut merged = 0_u64;
     while let Some(Reverse((key, index))) = heap.pop() {
         let Some((_, payload)) = heads[index].take() else {
             return Err(IndexError::from(StorageError::InvalidOperation(
@@ -558,6 +621,10 @@ fn merge_runs(
             .into());
         };
         write_framed(out, &key, &payload).map_err(failed)?;
+        merged = merged.saturating_add(1);
+        if merged.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
+            return Err(IndexBundleError::Cancelled);
+        }
         if let Some(next) = read_framed(&mut readers[index], key_len).map_err(failed)? {
             heap.push(Reverse((next.0.clone(), index)));
             heads[index] = Some(next);
@@ -648,9 +715,10 @@ impl RowExporter<'_> {
     /// runs, and only one row is resolved or emitted at a time, so export
     /// memory stays flat in family size on every backend. Cancellation is
     /// polled every [`CANCEL_POLL_RECORDS`] scanned, resolved, or emitted
-    /// rows. The writer's end-to-end fence, checked after the stream, covers
-    /// the whole external pass: any watermark movement aborts and removes
-    /// the output.
+    /// rows, and on the same interval through both sorts (run generation,
+    /// merging, and the final copy). The writer's end-to-end fence, checked
+    /// after the stream, covers the whole external pass: any watermark
+    /// movement aborts and removes the output.
     fn stream(
         &mut self,
         base: IndexWatermark,
@@ -663,10 +731,37 @@ impl RowExporter<'_> {
         if rows == 0 {
             return Ok((0, 0));
         }
-        external_sort(&mut staged, STAGED_SORT_KEY_LEN, self.path)?;
+        external_sort(&mut staged, STAGED_SORT_KEY_LEN, self.path, cancelled)?;
         let mut resolved = self.resolve(&mut staged, rows, cancelled)?;
-        external_sort(&mut resolved, RESOLVED_SORT_KEY_LEN, self.path)?;
+        external_sort(
+            &mut resolved,
+            RESOLVED_SORT_KEY_LEN,
+            self.path,
+            cancelled,
+        )?;
         self.emit(&mut resolved, rows, out, cancelled)
+    }
+
+    /// Validates one stored row value and charges its positions against the
+    /// running total, returning the new total. Invalid rows fail here with
+    /// `SourceRow` before any staging write, matching the later resolve
+    /// check. Totals past the shared restore bound fail with
+    /// `ExportTooLarge` before the row is written or sorted, so an
+    /// unimportable family never pays staging or sort I/O.
+    fn charge_row(value: &[u8], height: u32, total: u64) -> Result<u64, IndexBundleError> {
+        let positions = TxPositionValue::decode(value)
+            .filter(|found| positions_are_valid(found))
+            .ok_or_else(|| IndexBundleError::SourceRow {
+                height,
+                reason: "row carries no valid position list",
+            })?;
+        let total = total.saturating_add(u64::try_from(positions.len()).unwrap_or(u64::MAX));
+        if total > u64::try_from(MAX_RESTORE_POSITIONS).unwrap_or(u64::MAX) {
+            return Err(IndexBundleError::ExportTooLarge {
+                limit_positions: MAX_RESTORE_POSITIONS,
+            });
+        }
+        Ok(total)
     }
 
     /// Streams every stored row once, in stored-key order, into an anonymous
@@ -676,7 +771,11 @@ impl RowExporter<'_> {
     /// `base` at `self.floor`; the snapshot is dropped before the next page,
     /// so a long export never pins one key-value snapshot across the whole
     /// family. No body I/O happens here: bodies are read once the staging
-    /// file is sorted by height. Cancellation is polled every
+    /// file is sorted by height. Positions are decoded, validated, and
+    /// counted against the shared restore bound before staging: over-limit
+    /// families fail with `ExportTooLarge` before any write or sort, while
+    /// corrupt rows fail with `SourceRow`. The later resolve and emit checks
+    /// remain as defense. Cancellation is polled every
     /// [`CANCEL_POLL_RECORDS`] scanned rows. Returns the staging file, left
     /// at its start, and the stored-order row count.
     fn enumerate(
@@ -691,6 +790,7 @@ impl RowExporter<'_> {
         let mut staged = tempfile::tempfile().map_err(failed)?;
         let mut seq = 0_u64;
         let mut scanned = 0_u64;
+        let mut positions_total = 0_u64;
         loop {
             let page = {
                 let snapshot = self.host.reader.snapshot()?;
@@ -711,6 +811,7 @@ impl RowExporter<'_> {
                 if scanned.is_multiple_of(CANCEL_POLL_RECORDS) && cancelled() {
                     return Err(IndexBundleError::Cancelled);
                 }
+                positions_total = Self::charge_row(&row.value, row.row.height(), positions_total)?;
                 let key = row.row.to_db_row();
                 let mut sort_key = [0_u8; STAGED_SORT_KEY_LEN];
                 sort_key[..4].copy_from_slice(&row.row.height().to_be_bytes());
@@ -1132,6 +1233,64 @@ mod tests {
             fake.pages.load(Ordering::SeqCst) > 1,
             "cancellation fired after several small pages"
         );
+    }
+
+    /// A cancelled sort aborts instead of running to completion: without
+    /// the run-generation, merge, and copy polls this large file would sort
+    /// fully and return `Ok`, blocking shutdown.
+    #[test]
+    fn external_sort_aborts_when_cancelled() -> TestResult {
+        let mut file = tempfile::tempfile()?;
+        let records = 10_000_u64;
+        for i in 0..records {
+            let key = (records - i).to_be_bytes();
+            write_framed(&mut file, &key, b"payload")?;
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let path = Path::new("cancel-sort");
+        let polls = AtomicUsize::new(0);
+        let cancelled = || polls.fetch_add(1, Ordering::SeqCst) >= 3;
+        let result = external_sort(&mut file, 8, path, &cancelled);
+        assert!(
+            matches!(result, Err(IndexBundleError::Cancelled)),
+            "a cancelled sort must abort instead of running to completion"
+        );
+        Ok(())
+    }
+
+    /// Enumeration charges positions before staging: over-limit totals fail
+    /// with `ExportTooLarge` before any write or sort, while corrupt values
+    /// fail with `SourceRow` exactly as the later resolve check would.
+    #[test]
+    fn enumeration_charges_positions_before_staging() -> TestResult {
+        let valid = TxPositionValue::encode(&[TxPosition::new(0, 1), TxPosition::new(1, 1)]);
+        let ceiling = u64::try_from(MAX_RESTORE_POSITIONS).unwrap_or(u64::MAX);
+        let almost_full = ceiling.saturating_sub(1);
+        assert!(
+            matches!(
+                RowExporter::charge_row(&valid, 7, almost_full),
+                Err(IndexBundleError::ExportTooLarge { .. })
+            ),
+            "over-limit positions must fail before staging"
+        );
+        let charged = RowExporter::charge_row(&valid, 7, 0)?;
+        assert_eq!(charged, 2, "valid positions charge their exact count");
+        assert!(
+            matches!(
+                RowExporter::charge_row(&[], 7, 0),
+                Err(IndexBundleError::SourceRow { .. })
+            ),
+            "empty values must fail validation before staging"
+        );
+        let zero_len = TxPositionValue::encode(&[TxPosition::new(0, 0)]);
+        assert!(
+            matches!(
+                RowExporter::charge_row(&zero_len, 7, 0),
+                Err(IndexBundleError::SourceRow { .. })
+            ),
+            "zero-length positions must fail validation before staging"
+        );
+        Ok(())
     }
 
     /// An empty family completes with no rows and no error.
