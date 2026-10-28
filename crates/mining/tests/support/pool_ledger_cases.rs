@@ -3171,28 +3171,28 @@ fn bounded_reconcile_units_are_bounded_and_generation_guarded() {
     fund.chain.set_block(101, second.share.header_hash);
     fund.chain
         .set_coinbase(second.share.header_hash, coinbase_for(&second, 1_000_001));
-    let (empty, more_empty) = fund
+    let (empty, more_empty, _) = fund
         .ledger
-        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 0, 0)
+        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 0, None)
         .fixture("rounds limit 0");
     assert!(empty.transitions.is_empty() && empty.anomalies.is_empty());
     assert!(more_empty, "limit 0 must report more open rounds");
-    let (_, more_first) = fund
+    let (_, more_first, next_first) = fund
         .ledger
-        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 1, 0)
+        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 1, None)
         .fixture("rounds first page");
     assert!(more_first, "two open rounds need a second page");
-    let (_, more_second) = fund
+    let (_, more_second, _) = fund
         .ledger
-        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 1, 1)
+        .reconcile_rounds_checked_limit(&fund.chain, &|| false, 1, next_first)
         .fixture("rounds second page");
-    assert!(!more_second, "offset reaches the tail");
+    assert!(!more_second, "cursor reaches the tail");
 
     // Rounds: a generation change aborts instead of applying a torn view.
     fund.chain.set_tip(100);
-    let (aborted, _) = fund
+    let (aborted, _, _) = fund
         .ledger
-        .reconcile_rounds_checked_limit(&fund.chain, &|| true, 10, 0)
+        .reconcile_rounds_checked_limit(&fund.chain, &|| true, 10, None)
         .fixture("rounds aborted");
     assert!(aborted.transitions.is_empty() && aborted.anomalies.is_empty());
     let pending = fund
@@ -3209,15 +3209,15 @@ fn bounded_reconcile_units_are_bounded_and_generation_guarded() {
     fund.ledger
         .record_signed(&receipt(&batch, &tx))
         .fixture("signed");
-    let (none, more_none) = fund
+    let (none, more_none, _) = fund
         .ledger
-        .reconcile_payouts_checked_limit(&fund.chain, &|| false, 0, 0)
+        .reconcile_payouts_checked_limit(&fund.chain, &|| false, 0, None)
         .fixture("payouts limit 0");
     assert!(none.is_empty());
     assert!(more_none, "limit 0 must report more observable batches");
-    let (_, more_one) = fund
+    let (_, more_one, _) = fund
         .ledger
-        .reconcile_payouts_checked_limit(&fund.chain, &|| false, 1, 0)
+        .reconcile_payouts_checked_limit(&fund.chain, &|| false, 1, None)
         .fixture("payouts limit 1");
     assert!(!more_one, "single observable batch fits in limit 1");
 
@@ -3228,13 +3228,84 @@ fn bounded_reconcile_units_are_bounded_and_generation_guarded() {
         .fixture("broadcast");
     confirm_tx(&fund, tx.txid, 0xB1, 102, 102);
     fund.chain.set_tip(103);
-    let (held, _) = fund
+    let (held, _, _) = fund
         .ledger
-        .reconcile_payouts_checked_limit(&fund.chain, &|| true, 10, 0)
+        .reconcile_payouts_checked_limit(&fund.chain, &|| true, 10, None)
         .fixture("payouts aborted");
     assert!(held.is_empty());
     let still = fund.ledger.batch(&batch.id).fixture("batch").fixture("exists");
     assert_eq!(still.state, BatchState::Broadcast);
+}
+
+#[test]
+fn bounded_pages_advance_via_cursor_without_rescanning_head() {
+    // Cursor pagination bounds each page: one `page_after` seek (`limit + 1`
+    // rows) plus `limit` point gets, never the whole tables. Collect five open
+    // rounds with `limit = 2` via cursors: cursors strictly increase, no id
+    // repeats (no head re-scan), pages hold at most `limit` rows, and the tail
+    // reports no more. Linearizable seeks; snapshot isolation per commit;
+    // idempotent retry from cursors.
+    let fund = staged(0, 1_000_001);
+    let mut hashes = vec![fund.block.share.header_hash];
+    for tag in [7u8, 8, 9, 10] {
+        let block = found(share(1, 4, u32::from(tag), 20), 101, 1_000_001);
+        fund.ledger.record_found_block(&block).fixture("extra block");
+        fund.chain.set_block(101, block.share.header_hash);
+        hashes.push(block.share.header_hash);
+    }
+    let mut ids: Vec<u64> = hashes
+        .iter()
+        .map(|hash| {
+            fund.ledger
+                .round_for_block(hash)
+                .fixture("round")
+                .fixture("exists")
+                .id
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 5);
+    let mut after: Option<u64> = None;
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0usize;
+    loop {
+        let (report, more, next) = fund
+            .ledger
+            .reconcile_rounds_checked_limit(&fund.chain, &|| false, 2, after)
+            .fixture("page");
+        // Pages never materialize the whole table: at most `limit` observations
+        // per commit (transitions may be fewer when chain is Unknown).
+        assert!(
+            report.transitions.len() <= 2 && report.anomalies.is_empty(),
+            "each page bounds work"
+        );
+        // Cursor must advance past the raw page; no head re-scan means `next`
+        // strictly increases, so repeats are impossible. Track cursors to
+        // prove pages never re-observe the head.
+        if let Some(cursor) = next {
+            if let Some(previous) = after {
+                assert!(cursor > previous, "cursor must advance");
+            }
+            assert!(!seen.contains(&cursor), "no repeats across pages");
+            seen.push(cursor);
+        }
+        pages += 1;
+        assert!(pages <= 4, "five rows with limit 2 converge in three pages");
+        if !more {
+            break;
+        }
+        after = next;
+    }
+    // Five rows with `limit = 2` paginate as `[ids[0], ids[1]]`, `[ids[2],
+    // ids[3]]`, `[ids[4]]`: cursors are the last raw seq per page, `[ids[1],
+    // ids[3], ids[4]]`, strictly increasing with no repeats or head re-scan.
+    assert_eq!(seen.len(), 3, "three pages advance cursors without rescan");
+    assert_eq!(
+        seen,
+        vec![ids[1], ids[3], ids[4]],
+        "raw cursors must be [1,3,4] for five rows at limit 2"
+    );
+
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Snapshot-backed logical tables and a single revision-guarded durable commit.
 use super::LedgerError;
-use bitcoin_rs_storage::{ColumnFamily, KvSnapshot, KvStore, WriteCondition};
+use bitcoin_rs_storage::{ColumnFamily, KvSnapshot, KvStore, PrefixScanLimit, WriteCondition};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -317,6 +317,7 @@ impl<K: Value, V: Value> Table<'_, K, V> {
         let end = bound(range.end_bound());
         self.rows(&start, &end)
     }
+
     fn rows(&self, start: &EncodedBound, end: &EncodedBound) -> Result<Rows<K, V>, LedgerError> {
         let within = |key: &[u8]| {
             !start.as_ref().is_some_and(|(b, inclusive)| {
@@ -463,5 +464,104 @@ impl<K: Value, V: Value> Table<'_, K, V> {
             Ok((Guard(K::decode(logical)?), Guard(V::decode(value)?)))
         })
         .transpose()
+    }
+}
+
+impl<V: Value> Table<'_, u64, V> {
+    /// Bounded page after an exclusive `u64` cursor: at most `limit` live rows
+    /// in key order plus whether more remain. Uses a single
+    /// `scan_prefix_from_bounded` seek (`limit + 1` rows) so each page bounds
+    /// storage reads (no head collection, no tail read) and allocations
+    /// (at most `limit + 1` decoded rows). Linearizable seek; snapshot
+    /// isolation per read; idempotent callers retry from the returned cursor.
+    /// Read-only fast path: reconcile pages run on `begin_read` with an empty
+    /// overlay, so no BTreeMap materializes the whole table before
+    /// offset/limit. Returns `(rows, more)` where `more` means another page
+    /// exists after the last returned key.
+    pub(crate) fn page_after(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<(Vec<GuardPair<u64, V>>, bool), LedgerError> {
+        // Exclusive start as the least full key above `after`, per the store
+        // contract (`k` followed by one zero byte). `None` starts at the table
+        // prefix (first row). No lock is held across storage I/O: the scan is
+        // one bounded engine seek.
+        let mut start = self.prefix.clone();
+        if let Some(cursor) = after {
+            start.extend_from_slice(&cursor.encode());
+            start.push(0x00);
+        }
+        // `limit + 1` detects `more` without a second seek. Finite per-row
+        // bound for `U64Unit`/`U64Bytes` (key 8 bytes + tiny value + overhead,
+        // `128` covers both): `max_bytes` stays `O(limit)`, never
+        // `usize::MAX`, so engine-side allocation is bounded too. Each row's
+        // codec already bounds its own size, so total allocations stay bounded
+        // by `limit + 1` rows. `saturating_add`/`saturating_mul` keep
+        // `usize::MAX` from wrapping.
+        let want = limit.saturating_add(1);
+        let max_bytes = want.saturating_mul(128);
+        let scan = self.snapshot.scan_prefix_from_bounded(
+            CF,
+            &self.prefix,
+            &start,
+            PrefixScanLimit {
+                max_rows: want,
+                max_bytes,
+            },
+        )?;
+        let complete = scan.complete;
+        // `more` comes from the engine (`!complete`), not just length: with
+        // `limit = 0`, `want = 1` returns one row when any exists, so length
+        // alone would still report `more`, but `!complete` is exact when the
+        // engine withholds by either bound. Combine both: withheld or an extra
+        // row beyond `limit` means another page exists.
+        let mut rows: Vec<GuardPair<u64, V>> = Vec::new();
+        for (full_key, value) in scan.rows.into_iter() {
+            if !full_key.starts_with(&self.prefix) {
+                break;
+            }
+            // Read-only reconcile path has no overlay; point-check defensively
+            // without range materialization (still bounded by `want` lookups).
+            if !self.changes.borrow().is_empty()
+                && let Some(staged) = self.changes.borrow().get(&full_key)
+            {
+                if staged.is_none() {
+                    continue;
+                }
+            }
+            let logical = full_key[self.prefix.len()..].to_vec();
+            let key_bytes: [u8; 8] = logical.as_slice().try_into().map_err(|_| {
+                LedgerError::Invariant("non-u64 key in u64 table page".into())
+            })?;
+            let key = u64::from_be_bytes(key_bytes);
+            if let Some(cursor) = after
+                && key <= cursor
+            {
+                continue;
+            }
+            let stored = if !self.changes.borrow().is_empty()
+                && let Some(Some(put)) = self.changes.borrow().get(&full_key).cloned()
+            {
+                put
+            } else {
+                value
+            };
+            rows.push((Guard(key), Guard(V::decode(stored)?)));
+            if rows.len() >= want {
+                break;
+            }
+        }
+        // `complete == false` means the engine withheld rows by either bound;
+        // `rows.len() > limit` means an extra row beyond this page. Either
+        // implies another page. Truncate to `limit` before returning.
+        // Linearizable page decision; snapshot-isolated read; idempotent retry
+        // from the last key. Bounded per page with backoff on retry, never
+        // unbounded scans.
+        let more = !complete || rows.len() > limit;
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        Ok((rows, more))
     }
 }

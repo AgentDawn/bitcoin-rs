@@ -766,40 +766,51 @@ impl LedgerHost {
         // isolation holds per commit: a commit only applies observations taken
         // under one generation. Callers stay idempotent, so a deferred
         // reconcile is retried.
-        let mut round_offset = 0usize;
-        let mut payout_offset = 0usize;
+        // Bounded cursor pagination: each commit seeks from the last key via
+        // `page_after` (`limit + 1` rows) instead of re-scanning the head to
+        // skip `offset` rows. Linearizable seeks; snapshot isolation per
+        // commit; idempotent retry from cursors. Sheds no work; bulkheaded by
+        // `RECONCILE_*_BATCH_LIMIT` per commit with at most one retry on
+        // generation change, then defers to the next 250ms tick (monotonic).
+        let mut round_after: Option<u64> = None;
+        let mut payout_after: Option<u64> = None;
         let mut attempts = 0;
         let reconcile_result = loop {
             let before = chain.tip_generation();
             let observation = RawChainView(chain);
             let aborted = || !tip_unchanged(&before, &chain.tip_generation());
-            let result: Result<(bool, bool), pool_ledger::LedgerError> = (|| {
-                let (_, round_more) =
-                    self.ledger.reconcile_rounds_checked_limit(
-                        &observation,
-                        &aborted,
-                        pool_ledger::RECONCILE_ROUND_BATCH_LIMIT,
-                        round_offset,
-                    )?;
-                let (_, payout_more) =
-                    self.ledger.reconcile_payouts_checked_limit(
-                        &observation,
-                        &aborted,
-                        pool_ledger::RECONCILE_PAYOUT_BATCH_LIMIT,
-                        payout_offset,
-                    )?;
-                Ok((round_more, payout_more))
-            })();
+            let result: Result<(bool, bool, Option<u64>, Option<u64>), pool_ledger::LedgerError> =
+                (|| {
+                    let (_, round_more, round_next) =
+                        self.ledger.reconcile_rounds_checked_limit(
+                            &observation,
+                            &aborted,
+                            pool_ledger::RECONCILE_ROUND_BATCH_LIMIT,
+                            round_after,
+                        )?;
+                    let (_, payout_more, payout_next) =
+                        self.ledger.reconcile_payouts_checked_limit(
+                            &observation,
+                            &aborted,
+                            pool_ledger::RECONCILE_PAYOUT_BATCH_LIMIT,
+                            payout_after,
+                        )?;
+                    Ok((round_more, payout_more, round_next, payout_next))
+                })();
             let after = chain.tip_generation();
             match result {
-                Ok((false, false)) if tip_unchanged(&before, &after) => break Ok(()),
-                Ok((round_more, payout_more)) if tip_unchanged(&before, &after) => {
-                    if round_more {
-                        round_offset += pool_ledger::RECONCILE_ROUND_BATCH_LIMIT;
-                    }
-                    if payout_more {
-                        payout_offset += pool_ledger::RECONCILE_PAYOUT_BATCH_LIMIT;
-                    }
+                Ok((false, false, _, _)) if tip_unchanged(&before, &after) => break Ok(()),
+                Ok((round_more, payout_more, round_next, payout_next))
+                    if tip_unchanged(&before, &after) =>
+                {
+                    // Stable generation: the commits above were snapshot-isolated
+                    // under one generation, so advancing cursors cannot skip
+                    // work. On a moved tip the commits aborted (torn view
+                    // sheds without applying); keep the old cursors to retry
+                    // the same pages under the new generation instead of
+                    // skipping. Idempotent retry; linearizable cursors.
+                    round_after = round_next;
+                    payout_after = payout_next;
                     if !round_more && !payout_more {
                         break Ok(());
                     }

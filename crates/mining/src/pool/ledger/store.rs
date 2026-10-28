@@ -854,33 +854,37 @@ impl Ledger {
         chain: &dyn ChainView,
         abort: &dyn Fn() -> bool,
         limit: usize,
-        offset: usize,
-    ) -> Result<(RoundReconcileReport, bool), LedgerError> {
-        let (open, more) = {
+        after: Option<u64>,
+    ) -> Result<(RoundReconcileReport, bool, Option<u64>), LedgerError> {
+        // Bounded snapshot page with a key cursor: one `page_after` seek
+        // (`limit + 1` rows) plus `limit` point gets, never the whole
+        // open-rounds and rounds tables before offset/limit. Linearizable
+        // seek; snapshot isolation per commit; idempotent retry from `after`.
+        // Sheds no work; each commit observes at most `limit` rounds so chain
+        // stalls cannot wedge on history.
+        let (open, more, next) = {
             let read = self.db.begin_read()?;
             let open_tbl = read.open_table(OPEN_ROUNDS)?;
             let rounds_tbl = read.open_table(ROUNDS)?;
+            let (page, more) = open_tbl.page_after(after, limit)?;
             let mut list = Vec::new();
-            let mut more = false;
-            let mut skipped = 0usize;
-            for item in open_tbl.rows_iter()? {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
-                if list.len() >= limit {
-                    more = true;
-                    break;
-                }
-                let (key, _) = item?;
-                if let Some(round) = load_round(&rounds_tbl, key.value())? {
+            let mut last: Option<u64> = after;
+            for (seq_guard, _) in &page {
+                let seq = seq_guard.value();
+                last = Some(seq);
+                if let Some(round) = load_round(&rounds_tbl, seq)? {
                     list.push(round);
                 }
             }
-            (list, more)
+            // `next` advances past the raw page even when filtering drops rows
+            // (no filter here, but keep the cursor contract for callers).
+            // `limit == 0` with data returns `(empty, true, after)`: no advance,
+            // more remains.
+            let next = if page.is_empty() { after } else { last };
+            (list, more, next)
         };
         if open.is_empty() {
-            return Ok((RoundReconcileReport::default(), more));
+            return Ok((RoundReconcileReport::default(), more, next));
         }
         let mut report = RoundReconcileReport::default();
         let tip = chain.tip_height()?;
@@ -909,7 +913,7 @@ impl Ledger {
         }
         let txn = self.db.begin_write()?;
         if abort() {
-            return Ok((RoundReconcileReport::default(), more));
+            return Ok((RoundReconcileReport::default(), more, next));
         }
         let mut dirty = false;
         {
@@ -931,7 +935,7 @@ impl Ledger {
         if dirty {
             self.commit(txn, OP_RECONCILE_ROUNDS)?;
         }
-        Ok((report, more))
+        Ok((report, more, next))
     }
 
     fn open_round_list(&self) -> Result<Vec<Round>, LedgerError> {
@@ -1549,25 +1553,27 @@ impl Ledger {
         chain: &dyn ChainView,
         abort: &dyn Fn() -> bool,
         limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<BatchTransition>, bool), LedgerError> {
-        let (observable, more) = {
+        after: Option<u64>,
+    ) -> Result<(Vec<BatchTransition>, bool, Option<u64>), LedgerError> {
+        // Bounded snapshot page with a key cursor over raw `ACTIVE_BATCHES`
+        // seqs: one `page_after` seek (`limit + 1` rows) plus `limit` point
+        // gets, never the whole active-batch and round tables before
+        // offset/limit. Raw pagination bounds storage reads and allocations
+        // per page; observable filtering happens after the bounded load, and
+        // the cursor advances past raw keys (including filtered-out
+        // non-observable batches) so pages never re-scan the head.
+        // Linearizable seek; snapshot isolation per commit; idempotent retry
+        // from `after`. Each commit observes at most `limit` batches.
+        let (observable, more, next) = {
             let read = self.db.begin_read()?;
             let active_tbl = read.open_table(ACTIVE_BATCHES)?;
             let batches_tbl = read.open_table(BATCHES)?;
+            let (page, more) = active_tbl.page_after(after, limit)?;
             let mut list = Vec::new();
-            let mut more = false;
-            let mut skipped = 0usize;
-            for item in active_tbl.rows_iter()? {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
-                if list.len() >= limit {
-                    more = true;
-                    break;
-                }
-                let (_, value) = item?;
+            let mut last: Option<u64> = after;
+            for (seq_guard, value) in &page {
+                let seq = seq_guard.value();
+                last = Some(seq);
                 let id = hash_from(value.value())?;
                 let Some(batch) = load_batch(&batches_tbl, &id)? else {
                     continue;
@@ -1576,11 +1582,34 @@ impl Ledger {
                     continue;
                 }
                 list.push(batch);
+                if list.len() >= limit {
+                    // Observable cap reached, but `more`/`next` still track raw
+                    // pagination: further raw rows in this page are left for
+                    // the next cursor (which is the last raw seq, not just
+                    // observable). Break to bound per-commit work.
+                    break;
+                }
             }
-            (list, more)
+            // Advance past the raw page even when filtering drops rows;
+            // `limit == 0` with data returns `(empty, true, after)`.
+            // Note: when `list` hits `limit` early, `last` may point beyond
+            // the last observable (skipping raw rows in this page). To avoid
+            // skipping those raw rows, use the last observable seq as cursor
+            // when capped, else the last raw seq.
+            let next = if page.is_empty() {
+                after
+            } else if list.len() >= limit {
+                list.last().map(|batch: &PayoutBatch| batch.seq)
+            } else {
+                last
+            };
+            // `more` from raw pagination may be true while observable `list`
+            // is empty (all filtered): still advance via `next`, converge on
+            // the tail instead of re-scanning the head.
+            (list, more, next)
         };
         if observable.is_empty() {
-            return Ok((Vec::new(), more));
+            return Ok((Vec::new(), more, next));
         }
         let mut observations = Vec::with_capacity(observable.len());
         let mut tip: Option<u32> = None;
@@ -1596,12 +1625,12 @@ impl Ledger {
         }
         let mut transitions = Vec::new();
         if observations.is_empty() {
-            return Ok((transitions, more));
+            return Ok((transitions, more, next));
         }
         let tip = tip.unwrap_or(0);
         let txn = self.db.begin_write()?;
         if abort() {
-            return Ok((Vec::new(), more));
+            return Ok((Vec::new(), more, next));
         }
         let mut dirty = false;
         {
@@ -1633,7 +1662,7 @@ impl Ledger {
         if dirty {
             self.commit(txn, OP_RECONCILE_PAYOUTS)?;
         }
-        Ok((transitions, more))
+        Ok((transitions, more, next))
     }
 
     // -----------------------------------------------------------------------------------------
