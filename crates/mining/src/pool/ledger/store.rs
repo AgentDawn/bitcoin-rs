@@ -22,11 +22,12 @@ use super::codec::{Dec, Enc};
 use super::{
     AuditKind, AuditRecord, Balance, BatchState, BatchTransition, BlockFound, BlockRecorded,
     CancelBasis, ChainView, Closure, Confirmation, ExternalSigner, Hash32, LedgerError,
-    MAX_BATCH_OUTPUTS, MAX_MONEY_SAT, MAX_SCRIPT_LEN, MAX_SHARE_TUPLE_LEN, MinerId,
-    ObservedCoinbase, OutPoint, PayoutBatch, PayoutOutput, PayoutPolicy, PayoutReceipt,
-    PayoutRequest, PoolConfig, ReceiptError, Round, RoundState, RoundTransition, ShareCredit,
-    ShareReceipt, SignedTx, TxStatus, WindowAccumulator, compute_batch_id, parse_transaction,
-    split_pool_fee, split_reward, verify_payout_transaction,
+    MAX_BATCH_OUTPUTS, MAX_MONEY_SAT, MAX_PAYOUT_OUTPUT_WEIGHT_WU, MAX_SCRIPT_LEN,
+    MAX_SHARE_TUPLE_LEN, MinerId, ObservedCoinbase, OutPoint, PayoutBatch, PayoutOutput,
+    PayoutPolicy, PayoutReceipt, PayoutRequest, PoolConfig, ReceiptError, Round, RoundState,
+    RoundTransition, ShareCredit, ShareReceipt, SignedTx, TxStatus, WindowAccumulator,
+    compute_batch_id, parse_transaction, payout_output_weight_wu, split_pool_fee, split_reward,
+    verify_payout_transaction,
 };
 
 /// Most signed transactions (RBF replacements) recorded for one batch.
@@ -1088,6 +1089,7 @@ impl Ledger {
                 return Ok(Some(batch));
             }
             let mut picks: Vec<PayoutOutput> = Vec::new();
+            let mut picks_weight_wu: u64 = 0;
             for item in tables.balances.rows_iter()? {
                 let (key, value) = item?;
                 let balance = decode_balance(value.value())?;
@@ -1099,6 +1101,16 @@ impl Ledger {
                     Some(guard) => guard.value().to_vec(),
                     None => continue,
                 };
+                // Serialized-output weight budget with funding headroom: the
+                // count cap alone admits 2,500 P2TR/P2WSH outputs (~430,000 WU)
+                // before funding inputs and signatures, exceeding the 400,000-WU
+                // standard limit. Stop before exceeding the budget so any signed
+                // funding of the reserved outputs stays standard.
+                let weight = payout_output_weight_wu(script.len());
+                if picks_weight_wu.saturating_add(weight) > MAX_PAYOUT_OUTPUT_WEIGHT_WU {
+                    break;
+                }
+                picks_weight_wu = picks_weight_wu.saturating_add(weight);
                 picks.push(PayoutOutput {
                     account,
                     script_pubkey: script,

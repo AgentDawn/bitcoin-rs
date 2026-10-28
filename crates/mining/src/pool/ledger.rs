@@ -46,6 +46,14 @@ pub const MAX_SCRIPT_LEN: usize = 10_000;
 pub const MAX_RAW_TX_BYTES: usize = 4_000_000;
 /// Largest number of outputs in one payout batch.
 pub const MAX_BATCH_OUTPUTS: usize = 2_500;
+/// Maximum weight of a standard transaction (400 000 weight units).
+pub const MAX_STANDARD_TX_WEIGHT_WU: u64 = 400_000;
+/// Weight reserved for funding inputs, witness, transaction overhead and one
+/// change output, so a batch of outputs alone can still be funded standardly.
+pub const PAYOUT_TX_HEADROOM_WU: u64 = 10_000;
+/// Largest aggregate serialized-output weight a payout batch may reserve:
+/// `MAX_STANDARD_TX_WEIGHT_WU - PAYOUT_TX_HEADROOM_WU`.
+pub const MAX_PAYOUT_OUTPUT_WEIGHT_WU: u64 = MAX_STANDARD_TX_WEIGHT_WU - PAYOUT_TX_HEADROOM_WU;
 /// Number of non-batch (change) outputs a signed payout transaction may carry.
 pub const MAX_CHANGE_OUTPUTS: usize = 1;
 /// Largest number of allowed change scripts in a pool configuration.
@@ -910,6 +918,26 @@ pub struct PayoutRequest {
     pub total_sat: u64,
     /// Scripts the signer may use for a single change output.
     pub allowed_change_scripts: Vec<Vec<u8>>,
+}
+
+/// Serialized weight of one payout output: `(8 + varint(script_len) + script_len) * 4`.
+#[must_use]
+pub fn payout_output_weight_wu(script_len: usize) -> u64 {
+    let prefix = if script_len <= 0xfc {
+        1u64
+    } else if script_len <= 0xffff {
+        3u64
+    } else if script_len <= 0xffff_ffff {
+        5u64
+    } else {
+        9u64
+    };
+    let len = u64::try_from(script_len).unwrap_or(u64::MAX);
+    let serialized = prefix
+        .checked_add(len)
+        .and_then(|sum| sum.checked_add(8))
+        .unwrap_or(u64::MAX);
+    serialized.checked_mul(4).unwrap_or(u64::MAX)
 }
 
 fn check_outputs(outputs: &[PayoutOutput]) -> Result<u64, LedgerError> {

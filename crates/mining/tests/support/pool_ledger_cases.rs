@@ -3407,3 +3407,115 @@ fn confirmed_payout_with_shallow_depth_reverts_and_restores_reservation() {
     assert_eq!(reserved_total, total, "revert must restore the reservation");
     fund.ledger.check_invariants().fixture("conservation");
 }
+#[test]
+fn prepare_caps_outputs_by_serialized_weight_before_count() {
+    // The count cap alone admits 2,500 P2TR/P2WSH outputs (~430,000 WU) before
+    // funding inputs and signatures, exceeding the 400,000-WU standard limit.
+    // The serialized-output weight budget (with funding headroom) must truncate
+    // the batch first.
+    assert_eq!(
+        payout_output_weight_wu(34),
+        172,
+        "a P2TR/P2WSH output weighs 43 bytes * 4"
+    );
+    assert!(
+        2_500u64.saturating_mul(172) > MAX_PAYOUT_OUTPUT_WEIGHT_WU,
+        "the count cap alone would exceed the output weight budget"
+    );
+    let dir = tempfile::tempdir().fixture("tempdir");
+    let path = ledger_path(&dir);
+    let mut cfg = config(1_000_000, 0);
+    cfg.payout_confirmations = 2;
+    cfg.abandon_confirmations = 2;
+    cfg.reorg_watch_depth = 10;
+    let ledger = create(&path, cfg).fixture("create");
+    const ACCOUNTS: u64 = 2_400;
+    for account in 1..=ACCOUNTS {
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&1u64.to_be_bytes());
+        seed.extend_from_slice(&account.to_be_bytes());
+        seed.extend_from_slice(&1u32.to_be_bytes());
+        let credit = ShareCredit {
+            header_hash: sha256(&seed),
+            job: 1,
+            account: MinerId(account),
+            extranonce: account.to_le_bytes().to_vec(),
+            nonce: u32::try_from(account).fixture("small nonce"),
+            version: 1,
+            ntime: 1_700_000_000,
+            work: 1,
+        };
+        ledger.record_share(&credit).fixture("share");
+    }
+    let solving = ShareCredit {
+        header_hash: sha256(b"solve"),
+        job: 1,
+        account: MinerId(ACCOUNTS + 1),
+        extranonce: b"solve".to_vec(),
+        nonce: 0,
+        version: 1,
+        ntime: 1_700_000_000,
+        work: 1,
+    };
+    let block = BlockFound {
+        share: solving,
+        height: 100,
+        coinbase_txid: sha256(b"coinbase"),
+        claimed_coinbase_value_sat: 5_000_000,
+    };
+    ledger.record_found_block(&block).fixture("block");
+    let chain = FakeChain::default();
+    chain.set_block(100, block.share.header_hash);
+    chain.set_coinbase(
+        block.share.header_hash,
+        ObservedCoinbase {
+            txid: block.coinbase_txid,
+            outputs: vec![TxOut {
+                value_sat: 5_000_000,
+                script_pubkey: pool_script(),
+            }],
+        },
+    );
+    chain.set_tip(99);
+    for account in 1..=ACCOUNTS {
+        let mut script = vec![0x51u8, 0x20];
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&account.to_le_bytes());
+        script.extend_from_slice(&key);
+        assert_eq!(script.len(), 34);
+        ledger
+            .set_payout_script(MinerId(account), &script)
+            .fixture("script");
+    }
+    chain.set_tip(102);
+    ledger.reconcile_rounds(&chain).fixture("mature");
+    let batch = ledger
+        .prepare_payout_batch(
+            idem(1),
+            PayoutPolicy {
+                min_payout_sat: 546,
+                max_outputs: MAX_BATCH_OUTPUTS,
+            },
+        )
+        .fixture("prepare")
+        .fixture("a batch");
+    let weight: u64 = batch
+        .outputs
+        .iter()
+        .map(|output| payout_output_weight_wu(output.script_pubkey.len()))
+        .sum();
+    assert!(
+        batch.outputs.len() < MAX_BATCH_OUTPUTS,
+        "weight budget must bind before the 2,500-output count cap"
+    );
+    assert!(
+        weight <= MAX_PAYOUT_OUTPUT_WEIGHT_WU,
+        "reserved outputs must leave funding headroom: {weight} > {}",
+        MAX_PAYOUT_OUTPUT_WEIGHT_WU
+    );
+    assert!(
+        weight.saturating_add(payout_output_weight_wu(34)) > MAX_PAYOUT_OUTPUT_WEIGHT_WU,
+        "the next 34-byte output must not fit the budget"
+    );
+    ledger.check_invariants().fixture("invariants");
+}
