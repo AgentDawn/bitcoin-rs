@@ -2710,12 +2710,12 @@ mod tests {
         let queued = observe(&policy, key);
         let replacement = source(1);
         for foreign in [replacement, b] {
-            assert!(policy.release_package(foreign, subject, late).is_empty());
+            assert_eq!(policy.release_package(foreign, subject, late).len(), 0);
             assert!(!policy.begin_package_resolution(foreign, subject, combined, &sequence, now));
         }
         assert_eq!(observe(&policy, key), queued);
 
-        assert!(!policy.release_package(a, subject, late).is_empty());
+        assert_ne!(policy.release_package(a, subject, late).len(), 0);
         assert!(!policy.counts.contains_key(&a));
         assert_eq!(policy.requests[&key].owner, None);
         assert_eq!(package_state(&policy, key), None);
@@ -3000,7 +3000,7 @@ mod tests {
                     policy.requests.contains_key(&key),
                     "{stage}: its body is already queued"
                 );
-                assert!(!policy.release_package(a, subject, deadline).is_empty());
+                assert_ne!(policy.release_package(a, subject, deadline).len(), 0);
                 policy.forget_known(key, deadline);
             }
             assert!(policy.requests.is_empty(), "{stage}");

@@ -819,10 +819,27 @@ impl PeerTable {
 
     /// Reports whether the live published connection at `addr` requested
     /// compact-block relay.
+    #[cfg(test)]
     pub(crate) fn compact_relay_of(&self, addr: PeerEndpoint) -> bool {
         let entries = self.entries.read();
         entries
             .get(&SessionKey::Endpoint(addr))
+            .is_some_and(|entry| {
+                entry
+                    .info
+                    .as_ref()
+                    .is_some_and(|info| info.compact_block_relay)
+            })
+    }
+
+    /// Reports whether the live connection identified by `source` requested
+    /// compact-block relay. Source-keyed so anonymous (`endpoint: None`)
+    /// sessions participate identically to addressed ones.
+    pub(crate) fn compact_relay_of_source(&self, source: PeerSource) -> bool {
+        let entries = self.entries.read();
+        entries
+            .get(&SessionKey::from_source(source))
+            .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
             .is_some_and(|entry| {
                 entry
                     .info
@@ -1191,11 +1208,24 @@ impl PeerTable {
     }
 
     /// Metadata of the one connection at `addr`, if it completed its handshake.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn info_of(&self, addr: PeerEndpoint) -> Option<PeerInfo> {
         self.entries
             .read()
             .get(&SessionKey::Endpoint(addr))
+            .and_then(|entry| entry.info.clone())
+    }
+
+    /// Metadata of the live connection identified by `source`, if it
+    /// completed its handshake. Source-keyed so anonymous (`endpoint: None`)
+    /// sessions resolve identically to addressed ones.
+    #[must_use]
+    pub(crate) fn info_of_source(&self, source: PeerSource) -> Option<PeerInfo> {
+        self.entries
+            .read()
+            .get(&SessionKey::from_source(source))
+            .filter(|entry| entry.lease.is_current(source) && !entry.lease.is_cancelled())
             .and_then(|entry| entry.info.clone())
     }
 

@@ -96,9 +96,9 @@ pub use dispatch::{
     ChainQuery, FilterRequest, FilterServing, InventoryServing, StaleTipHeaders, TxInventory,
 };
 pub use endpoint::{
-    DialFailure, DialRoutes, OverlayConfig, TransportRemote, accepted_ip_identity,
-    addrv2_gossip_enabled, connect_peer_stream, dialed_ip_identity, endpoint_from_addrv2,
-    endpoint_to_addrv2, format_endpoint, parse_endpoint,
+    DialFailure, DialRoutes, OverlayConfig, RouteDenial, RouteTable, TransportRemote,
+    accepted_ip_identity, addrv2_gossip_enabled, connect_peer_stream, dialed_ip_identity,
+    endpoint_from_addrv2, endpoint_to_addrv2, format_endpoint, parse_endpoint,
 };
 pub use feature::{
     FEATURE_COMMAND, FEATURE_V2_SHORT_ID, FEATURE_VERSION, FeatureAnnouncement, FeatureError,

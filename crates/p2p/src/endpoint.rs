@@ -370,6 +370,74 @@ impl DialRoutes {
     }
 }
 
+/// Why this node cannot route a dial to an endpoint. Pure configuration
+/// fact: no I/O, derivable before any socket is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteDenial {
+    /// The endpoint's network is outside the configured `onlynet` set.
+    NotInOnlynet,
+    /// A Tor endpoint with no onion proxy route configured.
+    NoOnionRoute,
+    /// An I2P endpoint with no SAM session established.
+    NoI2pRoute,
+}
+
+/// Static reachability predicate over one node's local routes.
+///
+/// Selection applies [`RouteTable::denial`] before any worker, thread, or
+/// address-book claim is spent; the dial-time gate in [`connect_peer_stream`]
+/// stays as defense in depth for fixed peers and races.
+#[derive(Clone, Debug, Default)]
+pub struct RouteTable {
+    /// Dial restriction; empty allows every network.
+    pub onlynet: Vec<NetworkLabel>,
+    /// SOCKS5 proxy for onion dials (or the general proxy as fallback).
+    pub proxy: Option<SocketAddr>,
+    /// SOCKS5 proxy dedicated to onion dials.
+    pub onion: Option<SocketAddr>,
+    /// Established persistent SAM session for I2P dials.
+    pub sam_session: Option<Arc<SamSession>>,
+}
+
+impl RouteTable {
+    /// Build the predicate from the live dial routes. The snapshot is taken
+    /// after overlay startup, so an established SAM session is included.
+    #[must_use]
+    pub fn from_routes(routes: &DialRoutes) -> Self {
+        Self {
+            onlynet: routes.onlynet.clone(),
+            proxy: routes.proxy,
+            onion: routes.onion,
+            sam_session: routes.sam_session.clone(),
+        }
+    }
+
+    /// Pure reachability check. `None` means dialable by this node.
+    #[must_use]
+    pub fn denial(&self, endpoint: &PeerEndpoint) -> Option<RouteDenial> {
+        if !self.onlynet.is_empty() && !self.onlynet.contains(&endpoint.net()) {
+            return Some(RouteDenial::NotInOnlynet);
+        }
+        match endpoint {
+            PeerEndpoint::Ip(_) => None,
+            PeerEndpoint::TorV3 { .. } => {
+                if self.onion.is_some() || self.proxy.is_some() {
+                    None
+                } else {
+                    Some(RouteDenial::NoOnionRoute)
+                }
+            }
+            PeerEndpoint::I2p { .. } => {
+                if self.sam_session.is_some() {
+                    None
+                } else {
+                    Some(RouteDenial::NoI2pRoute)
+                }
+            }
+        }
+    }
+}
+
 /// Typed dial outcome at the transport seam.
 ///
 /// `Transport` covers every local failure: dead or refusing proxy, SOCKS
@@ -770,6 +838,30 @@ mod tests {
         };
         assert!(matches!(error, DialFailure::Transport(_)));
         assert!(!error.counts_as_peer_failure());
+    }
+
+    #[test]
+    fn route_table_denial_prefilters_unroutable_endpoints() {
+        let ip = PeerEndpoint::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333));
+        let i2p = PeerEndpoint::I2p {
+            hash: [7u8; 32],
+            port: 8333,
+        };
+        // Unrestricted direct routes dial IP without denial.
+        let open = RouteTable::default();
+        assert_eq!(open.denial(&ip), None);
+        // Missing overlay routes deny without spending a dial.
+        assert_eq!(
+            open.denial(&tor_endpoint()),
+            Some(RouteDenial::NoOnionRoute)
+        );
+        assert_eq!(open.denial(&i2p), Some(RouteDenial::NoI2pRoute));
+        // `onlynet` denies first, even for otherwise routable endpoints.
+        let onion_only = RouteTable {
+            onlynet: vec![NetworkLabel::Onion],
+            ..RouteTable::default()
+        };
+        assert_eq!(onion_only.denial(&ip), Some(RouteDenial::NotInOnlynet));
     }
 
     #[test]

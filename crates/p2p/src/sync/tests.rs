@@ -2445,6 +2445,24 @@ pub(crate) fn test_addr(
     ))
 }
 
+/// The canonical sync-test anonymous peer: inbound Tor (`endpoint: None`,
+/// `network = Onion`), mirroring what the listener publishes for an
+/// unidentified session. Anonymous sessions schedule by exact connection
+/// identity, never by endpoint.
+pub(crate) fn connect_anonymous_peer(
+    peer_table: &Arc<PeerTable>,
+    mut info: PeerInfo,
+) -> crate::test_support::MessageReceiver {
+    let (tx, rx) = crate::test_support::message_channel();
+    let lease = PeerLease::new(tx);
+    info.endpoint = None;
+    info.network = crate::NetworkLabel::Onion;
+    info.inbound = true;
+    peer_table.register_unidentified(lease.clone());
+    assert!(peer_table.publish_info_unidentified(&lease, info));
+    rx
+}
+
 pub(crate) fn connect_peer(
     peer_table: &Arc<PeerTable>,
     info: PeerInfo,

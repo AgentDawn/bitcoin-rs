@@ -710,12 +710,20 @@ impl P2pService {
             workers.listeners.push(handle);
         }
 
+        // Snapshot the fully populated dial routes (SAM session included)
+        // before `shared` moves into the outbound worker: overlay
+        // configuration never changes after this start.
+        let routes = crate::RouteTable::from_routes(&shared.dial_routes);
         let dial_allowance = shared.block_sync.clone();
         let outbound = self.spawn_outbound_worker(shared, &workers.shutdown)?;
         workers.outbound = Some(outbound);
 
-        let bootstrap =
-            self.spawn_bootstrap_worker(dial_allowance, chain_query.cloned(), &workers.shutdown)?;
+        let bootstrap = self.spawn_bootstrap_worker(
+            dial_allowance,
+            chain_query.cloned(),
+            &workers.shutdown,
+            routes,
+        )?;
         workers.bootstrap = bootstrap;
 
         Ok(())
@@ -956,6 +964,7 @@ impl P2pService {
         block_sync: Option<Arc<crate::sync::BlockSync>>,
         chain_query: Option<Arc<dyn crate::ChainQuery>>,
         shutdown: &Arc<AtomicBool>,
+        routes: crate::RouteTable,
     ) -> Result<Option<JoinHandle<()>>, io::Error> {
         if !self.config.fixed_peers.is_empty() {
             let shutdown = Arc::clone(shutdown);
@@ -1001,6 +1010,7 @@ impl P2pService {
             address_book: Arc::clone(&self.address_book),
             banned: self.banned_reader(),
             manual_nodes: Arc::clone(&self.added_nodes),
+            routes,
         };
         thread::Builder::new()
             .name("bitcoin-rs-address-maintenance".to_owned())
@@ -1409,8 +1419,11 @@ fn spawn_feeler(
     let mut addresses: Vec<_> = active.keys().copied().collect();
     addresses.extend_from_slice(&connected);
     let policy = shared.banned.automatic_snapshot(SystemTime::now());
+    let routes = crate::RouteTable::from_routes(&shared.dial_routes);
     let Some(addr) = book.feeler(&addresses, &connected, crate::addrman::now(), |addr| {
-        !is_manual_endpoint(manual, addr) && policy.allows_endpoint(addr)
+        !is_manual_endpoint(manual, addr)
+            && policy.allows_endpoint(addr)
+            && routes.denial(&addr).is_none()
     }) else {
         return;
     };
@@ -1936,6 +1949,10 @@ struct AddressMaintenance {
     address_book: Arc<crate::addrman::AddressBook>,
     banned: BannedReader,
     manual_nodes: Arc<RwLock<Vec<crate::PeerEndpoint>>>,
+    /// Immutable snapshot of the local dial routes, taken after overlay
+    /// startup. Selection denies unroutable endpoints before any worker,
+    /// thread, or address-book claim is spent.
+    routes: crate::RouteTable,
 }
 
 fn park_automatic_dial(
@@ -2300,6 +2317,7 @@ fn queue_restart_anchors(
                 .address_book
                 .ordinary_services_eligible(addr, depth)
             || !policy.allows_endpoint(addr)
+            || maintenance.routes.denial(&addr).is_some()
         {
             maintenance.address_book.return_restart_anchor(addr, now);
             continue;
@@ -2387,7 +2405,9 @@ fn run_address_maintenance(maintenance: &AddressMaintenance) {
                 maintenance
                     .address_book
                     .resolve_collisions(&connected, now, |addr| {
-                        !is_manual_endpoint(&manual, addr) && policy.allows_endpoint(addr)
+                        !is_manual_endpoint(&manual, addr)
+                            && policy.allows_endpoint(addr)
+                            && maintenance.routes.denial(&addr).is_none()
                     });
             }
             // A fresh but unreachable book must not permanently suppress seed
@@ -2535,7 +2555,9 @@ fn queue_address_candidates(
         let Some(addr) = maintenance
             .address_book
             .select(&active, &grouped, now, depth, |addr| {
-                !is_manual_endpoint(&manual, addr) && policy.allows_endpoint(addr)
+                !is_manual_endpoint(&manual, addr)
+                    && policy.allows_endpoint(addr)
+                    && maintenance.routes.denial(&addr).is_none()
             })
         else {
             break;
@@ -3192,6 +3214,7 @@ mod tests {
                 chain_query: None,
                 address_book: book,
                 banned: BannedReader::fixture_empty(),
+                routes: crate::RouteTable::default(),
             },
             rx,
         )
@@ -4066,6 +4089,34 @@ mod tests {
                 SocketAddr::new(anchor.as_ip().expect("ip anchor").ip(), 8334).into()
             ),
             "a different port is a different endpoint"
+        );
+    }
+    #[test]
+    fn onlynet_prefilter_selects_no_forbidden_network_dial() {
+        let (mut maintenance, queue) = maintenance_fixture(4);
+        maintenance.routes.onlynet = vec![crate::NetworkLabel::Onion];
+        let now = 10_000;
+        queue_address_candidates(&maintenance, now, SystemTime::now(), 0);
+        assert!(
+            queue.try_recv().is_err(),
+            "an IP-heavy book under onlynet=onion must queue no ordinary dial"
+        );
+        let book = &maintenance.address_book;
+        let anchor = book
+            .select(&[], &[], now, u64::MAX, |_| true)
+            .expect("eligible ordinary candidate");
+        book.succeeded(anchor, 9, now);
+        book.remember_anchors(&[anchor], now);
+        assert_eq!(book.take_restart_anchors(now), vec![anchor]);
+        assert!(
+            book.anchor_eligible(anchor, &[], now),
+            "the anchor would otherwise be selectable"
+        );
+        let mut anchors = VecDeque::from(vec![anchor]);
+        queue_restart_anchors(&maintenance, &mut anchors, &mut None, &mut Vec::new(), now);
+        assert!(
+            queue.try_recv().is_err(),
+            "anchor selection must honor the route prefilter"
         );
     }
     fn register_ready_block_peer(
