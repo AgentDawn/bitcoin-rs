@@ -1212,10 +1212,13 @@ fn import_finalize_remove_archive_seed_completes() -> TestResult {
         .map_err(|error| format!("coin count does not fit u64: {error}"))?;
     assert!(expected > 0, "the fixture must hold live coins");
     let mut seen = 0_u64;
-    seed.for_each_coin_raw(&mut |_, _| {
-        seen += 1;
-        Ok::<(), std::convert::Infallible>(())
-    })?;
+    seed.for_each_coin_raw(
+        &mut |_, _| {
+            seen += 1;
+            Ok::<(), std::convert::Infallible>(())
+        },
+        &|| false,
+    )?;
     assert_eq!(seen, expected);
     Ok(())
 }

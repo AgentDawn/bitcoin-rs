@@ -73,4 +73,7 @@ pub enum IndexError {
     StateRevisionOverflow,
     #[error("TxIndex state changed; discard derived state and re-derive")]
     StaleIndexState,
+    /// Shutdown was requested mid-stream; the caller keeps its bundle for retry.
+    #[error("operation cancelled")]
+    Cancelled,
 }

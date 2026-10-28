@@ -203,10 +203,11 @@ impl TxIndexWriter for GatedWriter {
         &self,
         produce: &mut ScriptLiveSeedProduce<'_>,
         tip: IndexWatermark,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<usize, IndexError> {
         let gate = self.gate.lock().take();
         match gate {
-            None => self.inner.seed_script_live_stream(produce, tip),
+            None => self.inner.seed_script_live_stream(produce, tip, cancelled),
             Some(mut gate) => {
                 let mut emitted = 0usize;
                 self.inner.seed_script_live_stream(
@@ -224,6 +225,7 @@ impl TxIndexWriter for GatedWriter {
                         produce(&mut counting)
                     },
                     tip,
+                    cancelled,
                 )
             }
         }
@@ -937,10 +939,13 @@ fn seed_tamper_variants_yield_integrity_without_watermark() {
             },
         );
         let mut emitted = 0usize;
-        let result = artifact.for_each_coin_raw(&mut |_: &OutPoint, _: &[u8]| {
-            emitted += 1;
-            Ok::<(), StorageError>(())
-        });
+        let result = artifact.for_each_coin_raw(
+            &mut |_: &OutPoint, _: &[u8]| {
+                emitted += 1;
+                Ok::<(), StorageError>(())
+            },
+            &|| false,
+        );
         assert!(
             matches!(result, Err(bitcoin_rs_utxo::RawSeedError::Integrity)),
             "tampered bytes never traverse"
@@ -971,10 +976,13 @@ fn seed_tamper_variants_yield_integrity_without_watermark() {
     std::fs::rename(&swap, &path).expect("swap generation");
     let mut count = 0usize;
     artifact
-        .for_each_coin_raw(&mut |_: &OutPoint, _: &[u8]| {
-            count += 1;
-            Ok::<(), StorageError>(())
-        })
+        .for_each_coin_raw(
+            &mut |_: &OutPoint, _: &[u8]| {
+                count += 1;
+                Ok::<(), StorageError>(())
+            },
+            &|| false,
+        )
         .expect("sealed descriptor pins the accepted bytes");
     assert_eq!(count, 200, "every accepted coin replays from the held fd");
 
@@ -1080,7 +1088,10 @@ fn seed_mutation_check_digest_removal_fails() {
         },
     );
     let result =
-        artifact.for_each_coin_raw(&mut |_: &OutPoint, _: &[u8]| Ok::<(), StorageError>(()));
+        artifact.for_each_coin_raw(
+            &mut |_: &OutPoint, _: &[u8]| Ok::<(), StorageError>(()),
+            &|| false,
+        );
     assert!(
         matches!(result, Err(bitcoin_rs_utxo::RawSeedError::Integrity)),
         "only the digest comparison refuses a length-preserving flip"
@@ -1544,4 +1555,85 @@ fn seed_offer_skipped_without_demand() {
     );
     let expected = expected_live_keys(&expected_chain_live(&fixture, 1, 12, &[]));
     assert_eq!(scan_live_keys(&harness.store), expected);
+}
+
+/// Cancellation is polled at entry, every 4,096 rows, and before the final
+/// watermark commit; a trip returns `Cancelled` with no watermark so the
+/// caller can retry with the same coins.
+#[test]
+fn seed_stream_polls_cancellation_and_leaves_no_watermark() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(FjallStore::open(dir.path()).expect("fjall open"));
+    let mut writer = crate::IndexWriter::open(Arc::clone(&store), 1).expect("writer open");
+    let scripthash = ScriptHash::from_script_bytes(&[0x51]);
+    let tip = IndexWatermark {
+        height: 7,
+        hash: [0x07; 32],
+    };
+    // Immediate cancellation writes nothing.
+    let immediate = writer.seed_script_live_stream(
+        &mut |_: &mut dyn FnMut(OutPoint, ScriptHash) -> Result<(), IndexError>| Ok(()),
+        tip,
+        &|| true,
+    );
+    assert!(
+        matches!(immediate, Err(IndexError::Cancelled)),
+        "entry poll must stop before any write: {immediate:?}"
+    );
+    assert!(
+        writer
+            .watermarks()
+            .expect("watermarks")
+            .script_live
+            .is_none(),
+        "a cancelled entry must not stamp the watermark"
+    );
+
+    // Mid-stream cancellation stops at the next 4,096 boundary.
+    let coins: Vec<(OutPoint, ScriptHash)> = (0..9_000_u32)
+        .map(|v| {
+            let mut bytes = [0x77_u8; 32];
+            bytes[..4].copy_from_slice(&v.to_le_bytes());
+            (
+                OutPoint::new(Hash256::from_le_bytes(&bytes).into(), 0),
+                scripthash,
+            )
+        })
+        .collect();
+    let seen = std::cell::Cell::new(0_u64);
+    let mut next = 0_usize;
+    let mid = writer.seed_script_live_stream(
+        &mut |emit: &mut dyn FnMut(OutPoint, ScriptHash) -> Result<(), IndexError>| {
+            while next < coins.len() {
+                let (outpoint, hash) = coins[next];
+                next += 1;
+                seen.set(seen.get() + 1);
+                emit(outpoint, hash)?;
+            }
+            Ok(())
+        },
+        tip,
+        &|| seen.get() >= 5_000,
+    );
+    assert!(
+        matches!(mid, Err(IndexError::Cancelled)),
+        "mid-stream stop must report cancellation: {mid:?}"
+    );
+    assert!(
+        writer
+            .watermarks()
+            .expect("watermarks")
+            .script_live
+            .is_none(),
+        "a cancelled stream must not stamp the watermark"
+    );
+
+    // The retry's opening reset clears the cancelled prefix; the same coins
+    // commit and stamp the watermark.
+    let written = writer.seed_script_live(coins, tip).expect("retry seed");
+    assert_eq!(written, 9_000, "retry must commit every coin");
+    assert_eq!(
+        writer.watermarks().expect("watermarks").script_live,
+        Some(tip)
+    );
 }
