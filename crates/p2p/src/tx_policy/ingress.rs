@@ -940,9 +940,13 @@ impl PeerTable {
                 .is_some_and(|claim| claim.state == super::PackagePhase::Awaiting)
                 && request.owner.is_some_and(|(owner, _)| owner == source)
         });
-        if awaiting {
-            policy.failed(key, source, now);
+        if !awaiting {
+            return;
         }
+        // The claim's riding orphan parents fall back to `source`.
+        let keys = policy.failed_with_parents(key, source, now);
+        drop(policy);
+        self.send_transaction_requests(now, None, Some(&keys), std::time::Instant::now);
     }
 
     /// The sole pre-admission release: the body never reached the gateway
