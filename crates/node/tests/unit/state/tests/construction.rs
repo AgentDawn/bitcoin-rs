@@ -107,7 +107,7 @@ fn inbound_tx_channel_is_bounded_against_flood() -> anyhow::Result<()> {
     let sender = state.inbound_tx_sender();
     let (lease_tx, _lease_rx) = crossbeam_channel::unbounded();
     let lease = bitcoin_rs_p2p::PeerLease::new(lease_tx);
-    let source = lease.source(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+    let source = lease.source_ip(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
     let tx = bitcoin_rs_primitives::Tx {
         version: 1,
         inputs: Vec::new(),
@@ -116,10 +116,14 @@ fn inbound_tx_channel_is_bounded_against_flood() -> anyhow::Result<()> {
     };
     for _ in 0..super::INBOUND_TX_CHANNEL_LIMIT {
         sender
-            .try_send(bitcoin_rs_p2p::InboundTx::new(tx.clone(), source))
+            .try_send(bitcoin_rs_p2p::InboundBody::from(
+                bitcoin_rs_p2p::InboundTx::new(tx.clone(), source),
+            ))
             .unwrap_or_else(|error| panic!("send within the bound must succeed: {error}"));
     }
-    let overflow = sender.try_send(bitcoin_rs_p2p::InboundTx::new(tx, source));
+    let overflow = sender.try_send(bitcoin_rs_p2p::InboundBody::from(
+        bitcoin_rs_p2p::InboundTx::new(tx, source),
+    ));
     assert!(
         matches!(overflow, Err(crossbeam_channel::TrySendError::Full(_))),
         "channel must reject txs past INBOUND_TX_CHANNEL_LIMIT, got {overflow:?}",

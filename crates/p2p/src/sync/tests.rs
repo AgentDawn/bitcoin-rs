@@ -209,8 +209,9 @@ impl SyncChain for TestChain {
             bitcoin_rs_chain::current_unix_seconds(),
             bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
         ) {
-            Ok(node_ids) => {
-                let announced_tip = node_ids
+            Ok(admitted) => {
+                let announced_tip = admitted
+                    .ids
                     .last()
                     .and_then(|id| tree.node(*id).ok())
                     .map(|node| node.hash);
@@ -222,9 +223,10 @@ impl SyncChain for TestChain {
                             .and_then(|height| i32::try_from(height).ok())
                     });
                 HeaderAdmission::Accepted {
-                    accepted: node_ids.len(),
+                    accepted: admitted.ids.len(),
                     announced_tip,
                     active_height,
+                    demoted_tip: admitted.demoted_tip,
                 }
             }
             Err(error) => HeaderAdmission::Rejected(error),
@@ -292,7 +294,7 @@ impl SyncChain for TestChain {
             if !block.txs.is_empty() && block.txs.iter().skip(1).any(coinbase_shaped) {
                 let invalidated = tree
                     .invalidate_subtree(node_id)
-                    .map(Vec::into_boxed_slice)
+                    .map(|outcome| outcome.invalid.into_boxed_slice())
                     .unwrap_or_default();
                 return Err(WindowCommitError {
                     applied,
@@ -1117,7 +1119,7 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
         assert_eq!(scheduler.window.pending_len(), 2);
         assert_eq!(
             scheduler.window.stalling_peer().map(|(addr, _)| addr),
-            Some(staller),
+            Some(staller.endpoint()),
             "the front-stripe owner must be the observed staller"
         );
     }
@@ -1133,7 +1135,7 @@ fn stalled_frontier_peer_disconnected_after_adaptive_timeout_and_stripe_requeued
         sync.scheduler
             .lock()
             .window
-            .peer_in_staller_cooldown(staller, Instant::now()),
+            .peer_in_staller_cooldown(crate::PeerSource::for_test(staller), Instant::now()),
         "disconnected staller must enter the cooldown"
     );
     assert_no_getdata(&rxs[0])?;
@@ -1879,7 +1881,7 @@ fn historical_delivery_retries_corruption_and_does_not_rewind_foreground() -> Te
             .historical
             .lock()
             .window
-            .peer_in_staller_cooldown(addr, Instant::now())
+            .peer_in_staller_cooldown(crate::PeerSource::for_test(addr), Instant::now())
     );
     let retry_addr = test_addr(28001, 0)?;
     let retry_rx = connect_peer(&harness.peers, synthetic_peer(retry_addr, 3));
@@ -2384,7 +2386,7 @@ fn assert_applied_genesis(
 pub(crate) fn current_source(peer_table: &Arc<PeerTable>, addr: PeerRemote) -> PeerSource {
     peer_table.lease(addr).map_or_else(
         || panic!("test peer {addr} must be connected"),
-        |lease| lease.source(addr),
+        |lease| lease.source(addr.endpoint()),
     )
 }
 
@@ -2396,14 +2398,19 @@ fn test_frontier(sync: &BlockSync) -> super::ChainFrontier {
 fn register_info(peer_table: &Arc<PeerTable>, info: PeerInfo) {
     let (tx, _rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    peer_table.register(info.addr, lease.clone());
-    peer_table.publish_info(info.addr, &lease, info);
+    let Some(endpoint) = info.endpoint else {
+        panic!("identified peer endpoint");
+    };
+    peer_table.register(endpoint, lease.clone());
+    peer_table.publish_info(endpoint, &lease, info);
 }
 /// The canonical sync-test peer: outbound, and advertising `NODE_NETWORK` plus
 /// `NODE_WITNESS`, so it may serve block bodies at any height.
 pub(crate) fn synthetic_peer(addr: PeerRemote, start_height: i32) -> PeerInfo {
     PeerInfo {
         addr,
+        endpoint: addr.endpoint(),
+        network: addr.network().into(),
         version: 70_016,
         wtxid_relay: false,
         relay_transactions: true,
@@ -2416,10 +2423,11 @@ pub(crate) fn synthetic_peer(addr: PeerRemote, start_height: i32) -> PeerInfo {
         best_known_height: start_height,
         conn_time: 0,
         inbound: false,
-        addr_bind: addr
-            .endpoint()
-            .and_then(crate::PeerEndpoint::socket_addr)
-            .unwrap_or_else(|| panic!("expected IP fixture")),
+        addr_bind: crate::TransportRemote::new(
+            addr.endpoint()
+                .and_then(crate::PeerEndpoint::socket_addr)
+                .unwrap_or_else(|| panic!("expected IP fixture")),
+        ),
         time_offset: 0,
         counters: std::sync::Arc::new(crate::PeerCounters::default()),
         transport: crate::TransportProtocol::V1,
@@ -2446,14 +2454,35 @@ pub(crate) fn test_addr(
     )))
 }
 
+/// The canonical sync-test anonymous peer: inbound Tor (`endpoint: None`,
+/// `network = Onion`), mirroring what the listener publishes for an
+/// unidentified session. Anonymous sessions schedule by exact connection
+/// identity, never by endpoint.
+pub(crate) fn connect_anonymous_peer(
+    peer_table: &Arc<PeerTable>,
+    mut info: PeerInfo,
+) -> crate::test_support::MessageReceiver {
+    let (tx, rx) = crate::test_support::message_channel();
+    let lease = PeerLease::new(tx);
+    info.endpoint = None;
+    info.network = crate::NetworkLabel::Onion;
+    info.inbound = true;
+    peer_table.register_unidentified(lease.clone());
+    assert!(peer_table.publish_info_unidentified(&lease, info));
+    rx
+}
+
 pub(crate) fn connect_peer(
     peer_table: &Arc<PeerTable>,
     info: PeerInfo,
 ) -> crate::test_support::MessageReceiver {
     let (tx, rx) = crate::test_support::message_channel();
     let lease = PeerLease::new(tx);
-    peer_table.register(info.addr, lease.clone());
-    peer_table.publish_info(info.addr, &lease, info);
+    let Some(endpoint) = info.endpoint else {
+        panic!("identified peer endpoint");
+    };
+    peer_table.register(endpoint, lease.clone());
+    peer_table.publish_info(endpoint, &lease, info);
     rx
 }
 
@@ -2680,6 +2709,85 @@ mod frontier_model;
 mod head_sync;
 mod limited_peers;
 mod stale_tip;
+
+/// A permanently failed connect hands the executor the valid tip its
+/// invalidation displaced, once: with the heavier branch invalid, the next
+/// call finds no outweighed branch and reports no tip.
+#[test]
+fn failed_branch_switch_reports_the_displaced_tip_once() -> TestResult {
+    let genesis = genesis_header();
+    let mut tree = BlockTree::new();
+    let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+    let side = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 1)
+        .or_fail("regtest fixture header");
+    let side_id = tree.insert_node(Some(genesis_id), side, NodeStatus::HeaderValid)?;
+    let first = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 101)
+        .or_fail("regtest fixture header");
+    let first_id = tree.insert_node(Some(genesis_id), first, NodeStatus::HeaderValid)?;
+    let second = regtest_fixture::mined_regtest_header(first.compute_hash(), 102)
+        .or_fail("regtest fixture header");
+    tree.insert_node(Some(first_id), second, NodeStatus::HeaderValid)?;
+    // A valid stale leaf that survives the invalidation: the displaced tip
+    // must be neither the applied tip nor part of the invalid subtree.
+    let other = regtest_fixture::mined_regtest_header(genesis.compute_hash(), 201)
+        .or_fail("regtest fixture header");
+    tree.insert_node(Some(genesis_id), other, NodeStatus::HeaderValid)?;
+    let applied = {
+        let node = tree.node(side_id)?;
+        TipSnapshot {
+            tip_id: side_id,
+            chain_tx_count: node.chain_tx_count,
+            height: node.height,
+            chainwork: node.chainwork,
+            hash: node.hash,
+        }
+    };
+    let displaced = Hash256::from(other.compute_hash());
+    let invalidated = vec![
+        Hash256::from(first.compute_hash()),
+        Hash256::from(second.compute_hash()),
+    ];
+
+    let chain_tip = tree.tip_handle();
+    let block_tree = Arc::new(RwLock::new(tree));
+    let applied_tip = Arc::new(ArcSwapOption::from_pointee(applied));
+    let chain = Arc::new(TestChain::new(
+        chain_tip,
+        Arc::clone(&applied_tip),
+        Arc::clone(&block_tree),
+    ));
+    *chain.scripted_branch_switch.lock() = Some(ScriptedBranchSwitch {
+        connected: Vec::new(),
+        error: ReorgError::ConnectFailed {
+            disconnected: 1,
+            connected: 0,
+            hash: invalidated[0],
+            stopped_at: 0,
+            source: Box::new(bitcoin_rs_chainstate::ApplyError::Shutdown),
+            disposition: WindowApplyDisposition::Permanent,
+            invalidated: invalidated.into(),
+            demoted_tip: Some(displaced),
+        },
+    });
+    let (_inbound_headers_tx, inbound_headers_rx) = unbounded();
+    let (_inbound_blocks_tx, inbound_blocks_rx) = unbounded();
+    let sync = BlockSync::new(
+        chain,
+        Arc::new(PeerTable::new()),
+        inbound_headers_rx,
+        inbound_blocks_rx,
+        crate::sync::syncing_ibd_latch(),
+    );
+
+    assert!(sync.outweighed_branch_target().is_some());
+    assert_eq!(sync.switch_branch_if_outweighed(), Some(displaced));
+    assert_eq!(
+        sync.switch_branch_if_outweighed(),
+        None,
+        "the invalidated branch no longer outweighs the applied tip"
+    );
+    Ok(())
+}
 
 /// A sync loop over an applied chain whose commit fails on command for one
 /// hash, with block 2 announced and its body owed to one live connection.
@@ -2987,7 +3095,9 @@ fn notfound_from_owner_replans_the_body_to_the_alternate_once_with_one_request_p
     );
     assert!(fixture.sync.owns_body_fetch(alternate_source, x1));
     assert!(
-        fixture.peers.is_connected(fixture.owner),
+        fixture
+            .peers
+            .is_connected(fixture.owner),
         "a peer that lacks a body is not punished"
     );
 
@@ -3274,7 +3384,9 @@ fn notfound_only_peer_is_retried_after_the_interval_and_not_starved_or_polled() 
         "no wake-up-paced getdata/notfound loop against the only peer"
     );
     assert!(
-        fixture.peers.is_connected(fixture.owner),
+        fixture
+            .peers
+            .is_connected(fixture.owner),
         "a peer that lacks a body is not disconnected"
     );
 

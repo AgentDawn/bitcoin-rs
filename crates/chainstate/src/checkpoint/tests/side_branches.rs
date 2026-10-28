@@ -29,7 +29,7 @@ fn fork_header(tree: &mut BlockTree, parent: NodeId, height: u32, salt: u32) -> 
         bitcoin_rs_chain::current_unix_seconds(),
         bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
-    Ok(accepted[0])
+    Ok(accepted.ids[0])
 }
 
 /// Extends the active chain from `parent` with its canonical fixture header.
@@ -42,7 +42,7 @@ fn active_header(tree: &mut BlockTree, parent: NodeId, height: u32) -> TestResul
         bitcoin_rs_chain::current_unix_seconds(),
         bitcoin_rs_chain::HeaderValidationMode::LiveAdmission,
     )?;
-    Ok(accepted[0])
+    Ok(accepted.ids[0])
 }
 
 /// Active chain 0..=6 (applied at its tip) whose side branches are learned
@@ -72,7 +72,7 @@ fn branched() -> TestResult<Branched> {
         Some(best),
         "equal work never displaces the best tip"
     );
-    assert_eq!(invalid.len(), 2);
+    assert_eq!(invalid.invalid.len(), 2);
     let best_node = tree.node(best)?;
     let applied = headers::HeaderCheckpointPoint {
         height: best_node.height,
@@ -82,7 +82,7 @@ fn branched() -> TestResult<Branched> {
         tree,
         best,
         applied,
-        invalid,
+        invalid: invalid.invalid,
     })
 }
 

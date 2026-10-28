@@ -556,6 +556,9 @@ pub struct NetworkHandles {
     /// Service flags the node advertises, as resolved at P2P startup —
     /// `NETWORK` on an unpruned node, `NETWORK_LIMITED` on a pruned one.
     pub local_services: u64,
+    /// Resolved overlay transport configuration, reported (configured,
+    /// never probed) by `getnetworkinfo`.
+    pub overlay: bitcoin_rs_p2p::OverlayConfig,
 }
 
 /// Mining capability handles.
@@ -766,6 +769,7 @@ impl Default for NetworkHandles {
             peer_table: p2p.table(),
             p2p,
             local_services: 0x09,
+            overlay: bitcoin_rs_p2p::OverlayConfig::default(),
         }
     }
 }
@@ -2099,6 +2103,7 @@ mod tests {
                 peer_table: p2p.table(),
                 p2p: Arc::clone(&p2p),
                 local_services: 0x09,
+                overlay: bitcoin_rs_p2p::OverlayConfig::default(),
             },
             ..ContextHandles::default()
         });
@@ -2855,6 +2860,9 @@ mod admission_chain_tests {
         let result = ctx.mempool.gateway.submit_transaction(
             Arc::new(tx),
             AdmissionOrigin::Peer(PeerToken {
+                endpoint: Some(bitcoin_rs_primitives::PeerEndpoint::Ip(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 18444)),
+                )),
                 addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 18444)).into()),
                 connection_id: 1,
             }),

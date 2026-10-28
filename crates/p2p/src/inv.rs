@@ -32,17 +32,24 @@ pub fn request_missing_parents(
 ) -> bool {
     use bitcoin::hashes::Hash as _;
 
-    let source = crate::PeerSource::from(source);
-    let Some(lease) = peers.lease(source.addr) else {
+    // Unidentified-aware resolution: an anonymous inbound session has no
+    // endpoint, so it is found by connection id among live sessions rather
+    // than by the endpoint-keyed lookup. The token comparison still rejects
+    // stale tokens.
+    let Some(session) = peers.sessions().into_iter().find(|session| {
+        session.endpoint == source.endpoint
+            && session.lease.connection_id().get() == source.connection_id
+    }) else {
         return false;
     };
-    let connection = lease.source(source.addr);
-    if connection != source {
+    let lease = session.lease;
+    let connection = lease.source(session.endpoint);
+    if PeerToken::from(connection) != source {
         return false;
     }
     let mut witness = false;
     peers.for_each_ready_lease(|addr, current, info| {
-        if addr == source.addr && current.same_connection(&lease) {
+        if addr == source.endpoint && current.same_connection(&lease) {
             witness = info.services & bitcoin::p2p::ServiceFlags::WITNESS.to_u64() != 0;
         }
     });
@@ -60,6 +67,22 @@ pub fn request_missing_parents(
     // ordinary inv downloads. A retiring connection cannot target its successor.
     let retained = peers.request_parent_transactions(connection, &items);
     retained && !lease.is_cancelled()
+}
+
+/// Requests ancestor package information from the exact live connection
+/// represented by `source`.
+///
+/// The caller gates this path on the published `PKG_RELAY_ANC` bit. This
+/// adapter only resolves the token and applies existing bounds and ownership
+/// rules. `parents` ride the solicitation so its terminal outcomes can fall
+/// back to them instead of stranding them.
+pub fn request_package_info(
+    peers: &crate::PeerTable,
+    source: PeerToken,
+    subject: bitcoin_rs_primitives::Wtxid,
+    parents: &[Txid],
+) -> bool {
+    peers.request_package_info_from_token(source, subject, parents)
 }
 
 /// Applies BIP144's witness request flag to transaction vectors without
@@ -119,7 +142,7 @@ pub(crate) const fn is_within_inventory_bound(items: &[Inventory]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin_rs_primitives::PeerEndpoint;
+    use std::net::SocketAddr;
 
     use bitcoin::hashes::Hash as _;
 
@@ -132,12 +155,13 @@ mod tests {
 
     fn source(lease: &PeerLease) -> PeerToken {
         lease
-            .source(PeerEndpoint::from(([127, 0, 0, 1], 8333)))
+            .source_ip(SocketAddr::from(([127, 0, 0, 1], 8333)))
             .into()
     }
 
     #[test]
-    fn missing_parents_use_txids_and_deduplicate_repeated_inputs() {
+    fn missing_parents_use_txids_and_deduplicate_repeated_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
         let table = PeerTable::new();
         let (sender, receiver) = crate::test_support::message_channel_bounded(2);
         let lease = PeerLease::new(sender);
@@ -160,10 +184,12 @@ mod tests {
         assert!(!request_missing_parents(&table, source, &[]));
         assert!(receiver.try_recv().is_err());
         assert!(!lease.is_cancelled());
+        Ok(())
     }
 
     #[test]
-    fn missing_parents_request_witness_by_service_not_announcement_preference() {
+    fn missing_parents_request_witness_by_service_not_announcement_preference()
+    -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::p2p::ServiceFlags;
         use std::sync::Arc;
 
@@ -226,6 +252,7 @@ mod tests {
                 assert!(!lease.is_cancelled());
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -254,7 +281,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_missing_parent_source_cannot_send_to_or_cancel_replacement() {
+    fn stale_missing_parent_source_cannot_send_to_or_cancel_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
         let table = PeerTable::new();
         let (old_sender, old_receiver) = crate::test_support::message_channel_bounded(1);
         let old = PeerLease::new(old_sender);
@@ -286,10 +314,12 @@ mod tests {
             &[parent(1)]
         ));
         assert!(matches!(new_receiver.try_recv(), Ok(Message::GetData(_))));
+        Ok(())
     }
 
     #[test]
-    fn missing_parent_request_keeps_outbound_saturation_policy() {
+    fn missing_parent_request_keeps_outbound_saturation_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
         let table = PeerTable::new();
         let (sender, _receiver) = crate::test_support::message_channel_bounded(1);
         let lease = PeerLease::new(sender);
@@ -303,10 +333,12 @@ mod tests {
 
         assert!(!request_missing_parents(&table, source, &[parent(1)]));
         assert!(lease.is_cancelled());
+        Ok(())
     }
 
     #[test]
-    fn cancelled_missing_parent_source_does_not_enqueue_a_request() {
+    fn cancelled_missing_parent_source_does_not_enqueue_a_request()
+    -> Result<(), Box<dyn std::error::Error>> {
         let table = PeerTable::new();
         let (sender, receiver) = crate::test_support::message_channel_bounded(1);
         let lease = PeerLease::new(sender);
@@ -318,6 +350,32 @@ mod tests {
         lease.cancel();
 
         assert!(!request_missing_parents(&table, source, &[parent(1)]));
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_parents_resolve_unidentified_sessions() {
+        let table = PeerTable::new();
+        let (sender, receiver) = crate::test_support::message_channel_bounded(2);
+        let lease = PeerLease::new(sender);
+        table.register_unidentified(lease.clone());
+        let source = PeerToken::from(lease.source(None));
+        assert!(source.endpoint.is_none());
+
+        assert!(request_missing_parents(&table, source, &[parent(1)]));
+        let expected = Message::GetData(vec![Inventory::Transaction(
+            bitcoin::Txid::from_byte_array(*parent(1).as_bytes()),
+        )]);
+        assert!(matches!(receiver.try_recv(), Ok(message) if message == expected));
+        assert!(!lease.is_cancelled());
+
+        let stale = PeerToken {
+            endpoint: None,
+            addr: None,
+            connection_id: source.connection_id.wrapping_add(1),
+        };
+        assert!(!request_missing_parents(&table, stale, &[parent(1)]));
         assert!(receiver.try_recv().is_err());
     }
 }

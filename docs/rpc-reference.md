@@ -38,8 +38,9 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `getmemoryinfo` | 0.4.0 | mode=mallocinfo is rejected with an invalid-parameter error instead of returning allocator XML (crates/rpc/src/handlers/util.rs). The figures are resident set size read from the OS, not Core's locked-pool allocator accounting. |
 | `estimaterawfee` | 0.4.0 | local_shape: the fee estimator does not expose Core decay/scale/pass/fail internals, so horizon objects carry feerate only and the no-estimate branch stays {} (crates/rpc/src/handlers/util.rs). All three horizons carry the same feerate where Core computes three independent estimates. |
 | `validateaddress` | 0.4.0 | local_shape (invalid branch): a malformed or wrong-network address is hand-built as Core's sparse {isvalid:false} object because corepc-types models the valid-only fields (address, scriptPubKey, isscript, iswitness) as required and cannot represent that wire shape; valid addresses round-trip the typed v31 contract (crates/rpc/src/handlers/util.rs). |
-| `getpeerinfo` | 0.4.0 | Pinned v31 shape; aggregate byte totals, negotiated transaction-relay preference, and received minimum_fee_filter are measured, while per-message byte breakdowns report empty maps and last_transaction/last_block/last_inv_sequence report Core's zero-value defaults; unmeasured telemetry (ping times, addr relay stats, starting_height, address_local, mapped_as) is null-omitted (crates/rpc/src/handlers/network.rs). |
+| `getpeerinfo` | 0.4.0 | Pinned v31 shape; aggregate byte totals, negotiated transaction-relay preference, and received minimum_fee_filter are measured, while per-message byte breakdowns report empty maps and last_transaction/last_block/last_inv_sequence report Core's zero-value defaults; unmeasured telemetry (ping times, addr relay stats, starting_height, address_local, mapped_as) is null-omitted; id is the connection's stable process-unique node id, not an array position, serialized at its full unsigned 64-bit width where the pinned v31 type narrows it to u32 (crates/rpc/src/handlers/network.rs). |
 | `ping` | 0.4.0 | Answers immediately; Core schedules a P2P ping and reports the seen pong (crates/rpc/src/handlers/network.rs). |
+| `disconnectnode` | 0.4.0 | Targets handshake-complete sessions only; nodeid is the unsigned 64-bit getpeerinfo id, alone or with an empty address, and reaches anonymous inbound sessions; address with nodeid is accepted as a conjunction where Core rejects the pair; readiness and selection are atomic under the peer-table lock, so a same-address replacement is never disconnected in place of the named session (crates/rpc/src/handlers/network.rs). |
 | `getmininginfo` | 0.4.0 | Pinned v30 shape including bits/target and next-block facts. Unset currentblocktx, currentblockweight, and signet_challenge are omitted like Core. |
 | `dumptxoutset` | 0.14.0 | Writes an unmodified Core v2 snapshot of the applied tip's UTXO set. Only type latest is served: type is required to be "latest" as in Core 31.1, and rollback snapshots and the options object (rollback, in_memory) are not accepted. The encode holds chain-transition and stable-view exclusion for its whole duration, blocking block commits, and logs that time; it is cancellable through the request latch and node shutdown, answering -1 and publishing nothing. The output goes to a fsynced exclusive sibling temporary file and is renamed into place without replacement, then the directory is fsynced; an existing destination (including a named pipe), a destination under the assumeutxo recovery namespace, or a platform without atomic no-replace rename is refused. See API-33 in docs/contracts/external-api.md. |
 | `getblockfilter` | 0.14.0 | Optional basic BIP158 filters. Active-chain only; stale/pruned or missing history is unavailable. Disabled by default; enable --blockfilterindex on an unpruned node. See docs/contracts/indexing.md. |
@@ -85,7 +86,6 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `deriveaddresses` | 0.4.0 |  |
 | `getnetworkinfo` | 0.4.0 |  |
 | `addnode` | 0.4.0 |  |
-| `disconnectnode` | 0.4.0 |  |
 | `getconnectioncount` | 0.4.0 |  |
 | `getnettotals` | 0.4.0 |  |
 | `getaddednodeinfo` | 0.4.0 |  |
@@ -242,4 +242,4 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `rawtx` | 0.4.0 | Requires the zmq feature and a --zmqpubrawtx endpoint. |
 | `sequence` | 0.4.0 | Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/rpc/src/zmq.rs). |
 
-Row counts: Supported 0, Deviation 33, Implemented (unverified) 57, Extension 5, Disabled 0, Unimplemented 83 - total 178.
+Row counts: Supported 0, Deviation 34, Implemented (unverified) 56, Extension 5, Disabled 0, Unimplemented 83 - total 178.

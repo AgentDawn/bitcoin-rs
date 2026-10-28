@@ -14,7 +14,7 @@ pub mod chain_constants {
 pub mod encode;
 /// Logical peer network destinations.
 pub mod endpoint;
-pub use endpoint::{PeerAddress, PeerEndpoint, PeerNetwork};
+pub use endpoint::{EndpointHost, NetworkLabel, PeerAddress, PeerEndpoint, PeerNetwork};
 /// Fixed-width 256-bit hash type.
 pub mod hash;
 /// Native block header type and header hash computation.
