@@ -43,6 +43,7 @@ use crate::pool::{
     AcceptedShare, BlockReceipt, Extranonce, FoundBlock, Job, JobBook, JobError, JobId, Session,
     SessionId, ShareError, ShareOutcome, ShareSubmission, ShareTarget,
 };
+use bitcoin_rs_primitives::{BlockHash, Hash256};
 use common_messages_sv2::{
     CHANNEL_BIT_RECONNECT, CHANNEL_BIT_SETUP_CONNECTION, CHANNEL_BIT_SETUP_CONNECTION_ERROR,
     CHANNEL_BIT_SETUP_CONNECTION_SUCCESS, ERROR_CODE_SETUP_CONNECTION_PROTOCOL_VERSION_MISMATCH,
@@ -573,6 +574,10 @@ struct Pending {
     sequence_number: u32,
     difficulty: u64,
     block_hash: Option<[u8; 32]>,
+    /// Header hash burned in [`JobBook`] by validation. Released via
+    /// [`JobBook::unburn`] when the ticket is dropped without a durable
+    /// record (channel close, connection teardown, expiry, or host refusal).
+    hash: [u8; 32],
     kind: PendingKind,
 }
 
@@ -1783,6 +1788,7 @@ impl ProtocolSession {
                                 sequence_number,
                                 difficulty,
                                 block_hash: None,
+                                hash: *accepted.hash.as_bytes(),
                                 kind: PendingKind::Share,
                             },
                         );
@@ -1801,6 +1807,7 @@ impl ProtocolSession {
                                 sequence_number,
                                 difficulty,
                                 block_hash: Some(*found.share.hash.as_bytes()),
+                                hash: *found.share.hash.as_bytes(),
                                 kind: PendingKind::Block,
                             },
                         );
@@ -2028,7 +2035,19 @@ impl ProtocolSession {
             return Ok(());
         };
         book.close_session(channel.session);
-        // Cancel: shares of a closed channel are not acknowledged.
+        // Cancel: shares of a closed channel are not acknowledged. Their
+        // burned duplicate keys are released so identical retries validate
+        // fresh instead of sticking at `Duplicate` while nothing can ever
+        // credit them.
+        for hash in self
+            .pending
+            .values()
+            .filter(|pending| pending.channel_id == channel_id)
+            .map(|pending| pending.hash)
+            .collect::<Vec<_>>()
+        {
+            unburn_hash(book, &hash);
+        }
         self.pending
             .retain(|_, pending| pending.channel_id != channel_id);
         self.push_event(Event::ChannelClosed { channel_id, reason })
@@ -2088,7 +2107,12 @@ impl ProtocolSession {
         for (_, channel) in std::mem::take(&mut self.channels) {
             book.close_session(channel.session);
         }
-        self.pending.clear();
+        // Dropped tickets will never be confirmed: release their burned
+        // duplicate keys so retries on a fresh connection validate anew
+        // rather than inherit `Duplicate` from uncredited work.
+        for pending in std::mem::take(&mut self.pending).into_values() {
+            unburn_hash(book, &pending.hash);
+        }
         self.phase = Phase::Closing;
     }
 }
@@ -2098,6 +2122,11 @@ struct PreparedShare {
     job: JobId,
     rolled: Vec<u8>,
     target: ShareTarget,
+}
+
+/// Releases one header hash burned by [`JobBook::validate`].
+fn unburn_hash(book: &mut JobBook, hash: &[u8; 32]) {
+    let _ = book.unburn(&BlockHash::from(Hash256::from_le_bytes(hash)));
 }
 
 struct Submit {

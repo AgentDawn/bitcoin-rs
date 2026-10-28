@@ -426,6 +426,31 @@ fn block_candidate_passes_consensus_and_reproduces_the_share() -> TestResult {
 }
 
 #[test]
+fn unburn_releases_duplicate_key_for_retry() -> TestResult {
+    let mut fx = fixture(config(), 100, 2)?;
+    let target = easy()?;
+    let job = Arc::clone(&fx.job);
+    let first = fx.book.validate(&submit_for(&fx.session, &job, 41), &target)?;
+    let hash = first.share().hash;
+    let replay = fx.book.validate(&submit_for(&fx.session, &job, 41), &target);
+    assert!(
+        matches!(replay, Err(ShareError::Duplicate { first_job, .. }) if first_job == job.id())
+    );
+    // Unknown keys release nothing.
+    assert!(!fx.book.unburn(&BlockHash::from(Hash256::from_le_bytes(&[0xcc; 32]))));
+    // The burned key releases once; a retry then validates fresh.
+    assert!(fx.book.unburn(&hash));
+    assert!(!fx.book.unburn(&hash));
+    let retry = fx.book.validate(&submit_for(&fx.session, &job, 41), &target)?;
+    assert_eq!(retry.share().hash, hash);
+    let replay = fx.book.validate(&submit_for(&fx.session, &job, 41), &target);
+    assert!(
+        matches!(replay, Err(ShareError::Duplicate { first_job, .. }) if first_job == job.id())
+    );
+    Ok(())
+}
+
+#[test]
 fn scriptsig_may_grow_to_exactly_the_consensus_limit() -> TestResult {
     let mut wide = config();
     wide.extranonce = ExtranonceLayout::new(1, 95);

@@ -1471,6 +1471,31 @@ impl JobBook {
         usize::try_from(id.0 - front).map_err(|_| ShareError::UnknownJob(id))
     }
 
+    /// Releases a burned duplicate key so a later identical submission
+    /// validates fresh. Removes the hash from the duplicate set and from the
+    /// owning job's remembered hashes; a missing or retired job still clears
+    /// the shared set. Returns whether the key was present.
+    ///
+    /// Call only when the validated share will never be durably recorded from
+    /// its ticket (rejected and dropped by the adapter, or expired while
+    /// unacknowledged): confirmed or buffered shares must keep their burn so
+    /// replays converge to [`ShareError::Duplicate`] instead of
+    /// double-crediting. Linearizable under the single `&mut` borrow.
+    #[must_use]
+    pub fn unburn(&mut self, hash: &BlockHash) -> bool {
+        let raw = Hash256::from(*hash);
+        let Some(job) = self.seen.remove(&raw) else {
+            return false;
+        };
+        if let Ok(index) = self.locate(job)
+            && let Some(entry) = self.jobs.get_mut(index)
+            && let Some(position) = entry.hashes.iter().position(|known| *known == raw)
+        {
+            entry.hashes.swap_remove(position);
+        }
+        true
+    }
+
     /// The single share predicate.
     ///
     /// Checks, in order: session, job existence, job staleness, extranonce

@@ -389,8 +389,15 @@ fn handle_events(
                     });
                 if recorded {
                     connection.confirm_share(event.ticket)?;
-                } else {
-                    connection.reject_share(event.ticket, ERROR_CODE_SHARE_NOT_RECORDED)?;
+                } else if connection.reject_share(event.ticket, ERROR_CODE_SHARE_NOT_RECORDED)? {
+                    // The ticket is gone and the share was never recorded:
+                    // release the burned duplicate key so a retry validates
+                    // fresh instead of sticking at `Duplicate`. A queued
+                    // refusal failure leaves the ticket in place, so no
+                    // release happens on `Err`.
+                    core.with_job_book(|book| {
+                        book.unburn(&event.outcome.hash);
+                    });
                 }
             }
             Event::BlockFound(pending) => {
