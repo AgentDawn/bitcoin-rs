@@ -110,10 +110,17 @@ impl<S: KvStore> IndexWriter<S> {
     /// A missing live watermark with leftover rows is treated as an
     /// interrupted seed: `ScriptLive` is reset before any new row is
     /// written so a later watermark cannot advertise a stale view.
+    ///
+    /// `cancelled` is polled at entry, every 4,096 emitted rows, and before
+    /// the final watermark commit; a trip returns
+    /// [`IndexError::Cancelled`] with no watermark stamped. A cancelled
+    /// prefix is cleared by the retry's opening reset, and the caller keeps
+    /// its artifact and lease for that retry.
     pub(crate) fn seed_script_live_stream<F>(
         &self,
         mut produce: F,
         seed_tip: IndexWatermark,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<usize, IndexError>
     where
         F: FnMut(
@@ -121,6 +128,9 @@ impl<S: KvStore> IndexWriter<S> {
         ) -> Result<(), IndexError>,
     {
         const SEED_BATCH_ROWS: usize = 4_096;
+        if cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         let existing = capture_write_fence(self.indexer.store.as_ref(), self.generation)?;
         if existing.watermarks.script_live.is_some() {
             return Err(IndexError::LiveAlreadySeeded);
@@ -134,7 +144,7 @@ impl<S: KvStore> IndexWriter<S> {
         if fence.watermarks.script_live.is_some() {
             return Err(IndexError::LiveAlreadySeeded);
         }
-        let mut written = 0;
+        let mut written: usize = 0;
         let mut batch = self.indexer.store.new_batch();
         batch.put(
             ColumnFamily::UtxoMeta,
@@ -162,9 +172,15 @@ impl<S: KvStore> IndexWriter<S> {
                 );
                 in_batch = 0;
             }
+            if written.is_multiple_of(SEED_BATCH_ROWS) && cancelled() {
+                return Err(IndexError::Cancelled);
+            }
             Ok(())
         };
         produce(&mut add)?;
+        if cancelled() {
+            return Err(IndexError::Cancelled);
+        }
         batch.put(
             ColumnFamily::UtxoMeta,
             FORMAT_VERSION_KEY,
@@ -228,6 +244,7 @@ impl<S: KvStore> IndexWriter<S> {
                 Ok(())
             },
             seed_tip,
+            &|| false,
         )
     }
 

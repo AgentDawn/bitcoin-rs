@@ -11,7 +11,7 @@
 
 use super::artifact::{
     ARTIFACT_VERSION, ArtifactHeader, CANCEL_POLL_RECORDS, HEADER_LEN, IO_BUFFER_BYTES, hash_file,
-    positions_are_valid, write_record,
+    write_record,
 };
 use super::chain::{BodyReader, ChainBase, Located};
 use super::manifest::{
@@ -21,7 +21,7 @@ use super::{
     BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, MAX_RESTORE_POSITIONS, io_error,
     sync_dir,
 };
-use crate::types::{HashPrefixRow, TxPosition, TxPositionValue};
+use crate::types::{HashPrefixRow, TxPosition, TxPositionValue, positions_are_valid};
 use crate::{
     IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexSnapshot,
 };

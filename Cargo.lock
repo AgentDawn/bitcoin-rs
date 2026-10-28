@@ -337,6 +337,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-rs-chain",
  "bitcoin-rs-primitives",
+ "bitcoin-rs-script",
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
  "bitcoin_hashes",
