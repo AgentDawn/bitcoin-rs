@@ -539,7 +539,7 @@ impl bitcoin_rs_mempool::MempoolObserver for MempoolSequenceObserver {
     }
 
     fn on_mutation(&self, envelope: &bitcoin_rs_mempool::MutationEnvelope) {
-        use bitcoin_rs_primitives::encode::ConsensusEncode;
+        use bitcoin_rs_primitives::encode::consensus_bytes;
         let result = &envelope.result;
         for (offset, change) in result.changes.iter().enumerate() {
             let Some(sequence) = result.sequence_of(offset) else {
@@ -554,9 +554,7 @@ impl bitcoin_rs_mempool::MempoolObserver for MempoolSequenceObserver {
                             .iter()
                             .find(|(index, _)| *index == offset)
                     {
-                        let mut bytes = Vec::with_capacity(tx.total_size());
-                        tx.consensus_encode(&mut bytes);
-                        self.publisher.publish_rawtx(&bytes);
+                        self.publisher.publish_rawtx(&consensus_bytes(tx.as_ref()));
                     }
                     self.publisher
                         .publish_sequence(SequenceEvent::Added(txid, sequence));
@@ -1113,6 +1111,10 @@ mod manifest_tests {
         let raw = subscriber.recv_multipart(0)?;
         assert_eq!(raw[0].as_slice(), b"rawtx");
         assert_eq!(raw[1], expected);
+        // Per-topic transport counters (`ZmqTopic::index`): the warm-up loop above
+        // publishes `SequenceEvent::Connected`, which advances only the `Sequence`
+        // counter (index 4). This is the first `rawtx` publish, so the `RawTx`
+        // counter (index 3) is still 0 here.
         assert_eq!(raw[2], 0_u32.to_le_bytes());
         let added = subscriber.recv_multipart(0)?;
         assert_eq!(added[0].as_slice(), b"sequence");
