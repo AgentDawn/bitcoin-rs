@@ -373,9 +373,17 @@ fields stay in tracing, where they can change with the implementation.
   scans every sample, including the real txindex readiness gauge; evidence
   identity remains in benchmark ledger records, not operator time-series labels.
 - The chainstate observability fixtures check retired metric names only on the
-  caller thread with coinbase-only apply/window fixtures. The window verify
+  caller thread with coinbase-only apply/window fixtures connected on top of a
+  directly published genesis seed. Seeding alone (`seed_genesis` in
+  `crates/chainstate/tests/unit/test_fixtures.rs`) publishes the genesis tip
+  with count 1 without connect and without hooks, so it emits no apply/window
+  observations. Nonzero stage observations require connecting at least one
+  mined coinbase-only child (`apply_block` for the apply timers, a
+  `connect_window` pair for the window histogram, `validate_block` for proposal
+  timings). The window verify
   histogram is emitted after the parallel verifier joins; the local recorder
-  does not cover arbitrary Rayon-worker emissions or script sub-stage metrics.
+  does not cover arbitrary Rayon-worker emissions, spending transactions, or
+  script-resolution sub-stages.
 - Real tracing-subscriber regressions cover proposal completion, contextual
   header rejection, and a missing-prevout script rejection. The last exercises
   successful prevout resolution followed by verification failure, not resolution
