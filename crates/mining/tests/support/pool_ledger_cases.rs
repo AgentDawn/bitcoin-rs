@@ -1164,6 +1164,39 @@ fn pruning_streams_bounded_batches() {
 }
 
 #[test]
+fn pruning_many_batches_applies_the_limit_before_materialization() {
+    let (_dir, ledger) = plain_ledger(100);
+    // 3500 unit-work shares: keeping the newest 100 dooms 3400, which needs
+    // three full 1024 batches plus a 328 partial. A range that materialized
+    // the whole doomed prefix before `take` would buffer all 3400 keys on the
+    // first commit; bounded sequence lookups commit at most 1024 per batch.
+    for nonce in 0..3500u32 {
+        ledger.record_share(&share(1, 1, nonce, 1)).fixture("share");
+    }
+    assert_eq!(ledger.share_count().fixture("count"), 3500);
+    assert_eq!(ledger.prune_shares(100).fixture("prune"), 3400);
+    assert_eq!(ledger.share_count().fixture("count"), 100);
+    assert_eq!(
+        ledger.current_window().fixture("window"),
+        vec![(MinerId(1), 100)]
+    );
+    let audits = ledger.audit_records(0, 10_000).fixture("audit");
+    let batches: Vec<u64> = audits
+        .iter()
+        .filter(|record| record.kind == AuditKind::SharesPruned)
+        .map(|record| record.values[1])
+        .collect();
+    assert_eq!(batches.len(), 4, "3400 doomed in 1024-sized batches");
+    assert!(
+        batches.iter().all(|batch| *batch <= 1024),
+        "every batch applies the 1024 limit: {batches:?}"
+    );
+    assert_eq!(batches.iter().sum::<u64>(), 3400);
+    assert_eq!(ledger.prune_shares(100).fixture("nothing left"), 0);
+    ledger.check_invariants().fixture("invariants");
+}
+
+#[test]
 fn share_count_comes_from_sequence_metadata_not_a_table_scan() {
     let (_dir, ledger) = plain_ledger(5);
     assert_eq!(ledger.share_count().fixture("empty"), 0);

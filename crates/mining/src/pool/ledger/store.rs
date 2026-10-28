@@ -509,44 +509,60 @@ impl Ledger {
             let txn = self.db.begin_write()?;
             let removed = {
                 let tables = Tables::open(&txn)?;
-                let doomed: Vec<u64> = tables
-                    .shares
-                    .range(..boundary)?
-                    .take(Self::PRUNE_BATCH_SIZE)
-                    .map(|item| item.map(|(key, _)| key.value()))
-                    .collect::<Result<Vec<u64>, LedgerError>>()?;
-                if doomed.is_empty() {
+                let start = meta_u64(&tables.meta_u64, M_PRUNED_BELOW)?;
+                if start >= boundary {
                     break;
                 }
-                for seq in &doomed {
-                    tables.shares.remove(*seq)?;
-                }
-                let batch = u64::try_from(doomed.len())
+                let batch_cap = u64::try_from(Self::PRUNE_BATCH_SIZE)
                     .map_err(|_| LedgerError::Overflow("count"))?;
-                let previous = meta_u64(&tables.meta_u64, M_PRUNED_BELOW)?;
-                // Advance past this batch; the final partial batch restores
-                // the exact floor. Batches ascend, so every remaining key
-                // exceeds the floor even before the last batch lands.
-                let floor = if doomed.len() < Self::PRUNE_BATCH_SIZE {
-                    boundary
-                } else {
-                    doomed
-                        .last()
-                        .and_then(|last| last.checked_add(1))
-                        .ok_or(LedgerError::Overflow("count"))?
-                };
-                if floor > previous {
-                    tables.meta_u64.insert(M_PRUNED_BELOW, floor)?;
+                let batch_end = start
+                    .checked_add(batch_cap)
+                    .ok_or(LedgerError::Overflow("count"))?
+                    .min(boundary);
+                let mut doomed: Vec<u64> = Vec::new();
+                doomed.reserve(
+                    usize::try_from(batch_end - start).unwrap_or(Self::PRUNE_BATCH_SIZE),
+                );
+                for seq in start..batch_end {
+                    if tables.shares.get(seq)?.is_some() {
+                        doomed.push(seq);
+                    }
                 }
-                append_audit(
-                    &tables,
-                    AuditKind::SharesPruned,
-                    0,
-                    &ZERO_HASH,
-                    &ZERO_HASH,
-                    [boundary, batch, low64(cumulative)],
-                )?;
-                batch
+                let previous = meta_u64(&tables.meta_u64, M_PRUNED_BELOW)?;
+                // `batch_end` is the floor: `doomed` holds every live key
+                // below it (seqs are dense), so every remaining key meets or
+                // exceeds it even before the last batch lands. The final
+                // slice restores the exact boundary.
+                let floor = batch_end;
+                if doomed.is_empty() {
+                    // A fully gapped slice cannot happen for contiguous seqs;
+                    // advancing the floor guarantees progress instead of
+                    // stalling on it. No audit for an empty slice.
+                    if floor > previous {
+                        tables.meta_u64.insert(M_PRUNED_BELOW, floor)?;
+                        0
+                    } else {
+                        break;
+                    }
+                } else {
+                    for seq in &doomed {
+                        tables.shares.remove(*seq)?;
+                    }
+                    let batch = u64::try_from(doomed.len())
+                        .map_err(|_| LedgerError::Overflow("count"))?;
+                    if floor > previous {
+                        tables.meta_u64.insert(M_PRUNED_BELOW, floor)?;
+                    }
+                    append_audit(
+                        &tables,
+                        AuditKind::SharesPruned,
+                        0,
+                        &ZERO_HASH,
+                        &ZERO_HASH,
+                        [boundary, batch, low64(cumulative)],
+                    )?;
+                    batch
+                }
             };
             self.commit(txn, OP_PRUNE_SHARES)?;
             removed_total = removed_total
