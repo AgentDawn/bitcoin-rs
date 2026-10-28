@@ -83,8 +83,8 @@ fn the_stale_tip_allowance_dials_past_the_slot_cap() {
 
     let listeners: Vec<TcpListener> = (0..3)
         .map(|_| {
-            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-                .expect("bind a fake peer listener");
+            let listener =
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a fake peer listener");
             listener
                 .set_nonblocking(true)
                 .expect("nonblocking fake peer listener");
@@ -94,7 +94,7 @@ fn the_stale_tip_allowance_dials_past_the_slot_cap() {
     for listener in &listeners {
         let addr = listener.local_addr().expect("fake peer address");
         service
-            .test_queue_automatic_dial(addr)
+            .test_queue_automatic_dial(addr.into())
             .expect("queue the automatic dial");
     }
 
