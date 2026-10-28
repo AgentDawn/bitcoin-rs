@@ -50,7 +50,6 @@ block size. Queue/model attributes are recorded for context only.
 
 import argparse
 import json
-import os
 import re
 import stat
 import sys
@@ -379,9 +378,10 @@ def identify_scope(
     """
     sys_base_path = Path(sys_base)
     diskstats = Path(diskstats_path)
-    real = str(Path(scratch).resolve())
+    scratch_path = Path(scratch).resolve()
+    real = str(scratch_path)
     try:
-        scratch_is_dir = stat.S_ISDIR(os.stat(real).st_mode)
+        scratch_is_dir = stat.S_ISDIR(scratch_path.stat().st_mode)
         scratch_reason: str | None = None
     except OSError as error:
         scratch_is_dir = False

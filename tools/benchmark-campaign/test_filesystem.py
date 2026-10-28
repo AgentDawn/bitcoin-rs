@@ -151,12 +151,12 @@ class MountBoundaryTests(unittest.TestCase):
     def test_nonutf8_child_mount_maps_to_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            # Non-UTF8 names are unrepresentable in ``pathlib`` (str-only),
-            # so the byte path is created with ``os.mkdir`` directly.
-            raw_child = os.fsencode(root) + b"/\xffraw"
-            os.mkdir(raw_child)
-            os.mkdir(raw_child + b"/scratch")
-            child = os.fsdecode(raw_child)
+            # Surrogateescaped names stay ``str``; ``pathlib`` syscalls
+            # re-encode them to the original non-UTF8 bytes.
+            raw_child = root / os.fsdecode(b"\xffraw")
+            raw_child.mkdir()
+            (raw_child / "scratch").mkdir()
+            child = str(raw_child)
             sys_base = root / "sys"
             sys_base.mkdir()
             _make_device(sys_base, "8:2", _ext4_device(11))
