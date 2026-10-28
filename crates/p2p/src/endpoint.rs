@@ -241,16 +241,17 @@ pub const fn addrv2_gossip_enabled(
     }
 }
 
-/// Core internal netgroup for an endpoint host (not the BIP155 tag).
+/// Canonical `AddrMan` netgroup for an endpoint host (not the BIP155 tag).
 ///
 /// IP uses the existing prefix/ASMap grouping via
 /// [`crate::netgroup::NetGroups`] at call sites; overlay groups are
-/// `[3, key[0]|0x0f]` / `[4, hash[0]|0x0f]` with `nBits = 4`.
+/// `[4, key[0]|0x0f]` / `[5, hash[0]|0x0f]` with `nBits = 4`, matching the
+/// canonical v1 schema that PR #1684 must adopt before its merge.
 #[must_use]
 pub fn overlay_netgroup(host: EndpointHost) -> Option<Vec<u8>> {
     match host {
-        EndpointHost::TorV3 { key } => Some(vec![3, key[0] | 0x0f]),
-        EndpointHost::I2p { hash } => Some(vec![4, hash[0] | 0x0f]),
+        EndpointHost::TorV3 { key } => Some(vec![4, key[0] | 0x0f]),
+        EndpointHost::I2p { hash } => Some(vec![5, hash[0] | 0x0f]),
         EndpointHost::Ip(_) => None,
     }
 }
@@ -901,11 +902,11 @@ mod tests {
     fn overlay_netgroup_vectors() {
         assert_eq!(
             overlay_netgroup(EndpointHost::TorV3 { key: [0x21u8; 32] }),
-            Some(vec![3, 0x2f])
+            Some(vec![4, 0x2f])
         );
         assert_eq!(
             overlay_netgroup(EndpointHost::I2p { hash: [0x30u8; 32] }),
-            Some(vec![4, 0x3f])
+            Some(vec![5, 0x3f])
         );
         assert_eq!(
             overlay_netgroup(EndpointHost::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST))),

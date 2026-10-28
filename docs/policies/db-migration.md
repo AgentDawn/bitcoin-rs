@@ -30,7 +30,7 @@ The durable head is the only authoritative commit point. A writer appends body a
 Estimator, discovery, and index formats evolve outside `CURRENT_SCHEMA`. Each carries its own version:
 
 - Fee estimator state carries an estimator-owned version. A corrupt, missing, or unknown version degrades to insufficient-data status. The node starts. It never fabricates a rate or a default confidence.
-- Peer discovery state carries a discovery-owned version. A corrupt, missing, or unknown version degrades to seeded or empty discovery with a typed reseed or rebuild status. The node starts.
+- Peer discovery state carries a discovery-owned version. A corrupt, missing, or unknown version degrades to seeded or empty discovery with a typed reseed or rebuild status. The node starts. Exception: the P2P address book's pre-release handling is owned by `docs/policies/p2p-compatibility.md` §7: an unmarked pre-release file is preserved byte-for-byte as `pre-release-<sha256>.bak` before a fresh book starts, instead of being reseeded in place.
 - Mempool restart snapshots carry a mempool-owned version, genesis identity and checksum. Rejected candidates never prevent Chainstate startup. On clean save, a rejected ordinary snapshot is moved intact into a unique `mempool-snapshot-rejected-*` directory before publishing fresh candidates. Failure to read or quarantine it prevents replacement. The gateway revalidates candidates against recovered Chainstate; fee-estimator history remains independent.
 - Index layout carries one durable marker in `UtxoMeta`. The durability marker (`[0x00, b'V']`, currently row-format 5) is the hard gate: a mismatch refuses open and recovery full-resets for rebuild. The marker covers key layout and row-value widths alike; format 5 changed both.
 
@@ -40,7 +40,7 @@ In every case:
 - Owner-local evolution keeps `CURRENT_SCHEMA` unchanged.
 - No translator, converter, or legacy reader exists for any owner-local format.
 - A rejected owner-local file stays in place until an explicit authorized rebuild. The node never silently deletes it. Exceptions: mempool restart snapshots are quarantined intact as described above; disposable derived index namespaces recovery full-resets for rebuild from retained canonical chainstate on a version mismatch (operator cost of an index format bump: one unattended derived re-index on first start, no authoritative data touched).
-- No backup or rotation framework exists. Recovery is reseed, rebuild, or re-admission from canonical data.
+- No backup or rotation framework exists, except the address book's one pre-release preservation backup (`pre-release-<sha256>.bak`, see above). Recovery is reseed, rebuild, or re-admission from canonical data.
 
 ## Operator resync procedure
 

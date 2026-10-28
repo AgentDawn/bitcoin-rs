@@ -462,7 +462,7 @@ forward body is retried, never punished.
   Accepted ordinary VERSION updates metadata before service rejection without
   marking Good. Unknown DNS service metadata retains its bootstrap exemption;
   an observed VERSION, including zero services, is known metadata. Representation
-  and migration are owned by `docs/policies/p2p-compatibility.md` section 7;
+  and persistence are owned by `docs/policies/p2p-compatibility.md` section 7;
   manual dials and feelers bypass this metadata prefilter.
 - The advertised set follows the prune setting (`init.cpp:2022-2026`):
   `WITNESS | NETWORK` normally, `WITNESS | NETWORK_LIMITED` when

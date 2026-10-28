@@ -386,54 +386,69 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
    Core ASN groups serialize as NET_IPV6 followed by little-endian ASN bytes,
    grouping IPv4/IPv6 together. ASN0 uses the corrected prefix/HE fallback;
    public linked-IPv4 forms use their embedded IPv4 without rewriting the dial
-   endpoint. Internal and legacy DNS sources retain their source namespaces.
+   endpoint. Internal DNS sources retain their source namespace.
    Startup logs the raw-file SHA256 identity. Invalid or unavailable configured
-   maps permit memory-only prefix fallback but disable all book publication
-   and migration backup creation; restoring the map recovers the untouched
-   book. Intentionally omitting the map permits backed-up prefix migration.
+   maps permit memory-only prefix fallback but disable all book publication;
+   restoring the map recovers the untouched book. Intentionally omitting the
+   map uses prefix grouping in the current format without any format change
+   or backup.
 
-   Schema v8 persists the secret, original source, health, map identity,
-   New membership and at most two anchors in one checksummed snapshot. Services
-   is a required field: JSON null means unknown DNS metadata, while numeric zero
-   means a known zero-bit claim. Null is valid only for an Internal/legacy-DNS
-   original source with no prior Good. Missing or invalid fields fail closed.
-   Same-map restart restores every reference; same-classifier v5/v6/v7-to-v8
-   upgrades preserve all references and anchors exactly. Known v1–v7 formats,
-   including genuine v3 files carrying anchors, are strict migration sources.
-   Their service fields must be numeric u64; old null or missing fields remain
-   invalid. Historical DNS zero/no-Good records cannot reveal whether zero was
-   actually observed. Decoding infers only that ambiguous case as unknown in
-   memory, where it may retry; its next accepted VERSION records the observation
-   precisely. Exact-byte backup gates publication of the upgraded file, not
-   in-memory discovery. If backup fails, the original file remains untouched and
-   the in-memory book runs with persistence disabled. IP zero and every
-   prior-Good zero stay known. No source, success or failure value is rewritten
-   to manufacture evidence.
-   The v1 reader retains its original 4,096-record/64-source/slot checks;
-   historical ASMap layouts validate source/record shape before re-bucketing.
-   The actual source bytes are copied to an exclusive content-named
-   `.v<schema>-<sha256>.bak` and file/directory-synced before replacement.
-   Schema-only upgrades do not discard corroboration. Changed classifiers or
-   old custom placement use deterministic original-source re-bucketing,
-   prioritizing proven/recent successes and logging retained/demoted/dropped
-   counts. Historic DNS u64 hashes retain a labelled legacy namespace; no
-   recovered seed name or Core hash is invented. Operational attempt/Good
-   times reset; advertised time, success and failures remain intact. A backup
-   failure allows memory discovery but disables writes. Unknown versions or
-   fields remain read-only. Retained anchors keep their original confirmation
-   time and remain a unique successful-record subset; regrouping prunes anchors
-   only when their endpoint is actually removed.
+   The book persists in one canonical v1 layout (issue #1688 pre-release
+   freeze). Every snapshot carries the explicit `FORMAT` identifier
+   `bitcoin-rs-addrman` with `SCHEMA_VERSION 1`, so an old unmarked
+   pre-release file is never mistaken for the canonical format. Until the
+   first official bitcoin-rs release `SCHEMA_VERSION` stays `1`: pre-release
+   layout changes edit the canonical v1 definition directly and never bump
+   the version or add a compatibility decoder or migration path. Only after
+   the first official release may a breaking storage change increment the
+   schema version with an explicit compatibility/migration decision; a
+   release itself does not require a bump. No historical v1–v9 decoders,
+   converters, version-specific re-bucketing, or upgrade fixtures exist.
+   PR #1684 must adopt this exact format and the shared canonical v1 fixture
+   before its merge; this branch does not claim that adoption has happened.
+   Canonical v1 persists the secret, original source, health, map identity,
+   New membership and at most two anchors in one checksummed snapshot.
+   Services is a required field: JSON null means unknown DNS metadata, while
+   numeric zero means a known zero-bit claim. Null is valid only for an
+   Internal DNS original source with no prior Good. Missing or
+   invalid fields fail closed. Same-map restart restores every reference.
+   IP zero and every prior-Good zero stay known. No source, success or
+   failure value is rewritten to manufacture evidence.
+   An old unmarked pre-release file is never interpreted as canonical v1 and
+   is never silently overwritten: its bytes are preserved byte-for-byte as
+   `pre-release-<sha256>.bak` (exclusive content-named creation,
+   file/directory-synced) and a fresh book starts without migration. A stale
+   file never forces permanent read-only operation: the in-memory book keeps
+   discovering peers and publishes the fresh book once preservation succeeds.
+   Byte-for-byte preservation gates publication of the fresh book, not
+   in-memory discovery. If preservation fails, the original file remains
+   untouched and the in-memory book runs with persistence disabled.
+   Corrupt, unsafe, unknown, or unreadable files still fail safely:
+   publication stays disabled while in-memory discovery continues.
+   Runtime ASMap regrouping is current-format invariance, not historical
+   migration: a changed classifier re-buckets current-format records by
+   deterministic original-source re-bucketing, prioritizing proven/recent
+   successes and logging retained/demoted/dropped counts, without discarding
+   corroboration. No seed name or Core hash is ever invented. Operational
+   attempt/Good times reset; advertised time, success and failures remain
+   intact. Unknown versions or fields remain read-only. Retained anchors keep
+   their original confirmation time and remain a unique successful-record
+   subset; regrouping prunes anchors only when their endpoint is actually
+   removed.
 
    Actual Core group/placement evidence includes 224 ASMap rows and official
-   Tried236/New795 anchors. Migration fixtures were emitted by the original
-   v1/v2/v3/v4/v5/v6/v7 writers; v5/v6/v7 fixtures pin all eight retained references. These
-   are specific algorithm/persistence checks, not full peer-lifecycle parity.
+   Tried236/New795 anchors. These are specific algorithm/persistence checks
+   against the canonical v1 format, not full peer-lifecycle parity; no
+   historical migration fixtures exist.
 
    Filenames remain scoped to actual P2P magic: `peers.dat` becomes
    `peers-<8 hexadecimal magic digits>.dat`, including custom/drynet magics.
-   A valid scoped book wins; same-magic legacy-base import retains the base,
-   and a valid foreign-magic base is left untouched. Corrupt/unknown/unreadable
-   files disable publication while in-memory discovery continues. Publication
+   A valid scoped book wins. An unscoped base-name file is read only when it is
+   canonical v1 bytes for the same magic, and that base is retained; a valid
+   foreign-magic base is left untouched. An unmarked pre-release base name is
+   not imported: it follows the preservation and fresh-start rule above.
+   Corrupt, unsafe, unknown or unreadable files disable publication while
+   in-memory discovery continues. Publication
    retains exclusive random temporary creation with bounded collisions, file
    sync, atomic installation and the storage owner's directory-sync policy.
    First installation cannot overwrite a newly appeared destination. Saves

@@ -233,6 +233,62 @@ impl fmt::Display for EndpointHost {
     }
 }
 
+impl EndpointHost {
+    /// Parse a port-free host: an IP literal, a 56-character Tor v3
+    /// `<payload>.onion` name, or a 52-character `<hash>.b32.i2p` name.
+    /// Overlay names are validated locally (checksum included).
+    #[must_use]
+    pub fn parse_host(text: &str) -> Option<Self> {
+        if let Ok(ip) = text.parse::<IpAddr>() {
+            return Some(Self::Ip(ip));
+        }
+        if let Some(onion) = text.strip_suffix(".onion") {
+            if onion.len() != 56 {
+                return None;
+            }
+            let payload = base32_decode(onion)?;
+            let key = tor_v3_key_from_payload(&payload)?;
+            return Some(Self::TorV3 { key });
+        }
+        if let Some(b32) = text.strip_suffix(".b32.i2p") {
+            if b32.len() != 52 {
+                return None;
+            }
+            let payload = base32_decode(b32)?;
+            if payload.len() != 32 {
+                return None;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&payload);
+            return Some(Self::I2p { hash });
+        }
+        None
+    }
+}
+
+impl serde::Serialize for EndpointHost {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for EndpointHost {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Host;
+        impl serde::de::Visitor<'_> for Host {
+            type Value = EndpointHost;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an IP, <56>.onion or <52>.b32.i2p host")
+            }
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<EndpointHost, E> {
+                EndpointHost::parse_host(text)
+                    .ok_or_else(|| serde::de::Error::custom("invalid overlay host"))
+            }
+        }
+        deserializer.deserialize_str(Host)
+    }
+}
+
 impl From<std::net::SocketAddr> for PeerEndpoint {
     fn from(socket: std::net::SocketAddr) -> Self {
         Self::Ip(socket)
