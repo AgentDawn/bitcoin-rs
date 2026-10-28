@@ -803,6 +803,7 @@ pub(crate) fn start_node(
                 relay_queue,
                 Arc::downgrade(&gateway),
             )),
+            bitcoin_rs_mempool::BodyInterest::Metadata,
         )
         .map_err(anyhow::Error::msg)?;
 

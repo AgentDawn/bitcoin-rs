@@ -4,7 +4,9 @@ use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::{
     BlockBodySource, BlockTreeReader, LatchReader, TipReader, TipSnapshot, softfork_state,
 };
-use bitcoin_rs_mempool::{AdmissionChain, ChainAdmissionSnapshot, MempoolGateway, PrevoutMeta};
+use bitcoin_rs_mempool::{
+    AdmissionChain, BodyInterest, ChainAdmissionSnapshot, MempoolGateway, PrevoutMeta,
+};
 #[cfg(any(test, feature = "test-seam"))]
 use bitcoin_rs_mempool::{Mempool, MempoolLimits, MempoolObserver};
 use bitcoin_rs_mining::MiningControl;
@@ -734,7 +736,7 @@ impl Context {
             mempool: MempoolHandles {
                 gateway: Arc::new(MempoolGateway::new(
                     Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-                    Some(observer),
+                    Some((observer, BodyInterest::Metadata)),
                     ValidationEngine::Native,
                     None,
                 )),
