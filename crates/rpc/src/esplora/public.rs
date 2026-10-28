@@ -161,14 +161,16 @@ pub(super) fn post(handler: &Handler, path: &str, body: &[u8]) -> Response {
                 unix_time_secs(),
                 &ctx.chain.admission_chain(),
             ) {
+                // `hashtx` for a newly admitted transaction is published once
+                // by the gateway observer; duplicates commit nothing and
+                // notify nothing.
                 Ok(_) => text_response("text/plain", txid.to_string().into_bytes()),
                 Err(error) => admission_error(error),
             }
         }
         // `/txs/package` is in this namespace so it cannot fall through to
-        // JSON-RPC. API.md makes package relay conditional on a
-        // package-admission backend; 404 is preferable to sequential
-        // sendrawtransaction calls pretending to be atomic.
+        // JSON-RPC. This endpoint remains unsupported until its Esplora wire
+        // contract is implemented over the gateway's package operation.
         _ => not_found(),
     }
 }

@@ -88,7 +88,7 @@ pub(super) fn restore(
     let (chain, count_withheld) = identity?;
     fresh?;
     // Without the receiver's count at the base the identity is unproven, so
-    // the locator outcome above is a placeholder and nothing activates.
+    // the locator outcome above is unchecked and nothing activates.
     if let Some(withheld) = count_withheld {
         return Ok(BundleOutcome::RestoreWithheld(withheld));
     }
@@ -96,6 +96,14 @@ pub(super) fn restore(
         LocatorOutcome::Verified => {}
         LocatorOutcome::Mismatch { height } => return Err(IndexBundleError::Locator { height }),
         LocatorOutcome::Withheld(withheld) => return Ok(BundleOutcome::RestoreWithheld(withheld)),
+        // Unreachable while the gates above run first: verification is only
+        // skipped when identity or freshness already refused. Fails closed so
+        // a future reorder can never activate an unchecked bundle.
+        LocatorOutcome::NotChecked => {
+            return Err(IndexBundleError::Identity(
+                "locator verification was skipped".to_owned(),
+            ));
+        }
     }
 
     let plan = ImportPlan {
@@ -232,6 +240,9 @@ enum LocatorOutcome {
     Mismatch { height: u32 },
     /// A body is unavailable, so the bundle cannot be proven here.
     Withheld(Withheld),
+    /// Verification was skipped: no chain was proven, so no outcome exists.
+    /// Never trusted; the gates in [`restore`] refuse before it is read.
+    NotChecked,
 }
 
 /// Locator verification that rides the validating pass. The first terminal
@@ -549,7 +560,7 @@ fn validate_artifact(
     if matches!(&framing, Err(IndexBundleError::Cancelled)) {
         return Err(IndexBundleError::Cancelled);
     }
-    io::copy(&mut reader, &mut io::sink()).map_err(fail)?;
+    drain_remaining_for_hash(&mut reader, host.cancelled, path)?;
     if into_digest(reader) != manifest.tx_lookup.sha256 {
         return Err(IndexBundleError::ArtifactHash { name });
     }
@@ -567,7 +578,10 @@ fn validate_artifact(
     let outcome = match (chain, locators) {
         (Some(_), Some(check)) => check.outcome,
         (Some(_), None) => LocatorOutcome::Withheld(Withheld::NoBodySource),
-        (None, _) => LocatorOutcome::Verified,
+        // No proven chain rode this pass, so there is no outcome to report;
+        // the caller refuses on identity, freshness, or count before reading
+        // it. Never `Verified`: correctness must not depend on that ordering.
+        (None, _) => LocatorOutcome::NotChecked,
     };
     Ok((header, outcome))
 }
@@ -628,6 +642,43 @@ fn read_records<R: Read>(
         }
         if visit(&record)?.is_break() {
             break;
+        }
+    }
+    Ok(())
+}
+
+/// Drains `reader` to end through its hashing layer in bounded 4,096-byte
+/// chunks, polling `cancelled` once per chunk ([`CANCEL_POLL_RECORDS`]).
+///
+/// A framing or locator fault does not stop the hash: the caller drains even
+/// after such a fault so a digest mismatch, which outranks every other
+/// artifact fault, is reported first. Cancellation returns at once with no
+/// digest comparison, preserving that precedence.
+fn drain_remaining_for_hash(
+    reader: &mut super::artifact::HashedFile,
+    cancelled: &dyn Fn() -> bool,
+    path: &Path,
+) -> Result<(), IndexBundleError> {
+    // Bounded: one small stack buffer, no allocation per chunk. Each chunk
+    // polls `cancelled` once, so a large invalid tail cannot block shutdown.
+    const DRAIN_CHUNK: usize = 4_096;
+    debug_assert!(
+        matches!(u64::try_from(DRAIN_CHUNK), Ok(v) if v == CANCEL_POLL_RECORDS),
+        "drain polls once per bounded chunk on the record interval"
+    );
+    let mut buf = [0_u8; DRAIN_CHUNK];
+    if cancelled() {
+        return Err(IndexBundleError::Cancelled);
+    }
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|error| io_error(path, error))?;
+        if n == 0 {
+            break;
+        }
+        if cancelled() {
+            return Err(IndexBundleError::Cancelled);
         }
     }
     Ok(())
@@ -733,6 +784,27 @@ impl ImportPlan<'_> {
         if into_digest(hashed) != self.manifest.tx_lookup.sha256 {
             return Err(IndexBundleError::ArtifactHash { name });
         }
+        // The chain may have reorged during the long stream: refuse to stamp
+        // a watermark for a base that left the active chain. A tip advance
+        // past the base is fine — restore supports an above-base tip and
+        // backfill continues above it — so only the base identity is
+        // rechecked. Un-watermarked rows are cleared by the existing reset
+        // path, so a retry starts clean.
+        let tip = self.host.applied_tip.load_full().ok_or_else(|| {
+            IndexBundleError::Identity("the receiver has no applied tip".to_owned())
+        })?;
+        let base_height = self.manifest.identity.base_height;
+        let still_active = {
+            let tree = self.host.block_tree.read();
+            tree.node_at_height_from(tip.tip_id, base_height)
+                .and_then(|id| tree.node(id).ok())
+                .is_some_and(|node| node.hash.to_le_bytes() == self.manifest.identity.base_hash)
+        };
+        if !still_active {
+            return Err(IndexBundleError::Identity(
+                "the bundle base is not on the receiver's active chain".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -763,6 +835,66 @@ fn discard_partial_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// The invalid-bundle drain is a bounded chunked copy that polls
+    /// cancellation once per 4,096-byte chunk: an untripped poll drains
+    /// fully so the digest comparison can outrank framing faults, while a
+    /// trip returns `Cancelled` at once with no digest comparison.
+    #[test]
+    fn invalid_tail_drain_polls_cancellation_per_bounded_chunk(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tail.dat");
+        // Several poll intervals plus a short tail: the final chunk is
+        // partial by construction, so the drain must not assert alignment.
+        let interval = usize::try_from(CANCEL_POLL_RECORDS)?;
+        let bytes = vec![0xAB_u8; 3 * interval + 17];
+        std::fs::write(&path, &bytes)?;
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let digest: [u8; 32] = hasher.finalize().into();
+            digest
+        };
+
+        // No cancellation drains fully and hashes every byte.
+        let mut reader = open_hashed(&path)?;
+        drain_remaining_for_hash(&mut reader, &|| false, &path)?;
+        assert_eq!(
+            into_digest(reader),
+            expected,
+            "the bounded drain must hash the whole tail"
+        );
+
+        // Immediate cancellation stops before any digest comparison.
+        let mut reader = open_hashed(&path)?;
+        let immediate = drain_remaining_for_hash(&mut reader, &|| true, &path);
+        assert!(
+            matches!(immediate, Err(IndexBundleError::Cancelled)),
+            "entry poll must stop the drain: {immediate:?}"
+        );
+
+        // A trip after the first chunk stops mid-tail, even though the
+        // undrained digest would mismatch: cancellation outranks the hash.
+        let polls = Cell::new(0_u32);
+        let mut reader = open_hashed(&path)?;
+        let mid = drain_remaining_for_hash(
+            &mut reader,
+            &|| {
+                polls.set(polls.get() + 1);
+                polls.get() > 1
+            },
+            &path,
+        );
+        assert!(
+            matches!(mid, Err(IndexBundleError::Cancelled)),
+            "mid-drain stop must return at once: {mid:?}"
+        );
+        assert!(polls.get() >= 2, "the drain must poll more than once");
+        Ok(())
+    }
 
     /// A locator must equal its top-level span exactly. An offset shifted
     /// into the transaction body (an embedded serialization), a truncated
