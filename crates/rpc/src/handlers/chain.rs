@@ -16,7 +16,7 @@ use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait, 
 
 use super::util::{ScanScript, parse_derivation_range, scan_descriptor};
 #[cfg(test)]
-use super::util::{scan_descriptor, scan_descriptor_range};
+use super::util::scan_descriptor_range;
 use bitcoin::hex::DisplayHex as _;
 
 use crate::context::{AppliedView, ChainControlError, Context, TxQueryError, TxUnavailableCause};
