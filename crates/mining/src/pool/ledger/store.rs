@@ -2487,6 +2487,7 @@ fn decide(batch: &PayoutBatch, observation: &BatchObservation, config: &PoolConf
                 observation.txs.iter().any(|tx| {
                     tx.txid == recorded.txid
                         && tx.canonical
+                        && tx.confirmations >= u64::from(config.payout_confirmations)
                         && matches!(
                             tx.status,
                             TxStatus::Confirmed { block_hash, height }

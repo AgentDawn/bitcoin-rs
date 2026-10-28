@@ -3287,3 +3287,52 @@ fn payout_lifecycle_events_are_audited_in_order() {
     assert_eq!(confirmed.hash2, tx.txid);
     assert_eq!(confirmed.values[0], 102);
 }
+
+#[test]
+fn confirmed_payout_with_shallow_depth_reverts_and_restores_reservation() {
+    // A retained payout block whose depth falls below `payout_confirmations`
+    // must not stay Confirmed and paid: the shallow-but-canonical observation
+    // reverts to Broadcast and restores the reservation via `Decision::Revert`.
+    let fund = funded(0, 1_000_001);
+    let batch = prepared(&fund);
+    let total = batch.total_sat;
+    let tx = pay_tx(&batch, &[outpoint(0xA1, 0)], None);
+    fund.ledger
+        .record_signed(&receipt(&batch, &tx))
+        .fixture("signed");
+    fund.chain.set_tx(tx.txid, TxStatus::InMempool);
+    fund.ledger
+        .record_broadcast(&batch.id, &tx.txid, &fund.chain)
+        .fixture("broadcast");
+    // Depth 2 meets `payout_confirmations = 2`: Confirmed and paid.
+    confirm_tx(&fund, tx.txid, 0xB1, 102, 103);
+    let confirmed = fund.ledger.reconcile_payouts(&fund.chain).fixture("confirm");
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0].to, BatchState::Confirmed);
+    let after_confirm = fund.ledger.batch(&batch.id).fixture("batch").fixture("exists");
+    assert_eq!(after_confirm.state, BatchState::Confirmed);
+    assert!(after_confirm.confirmation.is_some());
+
+    // Lower the tip so the same canonical block is only depth 1: the retained
+    // block no longer meets confirmations and must revert, restoring the
+    // reservation instead of staying paid.
+    fund.chain.set_tip(102);
+    let reverted = fund.ledger.reconcile_payouts(&fund.chain).fixture("shallow");
+    assert_eq!(reverted.len(), 1, "shallow Confirmed must transition");
+    assert_eq!(reverted[0].from, BatchState::Confirmed);
+    assert_eq!(reverted[0].to, BatchState::Broadcast);
+    let after_revert = fund.ledger.batch(&batch.id).fixture("batch").fixture("exists");
+    assert_eq!(after_revert.state, BatchState::Broadcast);
+    assert!(after_revert.confirmation.is_none());
+    for output in &after_revert.outputs {
+        let balance = fund.ledger.balance(output.account).fixture("balance");
+        assert_eq!(balance.paid_sat, 0, "revert must unsettle paid");
+    }
+    let mut reserved_total = 0u64;
+    for output in &after_revert.outputs {
+        let balance = fund.ledger.balance(output.account).fixture("balance");
+        reserved_total += balance.reserved_sat;
+    }
+    assert_eq!(reserved_total, total, "revert must restore the reservation");
+    fund.ledger.check_invariants().fixture("conservation");
+}
