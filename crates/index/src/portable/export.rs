@@ -25,7 +25,6 @@ use super::{BundleHost, ExportReport, IndexBundleError, IndexBundleRequest, io_e
 use crate::types::{HashPrefixRow, TxPosition, TxPositionValue};
 use crate::{
     IndexCapability, IndexError, IndexWatermark, IndexWriteFence, TxIndexFamily, TxIndexScanRow,
-    TxIndexSnapshot,
 };
 use bitcoin_rs_chain::BlockBodySource;
 use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
@@ -33,9 +32,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Rows per export page. Export streams the family through bounded pages
-/// over one snapshot, so export memory stays flat in family size on every
-/// backend instead of materializing the whole family before emitting rows.
+/// Rows per export page. Export streams the family through bounded pages,
+/// each read through a short-lived snapshot, so export memory stays flat in
+/// family size on every backend instead of materializing the whole family
+/// before emitting rows.
 const EXPORT_PAGE_ROWS: usize = 1_024;
 /// Cap on returned key-plus-value bytes per page after the first row.
 const EXPORT_PAGE_BYTES: usize = 1 << 20;
@@ -216,13 +216,14 @@ fn write_manifest(
 }
 
 /// Everything an export fixes at its start: the exact watermarks, the chain
-/// identity of the applied tip, and one snapshot taken at that watermark.
+/// identity of the applied tip, and the base watermark every per-page
+/// snapshot must still show.
 struct Captured<'a> {
     fence: IndexWriteFence,
     chain: ChainBase,
     /// The applied tip's cumulative transaction count, which is the base's.
     chain_tx_count: u64,
-    snapshot: Box<dyn TxIndexSnapshot + 'a>,
+    base: IndexWatermark,
     floor: u32,
     bodies: &'a dyn BlockBodySource,
 }
@@ -257,16 +258,18 @@ impl<'a> Captured<'a> {
         let bodies = host
             .body_source
             .ok_or(IndexBundleError::NotReady("there is no block body source"))?;
-        let snapshot = host.reader.snapshot()?;
-        if snapshot.capability_watermark(IndexCapability::TxLookup)? != Some(base) {
-            return Err(IndexBundleError::Stale);
-        }
-        let floor = snapshot.capability_floor(IndexCapability::TxLookup)?;
+        let floor = {
+            let snapshot = host.reader.snapshot()?;
+            if snapshot.capability_watermark(IndexCapability::TxLookup)? != Some(base) {
+                return Err(IndexBundleError::Stale);
+            }
+            snapshot.capability_floor(IndexCapability::TxLookup)?
+        };
         Ok(Self {
             fence,
             chain,
             chain_tx_count,
-            snapshot,
+            base,
             floor,
             bodies,
         })
@@ -310,7 +313,7 @@ impl<'a> Captured<'a> {
             positions: Vec::new(),
             path,
         };
-        let (records, payload_bytes) = rows.stream(self.snapshot.as_ref(), &mut out)?;
+        let (records, payload_bytes) = rows.stream(self.base, &mut out)?;
         let mut file = out
             .into_inner()
             .map_err(|error| io_error(path, error.into_error()))?;
@@ -359,15 +362,18 @@ struct StagedRow {
 }
 
 impl RowExporter<'_> {
-    /// Streams every row of `snapshot` once, in stored-key order, and
-    /// returns `(records, payload bytes)`.
+    /// Streams every row once, in stored-key order, and returns
+    /// `(records, payload bytes)`.
     ///
-    /// Rows stream through bounded snapshot pages, so no family-sized copy
-    /// is made on any backend. Cancellation is polled every
+    /// Each page is read through a short-lived snapshot that must still show
+    /// `base` at `self.floor`; the snapshot is dropped before any body I/O,
+    /// so a long export never pins one key-value snapshot across the whole
+    /// family. Rows stream through bounded pages, so no family-sized copy is
+    /// made on any backend. Cancellation is polled every
     /// [`CANCEL_POLL_RECORDS`] resolved rows.
     fn stream(
         &mut self,
-        snapshot: &dyn TxIndexSnapshot,
+        base: IndexWatermark,
         out: &mut impl Write,
     ) -> Result<(u64, u64), IndexBundleError> {
         // `host` is itself a shared reference, so copying the cancellation
@@ -378,11 +384,20 @@ impl RowExporter<'_> {
         let mut visited = 0_u64;
         let mut totals = (0_u64, 0_u64);
         loop {
-            let page = snapshot.scan_family_page(
-                TxIndexFamily::TxConfirmed,
-                start_after.as_deref(),
-                limit,
-            )?;
+            let page = {
+                let snapshot = self.host.reader.snapshot()?;
+                if snapshot.capability_watermark(IndexCapability::TxLookup)? != Some(base) {
+                    return Err(IndexBundleError::Stale);
+                }
+                if snapshot.capability_floor(IndexCapability::TxLookup)? != self.floor {
+                    return Err(IndexBundleError::Stale);
+                }
+                snapshot.scan_family_page(
+                    TxIndexFamily::TxConfirmed,
+                    start_after.as_deref(),
+                    limit,
+                )?
+            };
             let (records, bytes) = self.export_page(&page.rows, out, &mut visited, cancelled)?;
             totals.0 += records;
             totals.1 += bytes;
@@ -411,8 +426,8 @@ impl RowExporter<'_> {
     ///
     /// Export visits rows in transaction-id order while bodies are keyed by
     /// block, so resolving in stored order reloads and reparses one body per
-    /// row. Resolving each bounded page in height order instead keeps the
-    /// one-block parsed image resident across the page's same-block rows;
+    /// row. Resolving each bounded page in height order instead keeps
+    /// same-block rows adjacent in the body's bounded LRU window;
     /// emission still follows stored order, so the artifact keeps its
     /// strictly ascending record order.
     fn export_page(
