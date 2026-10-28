@@ -104,10 +104,36 @@ impl PeerInfo {
         version_received_time: u64,
         counters: Arc<PeerCounters>,
     ) -> Self {
+        let remote: PeerRemote = addr.into();
+        let Some(endpoint) = remote.endpoint() else {
+            return Self {
+                addr: remote,
+                endpoint: None,
+                network: NetworkLabel::Onion,
+                version: version.version,
+                wtxid_relay: false,
+                relay_transactions: version.relay,
+                compact_block_relay: false,
+                send_headers: false,
+                services: version.services.to_u64(),
+                user_agent: version.user_agent.clone(),
+                start_height: version.start_height,
+                best_known_height: version.start_height,
+                conn_time,
+                inbound: true,
+                addr_bind: TransportRemote::new(addr_bind),
+                // Freeze the offset at version receipt, not handshake completion.
+                time_offset: version
+                    .timestamp
+                    .saturating_sub(i64::try_from(version_received_time).unwrap_or(i64::MAX)),
+                counters,
+                transport: crate::TransportProtocol::V1,
+            };
+        };
         Self {
             inbound: true,
-            ..Self::outbound_from_version(
-                addr,
+            ..Self::outbound_from_version_endpoint(
+                endpoint,
                 addr_bind,
                 version,
                 conn_time,
@@ -442,6 +468,23 @@ mod tests {
         assert_eq!(
             peer_info_with_services(1_u64 << 63).services_names(),
             Vec::<&'static str>::new()
+        );
+    }
+
+    #[test]
+    fn anonymous_tor_inbound_preserves_identity_and_onion_network() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new_inbound(tx);
+        let remote = PeerRemote::AnonymousTor(lease.connection_id());
+        let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let info = PeerInfo::inbound_from_version(remote, bind, &fake_version(), 0, 0, counters());
+        assert!(info.inbound, "anonymous handshake stays inbound");
+        assert_eq!(info.endpoint, None, "no destination is fabricated");
+        assert_eq!(info.addr, remote, "AnonymousTor identity is preserved");
+        assert_eq!(
+            info.network,
+            NetworkLabel::Onion,
+            "anonymous inbound records Onion"
         );
     }
 }
