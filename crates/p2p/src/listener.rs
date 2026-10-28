@@ -446,6 +446,9 @@ impl ConnectionShared {
         if self.peer_table.publish_info(peer_addr, lease, info.clone())
             && self.peer_table.is_current(source)
         {
+            if package_relay != 0 {
+                self.peer_table.note_package_relay(source, package_relay);
+            }
             if let Some(announcer) = &self.block_announcer {
                 announcer.on_peer_ready();
             }
@@ -5567,6 +5570,36 @@ mod ready_notify_tests {
         ));
         assert_eq!(notified.load(Ordering::Relaxed), 1);
         assert_eq!(shared.peer_table.infos(), vec![peer_info(addr, 3)]);
+    }
+
+    #[test]
+    fn negotiated_package_bits_publish_before_ready() {
+        let addr = PeerEndpoint::from((Ipv4Addr::LOCALHOST, 18_452));
+        let notified = Arc::new(AtomicUsize::new(0));
+        let shared = shared_with_notify_counter(&notified);
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        shared.peer_table.register(addr, lease.clone());
+
+        let both =
+            crate::packages::PKG_RELAY_PKGTXNS | crate::packages::PKG_RELAY_ANC;
+        assert!(shared.publish_info_and_notify_ready_with_package(
+            addr,
+            &lease,
+            &peer_info(addr, 4),
+            both
+        ));
+        assert_eq!(notified.load(Ordering::Relaxed), 1);
+        let source = lease.source(Some(addr));
+        let token: bitcoin_rs_mempool::PeerToken = source.into();
+        let snapshot = shared.peer_table.package_relay_versions(token);
+        assert_eq!(snapshot, both, "peer-table must retain negotiated package bits");
+        assert_ne!(
+            snapshot & crate::packages::PKG_RELAY_ANC,
+            0,
+            "TxIngressConsumer gates ancestor-package requests on PKG_RELAY_ANC"
+        );
     }
 }
 
