@@ -3112,6 +3112,94 @@ fn notfound_owner_with_request_headroom_is_skipped_and_the_alternate_serves_the_
 }
 
 #[test]
+fn two_refusing_peers_do_not_starve_a_lower_ranked_holder() -> TestResult {
+    let fixture = NotFoundFixture::two_peers(one_request_peer_budget())?;
+    // A lower-ranked third peer holds the body both higher-ranked peers
+    // lack. A budget-bounded ledger would let the second refusal evict the
+    // first, so the scheduler would alternate between the refusers and never
+    // reach this holder; retention-bounded records demote both refusers.
+    let holder = test_addr(9_810, 2)?;
+    let holder_rx = connect_peer(&fixture.peers, synthetic_peer(holder, 90));
+    let owner_source = current_source(&fixture.peers, fixture.owner);
+    let alternate_source = current_source(&fixture.peers, fixture.alternate);
+    let holder_source = current_source(&fixture.peers, holder);
+    let x0 = fixture.hash(0);
+
+    // The highest-ranked peer is asked first and answers `notfound`.
+    fixture.sync.tick();
+    assert_eq!(fixture.owner_getdata(), vec![fixture.inventory(0, true)]);
+    assert_eq!(fixture.alternate_getdata(), Vec::<Inventory>::new());
+    assert_eq!(drain_getdata_items(&holder_rx), Vec::<Inventory>::new());
+    assert!(
+        fixture
+            .sync
+            .block_not_found(owner_source, &[fixture.inventory(0, true)])
+    );
+
+    // The second-ranked peer is asked next — not the demoted owner — and it
+    // answers `notfound` too.
+    fixture.sync.tick();
+    assert_eq!(
+        fixture.owner_getdata(),
+        Vec::<Inventory>::new(),
+        "a peer that answered notfound is not re-asked while its record lives"
+    );
+    assert_eq!(
+        fixture.alternate_getdata(),
+        vec![fixture.inventory(0, false)]
+    );
+    assert_eq!(drain_getdata_items(&holder_rx), Vec::<Inventory>::new());
+    assert!(
+        fixture
+            .sync
+            .block_not_found(alternate_source, &[fixture.inventory(0, true)])
+    );
+
+    // Both refusals are retained, so the scan reaches the lower-ranked
+    // holder instead of alternating between the refusers.
+    let now = Instant::now();
+    assert!(
+        fixture.sync.scheduler.lock().body_unavailable.refuses(owner_source, x0, now),
+        "the first refusal survives the second under retention bounding"
+    );
+    assert!(
+        fixture
+            .sync
+            .scheduler
+            .lock()
+            .body_unavailable
+            .refuses(alternate_source, x0, now),
+        "the second refusal is recorded"
+    );
+    for _ in 0..4 {
+        fixture.sync.tick();
+    }
+    assert_eq!(
+        fixture.owner_getdata(),
+        Vec::<Inventory>::new(),
+        "neither refuser is re-asked before the retry interval"
+    );
+    assert_eq!(
+        fixture.alternate_getdata(),
+        Vec::<Inventory>::new(),
+        "neither refuser is re-asked before the retry interval"
+    );
+    assert_eq!(
+        drain_getdata_items(&holder_rx),
+        vec![fixture.inventory(0, false)],
+        "the lower-ranked holder is asked exactly once"
+    );
+    assert!(fixture.sync.owns_body_fetch(holder_source, x0));
+    for peer in [fixture.owner, fixture.alternate, holder] {
+        assert!(
+            fixture.peers.is_connected(peer),
+            "a peer that lacks a body is not punished"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn notfound_only_releases_for_the_exact_current_owner_session() -> TestResult {
     let fixture = NotFoundFixture::two_peers(one_request_peer_budget())?;
     let owner_source = current_source(&fixture.peers, fixture.owner);

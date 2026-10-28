@@ -48,6 +48,8 @@ use std::time::Duration;
 
 #[cfg(test)]
 use crate::PeerLease;
+#[cfg(test)]
+use bitcoin_rs_mempool::BodyInterest;
 use bitcoin_rs_mempool::{
     AdmissionOrigin, MempoolGateway, MempoolObserver, MutationEnvelope, MutationOutcome,
 };
@@ -171,9 +173,6 @@ impl LocalTxRelayObserver {
 }
 
 impl MempoolObserver for LocalTxRelayObserver {
-    fn wants_accepted_transactions(&self) -> bool {
-        false
-    }
     fn on_mutation(&self, envelope: &MutationEnvelope) {
         if !matches!(
             envelope.origin,
@@ -857,6 +856,7 @@ mod tests {
                     queue.clone(),
                     Arc::downgrade(&gateway),
                 )),
+                BodyInterest::Metadata,
             )
             .expect("observer slot");
         let sink = FakeSink::new(Vec::new());
@@ -953,14 +953,14 @@ mod tests {
         let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
         let gateway = Arc::new(MempoolGateway::new(
             pool,
-            Some(Arc::new(CompositeObserver::new())),
+            Some((Arc::new(CompositeObserver::new()), BodyInterest::Metadata)),
             ValidationEngine::Native,
             None,
         ));
         let (queue, rx) = TxRelayQueue::new(8);
         let observer = Arc::new(LocalTxRelayObserver::new(queue, Arc::downgrade(&gateway)));
         gateway
-            .attach_observer_leg("relay", observer.clone())
+            .attach_observer_leg("relay", observer.clone(), BodyInterest::Metadata)
             .expect("observer slot");
         let mut last_txid = Txid::default();
         for (marker, origin, should_announce) in [
@@ -1108,7 +1108,7 @@ mod tests {
             Arc::new(parking_lot::RwLock::new(Mempool::new(
                 MempoolLimits::default(),
             ))),
-            Some(Arc::new(CompositeObserver::new())),
+            Some((Arc::new(CompositeObserver::new()), BodyInterest::Metadata)),
             ValidationEngine::Native,
             None,
         ))
@@ -1121,9 +1121,6 @@ mod tests {
     }
 
     impl MempoolObserver for MutateBeforeLocalRelay {
-        fn wants_accepted_transactions(&self) -> bool {
-            false
-        }
         fn on_mutation(&self, envelope: &MutationEnvelope) {
             let Some(entry) = self.next.lock().take() else {
                 return;
@@ -1159,12 +1156,14 @@ mod tests {
                     next: Mutex::new(Some(MempoolEntry::new(next, 100, 10_000, 2, 0, 0))),
                     clear_first,
                 }),
+                BodyInterest::Metadata,
             )
             .expect("fixture observer slot");
         gateway
             .attach_observer_leg(
                 "relay",
                 Arc::new(LocalTxRelayObserver::new(relay, Arc::downgrade(&gateway))),
+                BodyInterest::Metadata,
             )
             .expect("relay observer slot");
         gateway
@@ -1239,6 +1238,7 @@ mod tests {
             .attach_observer_leg(
                 "relay",
                 Arc::new(LocalTxRelayObserver::new(relay, Arc::downgrade(&gateway))),
+                BodyInterest::Metadata,
             )
             .expect("observer slot");
         let original = relay_identity_tx();

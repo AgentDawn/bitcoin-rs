@@ -26,6 +26,7 @@ use bitcoin_rs_chainstate::verify::{
 };
 use bitcoin_rs_consensus::{ScriptExecutionCache, ValidationEngine};
 use bitcoin_rs_index::block_log::BlockLog;
+use bitcoin_rs_mempool::BodyInterest;
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mempool::MempoolLimits;
 use bitcoin_rs_p2p::download_window::FAST_OUTBOUND_PEER_TARGET;
@@ -454,7 +455,7 @@ impl NodeState {
             let mining_leg: Arc<dyn bitcoin_rs_mempool::MempoolObserver> = cloned_mining;
             Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
                 Arc::clone(&mempool),
-                Some(mining_leg),
+                Some((mining_leg, BodyInterest::Metadata)),
                 config.validation.engine,
                 script_cache,
             ))
@@ -580,17 +581,23 @@ impl NodeState {
             tracing::info!(status = "disabled", "mempool snapshot persistence disabled");
         }
         if zmq_publisher.wants_notifications() {
+            let interest = if zmq_publisher.wants_rawtx() {
+                BodyInterest::Bodies
+            } else {
+                BodyInterest::Metadata
+            };
             mempool_gateway
                 .attach_observer_leg(
                     "sequence",
                     Arc::new(bitcoin_rs_rpc::zmq::MempoolSequenceObserver::new(
                         Arc::clone(&zmq_publisher),
                     )),
+                    interest,
                 )
                 .map_err(anyhow::Error::msg)?;
         } else if let Some(observer) = mempool_observer.cloned() {
             mempool_gateway
-                .attach_observer_leg("test", observer)
+                .attach_observer_leg("test", observer, BodyInterest::Bodies)
                 .map_err(anyhow::Error::msg)?;
         }
         // One chain-owned latch for the whole process: the chainstate builds

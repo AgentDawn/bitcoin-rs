@@ -325,9 +325,13 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   or duplicate mutation authority.
 - `MempoolGateway` owns the process mempool handle; `NodeState::mempool` is a
   read/composition capability borrowed from that gateway, not a parallel
-  retained `Arc`. Gateway interning remains the public one-gateway-per-pool
-  enforcement boundary for test seams and downstream composition; production
-  constructs that same owner once. `NodeState` retains `PruneService` as a
+  retained `Arc`. Gateway interning remains the public one-gateway-per-pool-ledger
+  enforcement boundary for test seams and downstream composition: the ledger is
+  `bitcoin_rs_mempool::Mempool` (defined in `crates/mempool/src/pool.rs`, re-exported
+  at the crate root since `mod pool` is private), the entry
+  arena plus derived txid/wtxid/funding/spending/priority indexes held behind the
+  gateway's `Arc<RwLock<Mempool>>` handle; production constructs that same owner
+  once. `NodeState` retains `PruneService` as a
   node/storage mutation capability because it is created only after
   chainstate supplies prune authority and is handed to the later RPC
   lifecycle; it contains no duplicate block or transaction projection.
