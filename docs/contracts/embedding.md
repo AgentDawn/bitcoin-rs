@@ -1,7 +1,12 @@
 # Embedded node lifecycle
 
 The typed in-process surface over the node lifecycle: `Node::start`,
-typed reads, gateway broadcast, consuming shutdown. The daemon runner is
+typed reads (`Node::snapshot`, `Node::sync_progress`, `Node::capabilities`,
+`Node::tx_by_id`, `Node::block_by_hash`, `Node::block_header`,
+`Node::mempool_info`, `Node::fee_estimate`, `Node::chainstates_summary`, and
+the settled chain-feed reads `Node::settled_snapshot`,
+`Node::subscribe_chain`/`Node::poll_chain`, `Node::pin_chain`/`Node::replay_chain`),
+gateway broadcast, consuming shutdown. The daemon runner is
 the first embedder — there is one lifecycle implementation, not two.
 
 ## Invariants
@@ -69,10 +74,16 @@ the first embedder — there is one lifecycle implementation, not two.
   No production path mutates the pool outside the gateway. Owner:
   `crates/node/src/embed.rs`; gateway invariants:
   [mempool-mutations.md](mempool-mutations.md).
-- **EMB-06 — TxLookup gating is honest.** `tx_by_id` answers from the
-  mempool and the direct cache first; confirmed lookup requires the
-  index: a disabled index is `NodeError::Unavailable`, a proven-absent
-  transaction is `NodeError::NotFound`. Owner: `crates/node/src/embed.rs`.
+- **EMB-06: TxLookup gating is honest.** `Node::tx_by_id`
+  (`crates/node/src/embed.rs`) answers from the mempool first through
+  `MempoolReader::read` into `Mempool::transaction_by_txid`
+  (`crates/mempool/src/reader.rs`, `crates/mempool/src/pool.rs`), then from
+  the confirmed index through `NodeState::esplora_derived_index_query`
+  (`crates/node/src/state.rs`) into `DerivedIndexQuery::transaction`
+  (`crates/index/src/query_api.rs`, adapted by `DerivedIndexQueryAdapter` in
+  `crates/index/src/runtime.rs`): a disabled index is
+  `NodeError::Unavailable`, a proven-absent transaction is
+  `NodeError::NotFound`. Owner: `crates/node/src/embed.rs`.
 - **EMB-07 — Shutdown consumes.** `Node::shutdown(self)` runs the ordered
   sequence exactly once and publishes the clean checkpoint; a node
   started on the same data dir afterwards resumes from that checkpoint.
@@ -158,18 +169,19 @@ worker without `test-seam` or an internal RPC client.
 
 ## Readiness
 
-`block_header(hash)` copies header, height and big-endian cumulative work from
-the block-tree owner without requiring a retained body. `broadcast_package`
+`Node::block_header(hash)` (`crates/node/src/chain_feed.rs`) copies header,
+height and big-endian cumulative work from
+the block-tree owner without requiring a retained body. `Node::broadcast_package`
 routes bounded native child-with-independent-parents CPFP through
 `MempoolGateway::submit_local_package` with the ordinary fee cap; it does not
 enable RPC `submitpackage` or implement package RBF. Settled polling, opaque
 replay targets, positional steps, gap/restart recovery and work bounds are
-owned by `EVT-06` in [chain-events.md](chain-events.md). `snapshot()` retains its
+owned by `EVT-06` in [chain-events.md](chain-events.md). `Node::snapshot()` retains its
 live applied-tip semantics; callers needing follower settlement use
-`settled_snapshot()` or `pin_chain()`.
+`Node::settled_snapshot()` or `Node::pin_chain()`.
 
 `Node::start` returns after storage is open, recovery is done, and every
-service thread is spawned; `snapshot()`/`sync_progress()` at that point
+service thread is spawned; `Node::snapshot()`/`Node::sync_progress()` at that point
 reflect the resumed applied tip. There is no separate ready flag and no
 sleep-based readiness: the snapshot is the readiness fact.
 
