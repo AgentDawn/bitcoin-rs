@@ -1457,7 +1457,7 @@ fn compact_reconstruction_admission_stays_near_the_applied_tip() -> TestResult {
         !sync.compact_reconstruction_admissible(source, &blocks[5].header),
         "five blocks above the applied tip"
     );
-    sync.record_owned_body_fetch(source, Hash256::from(blocks[3].block_hash()));
+    assert!(sync.enqueue_owned_body_fetch(source, Hash256::from(blocks[3].block_hash()), || true));
     assert!(
         sync.compact_reconstruction_admissible(source, &blocks[3].header),
         "a fetch this connection owns"
