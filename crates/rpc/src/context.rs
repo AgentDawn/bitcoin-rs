@@ -8,6 +8,8 @@ use bitcoin_rs_mempool::{AdmissionChain, ChainAdmissionSnapshot, MempoolGateway,
 #[cfg(any(test, feature = "test-seam"))]
 use bitcoin_rs_mempool::{Mempool, MempoolLimits, MempoolObserver};
 use bitcoin_rs_mining::MiningControl;
+#[cfg(feature = "pool")]
+use bitcoin_rs_mining::pool::ledger as pool_ledger;
 use bitcoin_rs_primitives::{
     BlockHash, CompactTarget, Hash256, Network, OutPoint, Tx, consensus_bytes, unix_time_secs,
 };

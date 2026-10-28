@@ -5,7 +5,7 @@
 //! encrypted frames, real regtest candidates from the node's own
 //! `assemble_candidate` over a mempool filled through the public
 //! `MempoolGateway::submit_transaction` path, and the real
-//! `bitcoin_rs_stratum::JobBook` as the one job
+//! `bitcoin_rs_mining::pool::JobBook` as the one job
 //! and share predicate. The miner side is a minimal SV2 client built from the
 //! same crates (a hand-written client would only test itself).
 //!
@@ -33,11 +33,11 @@ use bitcoin_rs_primitives::{
     Sequence, Tx, TxIn, TxOut, Txid, Witness, encode::double_sha256,
 };
 use bitcoin_rs_script::VerifyFlags;
-use bitcoin_rs_stratum::{
+use bitcoin_rs_mining::pool::{
     BIP320_VERSION_MASK, Extranonce, ExtranonceLayout, Installed, Job, JobBook, JobBookConfig,
     JobId, ShareClass, ShareError, ShareTarget,
 };
-use bitcoin_rs_stratum_v2::{
+use bitcoin_rs_mining::pool::stratum::sv2::{
     AuthorityKeypair, CloseReason, Connection, Error, Event, FLAG_REQUIRES_STANDARD_JOBS,
     FLAG_REQUIRES_VERSION_ROLLING, FLAG_REQUIRES_WORK_SELECTION, Limits, ROLES, RoleStatus,
     SUCCESS_FLAG_REQUIRES_FIXED_VERSION, ServerConfig, SessionError, TransportError,
@@ -741,7 +741,7 @@ fn share_error(frames: &mut Vec<Received>) -> (u32, u32, String) {
     )
 }
 
-fn accepted(events: Vec<Event>) -> bitcoin_rs_stratum_v2::ShareEvent {
+fn accepted(events: Vec<Event>) -> bitcoin_rs_mining::pool::stratum::sv2::ShareEvent {
     events
         .into_iter()
         .find_map(|event| match event {
@@ -1538,7 +1538,7 @@ fn the_host_can_refuse_to_credit_a_share() {
             .conn
             .reject_share(
                 share.ticket,
-                bitcoin_rs_stratum_v2::ERROR_CODE_SHARE_NOT_RECORDED
+                bitcoin_rs_mining::pool::stratum::sv2::ERROR_CODE_SHARE_NOT_RECORDED
             )
             .unwrap_or_else(|error| panic!("flushes: {error:?}"))
     );
@@ -2630,7 +2630,7 @@ fn malformed_reject_code_preserves_the_pending_ticket() {
             .conn
             .reject_share(
                 share.ticket,
-                bitcoin_rs_stratum_v2::ERROR_CODE_SHARE_NOT_RECORDED
+                bitcoin_rs_mining::pool::stratum::sv2::ERROR_CODE_SHARE_NOT_RECORDED
             )
             .unwrap_or_else(|error| panic!("valid refusal sends: {error:?}"))
     );

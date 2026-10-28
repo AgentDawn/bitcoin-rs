@@ -28,16 +28,15 @@ mod session;
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::{AcceptedShare, BlockReceipt, FoundBlock, Job, JobError, JobId, ShareTarget};
-use bitcoin_rs_mining::MiningControlError;
+use crate::pool::{Job, JobError, JobId, ShareTarget, WorkerIdentity};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::encode::hex_encode as primitives_hex_encode;
 use sonic_rs::{Array, JsonContainerTrait, JsonValueTrait, Value};
 
+pub use crate::pool::{BlockOutcome, PoolCore, RefreshError, Refreshed};
 pub use session::{
-    BlockOutcome, ConfigError, ConnectionLimiter, ConnectionPermit, Observer, PoolCore,
-    RefreshError, Refreshed, RefusalReason, Server, ServerConfig, ServerDeps, ServerEvent,
-    SessionEnd, ShutdownReport,
+    ConfigError, ConnectionLimiter, ConnectionPermit, Observer, RefusalReason, Server,
+    ServerConfig, ServerDeps, ServerEvent, SessionEnd, ShutdownReport,
 };
 
 /// Longest accepted JSON-RPC request id string.
@@ -650,15 +649,6 @@ impl fmt::Debug for Password {
     }
 }
 
-/// Who a share is credited to: the pool account and the rig under it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct WorkerIdentity {
-    /// Account that is paid.
-    pub account: String,
-    /// Rig name under the account.
-    pub worker: String,
-}
-
 /// Authentication failed. Carries no reason, so unknown account and wrong
 /// password are indistinguishable to the miner and to logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -854,52 +844,6 @@ impl DifficultyPolicy {
     pub fn contains(&self, difficulty: &Difficulty) -> bool {
         difficulty.target <= self.min.target && difficulty.target >= self.max.target
     }
-}
-
-// ---------------------------------------------------------------------------
-// Accounting boundary
-// ---------------------------------------------------------------------------
-
-/// The ledger could not take the record right now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LedgerUnavailable;
-
-/// Whether a share row was new.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecordOutcome {
-    /// New row written.
-    Recorded,
-    /// A row with this header hash already exists; nothing changed.
-    AlreadyRecorded,
-    /// The ledger refused the share permanently (retired round, conflicting
-    /// credit, or claimed block): never retry and never buffer. Adapters
-    /// report a rejected share, not an unavailable ledger.
-    Rejected,
-}
-
-/// Pool accounting, separate from this adapter.
-///
-/// Implementations must be idempotent on `share.hash`: the adapter retries a
-/// failed call, and the common owner's duplicate set makes every first delivery
-/// unique.
-pub trait ShareLedger: Send + Sync {
-    /// Records one accepted share (`share.class` may be `Block`) credited to
-    /// `worker`. `share.hash` is the unique key; `share.work` is the work.
-    fn record_share(
-        &self,
-        worker: &WorkerIdentity,
-        share: &AcceptedShare,
-    ) -> Result<RecordOutcome, LedgerUnavailable>;
-
-    /// Records what the node answered when `block` was submitted. `Err` or an
-    /// `Undetermined` receipt means the chain outcome is unknown: keep the
-    /// block pending and reconcile from chain observation.
-    fn record_block(
-        &self,
-        worker: &WorkerIdentity,
-        block: &FoundBlock,
-        submission: &Result<BlockReceipt, MiningControlError>,
-    ) -> Result<(), LedgerUnavailable>;
 }
 
 // ---------------------------------------------------------------------------

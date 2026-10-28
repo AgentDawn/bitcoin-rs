@@ -16,7 +16,7 @@
 //!    `CloseChannel`, `Reconnect`, and the error and cancel semantics around
 //!    them, using the official message layouts from `mining_sv2 12.0.0` and
 //!    `common_messages_sv2 9.0.0`.
-//! 3. **The one job and share owner**, [`bitcoin_rs_stratum::JobBook`]. This
+//! 3. **The one job and share owner**, [`crate::pool::JobBook`]. This
 //!    crate never assembles a template, never builds a coinbase, and never
 //!    validates a share or a block: it passes the owner's `Job` to the wire
 //!    and maps the owner's `ShareError` to an official error code.
@@ -91,7 +91,7 @@ pub use session::{
 use std::fmt;
 use std::time::Duration;
 
-use bitcoin_rs_stratum::{Installed, JobBook, ShareTarget};
+use crate::pool::{Installed, JobBook, ShareTarget};
 use codec_sv2::{
     Decoded, Decrypted, ENCRYPTED_SV2_FRAME_HEADER_SIZE, Handshake, NoiseDecoder, NoiseEncoder,
     SV2_FRAME_PLAINTEXT_CHUNK_SIZE, SerializedFrame, TransportDecryptState, TransportEncryptState,

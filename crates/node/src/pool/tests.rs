@@ -6,12 +6,14 @@ use bitcoin_rs_mining::{BlockValidationResult, MiningControlError};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, Txid};
 use bitcoin_rs_rpc::context::PoolOperator;
 use bitcoin_rs_storage::KvStore;
-use bitcoin_rs_stratum::{
-    AcceptedShare, AccountResolver, BlockReceipt, FoundBlock, JobId, LedgerUnavailable, Password,
-    RecordOutcome, SessionId, ShareClass, ShareLedger, ShareTarget, WorkerIdentity,
-};
-use pool_ledger::{
+use bitcoin_rs_mining::pool::ledger as pool_ledger;
+use bitcoin_rs_mining::pool::ledger::{
     Balance, Ledger, MinerId, PayoutPolicy, PoolConfig, RoundState, ShareCredit, ShareReceipt,
+};
+use bitcoin_rs_mining::pool::stratum::sv1::{AccountResolver, Password};
+use bitcoin_rs_mining::pool::{
+    AcceptedShare, BlockReceipt, FoundBlock, JobId, LedgerUnavailable, RecordOutcome, SessionId,
+    ShareClass, ShareLedger, ShareTarget, WorkerIdentity,
 };
 
 use super::ledger::LedgerHost;
@@ -340,7 +342,9 @@ fn block_record_reservations_are_bounded_and_released(open: OpenStore) -> TestRe
 
 #[test]
 fn protocol_admissions_share_total_capacity_and_release_it_on_drop() -> TestResult {
-    let shared = Arc::new(bitcoin_rs_stratum::ConnectionLimiter::new(1, 1)?);
+    let shared = Arc::new(
+        bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter::new(1, 1)?,
+    );
     let sv1 = Arc::clone(&shared);
     let sv2 = Arc::clone(&shared);
     let first = sv1
@@ -348,7 +352,7 @@ fn protocol_admissions_share_total_capacity_and_release_it_on_drop() -> TestResu
         .map_err(|reason| std::io::Error::other(format!("sv1 admission refused: {reason:?}")))?;
     assert!(matches!(
         sv2.try_admit("192.0.2.2".parse()?),
-        Err(bitcoin_rs_stratum::RefusalReason::ConnectionLimit)
+        Err(bitcoin_rs_mining::pool::stratum::sv1::RefusalReason::ConnectionLimit)
     ));
     assert_eq!(shared.active(), 1);
     drop(first);
@@ -363,7 +367,9 @@ fn protocol_admissions_share_total_capacity_and_release_it_on_drop() -> TestResu
 
 #[test]
 fn protocol_admissions_share_per_ip_capacity_without_consuming_refused_slots() -> TestResult {
-    let shared = Arc::new(bitcoin_rs_stratum::ConnectionLimiter::new(3, 1)?);
+    let shared = Arc::new(
+        bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter::new(3, 1)?,
+    );
     let sv1 = Arc::clone(&shared);
     let sv2 = Arc::clone(&shared);
     let same_ip = "192.0.2.1".parse()?;
@@ -372,7 +378,7 @@ fn protocol_admissions_share_per_ip_capacity_without_consuming_refused_slots() -
     })?;
     assert!(matches!(
         sv2.try_admit(same_ip),
-        Err(bitcoin_rs_stratum::RefusalReason::PerIpLimit)
+        Err(bitcoin_rs_mining::pool::stratum::sv1::RefusalReason::PerIpLimit)
     ));
     let other = sv2.try_admit("192.0.2.2".parse()?).map_err(|reason| {
         std::io::Error::other(format!("second-IP admission refused: {reason:?}"))
@@ -630,7 +636,7 @@ fn pool_prepare_holds_directory_lock_for_service_lifetime() -> TestResult {
         max_connections: 128,
         max_connections_per_ip: 8,
         share_difficulty: "1".to_owned(),
-        share_target: bitcoin_rs_stratum::ShareTarget::from_pool_difficulty_decimal("1")?,
+        share_target: bitcoin_rs_mining::pool::ShareTarget::from_pool_difficulty_decimal("1")?,
         window_work: 1_000,
         fee_bps: 0,
         reward_script: vec![0x51],

@@ -8,12 +8,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use bitcoin_rs_mining::pool::ledger as pool_ledger;
+use bitcoin_rs_mining::pool::stratum::sv1::{
+    ConnectionLimiter, DifficultyPolicy, Server, ServerConfig, ServerDeps,
+};
+use bitcoin_rs_mining::pool::{ExtranonceLayout, JobBookConfig, PoolCore};
 use bitcoin_rs_mining::{CoinbaseBudget, MiningControl};
 use bitcoin_rs_storage::KvStore;
-use bitcoin_rs_stratum::{
-    ConnectionLimiter, DifficultyPolicy, ExtranonceLayout, JobBookConfig, PoolCore, Server,
-    ServerConfig, ServerDeps,
-};
 
 #[cfg(feature = "pool-sv2")]
 mod authority;
@@ -65,7 +66,7 @@ impl crate::storage_backend::StoreConsumer for LedgerComposer {
 /// (twice the connection cap), 65,536 duplicate-tracked shares per job, and a
 /// deferred share-ledger outbox of 1024 records / 8 MiB. Owner sessions are
 /// not live TCP connections; the aggregate TCP caps live in the shared
-/// [`ConnectionLimiter`](bitcoin_rs_stratum::ConnectionLimiter).
+/// [`ConnectionLimiter`](bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter).
 struct ComposedCore {
     book: JobBookConfig,
     outbox_items: usize,
@@ -84,8 +85,8 @@ fn composed_core_config(max_connections: u32) -> Result<ComposedCore> {
             },
             extranonce: ExtranonceLayout::new(4, 4),
             coinbase_tag: b"/btcrs/".to_vec(),
-            version_mask: bitcoin_rs_stratum::BIP320_VERSION_MASK,
-            ntime_forward_secs: bitcoin_rs_stratum::MAX_NTIME_FORWARD_SECS,
+            version_mask: bitcoin_rs_mining::pool::BIP320_VERSION_MASK,
+            ntime_forward_secs: bitcoin_rs_mining::pool::MAX_NTIME_FORWARD_SECS,
             max_jobs: 64,
             max_sessions: sessions,
             max_shares_per_job: 65_536,

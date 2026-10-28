@@ -29,7 +29,7 @@ use bitcoin_rs_primitives::{
     Script, Sequence, Tx, TxIn, TxOut, Txid, Witness, encode::consensus_bytes,
 };
 use bitcoin_rs_script::VerifyFlags;
-use bitcoin_rs_stratum::{
+use bitcoin_rs_mining::pool::{
     BIP320_VERSION_MASK, BlockStatus, Extranonce, ExtranonceLayout, Job, JobBook, JobBookConfig,
     JobError, JobId, Session, SessionId, ShareClass, ShareError, ShareOutcome, ShareSubmission,
     ShareTarget, ShareWork, StaleReason, fetch_template,

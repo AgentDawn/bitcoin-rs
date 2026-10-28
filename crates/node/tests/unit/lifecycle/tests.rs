@@ -1083,7 +1083,7 @@ fn final_payout_script_prefers_pool_when_values_differ() {
         max_connections: 1,
         max_connections_per_ip: 1,
         share_difficulty: String::from("1"),
-        share_target: bitcoin_rs_stratum::ShareTarget::from_pool_difficulty_decimal("1")
+        share_target: bitcoin_rs_mining::pool::ShareTarget::from_pool_difficulty_decimal("1")
             .expect("fixed test difficulty parses"),
         window_work: 1,
         fee_bps: 0,
