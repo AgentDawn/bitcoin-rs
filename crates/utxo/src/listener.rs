@@ -1,29 +1,20 @@
-//! Internal, order-independent commit delivery to `CoinStatsListener`.
-//!
-//! Single-shard runs deliver directly; multi-shard commits collect landed events and
-//! deliver once after all attempts, including before returning a shard error. Chunking
-//! and shard order do not affect the result. The required local order is removal before
-//! insertion of a replacement outpoint: one-element `RemoveBatch` precedes its
-//! replacement `InsertBatch`.
+//! guarantee that always holds within a commit: the removal of an outpoint is
+//! delivered before the insertion that replaces it — overwrite removals
+//! arrive as one-element `RemoveBatch` events ahead of their replacement
+//! `InsertBatch`.
 
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use smallvec::SmallVec;
 
-/// One inserted UTXO event delivered to a change listener.
 #[derive(Debug)]
 pub(crate) struct UtxoInserted<'a> {
-    /// Outpoint that was inserted.
     pub op: &'a OutPoint,
-    /// Inserted transaction output.
     pub txout: &'a TxOut,
-    /// Height at which the inserted output was created.
     pub height: u32,
-    /// Whether the inserted output came from a coinbase transaction.
     pub coinbase: bool,
 }
 
 impl<'a> UtxoInserted<'a> {
-    /// Constructs one inserted UTXO event.
     #[must_use]
     pub(crate) const fn new(
         op: &'a OutPoint,
@@ -40,21 +31,15 @@ impl<'a> UtxoInserted<'a> {
     }
 }
 
-/// One removed UTXO event delivered to a change listener.
 #[derive(Debug)]
 pub(crate) struct UtxoRemoved {
-    /// Outpoint that was removed.
     pub op: OutPoint,
-    /// Removed transaction output.
     pub txout: TxOut,
-    /// Height at which the removed output was created.
     pub height: u32,
-    /// Whether the removed output came from a coinbase transaction.
     pub coinbase: bool,
 }
 
 impl UtxoRemoved {
-    /// Constructs one removed UTXO event.
     #[must_use]
     pub(crate) const fn new(op: OutPoint, txout: TxOut, height: u32, coinbase: bool) -> Self {
         Self {
@@ -71,27 +56,14 @@ enum UtxoChangeEvent<'a> {
     RemoveBatch(SmallVec<[UtxoRemoved; 2]>),
 }
 
-/// Events collected from the shards one multi-shard commit touched.
-///
-/// Handed to [`CoinStatsListener`](crate::stats::CoinStatsListener) after every
-/// shard mutation has landed. Batch order and chunking are not semantic:
-/// batches arrive in shard order and each groups one shard's
-/// same-transaction runs, but a listener must derive the same final state
-/// however the events are chunked or merged. Within one commit the removal
-/// of an outpoint always precedes the insertion that replaces it; overwrite
-/// removals appear as one-element `RemoveBatch` events ahead of their
-/// replacement `InsertBatch`.
 pub(crate) struct UtxoChangeEvents<'a> {
     events: Vec<UtxoChangeEvent<'a>>,
     operation_count: usize,
 }
 
-/// Read-only view over one committed UTXO event.
 #[derive(Clone, Copy)]
 pub(crate) enum UtxoCommittedEvent<'batch, 'coin> {
-    /// Batch of inserted UTXOs.
     InsertBatch(&'batch [UtxoInserted<'coin>]),
-    /// Batch of removed UTXOs, including one-element overwrite removals.
     RemoveBatch(&'batch [UtxoRemoved]),
 }
 

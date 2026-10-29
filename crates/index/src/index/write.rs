@@ -14,26 +14,17 @@ use super::{
 use bitcoin_rs_primitives::{OutPoint, encode};
 use bitcoin_rs_storage::{ColumnFamily, KvStore, PrefixScanLimit};
 
-/// Mutation-only handle for durable prepared `TxIndex` writes.
 pub struct IndexWriter<S: KvStore> {
     pub(super) indexer: Indexer<S>,
-    /// Process epoch recorded as reset-claim provenance. Any process may
-    /// complete the exact claim; the durable reset bytes, not this epoch,
-    /// fence ordinary mutations and reset completion.
     pub(super) generation: u64,
 }
 
 impl<S: KvStore> IndexWriter<S> {
-    /// Read access to the owned indexer, for queries beside the write path.
     pub fn indexer(&self) -> &Indexer<S> {
         &self.indexer
     }
 
-    /// Opens a writer over `store`, rejecting unversioned index tables.
-    ///
     /// Format 5 changed every row family (big-endian heights, 43-byte live
-    /// rows, 6-byte positions), so any older marker is
-    /// [`IndexError::UnsupportedTxIndexFormatVersion`]; recovery full-resets
     /// the store for rebuild. No in-place upgrade path exists.
     pub fn open(store: std::sync::Arc<S>, generation: u64) -> Result<Self, IndexError> {
         let indexer = Indexer::new(store);
@@ -55,8 +46,6 @@ impl<S: KvStore> IndexWriter<S> {
                 }
             }
         }
-        // A plain open adopts any outstanding obligation (requested mask 0)
-        // without publishing a claim of its own.
         resume_capability_reset(indexer.store.as_ref(), generation, 0)?;
         Ok(Self {
             indexer,
@@ -64,47 +53,23 @@ impl<S: KvStore> IndexWriter<S> {
         })
     }
 
-    /// Loads the exact durable watermark.
     pub fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
         self.indexer.watermark()
     }
 
-    /// Loads independently durable capability watermarks.
     pub fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
         self.indexer.watermarks()
     }
 
-    /// Captures one coherent fence with the exact reset state, ordinary revision,
-    /// and all capability watermarks from a single snapshot. It returns the
-    /// fence with the watermarks it carries. A reset that
-    /// begins or completes in the read window therefore returns
-    /// [`IndexError::ResetInProgress`]; callers must discard derived
-    /// state and re-capture.
     pub fn fenced_watermarks(&mut self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError> {
         let fence = capture_write_fence(self.indexer.store.as_ref(), self.generation)?;
         Ok((fence, fence.watermarks))
     }
 
-    /// Resets every derived capability through the durable exact-claim fence.
-    ///
-    /// A pre-existing selective reset is merged into the all-capability
-    /// obligation before any row is deleted.
     pub fn reset_index(store: &S, generation: u64) -> Result<(), IndexError> {
         resume_capability_reset(store, generation, IndexCapabilities::ALL.to_mask())
     }
 
-    /// Seeds every live `(outpoint, scripthash)` at `seed_tip` through fenced writes
-    /// (IDX-07 in `docs/contracts/indexing.md`).
-    ///
-    /// Reset state, ordinary revision, and all capability watermarks must match each
-    /// batch and the final watermark. A lost fence returns
-    /// `StaleIndexState`/`ResetInProgress`; storage errors propagate.
-    ///
-    /// Refuses an existing watermark (`LiveAlreadySeeded`). Un-watermarked leftovers
-    /// are reset first; only the last batch publishes the watermark, so interrupted
-    /// prefixes remain unqueryable. Polls cancellation at entry, every 4,096 rows,
-    /// and before publication. A cancelled caller retains its artifact and lease
-    /// for retry, whose opening reset clears the prefix.
     pub(crate) fn seed_script_live_stream<F>(
         &self,
         mut produce: F,
@@ -124,10 +89,6 @@ impl<S: KvStore> IndexWriter<S> {
         if existing.watermarks.script_live.is_some() {
             return Err(IndexError::LiveAlreadySeeded);
         }
-        // An interrupted seed leaves rows without a ready watermark. Clear
-        // them before writing so this publication cannot mix leftover
-        // locators from a previous attempt. Recapture after the reset: the
-        // claim advances the fence, so a pre-reset capture cannot commit.
         self.reset_capabilities(IndexCapabilities::SCRIPT_LIVE)?;
         let mut fence = capture_write_fence(self.indexer.store.as_ref(), self.generation)?;
         if fence.watermarks.script_live.is_some() {
@@ -184,19 +145,10 @@ impl<S: KvStore> IndexWriter<S> {
         Ok(written)
     }
 
-    /// Clears an interrupted `ScriptLive` seed before genesis replay.
-    ///
-    /// Ordinary commits stamp the live watermark with every batch, and an
-    /// artifact seed clears this family before writing, so rows without a
-    /// watermark exist only after an interrupted seed. Forward replay would
-    /// publish its watermark over those mixed rows, so the replay entry
-    /// clears them first. Returns whether anything was reset.
     pub(crate) fn reset_interrupted_script_live_seed(&self) -> Result<bool, IndexError> {
         if self.watermarks()?.script_live.is_some() {
             return Ok(false);
         }
-        // One bounded row decides the probe: any `ScriptLive` row without a
-        // watermark is leftover from an interrupted seed.
         let probe = self.indexer.store.scan_prefix_bounded(
             ColumnFamily::ScriptLive,
             &[],
@@ -212,10 +164,6 @@ impl<S: KvStore> IndexWriter<S> {
         Ok(true)
     }
 
-    /// Seeds `ScriptLive` from an iterator of compact locators.
-    ///
-    /// Delegates to `Self::seed_script_live_stream` so fenced write
-    /// failures and watermark publication have one owner.
     pub fn seed_script_live<I>(
         &mut self,
         coins: I,
@@ -237,15 +185,7 @@ impl<S: KvStore> IndexWriter<S> {
         )
     }
 
-    /// Imports verified `TxLookup` rows through the ordinary reset/revision/watermark
-    /// fence.
-    ///
-    /// A lost fence returns `StaleIndexState` or `ResetInProgress`. The final commit
-    /// stamps the watermark and coverage floor only after `produce` returns; earlier
-    /// failures leave partial rows unqueryable.
-    ///
-    /// An existing watermark is refused with `WatermarkMismatch`. Un-watermarked
-    /// leftovers are reset before writing. Returns the number of rows imported.
+    /// `TxLookup` watermark and coverage floor are written only in the final
     pub(crate) fn import_tx_lookup_stream<F>(
         &self,
         mut produce: F,
@@ -268,8 +208,6 @@ impl<S: KvStore> IndexWriter<S> {
         };
         let existing = capture_write_fence(self.indexer.store.as_ref(), self.generation)?;
         refuse_populated(&existing)?;
-        // Recapture after the reset: the claim advances the fence, so a
-        // pre-reset capture cannot commit.
         self.reset_capabilities(IndexCapabilities::TX_LOOKUP)?;
         let mut fence = capture_write_fence(self.indexer.store.as_ref(), self.generation)?;
         refuse_populated(&fence)?;
@@ -285,12 +223,6 @@ impl<S: KvStore> IndexWriter<S> {
         let mut add = |row: PortableImportRow<'_>| -> Result<(), IndexError> {
             match row {
                 PortableImportRow::Header(header) => {
-                    // Block headers are shared identity: another capability
-                    // may have committed this height already, and the reset
-                    // keeps them when any cursor remains. Rewriting every
-                    // covered header would turn each restore into a full
-                    // 800k-key rewrite; a point lookup per header skips the
-                    // covered ones with no extra memory.
                     if self
                         .indexer
                         .store
@@ -338,12 +270,6 @@ impl<S: KvStore> IndexWriter<S> {
         Ok(written)
     }
 
-    /// Marks selected derived rows unavailable, deletes them in bounded batches,
-    /// and leaves their durable cursors empty so the worker can rebuild from genesis.
-    ///
-    /// The claim and cursor deletion land atomically before row deletion, and
-    /// completion CASes the exact claim to the next idle version.
-    /// `open` resumes an interrupted reset before exposing the writer again.
     pub fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
         if capabilities.is_empty() {
             return Err(IndexError::InvalidResetMarker);
@@ -355,14 +281,7 @@ impl<S: KvStore> IndexWriter<S> {
         )
     }
 
-    /// Anchors history-derived capabilities before the first surviving body height.
-    ///
-    /// `floor` must be `anchor.height + 1`; queries below it cannot prove absence. The
-    /// next prepared block must be the anchor's child. Ordinary reset/revision fences
-    /// still apply (`ResetInProgress`/`StaleIndexState`).
-    ///
-    /// Never anchor `ScriptLive`: it needs rows reseeded from an immutable artifact
-    /// or retained history before its watermark can be published.
+    /// reseeds from an immutable artifact or retained history, so anchoring it would
     pub(crate) fn anchor_watermark(
         &self,
         capabilities: IndexCapabilities,
@@ -387,7 +306,6 @@ impl<S: KvStore> IndexWriter<S> {
         commit_ordinary(self.indexer.store.as_ref(), self.generation, &fence, batch)
     }
 
-    /// Derives a `PreparedBlock` from a serialized body without allocating a decoded block.
     pub fn prepare_block(
         &self,
         height: u32,
@@ -397,7 +315,6 @@ impl<S: KvStore> IndexWriter<S> {
         self.prepare_block_for(IndexCapabilities::HISTORICAL, height, hash, body)
     }
 
-    /// Derives capability-selected row mutations from one serialized block scan.
     pub fn prepare_block_for(
         &self,
         capabilities: IndexCapabilities,
@@ -413,8 +330,6 @@ impl<S: KvStore> IndexWriter<S> {
         self.prepare_block_with_spent_scripts(capabilities, height, hash, body, &NoSpentScripts)
     }
 
-    /// [`Self::prepare_block_for`] with the spent-coin script source
-    /// `ScriptLive` and `CompactFilters` preparation require.
     pub fn prepare_block_with_spent_scripts(
         &self,
         capabilities: IndexCapabilities,
@@ -456,17 +371,6 @@ impl<S: KvStore> IndexWriter<S> {
         })
     }
 
-    /// Commits one serialized block through the prepared-write owner.
-    ///
-    /// The successful return is the commit point: prepared rows and the
-    /// watermark become durable together. Storage-write failures can leave the
-    /// commit uncertain; the supervised worker owns retry from the last confirmed
-    /// watermark, or reset and rebuild.
-    ///
-    /// Selects [`IndexCapabilities::HISTORICAL`]. Callers maintaining
-    /// `ScriptLive` must use [`Self::prepare_block_with_spent_scripts`] with a
-    /// spent-script source, then [`Self::commit_forward`]. See `IDX-06` /
-    /// `IDX-07` in `docs/contracts/indexing.md`.
     pub fn commit_block(&mut self, height: u32, body: &[u8]) -> Result<IndexWatermark, IndexError> {
         let header = body.get(..crate::types::HEADER_ROW_SIZE).ok_or_else(|| {
             IndexError::InvalidHeaderLength {
@@ -487,18 +391,11 @@ impl<S: KvStore> IndexWriter<S> {
         self.commit_forward(batch)
     }
 
-    /// Atomically connects a bounded batch and advances the durable watermark.
-    ///
-    /// Captures its own fence before any store-dependent derivation and keeps
-    /// the consumer cursor untouched. See `IDX-06` / `IDX-07` in
-    /// `docs/contracts/indexing.md`.
     pub fn commit_forward(&mut self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
         let (fence, _) = self.fenced_watermarks()?;
         self.commit_forward_with_cursor(fence, batch, ConsumerCursorUpdate::Keep)
     }
 
-    /// Atomically connects a bounded batch and applies one explicit consumer
-    /// cursor disposition guarded by the captured reset-state fence.
     pub fn commit_forward_with_cursor(
         &mut self,
         fence: IndexWriteFence,
@@ -599,8 +496,6 @@ impl<S: KvStore> IndexWriter<S> {
         Ok(final_watermark)
     }
 
-    /// Atomically rolls back one block and applies one explicit consumer
-    /// cursor disposition guarded by the captured reset-state fence.
     pub fn commit_rollback_one_for_with_cursor(
         &mut self,
         fence: IndexWriteFence,
@@ -624,15 +519,6 @@ impl<S: KvStore> IndexWriter<S> {
         )
     }
 
-    /// Atomically rolls back one block with the exact scripts of its spent
-    /// coins. Required when `ScriptLive` or `CompactFilters` is selected.
-    ///
-    /// The commit point is the successful return from the durable conditional
-    /// write, so recovery sees either the prior state or the complete rollback.
-    /// Preparation and fence failures precede the rollback write. Storage-write
-    /// errors can leave its commit uncertain; reacquire a fence and reconcile the
-    /// stored watermark and cursor before retrying. Same fenced batch as
-    /// [`Self::commit_forward`]; see `IDX-06` / `IDX-07` in `docs/contracts/indexing.md`.
     pub fn commit_rollback_one_for_with_cursor_with_spent_scripts(
         &mut self,
         fence: IndexWriteFence,
@@ -694,9 +580,6 @@ impl<S: KvStore> IndexWriter<S> {
             });
         }
         let mut store_batch = self.indexer.store.new_batch();
-        // A disabled capability may still point above this block on the same
-        // disconnected prefix. Retain every ancestor identity it may need to
-        // reconcile when it is enabled again.
         let unselected_keeps_identity = IndexCapability::ALL.into_iter().any(|capability| {
             !capabilities.contains(capability)
                 && fence
@@ -729,11 +612,6 @@ impl<S: KvStore> IndexWriter<S> {
         Ok(())
     }
 
-    /// Loads the opaque consumer cursor bytes, or `None` when none is stored.
-    ///
-    /// The cursor is opaque to this crate: the owning consumer defines the
-    /// encoding and writes it only after its rows reached the position it
-    /// names, so a present cursor always describes committed rows.
     pub fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError> {
         Ok(self
             .indexer
@@ -741,13 +619,6 @@ impl<S: KvStore> IndexWriter<S> {
             .get(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY)?)
     }
 
-    /// Publishes the opaque consumer cursor under five exact conditions from the
-    /// captured fence: reset state, ordinary revision, and all watermark rows.
-    /// The commit atomically advances the ordinary revision.
-    ///
-    /// A lost race with an unchanged reset returns
-    /// [`IndexError::StaleIndexState`]. A moved reset cooperatively completes
-    /// the pending exact claim and returns [`IndexError::ResetInProgress`].
     pub fn commit_consumer_cursor(
         &mut self,
         fence: IndexWriteFence,
@@ -764,7 +635,6 @@ impl<S: KvStore> IndexWriter<S> {
     }
 }
 
-/// One verified row of a portable `TxLookup` import.
 pub(crate) enum PortableImportRow<'a> {
     /// The 80-byte header identity of an active-chain block at or below the
     /// bundle base, so ordinary rollback can unseat the base later.
@@ -773,12 +643,10 @@ pub(crate) enum PortableImportRow<'a> {
     TxLookup {
         /// Stored key: txid prefix and big-endian height.
         row: crate::types::HashPrefixRow,
-        /// Sorted, packed positions of every transaction filed under the key.
         value: &'a [u8],
     },
 }
 
-/// The compiled on-disk index format number a portable bundle must carry.
 pub(crate) const fn index_format_version() -> u32 {
     u32::from_le_bytes(FORMAT_VERSION_VALUE)
 }
@@ -800,13 +668,7 @@ fn has_any_index_row<S: KvStore>(store: &S) -> Result<bool, IndexError> {
     Ok(false)
 }
 
-/// Metric name for per-family planned write bytes histogram.
-///
-/// Records logical pre-coalescing planned bytes for row families present in a
-/// prepared batch. Excludes engine-internal overhead, write-ahead logs, and
-/// device-level physical storage writes.
 pub(crate) const FAMILY_PLANNED_WRITE_BYTES_HISTOGRAM: &str = "index.family_planned_write_bytes";
-/// Label key distinguishing row families in [`FAMILY_PLANNED_WRITE_BYTES_HISTOGRAM`].
 pub(crate) const FAMILY_LABEL: &str = "family";
 
 pub(crate) const FAMILY_TX_LOOKUP: &str = "tx_lookup";
@@ -819,10 +681,6 @@ fn metric_f64_from_usize(val: usize) -> f64 {
     bitcoin_rs_primitives::u64_to_f64(u64::try_from(val).unwrap_or(u64::MAX))
 }
 
-/// Emits one histogram observation per index family present with non-zero planned bytes in a committed batch.
-///
-/// Observations reflect the sum of prepared rows before multi-block coalescing (logical planned bytes),
-/// and do not measure actual emitted batch writes or physical storage I/O.
 pub(crate) fn record_family_byte_histograms(family_bytes: &IndexRowBytes) {
     if family_bytes.tx_lookup > 0 {
         metrics::histogram!(FAMILY_PLANNED_WRITE_BYTES_HISTOGRAM, FAMILY_LABEL => FAMILY_TX_LOOKUP)

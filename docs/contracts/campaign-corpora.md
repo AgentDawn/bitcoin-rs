@@ -130,6 +130,10 @@ that height. No Cmodern cell may close on a guessed or recalled UTXO total.
 - A corpus with a mismatched stop hash, an unsynchronized `coinstatsindex`, or
   a guessed `muhash` is rejected as reference-set failure.
 
+## Verification boundaries
+
+Corpus manifest and measured-campaign checks validate the recorded identities, bounds, and evidence schema. They do not establish that a corpus was acquired or that a product campaign completed; the custody and completion requirements above remain authoritative.
+
 ## Vocabulary
 
 Terms used above are defined in [`../../CONCEPTS.md`](../../CONCEPTS.md):

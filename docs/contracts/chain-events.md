@@ -1,8 +1,5 @@
 # Chain events contract
 
-The seam between the block-apply commit path and consumers that mirror the
-applied chain. The contract orders durable commit, mempool reconciliation,
-stable generation publication, and best-effort observer delivery.
 
 Owners:
 - Durable commit and stable publication:
@@ -139,6 +136,10 @@ consumers therefore reconcile against the durable applied tip. System-level
 convergence after crash, lost write, and reorg is owned by
 [recovery.md](recovery.md). The recovery path does not restore an authenticated
 checkpoint or replay a journal as an authority.
+
+## Verification boundaries
+
+Chain-feed, applied-chain publication, and index-runtime tests exercise bounded delivery, missed commits, branch changes, refusal, restart, and unsettled fences. The durable/recovery boundaries remain with their storage and chainstate owners.
 
 ## Vocabulary
 

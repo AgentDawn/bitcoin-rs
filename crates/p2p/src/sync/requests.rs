@@ -23,42 +23,29 @@ use std::time::Duration;
 use std::time::Instant;
 use std::vec::Vec;
 
-/// Requested blocks within this distance of the header tip ride the
-/// compact-block flavor: reconstruction costs a fraction of the full-body
-/// transfer exactly where blocks are freshest. Deeper requests keep the
-/// witness flavor, where full-body availability dominates; the download
-/// window stays hash-keyed, so either answer resolves the same pending
+/// Requested blocks within this distance of the header tip ride the compact-block
+/// flavor: reconstruction costs a fraction of the full-body transfer exactly where
+/// blocks are freshest.
+///
+/// Deeper requests keep the witness flavor, where full-body availability dominates; the
+/// download window stays hash-keyed, so either answer resolves the same pending
 /// request.
 pub(super) const COMPACT_RELAY_NEAR_TIP_BLOCKS: u32 = 5;
 
 /// How long a connection that answered `notfound` for a body is demoted for
 /// that same body: it is the last resort for the hash, and the request path
 /// refuses to ask it again, until the interval passes.
-///
-/// The peer is not at fault for lacking a block, so nothing else changes: its
-/// other requests, its conviction state, and its connection are untouched.
-/// After the interval a peer that has since obtained the body is asked once
-/// more; a fresh `notfound` starts the interval again.
 pub(super) const BODY_UNAVAILABLE_RETRY: Duration = Duration::from_mins(1);
 
-/// Safety ceiling on retained availability records: every live record below
-/// it is kept, so ledger pressure can never evict one peer's live answer to
-/// make room for another's. The bound caps memory at a few mebibytes, and
-/// evicting above it costs at most one redundant round trip — never a stall —
-/// because per-entry filtering only re-asks a peer it wrongly forgot.
+/// Safety ceiling on retained availability records: every live record below it is kept,
+/// so ledger pressure can never evict one peer's live answer to make room for
+/// another's.
+///
+/// The bound caps memory at a few mebibytes, and evicting above it costs at most one
+/// redundant round trip — never a stall — because per-entry filtering only re-asks a
+/// peer it wrongly forgot.
 pub(super) const MAX_UNAVAILABLE_BODY_RECORDS: usize = 65_536;
 
-/// Exact connections that answered an outstanding body request with
-/// `notfound`, keyed by connection identity and block hash.
-///
-/// PRE: none; the ledger is retention-bounded, not budget-bounded. Its live
-///   size follows live peers by refusals per peer within
-///   [`BODY_UNAVAILABLE_RETRY`], which is unrelated to `max_pending_blocks`.
-/// POST: holds every live record up to [`MAX_UNAVAILABLE_BODY_RECORDS`];
-///   a record older than [`BODY_UNAVAILABLE_RETRY`] never refuses anything.
-/// INVARIANT: records are keyed by exact [`PeerSource`], so a same-address
-///   replacement never inherits its predecessor's answer, and ages come from
-///   the monotonic clock the caller passes in. A lookup is one hash probe.
 #[derive(Debug, Default)]
 pub(super) struct UnavailableBodies {
     answered: hashbrown::HashMap<(PeerSource, Hash256), Instant>,
@@ -69,11 +56,6 @@ impl UnavailableBodies {
         Self::default()
     }
 
-    /// Records that `source` answered `notfound` for `hash` at `now`.
-    ///
-    /// Expired records leave first and every live record is retained. Only
-    /// when the safety ceiling is still reached does the oldest live record
-    /// leave, so the bound holds without refusing the newest answer.
     pub(super) fn note(&mut self, source: PeerSource, hash: Hash256, now: Instant) {
         self.answered
             .retain(|_, answered_at| Self::live(*answered_at, now));
@@ -90,17 +72,12 @@ impl UnavailableBodies {
         self.answered.insert((source, hash), now);
     }
 
-    /// Whether `source` answered `notfound` for `hash` within
-    /// [`BODY_UNAVAILABLE_RETRY`] of `now`.
     pub(super) fn refuses(&self, source: PeerSource, hash: Hash256, now: Instant) -> bool {
         self.answered
             .get(&(source, hash))
             .is_some_and(|answered_at| Self::live(*answered_at, now))
     }
 
-    /// Live hashes `source` answered `notfound` for within
-    /// [`BODY_UNAVAILABLE_RETRY`] of `now`, for lanes that consult the
-    /// ledger without nesting the scheduler lock inside their own.
     pub(super) fn refused_hashes(&self, source: PeerSource, now: Instant) -> Vec<Hash256> {
         self.answered
             .iter()
@@ -109,13 +86,10 @@ impl UnavailableBodies {
             })
             .collect()
     }
-    /// Forgets `source`'s answer for `hash`: it delivered the body, so the
-    /// earlier `notfound` no longer describes it.
     pub(super) fn clear(&mut self, source: PeerSource, hash: Hash256) {
         self.answered.remove(&(source, hash));
     }
 
-    /// Drops every record whose connection `owns` rejects.
     pub(super) fn retain_owned_by(&mut self, owns: impl Fn(&PeerSource) -> bool) {
         self.answered.retain(|(source, _), _| owns(source));
     }
@@ -125,9 +99,6 @@ impl UnavailableBodies {
     }
 }
 
-/// The body hash a `notfound` vector answers a body request for, in any of
-/// the three flavors this node requests (`MSG_BLOCK`, `MSG_WITNESS_BLOCK`,
-/// `MSG_CMPCT_BLOCK`); `None` for every other vector.
 fn not_found_block_hash(item: &Inventory) -> Option<Hash256> {
     match item {
         Inventory::CompactBlock(hash) => Some(Hash256::from_le_bytes(hash.as_byte_array())),
@@ -135,13 +106,6 @@ fn not_found_block_hash(item: &Inventory) -> Option<Hash256> {
     }
 }
 
-/// Releases only `source`'s matching request, under scheduler lock inside
-/// `PeerTable::with_current(source)`.
-///
-/// Ordinary window release also clears its timeout/cold-front observation and rewinds
-/// the cursor; a deferred mark drops. Remember a tracked probe/hedge alternate's
-/// refusal without releasing the owner. An untracked hash changes nothing. Return
-/// whether ownership released; this path never blames or disconnects a peer.
 fn release_unavailable_body(
     scheduler: &mut SchedulerState,
     source: PeerSource,
@@ -175,13 +139,6 @@ fn release_unavailable_body(
 }
 
 impl BlockSync {
-    /// Routes block `notfound` vectors under exact-source peer authority.
-    ///
-    /// Release this connection's foreground, deferred, or historical request without
-    /// blame and suppress its retry for `BODY_UNAVAILABLE_RETRY`. Return whether
-    /// anything released so the caller can wake sync. Ignore unasked vectors; a stale
-    /// source or same-address replacement cannot release or poison another connection's
-    /// request. Non-block vectors belong to their respective owners.
     pub(crate) fn block_not_found(&self, source: PeerSource, items: &[Inventory]) -> bool {
         if !items
             .iter()
@@ -192,9 +149,6 @@ impl BlockSync {
         let now = Instant::now();
         let mut released = 0_usize;
         self.peer_table.with_current(source, || {
-            // The historical window is its own request owner. Its lock is
-            // released before the scheduler's is taken: the two are never
-            // held together.
             let historical_released = self.release_historical_bodies(source, items, now);
             let mut scheduler = self.scheduler.lock();
             for hash in historical_released {
@@ -229,19 +183,6 @@ impl BlockSync {
         released > 0
     }
 
-    /// Releases the historical-window requests `source` owns among the block
-    /// vectors of `items`, returning the released hashes.
-    ///
-    /// PRE: the caller holds the peer table's `with_current(source)`
-    ///   authority and no scheduler lock.
-    /// POST: each block vector that `source` is the exact pending owner of in
-    ///   the historical window is released through the owner-only delivery
-    ///   rejection, which lowers that window's request cursor so the next
-    ///   `request_historical` pass replans it; every other vector is left
-    ///   alone.
-    /// INVARIANT: only the exact owner releases, nothing is blamed, and the
-    ///   record of the answer lives in the scheduler's one ledger, written by
-    ///   the caller after this lock is released.
     fn release_historical_bodies(
         &self,
         source: PeerSource,
@@ -259,18 +200,12 @@ impl BlockSync {
         released
     }
 
-    /// Sends one estimated-2MiB common-prefix probe to each idle alternate.
-    ///
-    /// Every alternate receives the same earliest hashes, so the probe cannot
-    /// create a unique out-of-order height hole. It runs once per deep owner.
     pub(super) fn send_prefix_probes(&self, probe_peers: &[SyncPeer], now: Instant) {
         let Some((owner, hashes, required_height)) =
             self.scheduler.lock().window.prefix_probe_plan()
         else {
             return;
         };
-        // An alternate that already answered `notfound` for one of the probe
-        // hashes is not asked for it again before the retry interval ends.
         let unavailable: SmallVec<[PeerSource; 8]> = {
             let scheduler = self.scheduler.lock();
             probe_peers
@@ -323,7 +258,6 @@ impl BlockSync {
         );
     }
 
-    /// Builds one getdata inventory entry per planned block in the chosen flavor.
     fn build_inventory(
         request: &crate::download_window::PeerRequest,
         compact_fetch: bool,
@@ -340,9 +274,6 @@ impl BlockSync {
         inventory
     }
 
-    /// Compact flavor is worth its reconstruction round trip only when the
-    /// peer announced BIP152 relay and the whole batch sits within the
-    /// near-tip window of the header tip.
     fn compact_fetch_eligible(
         &self,
         request: &crate::download_window::PeerRequest,
@@ -358,9 +289,6 @@ impl BlockSync {
             && self.peer_table.compact_relay_of_source(request.owner())
     }
 
-    /// Requests the next window batch from `source`, a usable peer from the
-    /// frontier snapshot. The request start is the canonical next-required
-    /// height — recovery and scheduling never disagree about the frontier.
     pub(super) fn send_getdata_for_pending_blocks(
         &self,
         source: PeerSource,
@@ -377,10 +305,6 @@ impl BlockSync {
             return GetdataRequestOutcome::default();
         };
 
-        // The service clause that gates tick-time selection applies here
-        // too: header-drain fetches and stripe retries reach this function
-        // without passing the selector, so the gate is enforced at the one
-        // path every body request takes (net_processing.cpp).
         let Some(info) = self.peer_table.info_of_source(source) else {
             return GetdataRequestOutcome::default();
         };
@@ -394,13 +318,6 @@ impl BlockSync {
         }
         let servable_floor = servable_floor(&info, &policy);
         let tree = self.chain.block_tree();
-        // Bodies `source` already answered `notfound` for are excluded while
-        // the batch is built, never by dropping it: the scan plans around
-        // them and pins the cursor at the lowest refused height, so the next
-        // peer this tick — or `source` once the retry interval has passed —
-        // can still be offered the bodies it holds. Nothing was marked for a
-        // refused body, and no message names one, so a peer that lacks a body
-        // is never polled for it at wake-up pace.
         let request = {
             let mut scheduler = self.scheduler.lock();
             let SchedulerState {
@@ -434,9 +351,6 @@ impl BlockSync {
         let count = inventory.len();
         let msg = Message::GetData(inventory);
 
-        // `send_then` holds the connection's identity through the enqueue
-        // and the pending stamp under one table authority, so a replacement
-        // can never be blamed for — or credited with — this request.
         let mut has_request_capacity = false;
         let sent = self.peer_table.send_then(source, msg, || {
             let mut scheduler = self.scheduler.lock();
@@ -444,9 +358,6 @@ impl BlockSync {
             has_request_capacity = window.mark_requested(stager, &request, source, now);
         });
         if let Err(refusal) = sent {
-            // Nothing was queued and nothing was marked, so a refusal by the
-            // node's aggregate budget costs this tick only: the next tick
-            // plans the request again from the window's then-current state.
             if refusal.is_saturated() {
                 tracing::debug!(
                     peer_addr = ?source.endpoint,
@@ -482,11 +393,6 @@ impl BlockSync {
         }
     }
 
-    /// Sends one untracked duplicate request for a cold-start stalled front.
-    ///
-    /// The original request remains the sole pending owner. This bounded
-    /// hedge therefore changes neither capacity accounting nor timeout state.
-    /// Returns the alternate's source so the race can be armed.
     pub(super) fn send_cold_front_hedge(
         &self,
         owner: PeerSource,
@@ -509,10 +415,6 @@ impl BlockSync {
                 continue;
             };
             let source = session.lease.source(session.endpoint);
-            // One capability rule for every path that asks for a body: the
-            // same `body_capability` the frontier's usable-peer view
-            // precomputes, so the hedge and the scheduler can never disagree
-            // about whom to ask.
             let active_height = if session.demonstrated_tips.is_empty() {
                 u32::try_from(peer.best_known_height).ok()
             } else {
@@ -584,8 +486,6 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    /// A minimal header chain: genesis plus linked successors, so window
-    /// planning resolves contiguous heights without proof-of-work mining.
     fn test_chain() -> (
         bitcoin_rs_chain::BlockTree,
         Vec<(bitcoin_rs_chain::NodeId, bitcoin_rs_primitives::Header)>,
@@ -713,8 +613,6 @@ mod tests {
         let base = Instant::now();
         let mut ledger = UnavailableBodies::new();
 
-        // Two refusing peers alternate while a small pending budget could
-        // hold only one request: neither live record may evict the other.
         ledger.note(first, test_hash(1), base);
         ledger.note(second, test_hash(1), base + Duration::from_secs(1));
         ledger.note(first, test_hash(2), base + Duration::from_secs(2));
@@ -733,14 +631,9 @@ mod tests {
     fn safety_ceiling_evicts_oldest_live_and_stays_bounded() {
         let base = Instant::now();
         let mut ledger = UnavailableBodies::new();
-        // `for_test` mints a fresh connection identity per call, so bind each
-        // test connection once and reuse it: re-minting would address a
-        // different connection and never hit the noted record.
         let filler = test_source(9_832);
         let newcomer = test_source(9_833);
 
-        // Fill the ledger without going through the per-note expiry sweep,
-        // so all ceiling records are live at distinct ages.
         let ceiling = u64::try_from(MAX_UNAVAILABLE_BODY_RECORDS)
             .expect("the safety ceiling fits in a hash counter");
         for counter in 0..ceiling {

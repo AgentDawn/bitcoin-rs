@@ -1,18 +1,4 @@
-//! Best-effort outbound transaction announcements.
-//!
-//! `TxRelayQueue` bounds producer work and drops the newest announcement on
-//! saturation, so relay cannot block admission. The worker drives request and
-//! relay timers, including bounded retries of pending local broadcasts.
-//!
-//! Peer-origin accepts enqueue after ingress commits; RPC/reorg accepts use
-//! `LocalTxRelayObserver`, whose weak gateway reference cannot retain the owner.
-//! The observer resolves a wtxid only while that acceptance remains resident.
-//!
-//! `PeerRelaySink` delegates inventory, source exclusion, fee/dependency policy
-//! and delayed-item revalidation to the shared transaction-policy owner. A
-//! later removal may race `getdata` and produce `notfound`. Per-peer output
-//! saturation follows `PeerLease::send`; it cannot silently lose a queued
-//! message while leaving that connection live.
+//! Outbound transaction relay worker.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -28,33 +14,22 @@ use bitcoin_rs_mempool::{
 use bitcoin_rs_primitives::{Txid, Wtxid};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
-/// Default maximum pending transaction announcements.
 pub const DEFAULT_TX_RELAY_QUEUE_CAPACITY: usize = 1024;
 
-/// Drain poll interval when the relay queue is empty.
 const RELAY_POLL: Duration = Duration::from_millis(100);
 const INITIAL_BROADCAST_RETRY: Duration = Duration::from_secs(1);
 const INITIAL_BROADCAST_BATCH: usize = 1024;
 
-/// One accepted transaction awaiting `inv` announcement.
 #[derive(Clone, Copy, Debug)]
 pub struct RelayRequest {
-    /// Transaction id advertised in `inv` vectors.
     pub txid: Txid,
     /// Accepted transaction's witness identifier for BIP339 peers.
     pub wtxid: Wtxid,
-    /// The delivering peer's node id to exclude, or `None` for local
-    /// injection.
     pub source: Option<u64>,
-    /// The mempool admission epoch the request was queued under, from
-    /// [`bitcoin_rs_mempool::MutationResult::sequence_of`]. Removal
-    /// and re-admission of the same body invalidates the epoch, so the
-    /// send-time check matches the exact admission that queued the request.
     pub sequence: u64,
 }
 
 impl RelayRequest {
-    /// Builds a relay request for an accepted transaction.
     #[must_use]
     pub fn new(txid: Txid, wtxid: Wtxid, source: Option<u64>, sequence: u64) -> Self {
         Self {
@@ -66,11 +41,6 @@ impl RelayRequest {
     }
 }
 
-/// Bounded producer side of the relay queue.
-///
-/// Cloneable and cheap to share: the underlying crossbeam [`Sender`] is
-/// cloneable. [`announce`](Self::announce) never blocks — on a full queue the
-/// request is dropped and [`dropped`](Self::dropped) is incremented.
 #[derive(Clone)]
 pub struct TxRelayQueue {
     tx: Sender<RelayRequest>,
@@ -79,8 +49,6 @@ pub struct TxRelayQueue {
 }
 
 impl TxRelayQueue {
-    /// Creates a bounded relay queue of `capacity` pending announcements and
-    /// returns the queue plus the receiver the worker drains.
     #[must_use]
     pub fn new(capacity: usize) -> (Self, Receiver<RelayRequest>) {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
@@ -92,11 +60,6 @@ impl TxRelayQueue {
         (queue, rx)
     }
 
-    /// Enqueues one announcement without blocking.
-    ///
-    /// Returns `true` if the request was queued, `false` if the queue was
-    /// full (the request is dropped) or the worker receiver has been dropped.
-    /// Admission callers ignore the return value: relay is best-effort.
     pub fn announce(&self, txid: Txid, wtxid: Wtxid, source: Option<u64>, sequence: u64) -> bool {
         let request = RelayRequest::new(txid, wtxid, source, sequence);
         match self.tx.try_send(request) {
@@ -112,32 +75,23 @@ impl TxRelayQueue {
         }
     }
 
-    /// Total announcements successfully enqueued since construction.
     #[must_use]
     pub fn enqueued(&self) -> u64 {
         self.enqueued.load(Ordering::Relaxed)
     }
 
-    /// Total announcements dropped because the queue was full.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
 
-/// Announces locally-injected accepted transactions (`sendrawtransaction`,
-/// Esplora `POST /tx`, reorg re-admission) to every connected peer.
-///
-/// Peer-origin accepts are announced by their ingress caller after admission
-/// returns a committed outcome. This observer publishes RPC, Esplora and reorg
-/// acceptances, which have no source peer to exclude.
 pub struct LocalTxRelayObserver {
     relay: TxRelayQueue,
     gateway: Weak<MempoolGateway>,
 }
 
 impl LocalTxRelayObserver {
-    /// Relays accepted local mutations through `relay`.
     #[must_use]
     pub fn new(relay: TxRelayQueue, gateway: Weak<MempoolGateway>) -> Self {
         Self { relay, gateway }
@@ -174,29 +128,16 @@ impl MempoolObserver for LocalTxRelayObserver {
     }
 }
 
-/// Synchronous announcement admission reported by a [`RelaySink`].
-///
-/// Deferred inventory delivery occurs during `poll`; its send failures cannot
-/// be reported in an earlier admission result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RelayOutcome {
-    /// Handshake-complete peers considered for the announcement.
     pub attempted: usize,
-    /// Peers skipped because they were the source of the transaction.
     pub excluded: usize,
-    /// Peers whose pending announcement queue could not accept this identity
-    /// because its per-peer or global budget was saturated. This counts queue
-    /// admission failures; later transport failures are logged when polled.
     pub saturated: usize,
 }
 
-/// Consumer seam for the relay worker.
 pub trait RelaySink: Send + Sync {
-    /// Advances time-based transaction download policy.
     fn poll(&self, _gateway: &MempoolGateway) {}
 
-    /// Queues an accepted identity and admission epoch, excluding its source.
-    /// The production sink emits inventory on its next eligible timer tick.
     fn announce_inv(
         &self,
         txid: Txid,
@@ -206,15 +147,6 @@ pub trait RelaySink: Send + Sync {
     ) -> RelayOutcome;
 }
 
-/// Production [`RelaySink`] over the shared peer table.
-///
-/// Borrows the shared table, so the relay worker sees peer
-/// connect/disconnect/reconnect and their published BIP339 preference. A
-/// handshaking lease receives no inventory: choosing before negotiation could
-/// queue `MSG_TX` for a connection that later requests `MSG_WTX`. A
-/// block-relay-only lease receives none either: transaction relay is
-/// prohibited on such a connection, as Core restricts `RelayTransaction` to
-/// full-relay peers (`net_processing.cpp`).
 pub struct PeerRelaySink {
     peers: Arc<crate::PeerTable>,
     ibd: Option<(
@@ -224,13 +156,11 @@ pub struct PeerRelaySink {
 }
 
 impl PeerRelaySink {
-    /// Wraps the shared peer table.
     #[must_use]
     pub fn new(peers: Arc<crate::PeerTable>) -> Self {
         Self { peers, ibd: None }
     }
 
-    /// Shares the node's existing IBD decision for outgoing fee filters.
     #[must_use]
     pub fn with_ibd(
         mut self,
@@ -275,16 +205,6 @@ impl RelaySink for PeerRelaySink {
     }
 }
 
-/// Returns whether the queued transaction is still relayable.
-///
-/// PRE: `gateway` is the shared gateway for the node's live mempool.
-/// POST: returns true exactly when the admission that queued `request` —
-/// identified by its txid at its admission epoch — is still resident in the
-/// mempool read at this call. Removal and re-admission, even of byte-identical
-/// bytes or a witness-mutated same-txid entry, does not satisfy the queued
-/// request: `entry_by_txid_at_sequence` invalidates on the sequence, so a
-/// stale request can neither announce a transaction admitted under a
-/// different epoch nor advertise it back to a different source peer.
 /// INVARIANT: the check does not mutate the mempool, relay queue, or
 /// observer state. The read guard is released before this function
 /// returns, so no caller holds it while it sends to peers.
@@ -295,9 +215,6 @@ fn transaction_is_live(gateway: &MempoolGateway, request: &RelayRequest) -> bool
         .is_some()
 }
 
-// Pending state belongs to the live mempool entries, not a second relay queue.
-// Retry bounded batches so absent peers or queue saturation cannot consume the
-// only announcement. The existing sink applies peer, fee and inventory rules.
 fn retry_initial_broadcast(
     gateway: &MempoolGateway,
     sink: &dyn RelaySink,
@@ -321,19 +238,6 @@ fn retry_initial_broadcast(
     }
 }
 
-/// Synchronously drains every currently-queued relay request into `sink`,
-/// announcing only transactions still resident in `gateway`.
-///
-/// Returns the number of requests processed. Tests call it to flush the
-/// queue deterministically.
-///
-/// PRE: `gateway` is the shared gateway for the node's live mempool; `rx`
-/// is the relay queue receiver.
-/// POST: every request queued at the call is consumed and counted once. A
-/// request whose transaction is resident with its queued wtxid at the send
-/// is announced through `sink`, excluding its source connection. A request
-/// whose transaction left the mempool — or was re-admitted under a
-/// different wtxid — produces no announcement.
 /// INVARIANT: no mempool guard is held while `sink` sends to peers.
 #[cfg(test)]
 pub(crate) fn drain_relay_queue(
@@ -356,12 +260,10 @@ pub(crate) fn drain_relay_queue(
     processed
 }
 
-/// Runs the single relay worker against a weak live gateway.
+/// INVARIANT: no mempool guard is held while `sink` sends to peers.
 ///
-/// At send time the queued wtxid must still be resident; removed or witness-replaced
-/// transactions are consumed silently. Exclude the source connection and release
-/// mempool guards before sending. Hold no strong gateway reference while waiting; exit
-/// on shutdown or queue close. `drain_relay_queue` uses the same rule.
+/// The worker applies the same send-time rule as `drain_relay_queue` and never retains a
+/// strong gateway reference while it waits for queue input.
 pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
     sink: S,
     rx: Receiver<RelayRequest>,
@@ -416,21 +318,16 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::atomic::AtomicBool;
 
-    /// A peer in the fake sink: a node id and a remaining send budget.
     #[derive(Clone)]
     struct FakePeer {
         node_id: u64,
         capacity: usize,
     }
 
-    /// One recorded announcement: txid, excluded source, outcome.
     type SinkEntry = (Txid, Option<u64>, RelayOutcome);
 
-    /// Test sink that records announcements without a live connection.
     struct FakeSink {
         peers: Mutex<Vec<FakePeer>>,
-        /// Shared so a test can read it after the sink moves into the
-        /// spawned relay worker.
         log: Arc<Mutex<Vec<SinkEntry>>>,
     }
 
@@ -484,14 +381,11 @@ mod tests {
         Wtxid::from(Hash256::from_le_bytes(&[byte; 32]))
     }
 
-    /// Allocates a fresh process-unique node id via a throwaway lease.
     fn fresh_node_id() -> u64 {
         let (tx, _rx) = bounded::<crate::QueuedFrame>(1);
         PeerLease::new(tx).node_id()
     }
 
-    /// Builds `count` fake peers with generous capacity and returns the
-    /// peers plus their node ids, so tests can exclude a specific peer.
     fn fake_peers(count: usize) -> (Vec<FakePeer>, Vec<u64>) {
         let mut peers = Vec::with_capacity(count);
         let mut ids = Vec::with_capacity(count);
@@ -586,8 +480,6 @@ mod tests {
         for (_, wtxid, _) in remaining {
             gateway.mark_broadcast(wtxid);
         }
-        // Reusing the removed transaction as a peer admission must not inherit
-        // its previous local pending flag or index membership.
         gateway
             .insert_entry(
                 relay_identity_peer(),
@@ -1016,9 +908,6 @@ mod tests {
         })
     }
 
-    /// Admits a transaction with a distinct coinbase-style input to
-    /// `gateway`, so a queued announcement for its txid is live at send
-    /// time, and returns the transaction with its admission epoch.
     fn admit_live_tx(
         marker: u8,
         gateway: &MempoolGateway,
@@ -1032,8 +921,6 @@ mod tests {
         (tx, sequence)
     }
 
-    /// Inserts `tx` and returns the admission epoch its relay request must
-    /// carry for the send-time residency check to match.
     fn admit_entry(tx: &Arc<bitcoin_rs_primitives::Tx>, gateway: &MempoolGateway) -> u64 {
         use bitcoin_rs_mempool::MempoolEntry;
 
@@ -1047,8 +934,6 @@ mod tests {
             .expect("a single insert carries one admission sequence")
     }
 
-    /// Reads the resident entry's wtxid for a fixture transaction, so a
-    /// queued request carries the same identity the gateway serves.
     fn live_wtxid(txid: &Txid, gateway: &MempoolGateway) -> Wtxid {
         gateway
             .read()

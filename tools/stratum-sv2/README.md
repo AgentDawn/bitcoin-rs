@@ -27,8 +27,9 @@ docker compose -f tools/stratum-sv2/compose.yaml down --timeout 30
 
 The provider builds from the repository root with Rust 1.99 and the standalone
 lockfile. It uses native validation and Fjall, and stores its regtest node in
-the existing `bitcoin-rs-data` volume. Do not run another node against that volume concurrently. No volume is reset by startup or shutdown.
-The optional SV1 translator still listens on host loopback port 3333. Pool
+the existing `bitcoin-rs-data` volume. Do not run the previous separate node
+against that volume concurrently. No volume is reset by startup or shutdown.
+The optional SV1 translator listens on host loopback port 3333. Pool
 monitoring remains on loopback port 9090. Device core counts are deliberately
 small; increase them only for the test host's capacity.
 
@@ -60,10 +61,14 @@ microseconds, canonical submission results, and the resulting applied height.
 
 ## Ownership and bounds
 
-- The adapter passes `CoinbaseOutputConstraints` as a `CoinbaseBudget` and
-  checks `Candidate::admits` before sending a job; no job is sent before
-  constraints arrive. The [mining owner](../../crates/mining/README.md#coinbase-budgeted-templates)
-  owns selection, reuse, and the fit rule.
+- The mining owner builds every candidate and decides what fits. A pool's
+  `CoinbaseOutputConstraints` become a `CoinbaseBudget` on the typed template
+  request. The owner selects transactions that leave that room in the
+  coinbase, or answers with the generation's ordinary candidate when it already
+  admits the budget. `Candidate::admits` is the one fit rule. The adapter owns
+  no selector, headroom constant or second fit check; it calls `admits` once
+  more before writing a job and closes the session if the owner's candidate
+  fails it. No job is sent before constraints arrive.
 - A dedicated OS thread long-polls the owner's ordinary template only to learn
   that the generation moved, using the owner's opaque template identity. It
   wakes the sessions and publishes nothing: its candidate is never sent to a

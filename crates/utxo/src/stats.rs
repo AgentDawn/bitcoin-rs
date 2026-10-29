@@ -1,17 +1,10 @@
-//! Derived statistics over the live set owned by `crate::set`.
+//! Running UTXO-set statistics over the live set.
 //!
-//! `MuHash3072` owns the Core-compatible accumulator; `CoinStats` owns scalar folds and
-//! its byte codec. `CoinStatsListener` applies committed events and explicit disconnect
-//! rewinds; `CoinStatsAccumulator` serves checkpoints with ordered parallel MuHash
-//! partials or hashing disabled. `scan_coin_stats` recomputes from a stable view. See
-//! "Owed derived state" in `CONCEPTS.md`.
-//!
-//! The durable codec id `bitcoin-rs-coinstats-v1` requires a datadir schema epoch
-//! bump if changed.
+//! The checkpoint manifest records this component under the current codec
+//! identifier `"bitcoin-rs-coinstats-v1"`. It is an on-disk value and changes
+//! to it require a datadir schema epoch bump.
 
-/// Running UTXO statistics.
 pub mod coin_stats;
-/// `MuHash3072` accumulator.
 mod muhash3072;
 
 pub use coin_stats::{

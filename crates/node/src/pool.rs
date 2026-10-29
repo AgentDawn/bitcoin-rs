@@ -1,5 +1,3 @@
-//! Node-owned native pool lifecycle. No wallet or signing capability enters this module.
-
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -24,7 +22,6 @@ mod sv2;
 #[cfg(test)]
 mod tests;
 
-/// Constructed before RPC; listeners are started only after RPC binds successfully.
 pub(crate) struct PoolService {
     config: crate::config::PoolConfig,
     host: Arc<ledger::LedgerHost>,
@@ -59,24 +56,17 @@ impl crate::storage_backend::StoreConsumer for LedgerComposer {
     }
 }
 
-/// Retained jobs shared by every protocol listener.
-const MAX_RETAINED_JOBS: usize = 64;
-/// Session slots per live connection, including spare slots for reconnects.
-const SESSION_SLOTS_PER_CONNECTION: usize = 2;
-/// Duplicate-tracked shares retained per job.
-const MAX_SHARES_PER_JOB: usize = 65_536;
-/// Deferred accounting records shared by the composed core.
-const MAX_OUTBOX_RECORDS: usize = 1024;
-/// Deferred accounting byte budget for the composed core.
-const MAX_OUTBOX_BYTES: usize = 8 * 1024 * 1024;
-
-/// Shared core bounds. Owner sessions are not live TCP connections; the
-/// aggregate connection caps belong to the shared `ConnectionLimiter`.
 struct ComposedCore {
     book: JobBookConfig,
     outbox_items: usize,
     outbox_bytes: usize,
 }
+
+const MAX_RETAINED_JOBS: usize = 64;
+const SESSION_SLOTS_PER_CONNECTION: usize = 2;
+const MAX_SHARES_PER_JOB: usize = 65_536;
+const MAX_OUTBOX_RECORDS: usize = 1024;
+const MAX_OUTBOX_BYTES: usize = 8 * 1024 * 1024;
 
 fn composed_core_config(max_connections: u32) -> Result<ComposedCore> {
     let sessions = usize::try_from(max_connections)?
@@ -163,7 +153,6 @@ impl PoolService {
     }
 
     pub(crate) fn start(&mut self) -> Result<()> {
-        // Never acknowledge work before there is a durably opened ledger and a template.
         self.core
             .refresh(None, Vec::new())
             .context("initial pool template")?;
@@ -210,7 +199,6 @@ impl PoolService {
                 .name("pool-reconcile".into())
                 .spawn(move || {
                     while !cancel.load(Ordering::Acquire) {
-                        // No long-poll: shutdown never waits for a future mining generation.
                         if let Err(error) = core.refresh(None, Vec::new()) {
                             core.invalidate_active();
                             tracing::warn!(%error, "pool template refresh unavailable");
@@ -299,7 +287,6 @@ impl Drop for PoolService {
         if let Err(error) = self.shutdown(Instant::now() + Duration::from_secs(10)) {
             tracing::error!(%error, "pool shutdown failed");
         }
-        // A failed deadline is not permission to detach a durable writer.
         if let Some(worker) = self.worker.take() {
             worker.thread().unpark();
             if worker.join().is_err() {

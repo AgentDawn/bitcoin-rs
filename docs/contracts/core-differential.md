@@ -129,3 +129,7 @@ a running pinned binary, not a replay of captured JSON.
   identities, launch arguments, RPC transcripts, and output logs.
 - This is a bounded curated suite. Coverage-guided live Core fuzzing and
   broader rule-family coverage remain follow-up work under #1323.
+
+## Verification boundaries
+
+The binary process harness owns real Core comparisons over RPC, P2P announcements, reorgs, and negotiated transport. Shared fixture/custody checks validate inputs; they do not replace a provisioned process run or close the clause-local gaps. The configured CI/evidence lanes own execution results.

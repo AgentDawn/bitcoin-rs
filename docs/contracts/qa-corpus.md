@@ -116,6 +116,10 @@ semantics:
 Injected numeric statuses in regression tests are sentinels used to prove
 nonzero-status propagation; they are not stable public status-code assignments.
 
+## Verification boundaries
+
+Corpus/schema tests exercise malformed, incomplete, mismatched, and unbound evidence, including custody and bounded input handling. A fixture/schema check does not certify a measured campaign or a missing external result.
+
 ## Vocabulary
 
 Terms used above are defined in [`../../CONCEPTS.md`](../../CONCEPTS.md):

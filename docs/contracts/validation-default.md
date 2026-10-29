@@ -110,3 +110,7 @@
   repeat the full `--config --data-dir --p2p-listen` set.
 - The kernel-free default keeps `kernel` out of every manifest default; it is not a C++-free claim: the default build compiles bundled ZeroMQ C++ from source and still needs C/C++ compilers plus `ar` (see [getting-started prerequisites](../getting-started.md#prerequisites)). Changing the production
   default engine under `VAL-01` does not add `kernel` to any manifest default.
+
+## Verification boundaries
+
+Configuration, backend metadata, native/kernel capability, and startup failure tests own selection and refusal behavior. CI and provisioned reference campaigns own execution evidence; compiling a capability does not select it at runtime or establish consensus parity.
