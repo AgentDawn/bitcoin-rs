@@ -219,8 +219,16 @@ enum ReplacementStage {
 impl PreparedAdmission {
     pub(crate) fn check_package_max_feerate(&mut self, maximum: Option<u64>) {
         if self.rejection.is_none()
-            && maximum
-                .is_some_and(|max| self.fact.effective_fee_rate.is_some_and(|rate| rate > max))
+            && self.fact.vsize != 0
+            && maximum.is_some_and(|max| {
+                self.fact.modified_fee.is_some_and(|fee| {
+                    // Core 31.1 compares CFeeRate ratios, not GetFee or the
+                    // displayed integer rate. Divide the nonnegative limit
+                    // instead of multiplying the signed fee. u64 * u32 fits
+                    // i128, and negative or very large fee deltas stay exact.
+                    fee > i128::from(max) * i128::from(self.fact.vsize) / 1_000
+                })
+            })
         {
             self.reject(
                 AdmitError::Policy(crate::standardness::AcceptanceRejectReason::MaxFeeExceeded),
@@ -4174,6 +4182,37 @@ mod tests {
         let result = gateway.admit_transaction(request);
         assert!(matches!(result, Err(AdmitError::Consensus)));
         assert!(!cache.take(candidate.wtxid(), bitcoin_rs_script::VerifyFlags::MANDATORY));
+    }
+
+    #[test]
+    fn package_fee_cap_keeps_signed_extremes_exact() {
+        let gateway = gateway_with(None);
+        let candidate = standard_tx(0x63);
+        let request = admit_request(&gateway, &candidate, AdmissionOrigin::Rpc);
+        for (fee, rejects) in [
+            (i128::MIN, false),
+            (-1, false),
+            (0, false),
+            (i128::from(u64::MAX) + i128::from(i64::MAX), true),
+            (i128::MAX, true),
+        ] {
+            let mut prepared = MempoolGateway::prepare_admission(
+                &gateway.read(),
+                &request,
+                AdmissionMode::PackageRpcSubmit(Some(1_000)),
+                crate::admission::AdmissionFence::Stable,
+                gateway.engine(),
+            );
+            assert!(prepared.rejection.is_none());
+            prepared.fact.modified_fee = Some(fee);
+            // A quote that cannot fit u64 must not disable the fee cap.
+            prepared.fact.effective_fee_rate = None;
+            prepared.check_package_max_feerate(Some(1_000));
+            assert_eq!(
+                prepared.fact.reject_reason,
+                rejects.then_some(crate::standardness::AcceptanceRejectReason::MaxFeeExceeded)
+            );
+        }
     }
 
     /// A transaction the fee-cap policy rejects after the `STANDARD` pass

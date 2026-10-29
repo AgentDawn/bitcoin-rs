@@ -718,6 +718,117 @@ fn rpc_package_underpayment_priority_cap_and_unsupported_shapes_mutate_nothing()
 }
 
 #[test]
+fn rpc_package_fee_cap_compares_signed_fees_without_rounding() -> TestResult {
+    use crate::PackageTxResult;
+    // A >1,000-vB member can exceed the cap by one satoshi while its
+    // displayed integer sat/kvB quote still equals the cap.
+    for (outputs, fee, rate, delta, rejected) in [
+        (30, 100, 1_000, -1, false),
+        (30, 100, 1_000, 0, false),
+        (30, 100, 1_000, 1, true),
+        (1, 1, 1, 0, true), // No one-satoshi minimum for a ratio comparison.
+    ] {
+        let seen = Arc::new(Seen::default());
+        let gateway = gateway_observed(Some(seen.clone()));
+        let tx = spend(&[coin(840)], &vec![1_000; outputs], false);
+        let size = u32::try_from(tx.vsize())?;
+        let chain = Coins(vec![(
+            coin(840),
+            TxOut {
+                value: Amount::from_sat(u64::try_from(outputs)? * 1_000 + fee),
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            },
+        )]);
+        if outputs == 30 {
+            assert!(size > 1_000);
+            gateway.prioritise(tx.txid(), i64::from(size) - i64::try_from(fee)? + delta)?;
+        }
+        let history = gateway.read().estimator_history();
+        let result = gateway.submit_rpc_package(
+            core::slice::from_ref(&tx),
+            Some(rate),
+            unix_time_secs(),
+            &chain,
+        )?;
+        if rejected {
+            assert_eq!(
+                result.tx_results,
+                vec![PackageTxResult::Rejected(
+                    AcceptanceRejectReason::MaxFeeExceeded.into()
+                )]
+            );
+            assert!(gateway.read().is_empty());
+            assert_eq!(gateway.read().sequence_number(), 0);
+            assert!(seen.0.lock().is_empty());
+            // Explicit zero continues to disable the caller cap.
+            let uncapped = gateway.submit_rpc_package(&[tx], Some(0), unix_time_secs(), &chain)?;
+            assert!(matches!(
+                uncapped.tx_results[0],
+                PackageTxResult::Accepted { .. }
+            ));
+        } else {
+            assert!(matches!(
+                result.tx_results[0],
+                PackageTxResult::Accepted { .. }
+            ));
+            assert_eq!(gateway.read().len(), 1);
+            assert_eq!(seen.0.lock().len(), 1);
+        }
+        assert_eq!(gateway.read().estimator_history(), history);
+    }
+    Ok(())
+}
+
+#[test]
+fn rpc_package_fee_failure_precedence_preserves_other_planner_errors() -> TestResult {
+    for (dust, full) in [(false, false), (true, false), (true, true)] {
+        let seen = Arc::new(Seen::default());
+        let gateway = gateway_observed(Some(seen.clone()));
+        {
+            let mut pool = gateway.pool.write();
+            pool.limits.min_relay_fee_sat_per_kvb = 1_000;
+            if !dust {
+                pool.limits.cluster_count = 1;
+            }
+        }
+        let outputs = if dust {
+            vec![100_000, 0]
+        } else {
+            vec![100_000]
+        };
+        let parent = spend(&[coin(841)], &outputs, false);
+        let child = spend(&[OutPoint::new(parent.txid(), 0)], &[99_999], true);
+        if full {
+            gateway.pool.write().limits.max_total_bytes = parent.vsize() + child.vsize() - 1;
+        }
+        let chain = Coins(vec![(
+            coin(841),
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: Script::from_bytes(vec![0x51]),
+            },
+        )]);
+        let history = gateway.read().estimator_history();
+        let result =
+            gateway.submit_rpc_package(&[parent, child], None, unix_time_secs(), &chain)?;
+        assert_eq!(
+            result.package_error,
+            Some(if full {
+                // Capacity refusal retains its old position after dust checks.
+                AcceptanceRejectReason::MissingEphemeralSpends
+            } else {
+                AcceptanceRejectReason::MinRelayFeeNotMet
+            })
+        );
+        assert!(gateway.read().is_empty());
+        assert_eq!(gateway.read().sequence_number(), 0);
+        assert_eq!(gateway.read().estimator_history(), history);
+        assert!(seen.0.lock().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn rpc_package_retries_fee_revision_and_chain_fences_without_membership_leaks() -> TestResult {
     struct MovingChain<'a> {
         gateway: &'a MempoolGateway,
