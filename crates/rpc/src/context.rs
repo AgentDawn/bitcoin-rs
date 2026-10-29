@@ -5,9 +5,9 @@ use bitcoin_rs_chain::{
     BlockBodyReadError, BlockBodySource, BlockTreeReader, LatchReader, TipReader, TipSnapshot,
     softfork_state,
 };
-use bitcoin_rs_mempool::{
-    AdmissionChain, BodyInterest, ChainAdmissionSnapshot, MempoolGateway, PrevoutMeta,
-};
+#[cfg(any(test, feature = "test-seam"))]
+use bitcoin_rs_mempool::BodyInterest;
+use bitcoin_rs_mempool::{AdmissionChain, ChainAdmissionSnapshot, MempoolGateway, PrevoutMeta};
 
 #[cfg(any(test, feature = "test-seam"))]
 use bitcoin_rs_mempool::{Mempool, MempoolLimits, MempoolObserver};
