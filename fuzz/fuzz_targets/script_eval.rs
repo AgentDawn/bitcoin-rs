@@ -32,7 +32,6 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-
     fn take<'a>(rest: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
         let chunk = rest.get(..len)?;
         *rest = &rest[len.min(rest.len())..];
@@ -55,8 +54,7 @@ fuzz_target!(|data: &[u8]| {
         let Some(tx_bytes) = take(&mut rest, tx_len) else {
             return;
         };
-        let Ok(tx) =
-            bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Tx>(tx_bytes)
+        let Ok(tx) = bitcoin_rs_primitives::deserialize::<bitcoin_rs_primitives::Tx>(tx_bytes)
         else {
             return;
         };
@@ -82,9 +80,7 @@ fuzz_target!(|data: &[u8]| {
                 return;
             };
             prevouts.push(bitcoin_rs_primitives::TxOut {
-                value: Amount::from_sat(u64::from_le_bytes(
-                    value.try_into().unwrap_or([0; 8]),
-                )),
+                value: Amount::from_sat(u64::from_le_bytes(value.try_into().unwrap_or([0; 8]))),
                 script_pubkey: script.to_vec().into(),
             });
         }
