@@ -1,6 +1,6 @@
 # Contracts
 
-`docs/contracts/` owns current normative behavior. Each page names its owners and executable proof. `CONCEPTS.md` owns vocabulary; `docs/benchmarks/` holds measured evidence.
+`docs/contracts/` owns current normative behavior. Each page names its owners and behavioral proof boundaries. `CONCEPTS.md` owns vocabulary; `docs/benchmarks/` holds measured evidence.
 
 ## Precedence
 
@@ -13,48 +13,40 @@ When code and a contract disagree, fix the drift in the same change. Do not dupl
 
 ## Index
 
-| Contract | Clauses | Scope | Primary proof |
-| --- | --- | --- | --- |
-| [architecture.md](architecture.md) | `ARCH-01`–`ARCH-09` | Layering, storage confinement and bounded prefix scans, composition, chainstate authority, single mutation owners, capability boundaries, immutable snapshot/replay seeding, one immutable `BlockPayload` | `g17_dependency_direction`; storage bounded-scan suites; node apply/effects tests; capability suites |
-| [validation-default.md](validation-default.md) | `VAL-01`–`VAL-03` | Kernel/native default decision and portable validation | feature-matrix builds; Core vectors; measured promotion evidence |
-| [consensus-difficulty.md](consensus-difficulty.md) | `DAA-01` | Core 31.1 difficulty adjustment: clamped retarget timespan and testnet minimum-difficulty exception | `crates/chain/tests/header_sync_roundtrip.rs` retarget and minimum-difficulty tests |
-| [indexing.md](indexing.md) | `IDX-01`–`IDX-12` | Capability gating, coherent reads, reset/rebuild, reorg reconciliation, worker scheduling, canonical row cardinality, atomic commit durability, portable `TxLookup` bundle export/restore, historical prefix queries | `index_roundtrip.rs` row occupancy; txindex worker recovery/query/lifecycle/scheduling suites; RPC capability tests; portable bundle manifest/artifact codec tests and bundle configuration tests (no end-to-end export/restore test) |
-| [recovery.md](recovery.md) | `RCV-01`–`RCV-15` | Durable root, ordered commits, crash outcomes, reorgs, schema refusal | storage durability tests; chainstate checkpoint/journal/replay suites; node crash/reorg suites; txindex recovery tests |
-| [chain-events.md](chain-events.md) | `EVT-01`–`EVT-06` | Applied-chain event seam, consumer cursors, and settled polling/positional replay (`crates/node/src/chain_feed.rs`: `ChainSubscription`, `ChainUpdate`, `ChainStep`, `ChainReplay`, `ChainTarget`; proven by `crates/node/tests/unit/chain_feed.rs` covering bounded batches, missed commits, stale targets, disconnect-before-connect, restart, refusal and unsettled fences) | state/apply/txindex recovery tests; `crates/node/tests/unit/chain_feed.rs` proves what a polling consumer can verify: gap flag on missed commits, disconnect-before-connect positional steps with header linkage, pinned-target reconciliation with `complete`, and limit/budget/restart/unsettled-fence refusals |
-| [mempool-mutations.md](mempool-mutations.md) | `MPL-01`–`MPL-04` | Mutation ordering, sequence events, chain-change fencing | mempool gateway, RPC ZMQ, and node apply tests |
-| [mempool-policy.md](mempool-policy.md) | `POL-01`–`POL-06` | Admission owner, policy pins, preview/finality, replacement and package rules | policy/RBF suites plus planned admission/finality/cluster suites |
-| [pool.md](pool.md) | `POOL-01`–`POOL-09` | Default-off experimental native SV1/SV2 pool, PPLNS accounting, and external-signer boundary | scoped protocol, ledger, node, and RPC suites; final strict gates pending |
-| [external-api.md](external-api.md) | `API-01`–`API-35` | RPC/REST/ZMQ behavior, mining requests, errors, and reference provenance | Manifest coverage, Core parity, mining and request-validation tests |
-| [wallet-facing.md](wallet-facing.md) | `WF-01`–`WF-03` | Public wallet-facing surface and isolation from node internals | wallet-facing and Esplora tests; `listener_directory_table_is_closed_over_http` |
-| [p2p-wire.md](p2p-wire.md) | `P2P-01`–`P2P-11` | Wire compatibility, peer leases, demonstrated capability, canonical frontier recovery, connected-socket posture, body-carried header admission, header-led block announcements with bounded ingress, inbound admission and outbound service gating, block-body service eligibility, header presync admission gating, BIP324 v2 transport negotiation | P2P compatibility/live interop, dispatch/listener, peer-table and sync tests |
-| [synchronization.md](synchronization.md) | `CONV-1`, `SYNC-01`–`SYNC-07` | Node-level, cross-crate synchronization: top-level conditional convergence property (`CONV-1`) with the pipeline obligations it discharges (discovery, scheduling/execution, recovery closure, non-starvation, durable convergence), independent progress authorities, transient-hint rule, work drivers, failure classification, coherent consumer views, retained-history availability; open contention/proof gaps recorded, not assumed away | chainstate connect/recovery suites; p2p sync tick/handover suites; index reconciliation/recovery suites; assumeutxo fail-closed paths; node crash/durable-head tests; `e2e/tests/assumeutxo.rs`; immutable snapshot/replay `ScriptLive` seeding; scoped `Unavailable` on missing history |
-| [qa-corpus.md](qa-corpus.md) | `QAC-01` | Fuzz corpus provenance | corpus provenance and fuzz targets |
-| [campaign-corpora.md](campaign-corpora.md) | `CORP-01`–`CORP-05` | C150/Cmodern custody and Core-framed corpus format | `tools/campaign-corpus/test_corpus.py` |
-| [muhash-rpc.md](muhash-rpc.md) | `MRPC-01`–`MRPC-03` | MuHash RPC arity and benchmark custody | RPC arity and benchmark-campaign tests |
-| [embedding.md](embedding.md) | `EMB-01`–`EMB-10` | Embedded lifecycle, shared node services and independent stall evidence | `crates/node/tests/embed.rs`; daemon teardown test; `crates/node/src/event_loop.rs` telemetry test; `scripts/tests/test_watch_runtime_stall.py` |
-| [storage-footprint.md](storage-footprint.md) | `FP-01`–`FP-04` | Offline apparent/allocated snapshot boundary and evidence limits | offline-tool tests; isolated production API gate |
-| [hot-path-attribution.md](hot-path-attribution.md) | `HPA-01`–`HPA-13` | Product cells, overlap accounting, evidence identity, promotion thresholds | benchmark evidence tests and measured campaign artifacts |
-| [dependency-range.md](dependency-range.md) | `DEP-01`–`DEP-02` | Declared Cargo ranges compile at their minimum and maximum resolvable versions; one copy each of `bitcoin`, `bitcoin_hashes`, `secp256k1`, `secp256k1-sys` | `scripts/check-dep-range.sh`; `cargo deny check bans` |
-| [feature-matrix.md](feature-matrix.md) | `FEAT-01`–`FEAT-02` | Named supported feature combinations; no empty backend markers on crates that do not own storage | `scripts/check-feature-matrix.sh`; `g17_dependency_direction` |
-| [reference-set.md](reference-set.md) | `REF-01`–`REF-07` | Released Core, kernel, corpus, and formal-tool identities | reference record and `overhaul_reference_set` |
-| [ecosystem-compatibility.md](ecosystem-compatibility.md) | `ECO-01`–`ECO-09` | External ecosystem compatibility strategy: black-box evidence, one representative consumer, evidence matrix and status vocabulary | [api/ecosystem-compat.toml](../api/ecosystem-compat.toml) rows; live Core interop lane (`core-differential.md`) |
-| [formal-verification.md](formal-verification.md) | Formal inventory | Model hashes, runner identity, return-code mapping, and proof status | `scripts/check_models.py`; manual model-check workflow |
-| [chainstate-journal-v1.md](chainstate-journal-v1.md) | `JW-*-1` | Chainstate journal writer: append ordering, durable head, rotation, retention, lifecycle | `crates/storage/src/chainstate_journal/writer/tests/` |
-
-## Permanent suite traceability
-
-Tests map to current contracts, not task numbers. [test-evidence.md](test-evidence.md) records
-reviewed deletions, surviving proof owners and outstanding coverage gaps.
-
-Representative retained suites:
-
-- `bin/bitcoin-rs/tests/overhaul_process_harness.rs` → `REF-02`, `REF-07`
-- `bin/bitcoin-rs/tests/overhaul_external_miner.rs` → `API-14`, `API-15`
-- `crates/consensus/tests/overhaul_parse_parity.rs` → `VAL-02`
-- `crates/consensus/tests/overhaul_prepared_inputs.rs` → `POL-03`, `VAL-02`
-- `crates/node/tests/overhaul_fee_history.rs` → `API-26`, `EVT-02`, `RCV-11`
-- `crates/primitives/tests/overhaul_layout.rs` → `ARCH-01`
+| Contract | Clauses | Scope |
+| --- | --- | --- |
+| [architecture.md](architecture.md) | `ARCH-01`–`ARCH-09` | Layering, storage confinement and bounded prefix scans, composition, chainstate authority, single mutation owners, capability boundaries, immutable snapshot/replay seeding, one immutable `BlockPayload` |
+| [validation-default.md](validation-default.md) | `VAL-01`–`VAL-03` | Kernel/native default decision and portable validation |
+| [consensus-difficulty.md](consensus-difficulty.md) | `DAA-01` | Core 31.1 difficulty adjustment: clamped retarget timespan and testnet minimum-difficulty exception |
+| [indexing.md](indexing.md) | `IDX-01`–`IDX-12` | Capability gating, coherent reads, reset/rebuild, reorg reconciliation, worker scheduling, canonical row cardinality, atomic commit durability, portable `TxLookup` bundle export/restore, historical prefix queries |
+| [recovery.md](recovery.md) | `RCV-01`–`RCV-15` | Durable root, ordered commits, crash outcomes, reorgs, schema refusal |
+| [chain-events.md](chain-events.md) | `EVT-01`–`EVT-06` | Applied-chain event seam, consumer cursors, and settled polling/positional replay (`crates/node/src/chain_feed.rs`: `ChainSubscription`, `ChainUpdate`, `ChainStep`, `ChainReplay`, `ChainTarget`) |
+| [mempool-mutations.md](mempool-mutations.md) | `MPL-01`–`MPL-04` | Mutation ordering, sequence events, chain-change fencing |
+| [mempool-policy.md](mempool-policy.md) | `POL-01`–`POL-06` | Admission owner, policy pins, preview/finality, replacement and package rules |
+| [pool.md](pool.md) | `POOL-01`–`POOL-09` | Default-off experimental native SV1/SV2 pool, PPLNS accounting, and external-signer boundary |
+| [external-api.md](external-api.md) | `API-01`–`API-35` | RPC/REST/ZMQ behavior, mining requests, errors, and reference provenance |
+| [wallet-facing.md](wallet-facing.md) | `WF-01`–`WF-03` | Public wallet-facing surface and isolation from node internals |
+| [p2p-wire.md](p2p-wire.md) | `P2P-01`–`P2P-11` | Wire compatibility, peer leases, demonstrated capability, canonical frontier recovery, connected-socket posture, body-carried header admission, header-led block announcements with bounded ingress, inbound admission and outbound service gating, block-body service eligibility, header presync admission gating, BIP324 v2 transport negotiation |
+| [synchronization.md](synchronization.md) | `CONV-1`, `SYNC-01`–`SYNC-07` | Node-level, cross-crate synchronization: top-level conditional convergence property (`CONV-1`) with the pipeline obligations it discharges (discovery, scheduling/execution, recovery closure, non-starvation, durable convergence), independent progress authorities, transient-hint rule, work drivers, failure classification, coherent consumer views, retained-history availability; open contention/proof gaps recorded, not assumed away |
+| [qa-corpus.md](qa-corpus.md) | `QAC-01` | Fuzz corpus provenance |
+| [campaign-corpora.md](campaign-corpora.md) | `CORP-01`–`CORP-05` | C150/Cmodern custody and Core-framed corpus format |
+| [muhash-rpc.md](muhash-rpc.md) | `MRPC-01`–`MRPC-03` | MuHash RPC arity and benchmark custody |
+| [embedding.md](embedding.md) | `EMB-01`–`EMB-10` | Embedded lifecycle, shared node services and independent stall evidence |
+| [storage-footprint.md](storage-footprint.md) | `FP-01`–`FP-04` | Offline apparent/allocated snapshot boundary and evidence limits |
+| [hot-path-attribution.md](hot-path-attribution.md) | `HPA-01`–`HPA-13` | Product cells, overlap accounting, evidence identity, promotion thresholds |
+| [dependency-range.md](dependency-range.md) | `DEP-01`–`DEP-02` | Declared Cargo ranges compile at their minimum and maximum resolvable versions; one copy each of `bitcoin`, `bitcoin_hashes`, `secp256k1`, `secp256k1-sys` |
+| [feature-matrix.md](feature-matrix.md) | `FEAT-01`–`FEAT-02` | Named supported feature combinations; no empty backend markers on crates that do not own storage |
+| [reference-set.md](reference-set.md) | `REF-01`–`REF-07` | Released Core, kernel, corpus, and formal-tool identities |
+| [ecosystem-compatibility.md](ecosystem-compatibility.md) | `ECO-01`–`ECO-09` | External ecosystem compatibility strategy: black-box evidence, one representative consumer, evidence matrix and status vocabulary |
+| [formal-verification.md](formal-verification.md) | Formal inventory | Model hashes, runner identity, return-code mapping, and proof status |
+| [chainstate-journal-v1.md](chainstate-journal-v1.md) | `JW-*-1` | Chainstate journal writer: append ordering, durable head, rotation, retention, lifecycle |
 
 ## Vocabulary
 
 Project-specific terms are defined once in [../../CONCEPTS.md](../../CONCEPTS.md).
+
+The [documentation ownership policy](../policies/documentation.md) defines
+where comments, numeric defaults, operator instructions, and verification
+evidence belong. The [test-evidence contract](test-evidence.md) maps behavioral
+obligations to proof families; exact test names are discovered from source and
+Cargo test listings rather than copied into each clause.

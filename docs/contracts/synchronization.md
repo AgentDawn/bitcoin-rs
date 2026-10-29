@@ -118,12 +118,6 @@ different frontier. `sync_progress` reports blocks and headers separately for
 this reason (`crates/rpc/src/context.rs`); a `blocks == headers` projection is
 not validation progress when an AssumeUTXO historical role is still replaying.
 
-- Proof: `crates/node/tests/unit/state/tests/events.rs`
-  (`record_returns_hints_in_commit_order_and_advances_the_snapshot`,
-  `active_chain_snapshot_anchors_at_restored_tip_after_restart`);
-  `crates/chainstate` post-commit publication tests (`EVT-02`);
-  `crates/index/src/index/tests.rs` watermark identity.
-
 ### `SYNC-02`: Canonical applied progress; transient work is a hint
 
 The selected header ancestry plus the chainstate's committed applied frontier
@@ -138,10 +132,6 @@ block, and no transient completed state is read back as chain progress.
 Discoverable is necessary but not sufficient. `SYNC-06` discharges the
 remaining pipeline obligation: the eligible work item must actually reach its
 driver and be sent or executed.
-
-- Proof: `crates/p2p/src/sync/tests/` (frontier recovery, peer handover,
-  cold-start hedge regressions); `crates/node/tests/unit/state/tests/events.rs`
-  `record_returns_hints_in_commit_order_and_advances_the_snapshot`.
 
 ### `SYNC-03`: Foreground progress, resource, and failure isolation
 
@@ -161,23 +151,12 @@ assumptions of `CONV-1`.
   evidence. Known bounded holds: apply holds both fences only around the
   mutation window (`EVT-02`).
 
-**Seeding and replay isolation:** `ScriptLive` seeding no longer holds the
+**Seeding and replay isolation:** `ScriptLive` seeding does not hold the
 live UTXO stable-view lock. It consumes an accepted immutable snapshot
 artifact or replays retained block bodies and undo records through the
 existing worker. Missing history produces a scoped `ScriptLive`
 `Unavailable`; it does not block the worker, other indexes, or authoritative
-chain commits. This closes the former `seed_live_from_utxo` lock-hold gap.
-
-- Proof: `EVT-02` step 1–7 fencing tests; the event-loop tick tests
-  (`crates/node/src/event_loop.rs`, `EMB-10`); paused-seed apply/lease
-  regressions `crates/index/src/runtime/seed_paused_tests.rs`
-  `seed_paused_write_permits_apply_and_retires_generation` (concurrent
-  applies land while the seed stream holds its pin, then retire to zero
-  leases) and `catch_up_drops_subsumed_seed_lease_for_lower_start`
-  (single-holder drain) plus
-  `crates/index/src/runtime/recovery_tests.rs`
-  `seed_first_leg_consumes_held_lease` (the forward leg consumes the held
-  bundle pin with at most one live lease, stalled legs park it back).
+chain commits.
 
 ### `SYNC-04`: Failure classification and recovery semantics
 
@@ -206,15 +185,6 @@ the owning mechanism (`RCV-08` reconnection, `RCV-07` reconstruction); this
 is the recovery-closure obligation of `CONV-1`. Failed validation publishes
 nothing; settlement failure closes admission for recovery and stays an error
 even when the anchor committed (`API-33`).
-
-- Proof: `crates/node/tests/crash_recovery.rs` (`RCV-04` crash points);
-  `crates/node/src/chain_effects.rs::committed_connect_settlement_failure_retains_outcome_and_forbids_retry`
-  and `crates/node/src/chain_effects.rs::mining_reports_a_committed_settlement_failure_as_accepted`
-  (settlement behavior); `e2e/tests/assumeutxo.rs::invalid_core_snapshots_fail_without_activating`
-  (malformed-import refusal with no activation and untouched input; no
-  process-level settlement-injection scenario exists);
-  `crates/index/src/runtime/recovery_tests.rs` (missing-body wait/resume,
-  `RCV-07`); `crates/p2p/src/sync/` body-rejection regressions.
 
 ### `SYNC-05`: Validated/durable progress and coherent cross-consumer views
 
@@ -245,12 +215,6 @@ Consumer views split by mechanism:
 
 A feature must not introduce mixed-tip or mixed-generation responses, stale
 admission, or false-ready projections.
-
-- Proof: `crates/index/src/runtime/query_tests.rs`
-  (`transaction_rejects_watermark_from_rival_tip`); `crates/mempool/src/gateway.rs`
-  generation-fencing tests (`MPL-04`); `crates/rpc/tests/` capability and
-  coherence suites; the durable-before-publication matrix
-  (`crates/node/tests/overhaul_durable_head.rs`).
 
 ### `SYNC-06`: Work drivers and proof obligations
 
@@ -295,14 +259,6 @@ verdict, or extra state machine is implied.
   `SYNC-01`/`SYNC-02`/`SYNC-05`; it does **not** prove live peer sockets,
   durable crash recovery, or eventual progress under real index contention
   (those keep their owning deep lanes).
-- Proof: `crates/p2p/src/sync/tests/header_progress.rs::tick_fetches_new_tip_headers_from_at_tip_peers`;
-  `crates/p2p/src/sync/tests/headroom_throttling.rs::cold_start_stall_hedges_front_without_reassigning_owner`;
-  `crates/p2p/src/sync/tests/download_frontier.rs::tick_demotes_peer_after_expired_pending_and_retries_on_alternate_peer`;
-  `crates/p2p/src/sync/tests/peer_fanout.rs::tick_retries_when_all_selected_peers_have_expired_pending`;
-  `crates/index/src/runtime/recovery_tests.rs::run_loop_commits_a_retained_prefix_and_retries_an_absent_body_without_a_wake`
-  and `shutdown_after_an_absent_body_does_not_run_a_higher_group`;
-  `crates/node/src/event_loop.rs` telemetry test (`EMB-10`);
-  observability counters (`docs/observability.md`).
 - Whole-node process evidence for `CONV-1`: the existing deep lanes below.
   A declared TLA+ `ConditionalProgress` is **not** completed proof
   (`docs/contracts/formal-verification.md` records exhausted/non-completed
@@ -329,12 +285,6 @@ currently required synchronization/recovery operation still depends on them.
   history are not violations; do not promise archival availability on a pruned
   node.
 
-- Proof: `crates/index/src/runtime/recovery_tests.rs`
-  (`pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`);
-  `crates/storage/src/` pruning retention tests and the `RCV-05`
-  deep-rollback matrix; `crates/chainstate/src/reorg.rs` bounded disconnect
-  streaming under a retention lease (`RCV-08`).
-
 ## Review guidance by change class
 
 Use this to decide which obligations a feature PR can disturb and which
@@ -358,10 +308,10 @@ per hypothetical feature.
 | `CONV-1` obligation | Observable end-to-end result | Owner / mechanism | Smallest evidence | Open condition |
 | :--- | :--- | :--- | :--- | :--- |
 | Discovery | A lost/cancelled frontier request becomes requestable again | P2P `BlockSync` sweeps (`P2P-05`) | `crates/p2p/src/sync/tests/` frontier/handover regressions | None recorded |
-| Scheduling/execution | An eligible request is actually sent to a peer, or the tick records why not | Event-loop sync tick → `BlockSync::tick` | `crates/p2p/src/sync/tests/header_progress.rs::tick_fetches_new_tip_headers_from_at_tip_peers`, `headroom_throttling.rs::cold_start_stall_hedges_front_without_reassigning_owner`, `download_frontier.rs::tick_demotes_peer_after_expired_pending_and_retries_on_alternate_peer`, `peer_fanout.rs::tick_retries_when_all_selected_peers_have_expired_pending` | None recorded |
+| Scheduling/execution | An eligible request is actually sent to a peer, or the tick records why not | Event-loop sync tick → `BlockSync::tick` | P2P sync owner tests for peer-visible frontier discovery, hedging, expiry, and alternate-peer retry | None recorded |
 | Recovery closure | A peer loss/timeout/failed delivery ends in retry, handover, or terminal outcome without restart | `P2P-05` strike/expiry and peer handover; startup dialing on persisted AddrMan recovery (not `RCV-08`, which covers chainstate reorg disconnect/reconnect) | `crates/p2p/src/sync/tests/` expiry strikes; `bin/bitcoin-rs/tests/addrman_restart_e2e.rs` restart reconnection | Live reorg + expiry combined lane is main-only |
 | Non-starvation | A foreground commit lands while optional work runs, on paths the fences bound | Apply fences (`EVT-02`) and immutable artifact/replay seeding | `EVT-02` fencing tests; paused-seed concurrent-apply proof | No live-UTXO seed lock; scoped `ScriptLive` unavailability is isolated from other work |
-| Index delay/failure | Queries refuse honestly during index worker failure | `IDX-07` supervision + `SYNC-01` authorities | `unusable_worker_makes_queries_unavailable` (marks the worker failed, asserts `TxQueryError::Unavailable`) | **Not proven for delay or apply isolation:** no test covers queries during index delay/rebuild or applies a block while the index is unusable, so "index failure never blocks apply" is an unproven obligation resting on the `SYNC-03` fences and `EVT-02` evidence |
+| Index delay/failure | Queries refuse honestly during index worker failure | `IDX-07` supervision + `SYNC-01` authorities | Index runtime failure injection and `TxQueryError::Unavailable` | **Not proven for delay or apply isolation:** no test covers queries during index delay/rebuild or applies a block while the index is unusable, so "index failure never blocks apply" is an unproven obligation resting on the `SYNC-03` fences and `EVT-02` evidence |
 | Durable convergence | A successful apply survives restart at the published tip | Durable head + checkpoint (`RCV-01`–`RCV-04`) | `crates/node/tests/crash_recovery.rs` `RCV-04` matrix | Formal temporal runs are not completed proofs |
 
 ## Formal models

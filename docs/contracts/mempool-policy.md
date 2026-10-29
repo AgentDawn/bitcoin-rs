@@ -43,10 +43,6 @@ holds the reference pins and the admission-profile evidence.
   pinned Core `AcceptPackage`, it first admits individually eligible members
   and then retries fee/missing-input failures together. An independently
   accepted parent survives child refusal; a fee-dependent pair commits together.
-- Proof: `package::tests::rpc_cpfp_commits_one_ordered_batch_with_actual_fees_and_pure_preview`
-  and `package::tests::rpc_package_keeps_independent_parent_but_never_uses_its_fees_twice`
-  in `crates/mempool/src/package/tests.rs` cover RPC package admission,
-  individual-first partial acceptance and resident fee exclusion.
 - Chain reads, script execution and fee-diagram solving run outside write locks.
   Callbacks run after pool/lifecycle locks are released.
 
@@ -134,15 +130,6 @@ holds the reference pins and the admission-profile evidence.
   before scripts. Native submission retains its existing base-fee guard and
   confirmed-member deduplication; RPC treats confirmed transactions as new
   input-resolution attempts. No package RBF or capacity eviction is implied.
-- Proof: `package::tests::rpc_package_underpayment_priority_cap_and_unsupported_shapes_mutate_nothing`
-  and `package::tests::rpc_package_capacity_and_replacement_refusals_preserve_authoritative_state`
-  in `crates/mempool/src/package/tests.rs` cover package cap,
-  unsupported-shape, capacity and replacement outcomes.
-- Proof: `package::tests::rpc_package_fee_cap_compares_signed_fees_without_rounding`
-  and `package::tests::rpc_package_fee_failure_precedence_preserves_other_planner_errors`
-  cover cap boundaries, disabled caps, fee/cluster/dust precedence and refusal
-  without mutation. `gateway::tests::package_fee_cap_keeps_signed_extremes_exact`
-  covers signed fees even when no displayable rate exists.
 - TRUC requires matching unconfirmed versions, at most one ancestor/descendant,
   10,000 adjusted vB for a root and 1,000 for a child. An eligible sole sibling
   joins single-transaction RBF and remains subject to its fees and diagrams.
@@ -290,82 +277,6 @@ clean checkpoints do not save.
 `persist_mempool=false` disables both load and save and leaves existing files
 untouched. There is no periodic writer. `savemempool` and `importmempool`
 remain unsupported RPCs; this format makes no Core disk-format claim.
-
-## Proven by
-
-- `pool::chunk_order_tests::maintained_chunk_order_matches_the_from_scratch_solver`
-  (proptest): random insert/remove/confirm/replace/prioritise/clear sequences
-  over multi-output transactions; after every mutation the maintained order
-  equals an independent per-component re-solve ordered by the index key, and
-  the index satisfies its partition, totals, topology, and rate invariants.
-- `pool::chunk_order_tests::equal_rate_parent_sorts_before_its_child`:
-  an equal-rate parent and child stay two chunks with the parent first.
-- `pool::chunk_order_tests::remove_for_block_confirms_and_conflicts` and
-  `rbf_replacement_keeps_the_index_current`: inclusion, conflict, and
-  replacement removals keep every surviving piece indexed.
-- `chunk_index::tests`: the key order pins (rate beats prefix, prefix beats
-  raw weight, greatest txid breaks cross-component ties), total-order
-  proptest, and relinearize-replaces/forget-drops maintenance.
-- `crates/mempool/src/snapshot/tests.rs` covers candidate revalidation,
-  CPFP/ephemeral dust and bounded subset selection, multi-generational CPFP
-  package restoration, upfront sigop standardness validation, per-member times,
-  whole-family capacity bounds, raised byte budgets, more than 100,000 records,
-  pending initial-broadcast flags and rejected-file quarantine.
-  `restores_cpfp_after_saved_ancestors_confirm_and_are_fully_spent` compares
-  restored descendants with direct gateway package admission after the saved
-  ancestors confirm. `restore_timeout_preserves_all_priorities_through_the_next_save`
-  expires the admission budget after decoding and checks the next saved overlay.
-  `restores_parent_paying_for_a_low_fee_child_before_standalone_admission`
-  compares native admission with restart restoration, including a paying sibling.
-  `family_collection_stops_at_the_package_count_boundary` checks collected member counts
-  at and beyond the package limit; `graph_build_stops_when_a_chain_read_exhausts_the_deadline`
-  verifies that graph construction performs no next read after budget exhaustion.
-  `snapshot::tests::restore_model::generated_small_graphs_match_direct_gateway_maximal_subsets`
-  generates selected two-to-four-member DAG shapes across fee placement,
-  nonfinal-member masks, unchanged/confirmed/spent funding, expired connectors, capacity and record
-  order. Its independent bitmask oracle tests every subset on a fresh gateway;
-  it is finite local evidence, not a proof for arbitrary transaction graphs.
-  `search_limits_do_not_commit_a_parent_before_subset_search_finishes` and
-  `deadline_exhaustion_leaves_the_current_family_uncommitted` cover the explicit
-  incomplete-search boundary, including absence of mutation publication.
-- `tx_relay::tests::pending_local_broadcast_survives_absent_peers_and_saturation`
-  and `dispatch::tests::getdata_completes_initial_broadcast_only_after_successful_send`
-  cover retry and completion through the existing relay/getdata owners.
-  `tx_relay::tests::pending_broadcast_batches_resume_by_key_after_completion_and_removal`
-  covers batch progress as pending entries complete or leave the pool.
-- `lifecycle::tests::timed_out_snapshot_worker_cannot_overwrite_the_next_runs_snapshot`
-  covers shutdown timeout followed by a newer save and late worker completion.
-- `bin/bitcoin-rs/tests/mempool_restart.rs` drives real daemon shutdowns,
-  restarts, RPC membership/lookup, mining, changed-tip reconciliation and
-  initial-broadcast continuation over the P2P wire.
-- `overhaul_process_harness::replacement_signaling_matches_pinned_core` and
-  `policy_cases`: isolated Core/candidate processes, identical funding blocks,
-  real signatures, nonsignaling replacement, insufficient fees, graph merge/split,
-  100/101 conflicting clusters, 64/65 connected members, 1 sat incremental
-  boundaries, prioritisation, TRUC siblings/sizes and package verdict shapes.
-- `crates/mempool/src/fee_diagram/tests.rs`: pinned Core comparison vectors,
-  independent exhaustive small-DAG oracle and maximal 64-node topology.
-- `crates/mempool/tests/replacement_profile.rs`, `graph_limits.rs`,
-  `policy_contract.rs` and `admission.rs`: exact graph/TRUC bounds, atomic
-  failures, fee arithmetic, next-block finality and sigops.
-- `crates/mempool/src/package/tests.rs`: 25/26 and 404,000/404,001 package
-  boundaries, reference-checked weight, TRUC/cluster projections, zero-floor
-  ephemeral spending and fee-only invalidation.
-- `package::tests::rpc_cpfp_commits_one_ordered_batch_with_actual_fees_and_pure_preview`
-  and the `rpc_package_*` cases cover public submission's atomic pair,
-  independent parent success, fee revision/chain fences, capacity and victim
-  preservation. `policy_cases::submitpackage_cpfp_partial_acceptance_and_guards`
-  compares signed CPFP, sigop-adjusted fees, resident witness identities,
-  partial acceptance, TRUC/dust, burn guards, limits and mining projection
-  against the pinned Core process. Generic rejection diagnostics are compared
-  by their documented reason or failure class, not claimed byte-identical.
-- Gateway tests: publication order under concurrency/reentrancy, stale verdicts
-  and rejected replacement preservation of estimator history and fee overlays.
-- Mining/RPC suites: shared chunks, block resource limits, witness commitment
-  oracle, both-RPC verdicts and manifest projection consistency.
-
-Performance, Core transient SFL/churn behavior and the project-wide formal
-model matrix remain unmeasured. Correctness tests do not promote defaults.
 
 ## Vocabulary
 

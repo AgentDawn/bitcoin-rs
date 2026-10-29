@@ -34,12 +34,3 @@ crates that do not own storage are not combinations.
   feature names; forwarding is limited to storage and the approved service
   adapters and operator-facing entry points. G17 enforces this constraint.
 - Empty backend markers are not combinations; the matrix lists none.
-
-## Proven by
-
-- `scripts/check-feature-matrix.sh` (`compatibility-campaign.yml`
-  `feature-combinations` job).
-- `scripts/tests/test_feature_matrix.py`: root and nested caller directories
-  resolve the root manifest through Cargo's workspace resolver; the script-tools
-  lane installs the workspace toolchain before running this offline regression.
-- `cargo test -p bitcoin-rs --test g17_dependency_direction`.

@@ -269,6 +269,11 @@ architecture or validation specification in this guide.
 Follow the [source and test organization policy](docs/policies/source-organization.md)
 when adding or reorganizing modules, tests, and fixtures.
 
+During review, check comments and documentation against the
+[documentation ownership policy](docs/policies/documentation.md): retain the
+enforcing owner for each fact, preserve safety and ordering explanations, and
+remove duplicate descriptions with their replacement links.
+
 ## Proposing and implementing BIPs
 
 External BIP authors and implementers are welcome to propose, prototype, and

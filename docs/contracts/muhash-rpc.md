@@ -37,17 +37,3 @@ bits; Linux 6.3 introduced those two flags, so older kernels retry with
 `MFD_ALLOW_SEALING` only. A rename of the workspace pathname or a later
 write to that inode cannot change the bytes the daemon reads. Receipts
 keep the original FileRef identity.
-
-## Proven by
-
-- `crates/rpc/src/handlers/chain.rs` test `gettxoutsetinfo_rejects_trailing_parameters`
-- `tools/benchmark-campaign/test_muhash_rpc.py` tests
-  `test_rpc_does_not_send_credentials_to_a_foreign_peer`,
-  `test_readiness_rejects_a_listener_the_child_does_not_own`,
-  `test_command_must_include_config_placeholder`,
-  `test_pinned_config_copy_ignores_later_operator_path_writes`,
-  `test_binary_snapshot_execs_and_config_snapshot_does_not`,
-  `test_snapshot_falls_back_when_exec_flags_are_einval`,
-  `test_verified_config_inode_survives_workspace_path_replace`,
-  `test_spawn_reads_verified_config_after_workspace_replace`,
-  `test_warm_campaign_agrees_across_all_backends`

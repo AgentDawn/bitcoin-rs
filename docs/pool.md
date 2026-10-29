@@ -91,13 +91,19 @@ PPLNS fixes each found block's work window at its solving share. A submission re
 
 Within the configured reorg-watch horizon, displacement of a matured block reverses its allocations. Available funds are removed first; amounts already reserved or paid create a deficit that future credits offset. A lower or equal replacement tip does not hide displacement because canonicality is hash-based. Unknown membership is not positive canonicality evidence. Monitoring is bounded by the configured watch depth; this is not an indefinite deep-reorg guarantee.
 
-Both mining protocols share the configured total and per-IP connection limiter. They also share the job and accounting owners. The runtime bounds retained jobs at 64, owner sessions at twice the configured connection limit, and duplicate-share tracking at 65,536 entries per job. The node explicitly sets the SV1 deferred ledger outbox to 1024 records and 8 MiB, overriding the standalone core defaults of 4096 records and 32 MiB. Found-block recovery has a shared eight-slot admission budget with 4,000,000 bytes charged per slot; failed records retain a compact ledger projection, not complete blocks. These are distinct budgets, not a total-process memory bound. A queue-pressure rejection is not an accepted share. SV1 retains failed writes in its bounded in-memory outbox but withholds success until the required share record and, for a found block, block record complete. Each SV1 session permits only one pending accounting response; additional submissions are rejected before validation with a retryable accounting error. Process failure can lose queued work before completion, but that work has not received a success response. SV2 likewise holds success until the host confirms the ledger record. Operators MUST NOT equate queued work with committed accounting.
+Both protocols share the connection, job, and accounting owners. Their
+bounded queues are independent limits, not a total-process memory bound;
+[POOL-03](contracts/pool.md#pool-03-shared-admission-and-bounded-deferred-work) owns the
+enforcing symbols and [POOL-05](contracts/pool.md#pool-05-one-mining-owner-and-acknowledgement-boundaries) owns durable success.
+A queue-pressure rejection is not an accepted share. SV1 retains failed writes in its bounded in-memory outbox but withholds success until the required share record and, for a found block, block record complete. Each SV1 session permits only one pending accounting response; additional submissions are rejected before validation with a retryable accounting error. Process failure can lose queued work before completion, but that work has not received a success response. SV2 likewise holds success until the host confirms the ledger record. Operators MUST NOT equate queued work with committed accounting.
  Once the node accepts a found block, the current job is retired at once: new and different shares on the old job are refused as stale (SV1 error 21, SV2 `stale-share`), while resending the exact accepted share reports a duplicate (SV1 error 22, SV2 `duplicate-share`) without extra credit. A block the backend answers with `inconclusive-not-best-prevblk` is still recorded, then refused as a nonfatal stale share; other node rejections are never answered as stale. The [pool contract](contracts/pool.md) states the authoritative rule.
 
 ## Evidence and operational limits
 
-The recorded prior evidence is **71 protocol tests** and **112 ledger tests**. The selected node/RPC evidence is **111 tests**. These counts describe separate reported runs, not one final verification of the entire current tree. Strict final gates remain pending. This documentation task ran no builds, tests, linters, formatters, or interoperability checks.
+Protocol implementation tests do not establish interoperability with a
+particular miner or proxy. No external miner interoperability is claimed.
+The [pool contract](contracts/pool.md) owns supported roles, refusal behavior,
+and current verification gaps; current execution results belong to CI/PRs.
 
-No external miner interoperability is claimed. The SV2 implementation supports authenticated Noise responder transport, mining setup version 2, standard and extended channels, a per-connection group, and job/share handling. It does not implement custom mining jobs, Job Declaration, a Template Distribution server, extranonce-prefix changes, or extensions negotiation. Protocol implementation tests do not establish interoperability with a particular miner or proxy.
-
-Before operation, inspect the [pool contract](contracts/pool.md). Keep existing operator databases unchanged. A deployment or existing-data cutover requires separate approval.
+Before operation, inspect that contract. Keep existing operator databases
+unchanged; deployment and existing-data cutover require separate approval.

@@ -136,11 +136,6 @@ Debugger attachment pauses the target and requires deployment-approved access.
 Requirements and evidence limits are in
 [../operations/runtime-stall.md](../operations/runtime-stall.md).
 
-Proof: `event_loop::tests::telemetry_uses_elapsed_time_not_wake_count`;
-`scripts/tests/test_watch_runtime_stall.py` covers log rotation, bounded reads,
-monotonic expiry, process identity changes, and incomplete debugger output.
-Synthetic runner checks cannot identify the historical stall's lock holder.
-
 ### Startup ownership
 
 `start_node` records every worker, socket owner, and channel end in a
@@ -160,12 +155,6 @@ must drain submissions before shutdown. The existing `RuntimeInputs` shutdown
 notification cancels outstanding template waits through the node's shutdown
 latch; the embedder then joins its workers before consuming `Node::shutdown`.
 RPC behavior and the default node dependency graph are unchanged.
-
-Proof: `tools/stratum-sv2/template-provider/src/tests.rs` test
-`embedded_templates_preserve_wire_data_commit_and_cancel_on_shutdown` uses
-production `Node::start`, typed candidate/wire projection, canonical submission,
-a same-tip mempool update, bounded retained jobs, and shutdown of a long-poll
-worker without `test-seam` or an internal RPC client.
 
 ## Readiness
 
@@ -282,38 +271,6 @@ failure, reported only by consuming shutdown, never by Drop), `Unavailable`
 `Broadcast` (policy rejection). The historical prefix reads above are outside
 that sentence: they return `HistoricalQueryError`, as documented in their own
 section. Daemon `run()` exposes teardown failures as `anyhow` errors.
-
-## Proof
-
-- `bin/bitcoin-rs/tests/gates/g17_dependency_direction.rs::node_composition_root_is_not_a_production_embedding_api`
-  compiles supported `Node` reads in an isolated production consumer and rejects
-  imports of `state::NodeState` and the ingress worker entry point (`EMB-03`).
-  The same gate's Cargo graph validator rejects production feature/dependency
-  edges that enable `test-seam`, excluding legitimate dev-only fixture edges.
-- `crates/node/tests/embed.rs::embedded_node_lifecycle_round_trip` exercises
-  typed reads, broadcast, consuming shutdown, and reopen.
-- `crates/node/tests/embed.rs::dropped_node_releases_services_and_datadir_for_reopen`
-  and `startup_failure_after_state_open_rolls_back_releases_state` exercise
-  abandoned-run cleanup and startup rollback.
-- `crates/node/tests/unit/state/tests/data_dir_lock.rs`
-  (`idle_keepalive_rpc_connection_keeps_the_directory_locked_after_shutdown`,
-  `retained_chainstate_handle_keeps_the_directory_locked_until_dropped`,
-  `retained_block_body_store_keeps_the_directory_locked_until_dropped`,
-  `block_files_alone_keep_the_directory_locked_until_dropped`,
-  `retained_index_query_adapter_keeps_the_directory_locked_until_dropped`,
-  `index_open_spec_and_opened_store_each_keep_the_directory_locked`) prove the
-  lock lifetime against a retained RPC connection, chainstate handle,
-  block-body store, block files, index query adapter, and the index open spec
-  and store opened on a worker thread.
-- `crates/node/tests/unit/lifecycle/tests.rs` contains checkpoint failure,
-  worker join failure, daemon/embedded identity, repeated teardown, rollback,
-  queued-wake, and owned-startup-result regressions.
-- `crates/node/src/embed.rs::tests::broadcast_publishes_one_ordered_a_event_through_the_shared_gateway`
-  retains the gateway publication test and its direct-insertion control, and
-  checks that a refused broadcast returns the gateway's policy reason and
-  publishes nothing.
-- `crates/node/tests/shutdown.rs::run_exits_cleanly_after_fast_shutdown_signal`
-  exercises the daemon path.
 
 ## Vocabulary
 

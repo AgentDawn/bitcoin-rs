@@ -217,49 +217,12 @@ coin view publication (step 5), and follower dispatch (step 8). Speculative
 projections never advance `tip` or `DurableHead`. They publish no applied tip,
 advance no durable serials, and expose no candidate before durable commit.
 
-Proof: `crates/node/tests/mining/coordination.rs` test
-`staged_preparation_does_not_publish_before_commit` pins the `PublishMode::Now`
-positive case (the worker finishes the direct tip child while the body sync is
-held) and the no-publish side (the applied tip and ordinary templates still
-reference the old parent); no dedicated test pins the reorg-connect-never-fires
-case;
-`crates/chainstate/tests/unit/apply/window_tx_count_tests.rs` test
-`a_grouped_window_stages_only_its_newest_block_before_the_sync` and
-`crates/chainstate/tests/unit/apply/window_invalidation_tests.rs` test
-`a_failing_window_stages_only_its_last_successful_block` pin the grouped
-newest-block handoff before the sync;
-`crates/chainstate/tests/unit/durable_replay_tests.rs` test
-`replay_of_a_committed_gap_never_fires_the_staged_tip_hook` pins the Replay
-arm. The IBD enqueue gate lives in `crates/node/src/state/open.rs` (the
-`set_tip_staged` closure over the chainstate IBD latch); no dedicated test
-pins that gate.
-
 Cache installation requires an authoritative committed receipt for the exact
 tip, matching txids and removal reasons, and the live full generation key. Any
 mismatch, prioritisation, or failure discards the preparation and falls back to
 lazy assembly. In follower dispatch (step 8), a gatewayless connect publishes a
 truthful empty receipt at the same point. Receipt publication notifies
 foreground waiters, including when the connect has no mempool gateway.
-
-Proof: `crates/mining/src/coordinator/tests.rs` tests
-`empty_preparation_installs_against_matching_receipt`,
-`nonempty_preparation_installs_against_matching_receipt`, and
-`empty_preparation_cannot_install_against_nonempty_receipt` pin exact-receipt
-installation and mismatch fallback;
-`stale_ready_without_a_receipt_serves_lazily_instead_of_parking` pins the
-prioritisation-moved fallback; `crates/node/tests/mining/coordination.rs`
-tests `prepared_candidate_installs_on_commit_with_arc_reuse` and
-`fee_priority_race_discards_stale_preparation` pin commit-time install and
-stale-race discard.
-
-Proof: `crates/node/src/chain_effects.rs` test
-`gatewayless_connect_publishes_an_empty_receipt_for_the_tip` pins the truthful
-empty receipt at the follower-dispatch point;
-`crates/mining/src/coordinator/tests.rs` test
-`ready_preparation_parks_until_the_receipt_and_serves_the_prepared_arc` pins
-receipt publication releasing the parked foreground waiter with the prepared
-candidate; `publish_block_generation_retains_receipt_and_publishes` pins the
-retained receipt carrying stable identities with exact removal reasons.
 
 A failure before stable publication leaves the fence closed until explicit
 recovery. A guard destructor must never quietly reopen the fence after an
@@ -293,7 +256,6 @@ the journal directory. It preserves the marker, head, and active cursor;
 append-gap admission and filesystem errors still fail closed.
 Other journal refusals (append gaps, unreadable state, corruption, or storage
 and filesystem failures) do not enter this checkpoint-and-retry path.
-
 
 ### `RCV-03`: Prior-or-whole-proposed and orphan tails
 
@@ -520,7 +482,7 @@ durable.
   `Chainstate::ReplayBlocks` reads the two persisted heads, rolls the
   restored coins back to the fork point, replays the active chain forward,
   and flushes the result
-  (`bitcoin-core/src/validation.cpp:4792-4880`). An interrupted disconnect
+  (`bitcoin-core/src/validation.cpp`). An interrupted disconnect
   is replayed, not deleted.
 
 ### Checkpoint header artifact and side branches
@@ -553,207 +515,6 @@ persists branch state.
   needs a fresh resync into a separate datadir.
 - Journal replay reuses a restored node with the record's hash and parent
   instead of inserting a duplicate, as block connection does.
-- Proof: `crates/chainstate/src/checkpoint/tests/side_branches.rs`
-  `valid_side_branches_survive_restart_in_learn_order` (two restarts keep
-  the valid side leaves in relative learn order while invalid subtrees stay
-  excluded and the best/applied tips are unchanged),
-  `active_only_artifact_still_loads_without_side_branches` (a version-1
-  active-only artifact restores with no side branches), and
-  `reader_rejects_malformed_side_sections` (truncated, inflated, duplicate,
-  orphan, tip-displacing, and version-mismatched side sections are
-  rejected); `crates/chainstate/tests/unit/chainstate_journal_replay.rs`
-  `replay_reuses_a_header_the_checkpoint_tree_already_holds` (journal
-  replay over a restored node reuses the held header instead of inserting
-  a duplicate).
-
-## Proven by
-
-- `crates/chainstate/src/durable.rs`: owns the durable-head
-  advance for connect, group, and disconnect commits, the lineage fence, and
-  the boot reconciliation of the stored head. `reconcile_at_boot` replays a
-  committed-but-unpublished gap from the durable bodies the stored head
-  chain names — any authenticated width above a restored tip, applied
-  through the ordinary commit path with the head suppressed
-  (`PublishMode::Replay`), publishing only the state the head already
-  certifies — replays the whole head chain from genesis when no chainstate
-  was restored, and fails startup closed on a gap that is not an ancestor
-  prefix of stored bodies (`RCV-02`, `RCV-04`).
-- `crates/chainstate/tests/unit/durable_replay_tests.rs`:
-  - `committed_gap_replays_to_head_without_recommitting_it` proves replay
-    lands exactly on the stored head and consumes its existing `commit_id`
-    instead of issuing a second durable receipt;
-  - `committed_gap_with_missing_body_fails_closed` proves a stored head whose
-    named body is gone is rejected without advancing the restored applied tip;
-  - `cold_chainstate_replays_head_chain_from_genesis` proves a durable head
-    with no restored chainstate replays its certified bodies from genesis
-    and consumes the existing `commit_id`;
-  - `cold_chainstate_with_missing_genesis_body_fails_closed` proves a cold
-    chainstate whose head chain names a missing body still fails closed
-    with no applied tip published;
-  - `committed_gap_replay_failure_fails_closed` proves an apply failure inside
-    the replay transition closes admission and leaves `begin_transition`
-    refusing with `ApplyError::Shutdown`.
-  - `committed_gap_append_gap_does_not_enter_retention_relief` proves a poisoned
-    writer returns its original append-gap refusal without progress publication,
-    preserving its recovery marker and journal head while closing admission;
-  - `replay_of_a_committed_gap_never_fires_the_staged_tip_hook` proves replay
-    of an authenticated gap never fires the speculative staged-tip hook (`RCV-02`).
-- `crates/chainstate/tests/unit/apply/`:
-  - `window_tx_count_tests::a_grouped_window_stages_only_its_newest_block_before_the_sync`
-    proves a grouped IBD window stages only its newest block before the durable sync (`RCV-02`);
-  - `window_invalidation_tests::a_failing_window_stages_only_its_last_successful_block`
-    proves a failing window stages only the last valid block before the error and never
-    the failing block (`RCV-02`).
-- `crates/chainstate/src/connect.rs` and
-  `crates/chainstate/src/disconnect.rs`: run the `RCV-02` tail —
-  sync, one atomic batch, derived journal emission, then publication — and
-  keep the durable root with the mutation authority (`ARCH-07`).
-- `crates/storage/src/durable_head.rs` (existing): owns the head record
-  codec, the encoded-head fence, and the atomic batch contents.
-- `crates/node/tests/overhaul_durable_head.rs` (existing): the `RCV-04`
-  fault matrix for the durable head — every `PersistFault` at the
-  connect-shaped and disconnect-shaped batch boundaries, fail-closed
-  startup on a corrupted head row, durability before publication,
-  commit-id monotonicity across restarts, and body reachability through
-  the real block files.
-- `crates/storage/tests/durable_head_store.rs` (existing): backend-level
-  reopen, fence, and fault laws for the head store.
-- `crates/chainstate/src/recovery.rs` orchestrates restart recovery and invokes
-  schema admission; `crates/storage/src/checkpoint/fs.rs` owns the
-  `incompatible_schema` refusal and the `CURRENT_SCHEMA` gate.
-- `crates/node/tests/crash_recovery.rs`: the `RCV-04` crash
-  points — SIGKILL restart across journal, reorg, and publication scenarios,
-  partial-write handling, and upgrade-matrix fallback;
-  `torn_disconnect_replays_parent_tip`, `torn_disconnect_cold_replays_head`,
-  and `torn_disconnect_checkpoint_above_head_rewinds_to_head` prove automatic
-  marker recovery to the certified head, including a checkpoint that leads
-  the rewound head (`RCV-15`), and
-  `checkpoint_fallback_replays_wide_gap_to_durable_head` proves an
-  authenticated gap of any width replays from stored bodies (`RCV-10`).
-- `crates/node/tests/unit/state/tests/recovery.rs`:
-  `restart_without_periodic_publication_restores_tip_and_commit_id` proves
-  the durable head replays past the last checkpoint with `commit_id`
-  preserved across restarts (`RCV-10`).
-  `cold_revalidation_relieves_journal_pressure_and_retries` proves boot replay
-  compacts retention pressure and retries the refused block with a coherent
-  cumulative transaction count, preserves the full-revalidation marker, and
-  restarts at the retention limit before genesis without an applied tip
-  (`RCV-02`).
-- `crates/storage/src/chainstate_journal/writer/tests/segment_lifecycle.rs`:
-  - `recovery_progress_compaction_preserves_full_revalidation_marker` proves
-    progress compaction leaves the sticky marker armed (`RCV-02`, `JW-MARK-2`);
-  - `recovery_compaction_cannot_clear_an_append_gap` proves compaction cannot
-    bypass append-gap admission or clear a gap on a frozen writer
-    (`RCV-02`, `JW-ORDER-1`);
-  - `cold_retention_removes_all_invalidated_generations_and_preserves_recovery`
-    proves pre-genesis retention relief removes all invalidated generations
-    across a large, sparse directory while preserving the marker, head,
-    active segment, unrelated files, and append/reopen continuity (`RCV-02`).
-- `crates/chainstate/src/reorg.rs` and `crates/chainstate/src/disconnect.rs`
-  cover `RCV-05` and bounded disconnect/reorg memory; `RCV-08`'s bounded
-  stream windows and retention leases are exercised by the node sync/recovery
-  scenarios together with the #655 boot-replay tests above.
-
-- Pruning and retained-history authority (#1151): `node:prune_executed` holds
-  the executed frontier — one past the highest row a committed pass deleted —
-  written in the same durable batch as its deletions, so a restart
-  reconstructs exactly the committed boundary and refuses a lease over
-  deleted history. Before the first committed pass all three prune records
-  are absent; ordinary unpruned stores use an empty frontier. Every pass,
-  including an empty one, atomically writes the frontier, requested
-  `node:pruneheight` and batch receipt with its deletions. A failed first
-  commit leaves them all absent; a committed or ambiguous-applied pass
-  leaves them all present. A missing frontier alongside either other prune
-  record, or a malformed frontier, refuses recovery without inferring a
-  boundary from surviving rows. Simultaneous loss of all three records is
-  not detectable from this metadata; arbitrary deletion of all metadata is
-  outside the atomic-write recovery guarantee.
-  `RetentionRegistry::reserve` is the single prune/retention
-  linearization point, and `PruneReservation::commit` is the only path that
-  moves the executed line. `crates/storage/tests/prune_then_reorg.rs` proves
-  the race (`history_request_between_planning_and_commit_is_refused`), the
-  restart law (`executed_frontier_survives_restart_and_refuses_deleted_heights`),
-  monotonicity across passes and reorg-reintroduced rows
-  (`executed_frontier_is_monotonic_across_passes_and_reintroduced_rows`), and
-  missing/corrupt marker refusal (`missing_executed_frontier_after_prune_fails_closed`,
-  `corrupt_prune_metadata_never_becomes_an_empty_frontier`), the empty-pass
-  lifecycle (`unpruned_store_has_no_executed_frontier`), and interrupted
-  commit outcomes (the `ambiguous_durability_*` tests).
-- Checkpoint publication and recovery:
-  `crates/chainstate/src/checkpoint/tests/` covers consensus-valid active-chain
-  replay, applied-ancestry selection, heavier-fork exclusion, and
-  immutable-generation resume, including
-  `failed_publication_preserves_current`; `side_branches.rs` covers
-  side-branch restart retention in learn order, invalid-subtree exclusion,
-  version-1 loading, and side-section corruption, and
-  `crates/chainstate/tests/unit/chainstate_journal_replay.rs`
-  `replay_reuses_a_header_the_checkpoint_tree_already_holds` covers journal
-  replay over a restored node;
-  `crates/chainstate/tests/unit/checkpoint_debt_tests.rs`
-  `checkpoint_refuses_inflight_disconnect_and_preserves_state` proves an
-  `InFlight` marker refuses publication with marker, `CURRENT`, and
-  generations untouched; `crates/node/tests/unit/lifecycle/tests.rs`
-  `shutdown_checkpoint_io_failure_is_returned_and_preserves_current` proves
-  clean-shutdown publication errors propagate through `run` without skipping
-  worker teardown; `crates/storage/src/checkpoint/tests.rs`
-  covers generation publication, failpoint preservation, and
-  manifest/artifact validation. This replaces the retired `overhaul_*`
-  checkpoint-independence row.
-- `crates/storage/tests/overhaul_atomic_durability.rs` (existing): tests the
-  storage-level prior-or-whole-proposed rule and durable batch completion.
-- `crates/index/src/runtime/recovery_tests.rs` (existing):
-  - `index_ahead_of_restored_tip_is_reported_once_and_rewound` (`RCV-04`);
-  - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
-    (`RCV-05`);
-  - `pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`
-    (`RCV-07`).
-
-- `crates/node/tests/overhaul_fee_history.rs` (existing):
-  - `restart_adopts_persisted_estimator_history`,
-    `corrupt_history_file_degrades_to_insufficient_data` (`RCV-11`);
-- `crates/node/tests/mining/coordination.rs`:
-  - `staged_preparation_does_not_publish_before_commit` proves that the worker
-    finishes the direct tip child while the body sync is held and that, while
-    held, applied tip and templates reference the old parent, and pool spends
-    remain uncommitted (`RCV-02`);
-  - `prepared_candidate_installs_on_commit_with_arc_reuse` proves that after
-    the durable commit lands, the first template on the new tip installs the
-    prepared candidate `Arc` with exact removal survivors (`RCV-02`);
-  - `fee_priority_race_discards_stale_preparation` proves that a fee-priority
-    mutation during held sync discards the stale prepared candidate and serves
-    the updated priority (`RCV-02`);
-  - `shutdown_with_staged_work_installs_nothing_and_answers_unavailable`
-    proves shutdown with staged work never installs or publishes speculative
-    templates and returns unavailable (`RCV-02`).
-- `crates/mining/src/coordinator/tests.rs`: the cache-installation and
-  foreground-waiter guarantees of the speculative preparation (`RCV-02`):
-  - `publish_block_generation_retains_receipt_and_publishes` proves the
-    committed receipt keeps its tip hash and each removed txid with its exact
-    reason, and the live generation key still publishes;
-  - `empty_preparation_installs_against_matching_receipt` and
-    `nonempty_preparation_installs_against_matching_receipt` prove a
-    preparation installs its candidate only against the receipt whose
-    identities, reasons, and live generation key match its prediction;
-  - `empty_preparation_cannot_install_against_nonempty_receipt` and
-    `fee_moved_preparation_discards_and_serves_live` prove a removal mismatch
-    or a moved fee sequence discards the preparation and serves lazy assembly
-    for the live key;
-  - `matching_foreground_joins_running_preparation_without_duplicate_finish`,
-    `pending_stage_foreground_joins_without_duplicate_finish`, and
-    `ready_preparation_parks_until_the_receipt_and_serves_the_prepared_arc`
-    prove a matching foreground joins a running, pending, or ready
-    preparation without a duplicate lazy finish, parks until the committed
-    receipt arrives, and is served the prepared candidate itself;
-  - `stale_ready_without_a_receipt_serves_lazily_instead_of_parking` proves a
-    foreground whose generation can no longer match is never parked;
-  - `shutdown_releases_a_preparation_waiter` proves shutdown releases a joined
-    waiter with the unavailable error, and
-    `worker_panic_releases_joined_waiter_to_lazy_fallback` proves a worker
-    panic releases a parked waiter into lazy assembly.
-- `crates/node/src/chain_effects.rs`:
-  `gatewayless_connect_publishes_an_empty_receipt_for_the_tip` proves a
-  connect through a follower set with no mempool gateway publishes a receipt
-  for the connected tip that names no removals (`RCV-02`).
 
 ## Vocabulary
 

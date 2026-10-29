@@ -157,20 +157,6 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
     (`crates/index/src/index/state.rs`) calls `KvStore::scan_prefix_bounded`
     under `RESET_SCAN_LIMIT` and deletes one page at a time. No production code
     calls `scan_prefix_from_bounded`; storage tests cover it.
-  - Proof: `crates/storage/tests/bounded_prefix_scan.rs` tests
-    `fjall_bounded_prefix_scan`, `rocksdb_bounded_prefix_scan`, and
-    `redb_bounded_prefix_scan` (feature-gated; limit semantics, prefix
-    boundaries, seek positions, pages resumed without gaps, snapshot isolation,
-    oversized first row); `crates/storage/tests/redb_txindex.rs` tests
-    `txindex_fixed_prefix_boundaries_12`, `txindex_fixed_prefix_boundaries_80`,
-    `txindex_bounded_scan_empty_values`,
-    `txindex_continuation_seeks_every_fixed_width_family`,
-    `txindex_continuation_snapshot_is_point_in_time`, and
-    `txindex_unsupported_column_families_rejected`. These tests assert returned
-    rows, `complete`, and errors. The statement that a scan reads at most one
-    row past the limit rests on the code: `collect_bounded_prefix` and the
-    redb scan loops return at the first refused row. The `usize`-overflow
-    refusal rests on `push_bounded_row` (`checked_add`); no test covers it.
 
 ### `ARCH-03`: Storage backend feature forwarding confinement
 
@@ -292,10 +278,6 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   user and password. After the fold, the winning `network` value fills the
   profile-owned fields once through `NetworkProfile::for_selection`, and
   `rpc_auth` chooses the final credential style from the winning values.
-  Proofs: `crates/node/tests/unit/config/tests.rs`
-  `resolve_prefers_higher_layers_field_by_field`,
-  `rpc_cookie_and_credential_layers_keep_one_auth_source`, and
-  `earlier_set_fields_survive_a_later_bare_network_selection`.
 
 ### `ARCH-06`: Hierarchy change and exception process
 
@@ -702,10 +684,9 @@ coherent apply/commit/disconnect contract (`crates/utxo/src/contract.rs`).
     (`TipReader`, `BlockTreeReader`), while worker orchestration belongs to
     `BlockSync`.
 
-## Current boundary and target design
+## Current data flow
 
-This section states what runs. In the graph, solid arrows are
-implemented. Ownership for the implemented behaviors lives in
+Solid arrows show the implemented data flow. Ownership for the implemented behaviors lives in
 `ARCH-07` / `ARCH-07a`, `ARCH-05`, `ARCH-02`, `IDX-12` in
 [indexing](indexing.md) with the historical-prefix reads in
 [embedding](embedding.md), the retained rows below, and the `T1` /
@@ -731,7 +712,7 @@ flowchart TD
     WORKER -->|"T1 seeds rows outside live UTXO lock (else reports unavailable); never from live set or fresh checkpoint"| ROWS
 ```
 
-### T1: snapshot-seeded ScriptLive outside the live UTXO lock (implemented)
+### T1: snapshot-seeded ScriptLive outside the live UTXO lock
 
 The seeder MUST run under the existing worker, retention, and
 reconciliation owners named in `ARCH-05` and `ARCH-07` / `ARCH-07b`,
@@ -748,28 +729,8 @@ ScriptLive as a fixed-width family under `ARCH-02`. Comparison
 of any index prefix
 ([coins.cpp](https://github.com/bitcoin/bitcoin/blob/9be056a8a72b624dae9623b2f7bded92c2a21c91/src/coins.cpp#L68-L80));
 no snapshot-seeded index path was found in the inspected Core code.
-Proof: `crates/index/src/runtime/seed_paused_tests.rs`
-`seed_paused_write_permits_apply_and_retires_generation` (concurrent
-applies land while the seed stream holds its pin, then retire to zero
-leases), `catch_up_drops_subsumed_seed_lease_for_lower_start`
-(single-holder drain when the fresh grant subsumes the seed pin),
-`seed_reorg_below_h_rolls_back_through_pinned_undo` (sub-`H` reorg
-rewinds through the pinned undo; the missing-undo control resets),
-`seed_prune_while_paused_refuses_at_or_above_floor` (pruned history
-yields scoped terminal `Unavailable` while the worker stays alive), and
-`script_live_reset_reloads_watermarks_before_selection` (post-reset legs
-reload the fence before selection);
-`crates/index/src/runtime/recovery_tests.rs`
-`seed_first_leg_consumes_held_lease` (the first leg consumes the held
-bundle pin with at most one live lease) and
-`forward_script_live_follows_undo_present_missing_or_corrupt` (missing
-or corrupt undo resets only `ScriptLive`, then reseeds at the tip);
-`crates/index/src/runtime/query.rs`
-`covered_anchor_rejects_watermark_height_mismatch` (a watermark whose
-height disagrees with its hash retries instead of joining an uncovered
-prefix).
 
-### P2: typed historical-prefix query with scoped absence (implemented)
+### P2: typed historical-prefix query with scoped absence
 
 Consistency and embedding usage are owned by `IDX-12` in
 [indexing](indexing.md) and the historical-prefix reads in
@@ -796,24 +757,10 @@ it describes no Core per-query behavior. An old-branch persisted cursor
 stays possible: strict reads refuse the stale watermark, while
 historical reads may serve the proved common prefix while the worker
 rewinds asynchronously.
-Proof: `crates/index/src/runtime/query_tests.rs`
-`historical_mixed_cap_script_anchors_at_sh_watermark` and
-`historical_mixed_cap_tx_anchors_at_tx_watermark` (each call anchors at
-its own required watermark), `historical_stale_watermark_anchors_at_fork_and_excludes_orphans`
-and `historical_deep_stale_branch_exhausts_shared_ancestry_budget` (fork
-anchor versus shared ancestry-budget exhaustion),
-`historical_full_history_positive_floor_is_unproven` and
-`historical_standalone_spender_scoped_none_above_floor` (positive-floor
-history split: full history unproven, exact-outpoint spend scoped),
-`historical_no_covered_prefix_for_reset_claim` (reset claim in the
-snapshot is `NoCoveredPrefix`, never `Retry`), and
-`historical_duplicate_txid_returns_earliest_verified_and_skips_stale`
-(earliest verified occurrence on the anchor chain).
 
-### T3: one private immutable BlockPayload in place of independent pairs (implemented)
+### T3: one private immutable BlockPayload in place of independent pairs
 
-Callers that today take an independent decoded input and a raw input
-MUST instead take one immutable `BlockPayload` bound to the exact wire
+Callers MUST take one immutable `BlockPayload` bound to the exact wire
 serialization. The fields are private (`block: Block` plus retained
 `bytes: bytes::Bytes`); read-only access is `block()` / `bytes()` plus
 the consuming `into_block()` for the proposal path, with no public
@@ -829,27 +776,9 @@ with no decoded field. `InboundBlock` owns the one payload while peer/source and
 `forward_credit` stay outer; the stager MUST own one payload per entry
 until drain (`insert(payload)`); apply borrows that payload. Wire,
 storage, and RPC formats are unchanged.
-Ownership stays where it is
-today: the stager owns one payload per entry until drain, while the
-apply path in `ARCH-07` / `ARCH-07a` borrows that payload; no paired
-call shape remains, and the payload adds no new crate, layer, runtime,
-or parser.
-Proof: `crates/primitives/src/block.rs`
-`payload_from_raw_retains_exact_fixture_bytes` (single decode retains
-the exact wire bytes), `payload_from_raw_rejects_trailing_bytes` and
-`payload_from_raw_rejects_malformed_bytes` (trailing and malformed
-bytes are rejected at construction),
-`payload_from_prefix_returns_consumed_and_discards_remainder` (only the
-consumed prefix is retained for the `submitblock` boundary), and
-`payload_from_local_encodes_witness_block_exactly` (local assembly
-encodes once, witness-exact, with a `from_raw` roundtrip);
-`crates/p2p/src/wire.rs` `block_message_roundtrip_preserves_wire_payload`
-(single `BlockPayload::from_raw` decode carries the frame; raw bytes
-are preserved end to end) and
-`block_payload_writes_the_same_frame_as_decoded_block` (decoded and
-raw-only envelopes encode identically).
+The stager owns each payload until drain; `ARCH-07` / `ARCH-07a` owns apply.
 
-### P4: retain current early rows until staged readers and recovery proof permit consolidation (implemented retention; consolidation gated)
+### P4: retain current early rows until staged readers and recovery proof permit consolidation
 
 The current early undo and body-locator rows MUST stay until every
 staged serving reader, historical undo consumer, and recovery dependency
@@ -863,14 +792,6 @@ blocks
 ([architecture](https://github.com/reardencode/rbitcoin/blob/572e72c1ce0b1c16dcd7182872a1e9c0089afd6a/docs/architecture.md),
 [reconstruct](https://github.com/reardencode/rbitcoin/blob/572e72c1ce0b1c16dcd7182872a1e9c0089afd6a/crates/rbitcoin-query/src/reconstruct.rs));
 the raw-body choice kept here is the opposite.
-Proof: `crates/storage/tests/prune_then_reorg.rs`
-`prune_to_height_respects_an_active_retention_lease` (a live lease clamps
-the prune line; release lets it advance),
-`retention_lease_stops_the_prune_line_at_its_floor` (staged rows at or
-above the lease floor survive), and
-`history_request_between_planning_and_commit_is_refused` (a lease
-arriving after planning but before commit is refused, so it can never
-pin staged-away rows).
 
 ## Test and evidence isolation
 
@@ -892,69 +813,3 @@ and [ARCH-03](#arch-03-storage-backend-feature-forwarding-confinement) (storage 
 backend construction), [ARCH-05](#arch-05-node-composition-and-orchestration-boundary)
 (node assembly) and [ARCH-07](#arch-07-chainstate-owns-authoritative-applied-chain-mutation)
 (chainstate transitions and the separate storage retention authority).
-
-## Proven by
-
-- `bin/bitcoin-rs/tests/gates/g17_dependency_direction.rs`:
-  - `workspace_dependency_direction_is_one_way`: validates `cargo metadata --no-deps`
-    against the manifest-level portions of `ARCH-01`–`ARCH-04` and the production
-    feature isolation rule above.
-  - `fixture_owners_expose_no_production_injection_or_synthetic_constructors`:
-    compiles an isolated consumer; ordinary read/composition APIs must compile,
-    while persistence/checkpoint injection, the old footprint module, and
-    synthetic chainstate/RPC constructors must be absent.
-  - `chainstate_facade_exposes_no_production_raw_mutation_handles`: compiles an
-    isolated Cargo consumer without dev-feature unification. Read operations
-    and `BlockUndoSource` reads must compile; raw mutation handles, undo writes,
-    retention acquisition, reader write/publication methods,
-    mutable tip-cell access through a read guard, and `SyncChain` fixture
-    methods must fail with the intended compiler diagnostics. Removing an
-    obsolete accessor or private field remains allowed, and the deleted
-    `Chainstate::retention_handle`, `Chainstate::read_fence`,
-    `Chainstate::utxo`, and `Chainstate::utxo_handle` accessors stay deleted:
-    retained-history authority, the transition domain, and the authoritative
-    UTXO set are owned elsewhere and chainstate must not broker any of them.
-    The deleted `Chainstate::read_block_tree` stays deleted too: tree reads,
-    including the P2P `SyncChain` adapter's, go through `BlockTreeReader`.
-    The same consumer asserts `UtxoReader::fixture_set` is unavailable, so a
-    production reader cannot reach the set `utxo::contract` mutates.
-- `crates/storage/tests/bounded_prefix_scan.rs` and
-  `crates/storage/tests/redb_txindex.rs`: bounded prefix scan limits, seek
-  points, completeness, and snapshot isolation (`ARCH-02`).
-- `crates/chainstate/tests/unit/apply/admission_tests.rs` and
-  `crates/chainstate/tests/unit/apply/chain_tx_count_tests.rs` cover admission
-  shutdown and coherent chain transaction-count publication. Checkpoint and
-  journal tests moved with their owner under `crates/chainstate/tests/unit/`.
-- `crates/node/src/chain_effects.rs` and node mining/sync/reorg integration
-  tests prove that mempool/follower work consumes committed chainstate outcomes
-  without making chainstate depend on those consumers.
-- `crates/node/tests/unit/state/tests/construction.rs` test
-  `runtime_accessors_borrow_their_subsystem_owner` and
-  `crates/node/tests/unit/lifecycle/tests.rs` test
-  `rpc_network_handles_borrow_p2p_service_state` prove that node and RPC
-  composition reuse the owning service's handles rather than retaining
-  parallel runtime projections.
-- `crates/node/src/chain_effects.rs` tests `noop_asks_for_no_payloads`,
-  `connect_then_disconnect_rewinds_the_rpc_log_and_emits_in_order`,
-  `disconnect_does_not_pop_a_different_tail`: post-commit RPC/ZMQ work is
-  owned by `ChainFollowers`, not by apply; the connect/disconnect test also
-  proves that the configured ZMQ publisher receives the committed effects.
-- `crates/node/tests/unit/config/tests.rs` tests
-  `resolve_prefers_higher_layers_field_by_field` and
-  `rpc_cookie_and_credential_layers_keep_one_auth_source`: later `UserConfig`
-  layers win on set fields, including nested `ChainstateJournalOverrides`, and
-  the RPC credential style is settled per layer and again after the fold
-  (`ARCH-05`).
-- `crates/node/tests/unit/config/tests.rs` test
-  `earlier_set_fields_survive_a_later_bare_network_selection`: the network
-  profile fills unset fields only (`ARCH-05`).
-- `crates/node/tests/config_layered.rs` test
-  `mining_payout_address_decodes_after_all_layers`: watch-only mining payout is
-  decoded once after every layer, against the resolved network (`ARCH-05`).
-- `bin/bitcoin-rs/src/bitcoin_conf.rs` test
-  `every_table_core_key_reaches_its_slot`: each `bitcoin.conf` key the option
-  table names writes the slot the table names.
-- `crates/mempool/tests/gateway_tests.rs`, `crates/chain/tests/latch_tests.rs`,
-  `crates/index/tests/block_log_tests.rs`, and `crates/p2p/tests/service_tests.rs`
-  prove single mutation ownership, capability encapsulation, and single-consumer
-  channel ownership (`ARCH-09`).

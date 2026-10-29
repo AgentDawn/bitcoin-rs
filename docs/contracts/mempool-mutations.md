@@ -46,15 +46,6 @@ state (`crates/mempool/src/orphan.rs`).
   replay saved sequences or blanket relay notifications. The existing P2P
   relay worker separately resumes saved pending initial broadcasts for
   successfully re-admitted entries.
-  Proof: `snapshot::tests::restores_dependencies_priorities_and_gateway_publication`
-  and `tx_relay::tests::local_tx_relay_uses_committed_wtxid_and_ignores_peer_and_removed_entries` cover restored
-  publication and the Snapshot origin's relay suppression.
-  The gateway clones one `MutationResult` into the envelope for each
-  committed non-empty batch that has an observer attached, so it can both
-  enqueue publication and return the original result to the caller.
-  Publication of empty results or with an absent observer enqueues nothing,
-  allocates nothing, and spawns no thread. Internal admission-state updates
-  do not depend on an observer being present or making progress.
 - Observers are best-effort mirrors. Observer errors and panics never
   affect the committed mutation. No gateway lock is held across an
   observer call, so an observer may re-enter the gateway: a nested call
@@ -72,13 +63,6 @@ state (`crates/mempool/src/orphan.rs`).
   fact (`BodyInterest`): `commit` loads the composite's atomic before
   taking the pool write lock, so no observer code runs under any gateway
   lock — neither to answer interest nor, per the clause above, at delivery.
-- Proof: `gateway::tests::concurrent_mutations_publish_in_sequence_order`
-  in `crates/mempool/src/gateway.rs` publishes 1,500 commit cycles from
-  parallel callers and checks the observed stream is gap-free commit order;
-  `gateway::tests::accepted_and_block_inclusion_events_arrive_in_commit_order`
-  checks accepted-then-removed publication order;
-  `gateway::tests::reentrant_observer_mutation_completes_with_callback_sequence_1_2`
-  checks a nested commit enqueues behind the in-flight callback.
 
 ### `MPL-02`: Atomic mutation records and sequence assignment
 
@@ -107,17 +91,6 @@ state (`crates/mempool/src/orphan.rs`).
   `MutationResult::sequence_of` returns the wrapped value for any
   in-range index. A sequence of `0` is a valid committed value; only an
   empty `MutationResult` carries no sequence.
-- Proof: `gateway::tests::sequence_base_matches_per_change_assignment`
-  in `crates/mempool/src/gateway.rs` checks the reconstructed base against
-  per-change assignment;
-  `gateway::tests::failed_insert_and_noop_remove_publish_nothing` checks a
-  failed insert and a no-op removal assign nothing and publish nothing.
-  The expiry/capacity ordering is covered by
-  `admission::tests::committed_admission_publishes_acceptance_before_expiry_atomically`,
-  `admission::tests::child_of_a_stale_parent_expires_with_it_and_is_refused_as_full`
-  in `crates/mempool/src/admission.rs`, and
-  `package::tests::native_package_commit_expires_an_unrelated_stale_entry_in_its_own_envelope`
-  in `crates/mempool/src/package/tests.rs`.
 
 ### `MPL-03`: ZeroMQ sequence event payload mapping
 
@@ -218,24 +191,6 @@ state (`crates/mempool/src/orphan.rs`).
   before reconsidering a fee-dependent pair. It captures resident/modified-fee
   response facts under the same stamp and applies the RPC modified-feerate cap
   before scripts; preview and native caller-cap semantics are unchanged.
-- Proof: `gateway::tests::chain_generation_starts_even_at_zero`,
-  `gateway::tests::explicit_finish_restores_even_generation`, and
-  `gateway::tests::chain_generation_overflow_fails_closed` in
-  `crates/mempool/src/gateway.rs` pin the even/odd/finish lifecycle;
-  `gateway::tests::stale_generation_rejects_without_mutation_or_publication`
-  and `gateway::tests::stale_mempool_sequence_rejects_without_mutation_or_publication`
-  check fenced submissions change nothing and publish nothing.
-- Proof: `package::tests::native_package_aggregates_cpfp_atomically_and_ignores_input_order`
-  in `crates/mempool/src/package/tests.rs` checks successful CPFP admission,
-  ordered publication and unchanged estimator history;
-  `package::tests::native_package_consensus_failures_match_single_submission`
-  checks script and overspend error parity for single and multi-member native
-  packages, unchanged preview facts and refusal without mutation.
-- Proof: `package::tests::rpc_cpfp_commits_one_ordered_batch_with_actual_fees_and_pure_preview`,
-  `package::tests::rpc_package_keeps_independent_parent_but_never_uses_its_fees_twice`,
-  and `package::tests::rpc_package_capacity_and_replacement_refusals_preserve_authoritative_state`
-  in `crates/mempool/src/package/tests.rs` cover RPC package admission,
-  resident fee exclusion, and refusal without mutation.
 - Chain facts come through `AdmissionChain` as provisional inputs for a
   submission attempt. The shared borrowed `ChainAdmissionView` in
   `crates/rpc/src/context.rs` reads the existing UTXO and block-tree handles,
@@ -387,104 +342,3 @@ state (`crates/mempool/src/orphan.rs`).
   the entry and its descendants as `Removed(Reorg)` in commit order; the
   commit re-checks the exact odd generation so a moved fence removes
   nothing.
-
-## Proven by
-
-- `crates/mempool/src/gateway.rs` (inline tests):
-  `input_structure_checks_follow_generation_and_sequence_guards`,
-  `input_structure_nonstandard_transactions_keep_policy_precedence`,
-  `accepted_and_block_inclusion_events_arrive_in_commit_order`,
-  `remove_for_block_publishes_removals_with_origins`,
-  `remove_for_block_leaves_unmined_child_and_publishes_only_the_parent`,
-  `failed_insert_and_noop_remove_publish_nothing`,
-  `replacement_tags_direct_conflicts_and_descendants`,
-  `observer_panic_does_not_roll_back_the_mutation`,
-  `insert_reports_accepted_then_policy_evictions`,
-  `sequence_base_matches_per_change_assignment`,
-  `stable_generation_reads_even_values`,
-  `admit_write_gate_retries_when_the_stamp_moved_after_prepare`.
-- `crates/node/src/sync/tests/reorg_invalidation.rs` and
-  `branch_connect_mempool.rs`: permanent and mutated-body reorg outcomes preserve the
-  committed-prefix and invalidation semantics while the node owns
-  mempool/follower coordination.
-- `crates/chainstate/src/reorg.rs` owns body preflight, bounded mid-rollback
-  body reads, exact disconnect/connect, and typed coherent-vs-recovery
-  outcomes. Node's reorg observer owns mempool reconsideration and generation
-  settlement.
-- `crates/rpc/src/handlers/tx.rs` (inline tests):
-  admission retry rebuilds context after a transient rejection.
-- `crates/mempool/src/admission.rs` (inline tests):
-  `input_structure_duplicate_rejection_is_shared_across_witnesses`,
-  `input_structure_null_rejection_is_shared_across_witnesses`,
-  `input_structure_rpc_rejection_does_not_populate_peer_caches`,
-  `parent_commit_without_observers_retries_orphan_with_original_source`,
-  `chain_change_with_no_pool_mutation_clears_rejects_and_preserves_odd_ready_work`,
-  `exhausted_ready_retry_stays_bounded_and_is_retried_on_later_poll`,
-  `parent_commit_between_resolution_and_hold_cannot_lose_the_only_wake`,
-  `rpc_missing_inputs_does_not_create_peer_lifecycle_state`,
-  `coinbase_and_nonstandard_missing_transactions_are_not_held`,
-  `known_parent_invalid_output_is_rejected_without_orphan_retention`,
-  `orphan_retry_removes_known_invalid_outpoint_after_parent_arrival`,
-  `witness_rejection_preserves_valid_variant_and_legacy_inventory`,
-  `fresh_invalid_witness_preserves_a_different_resident_orphan_variant`,
-  `nonexistent_mempool_output_is_rejected_without_holding_or_mutating`,
-  `absent_parent_is_held_but_its_nonexistent_output_is_rejected_on_retry`,
-  `stale_invalid_outpoint_claim_cannot_reject_a_refreshed_orphan`,
-  `rejected_witness_does_not_suppress_a_valid_body_with_the_same_txid`,
-  `rejected_stripped_body_does_not_suppress_its_valid_witness_variant`,
-  `zero_hash_output_zero_is_requested_and_retried_as_an_ordinary_outpoint`,
-  `orphan_txid_does_not_suppress_txid_inventory_but_wtxid_does`,
-  `same_txid_different_witnesses_both_survive_and_retry_after_parent`,
-  `null_input_in_a_non_coinbase_transaction_is_not_held`,
-  `reconsider_disconnected_admits_parent_then_child_under_the_guard`,
-  `reconsider_disconnected_withholds_descendants_of_a_refused_parent`,
-  `reconsider_disconnected_refuses_a_script_failure`,
-  `reconsider_disconnected_does_not_register_with_the_estimator`,
-  `reconsider_disconnected_admits_below_floor_then_trims_once`,
-  `remove_for_reorg_sweeps_only_unsupported_residents`,
-  `remove_for_reorg_refuses_a_moved_generation`,
-  `reorg_methods_refuse_a_guard_from_another_gateway`,
-  `admission_state_accepts_only_the_current_generation`.
-- `crates/rpc/src/context.rs` (`admission_chain_tests`):
-  `stable_chainstate_reader_does_not_block_transaction_admission`,
-  `unconfirmed_transaction_is_admitted_from_a_peer`,
-  `confirmed_hint_requires_live_chain_outputs`,
-  `admission_chain_uses_current_handles_and_one_applied_tip`.
-- `crates/mempool/src/orphan.rs` (inline tests):
-  `zero_quota_retains_no_body_or_index`,
-  `witness_refresh_keeps_announce_order_and_announcer_set`,
-  `readiness_is_deduplicated_and_removed_with_eviction`,
-  `maintenance_expires_old_bodies_and_cleans_every_index`,
-  `maintenance_uses_exact_connection_identity`,
-  `witness_refresh_does_not_extend_expiry`,
-  `rejects_are_bounded_and_chain_reset_clears_both_indexes`,
-  `aggregate_weight_evicts_fifo_even_when_count_quota_has_room`,
-  `rejecting_another_witness_preserves_the_resident_body_and_ready_work`,
-  `transaction_scoped_rejection_releases_the_resident_variants_weight`,
-  `same_wtxid_keeps_all_announcers_and_disconnect_removes_one`,
-  `eviction_trims_the_highest_peer_score_before_protected_peer`.
-- `crates/node/src/chain_effects.rs` (inline tests):
-  `connect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`,
-  `disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`:
-  committed chain changes run the mempool chain-change lifecycle even when the
-  pool itself has no removal/insertion.
-- `crates/node/tests/unit/tx_ingress/tests.rs` (unit tests):
-  `retry_poll_evicts_an_orphan_after_its_connection_is_gone`.
-- `crates/rpc/src/zmq.rs`:
-  `admission_publishes_one_a_frame_with_core_payload_bytes`,
-  `policy_eviction_publishes_r_frames_in_commit_order`,
-  `block_inclusion_suppresses_r_frames`,
-  `policy_eviction_publishes_r_frames_with_contiguous_sequences`,
-  `mempool_event_payloads_carry_reversed_txid_label_and_le_sequence`,
-  `sequence_event_payload_uses_core_hash_orientation_and_label`.
-- `crates/node/tests/mining.rs`:
-  `publish_generation_from_does_not_take_mempool_lock`,
-  `concurrent_publish_generation_paths_do_not_deadlock`,
-  `long_poll_returns_quickly_on_mempool_sequence_wake`.
-- `crates/node/tests/tx_ingress_e2e.rs`:
-  `accepted_peer_tx_is_admitted_and_relayed_excluding_the_source`,
-  `below_min_relay_tx_is_rejected_recorded_and_never_relayed`
-  (peer tx over a real socket: dispatch filter, admission through the
-  observer-installed gateway, source-excluding relay), and
-  `full_relay_queue_does_not_block_peer_admission_or_mining_wake`
-  (actual ingress and gateway with a saturated relay queue).

@@ -39,45 +39,12 @@ test names are intentionally not normative: the executable evidence may be
 consolidated or rewritten as long as the row's independent reference,
 failure-path coverage, and named contracts remain proved.
 
-## Reviewed deletion and replacement
+## Evidence boundary
 
-| Former test | Decision and replacement |
-| --- | --- |
-| `test_comp_lanes.py` and its fixture-only `comp_lanes.py` runner | Retire the wrapper as a whole. Direct P2P, offline-validation, and MuHash comparator suites own their CLI, custody, and error behavior. Historical fixture measurements remain archived; no live-product evidence is removed. |
-| Offline `NonVacuityProofs` | Delete assertions that expect another assertion to fail on a deliberately wrong literal. Direct CLI tests still verify the actual schema, 14-arm count, result digest, rejection paths, and publication. |
-| Per-engine `*_equivalence_hash` tests | Consolidate into `portable_backends_have_identical_aggregate_hashes`. Every enabled backend still runs the complete behavioral suite; multi-backend builds compare the resulting hashes without running each engine twice. Two-backend builds now compare too. |
-| Separate peer-constructor direction tests | Consolidate into `constructors_preserve_direction_and_handshake_metadata`. Check both directions, shared metadata, negotiation defaults, and a version-receipt time distinct from handshake completion. |
-| `g18_hot_path_ledger` | Delete historical matrix/path/disposition gates. The declared benchmark ledger and actual campaign artifacts remain. |
-| `overhaul_evidence` | Move identity, overlap and repetition checks to `crates/node/benches/evidence.rs`. Delete the all-cells-unmeasured assertion. |
-| `g19_validation_default` | Delete the hardcoded promotion verdict and ad-hoc Cargo feature parser. `VAL-01` requires measured promotion evidence; feature builds remain. |
-| `g20_unique_consensus_crates` | Delete the duplicate graph checker. Both dependency-range endpoints require `cargo deny check bans`. |
-| `g20_formal_models` | Remove external Java/solver execution and source-text checks from Rust tests. Keep pinned models, hashes, properties, K=128 and explicit failure outcomes in the dedicated runner. |
-| `cli_help` | Delete the exit-status-only smoke. Public process suites and actual CLI/config behavior remain. |
-| Reference manifest value enumeration | Delete duplicated pin literals and comment-sensitive text edits. Keep artifact custody and typed malformed/unbound identity matrices. |
-| `single_pass_shape_is_observable_and_second_decode_shape_is_not` | Delete. Golden facts, witness binding and independent identity parity remain. |
-| Exact input lookup counters | Delete both the integration assertion and duplicate inline counting-view test. Keep multi-input verification, missing-coin and duplicate-input errors. |
-| `prepared_facts_survive_source_record_replacement` | Delete: it dropped a view and re-parsed a transaction, never testing record replacement. It supplied no lifetime evidence. |
-| `sighash_variants_match_reference_oracle` | Rename to the transaction-identity behavior it actually checks. Signed-spend/Core suites, not this fixture, own sighash evidence. |
-| Node `apply::consensus_rule_tests` fixture tree | Delete the node-level duplicate consensus/apply matrix. Consensus rules stay with consensus/script/vector owners; authoritative mutation/recovery tests move to `bitcoin-rs-chainstate`; node keeps only cross-domain behavior. `crates/chainstate/tests/unit/apply/persistence_tests.rs` retains the mutation failure boundaries that are not consensus duplicates: failed undo persistence is atomic and BIP30 overwrite undo restores the original coin. |
-| `chain_generation_tests`, old reorg settlement tests, sync generation-settlement tests | Delete implementation-shape assertions around `ChainChangeProof`, `Chainstate.mempool_gateway`, odd/even generation internals, and no-op transition finish. Node integration/mining/reorg tests retain observable mempool fencing and reorg behavior. |
-| Node checkpoint/journal/event/recovery owner-unit modules | Move the retained checkpoint, journal, admission, chain-tx-count and event-state proofs to `crates/chainstate`. Delete node copies and forwarding modules. |
-| Test-only backend row injection, metrics recorder, scratch constructors, checkpoint failpoint forwarding | Delete after the reset left no contract test consumer. Production no longer exposes these seams solely for fixtures. |
-| `BlockTree` getter-by-getter and one-step linear helper tests | Delete the empty/inserted accessor matrix and linear happy-path duplicates. Locator, fork-switch, invalidation, ancestry, corruption-defense and reorg suites exercise the same lookups while proving chain behavior; accessor shape is not a separate contract. |
-| Mempool lookup getter and simple fee-floor unit tests | Delete individual insert/absent checks for `contains`, entry/transaction lookup, txid iteration and the two-row minimum example. Admission, mutation, replacement, removal, estimator and eviction suites exercise those indexes and fee aggregates across meaningful state changes; corruption and atomicity tests remain. |
-| Storage `into_ops`, deployment-view adapter and mining-signal forwarding unit tests | Delete direct wrapper/delegation assertions. Backend commit tests own batch ordering, BIP9 activation tests exercise the deployment view, and node mining/ZMQ suites retain observable wake sequencing and lock-safety evidence. |
-| Chain differential PoW oracle imported as an integration-test module | Move the helper below `tests/support` so its self-check runs once as its own target rather than once per importing test binary. Header-sync and deep-reorg tests retain the independent `bitcoin`-crate oracle. |
-
-The sync recovery cut also replaces four fake-application fixture paths
-with delivered blocks through the ordinary binding/apply path. The old
-`DownloadWindow::mark_applied` shortcut was removed with it; no such API
-remains.
-
-## Reset completion rule
-
-The contract-first reset is complete when all retained suites fit the proof
-matrix above, the full dependency/feature/process/recovery lanes pass, and no
-production API remains solely because a deleted test called it. Future tests
-follow the same rule: current contract proof or promoted real regression.
+Retain tests for current contract proof or an independently established real
+regression. The full dependency, feature, process, and recovery lanes own their
+verification; a layout cleanup does not change those obligations. Production
+APIs must not survive solely to satisfy a deleted fixture.
 
 A formal runner test uses a synthetic executable and cannot establish a
 model property. A successful evidence-parser test cannot establish a

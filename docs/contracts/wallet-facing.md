@@ -39,12 +39,7 @@ listener refuses JSON-RPC, including the legacy unknown-POST fallback, with
 same Context and authoritative services; routing, capability gates, broadcast
 origins and CORS inside the public namespaces are unchanged. Each binding
 owns its connection budget, dispatcher cancellation latch and blocking quota
-(API-34). Proof:
-`rpc::server::tests::listeners::split_listener_routes_are_closed_before_authentication_and_body_upload`,
-`rpc::server::tests::listeners::public_saturation_preserves_management_and_recovers`,
-and node lifecycle tests
-`split_rpc_listeners_start_and_join_through_node_services` and
-`public_bind_failure_rolls_back_management_binding_and_node_state`.
+(API-34).
 
 Every read captures the applied-tip publication and answers from one coherent view. A
 moved chain generation returns the declared unavailable response, never a
@@ -72,25 +67,6 @@ branch bodies do not substitute for authoritative parent history. Missing,
 pruned, unavailable and corrupt required data retain their explicit errors.
 Read-only backend POST batches use the same applied-tip publication fence
 as GET responses.
-
-Proof: `esplora::tests::backend_mempool_get_bounds_prevouts_without_limiting_rows`
-checks multi-batch counts, ordering, cursor/limit behavior, distinct prevout
-values and one external-parent lookup per batch.
-`esplora::tests::backend_mempool_get_keeps_captured_parents_across_batches`
-checks that a selected parent removed during rendering still supplies a later
-batch without an index readiness check or another parent query.
-
-Proof: `crates/rpc/src/esplora.rs` tests
-`history_resolves_shared_parents_once_per_page`,
-`batch_reuses_selected_transactions_and_mempool_parents`,
-`block_page_reuses_parent_outside_the_selected_page`,
-`block_transactions_reject_corrupt_witness_commitments`,
-`block_witness_binding_observes_activation`,
-`block_parent_reuse_checks_readiness_only_when_needed`,
-`backend_transaction_batches_share_duplicate_bodies_and_preserve_rows`, and
-`parent_query_errors_and_republication_never_yield_a_cached_success`
-exercise parent reuse, response fields/order, explicit data errors and
-the applied-tip fence across GET and read-only POST requests.
 
 - Chain tip: `GET /blocks/tip/height`, `GET /blocks/tip/hash`.
 - Checkpoint hashes: `GET /block-height/{h}` (BDK walks this while
@@ -133,16 +109,10 @@ the applied-tip fence across GET and read-only POST requests.
 
 - **WF-02 routing:** `HEAD /api/tx` and `PUT /` return 404, while
   `POST /api/tx` remains the broadcast route; neither unsupported request
-  reaches JSON-RPC. Evidence: the running-node assertions in
-  `external_wallet_can_scan_estimate_and_broadcast` (the `HEAD /api/tx` and
-  `PUT /` exchanges) and the
-  corresponding CI test log.
+  reaches JSON-RPC.
 - **Closed namespaces:** `/api` and `/esplora` accept only their documented
-  GET/POST routes, and unprefixed explorer paths remain 404. Evidence: the
-  same integration test plus `listener_directory_table_is_closed_over_http`;
-  run with `cargo test -p bitcoin-rs --test wallet_facing`.
+  GET/POST routes, and unprefixed explorer paths remain 404.
 - **Consumer boundary:** the proof uses only HTTP against a spawned node.
-  Evidence: the imports of that test target.
 
 ### `WF-03`: Proof is a public-process consumer
 
@@ -158,12 +128,6 @@ the applied-tip fence across GET and read-only POST requests.
   against a node started with `--network regtest --scriptindex`. Failures
   of that run are public-interface defects, not reasons to patch a wallet
   into this repository.
-
-## Proven by
-
-- `bin/bitcoin-rs/tests/wallet_facing.rs::external_wallet_can_scan_estimate_and_broadcast`
-- `crates/rpc/src/server.rs` tests `wf_02_classify_splits_rest_esplora_and_json_rpc` (existing)
-- `crates/rpc/src/esplora.rs` tests `esplora_lives_only_under_the_api_prefix`, `api_is_the_public_electrs_directory`, and `esplora_is_the_mempool_backend_superset` (existing)
 
 ## Vocabulary
 

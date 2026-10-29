@@ -93,16 +93,16 @@ nodes. None of these can be started from the current tree:
 - `bin/bitcoin-rs/src/cli.rs` (full CLI surface, lines 13–124) exposes
   no corpus, manifest, archive, blocks-dir, or stop-at-height flag; the
   binary routes only to `run` (P2P-driven node) and `measure_storage`
-  (`bin/bitcoin-rs/src/main.rs:91-99`). `run()` is a signal wrapper
+  (`bin/bitcoin-rs/src/main.rs`). `run()` is a signal wrapper
   around `lifecycle::startup::start_node`
-  (`crates/node/src/run.rs:31-38`); there is no mainnet offline-replay
+  (`crates/node/src/run.rs`); there is no mainnet offline-replay
   entry and no way to halt at C150 or Cmodern height.
-- `crates/node/src/import.rs:1-46` is an explicit "skeleton":
+- `crates/node/src/import.rs` is an explicit "skeleton":
   `import_block` decodes one block and "synthetically" applies it; it is
   not wired to any archive source or CLI path.
 - `gettxoutsetinfo` is implemented and can answer `muhash` for the
   current in-memory UTXO view
-  (`crates/rpc/src/handlers/chain.rs:1027-1056`), but it refuses
+  (`crates/rpc/src/handlers/chain.rs`), but it refuses
   specific-height queries (`:1053-1056`) and there is no shipped offline
   path to place the node at the frozen tip with certified state.
 - The P2P lane's product form (live loopback IBD between real nodes) is

@@ -91,10 +91,3 @@ contract.
   the `syn` pin above. When the pinned SRI release family moves, update those
   exceptions to the exact resolved versions in the same change. The entries
   approve no other split.
-
-## Proven by
-
-- `scripts/check-dep-range.sh minimal` and
-  `scripts/check-dep-range.sh maximum` (`compatibility-campaign.yml`
-  `dependency-range` job).
-- `cargo deny check bans` (`deny.toml` `[bans] multiple-versions = "deny"`).

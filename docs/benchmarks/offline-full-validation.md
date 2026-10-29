@@ -114,10 +114,10 @@ an alternate definition of speed.
 
 The child must remain in the foreground and exit. Bitcoin Core consumes the
 `{corpus_path}` file through its checked-in `-loadblock` family: flag
-`bitcoin-core/src/init.cpp:529`, collection `2128-2136` (`vImportFiles`,
+`bitcoin-core/src/init.cpp`, collection `2128-2136` (`vImportFiles`,
 `ImportBlocks(chainman, vImportFiles)`, then `ActivateBestChains`), fan-out
-`bitcoin-core/src/node/blockstorage.cpp:1270` (`ImportBlocks`), and
-`bitcoin-core/src/validation.cpp:4975`
+`bitcoin-core/src/node/blockstorage.cpp` (`ImportBlocks`), and
+`bitcoin-core/src/validation.cpp`
 (`ChainstateManager::LoadExternalBlockFile` magic scan, size gate, header
 hash, `AcceptBlock` without `ProcessNewBlock`). Core commands must not
 daemonize (`-daemon=0`) and should stop after import

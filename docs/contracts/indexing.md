@@ -95,17 +95,7 @@ only scheduling mechanics.
   their version message; every filter request still checks query readiness.
 - `getcapabilities` reports one compiled txindex row. A missing worker is
   `enabled: false` / `Disabled`; an attached worker supplies the row through
-  `DerivedIndexCapabilitySource`. Proof: `crates/index/src/capabilities.rs` tests
-  `missing_source_is_the_disabled_txindex_row`, `attached_source_is_the_worker_row`.
-  This row covers transaction/script capabilities only; filter-only operation
-  leaves it disabled. Filter progress, reconciliation and local failures do not
-  change that row. Filter status is reported by `getindexinfo` and service flags.
-  Proof: `crates/index/src/runtime/query_tests.rs` test
-  `filter_failure_refuses_filters_but_preserves_durable_progress_and_tx_queries`;
-  `crates/rpc/tests/handler_smoke.rs` test
-  `compact_filter_rpc_exposes_only_enabled_ready_data`;
-  `crates/p2p/src/listener.rs` test
-  `unbacked_filter_service_bit_is_removed_from_handshake`.
+  `DerivedIndexCapabilitySource`.
 
 `ScriptLive` is not a duplicate coin table. Its empty-valued key is
 `script-hash-prefix || full-outpoint`; the prefix is only a scan accelerator.
@@ -155,7 +145,6 @@ unneeded funding record lists when callers only require history records.
   MUST evict the retained block before fetching another one. Evicted
   identities are read and charged again.
 
-Proof: these tests establish the memo-retention rule:
 - `crates/index/src/runtime/query.rs`:
   `block_memo_retains_only_the_latest_identity` proves release on a miss
   before replacement and release when the query budget is dropped.
@@ -205,9 +194,6 @@ Proof: these tests establish the memo-retention rule:
   Queries reject empty values as corrupt derived state with a storage error
   directing a derived-index rebuild. Other invalid or mismatched positions
   retain full-block verification for collision and correctness handling.
-  Proof: `empty_position_rows_are_refused_before_body_reads` and the
-  position-mismatch/full-block tests in `runtime/query_tests.rs`;
-  `tests/tx_positions.rs` exercises current writer position values.
 - On node startup, index workers read their persisted watermarks and reconcile
   against `Chainstate::chain_snapshot()` (via `NodeState::chainstate()`):
   - If the watermark is an ancestor of the restored tip, the worker connects
@@ -258,9 +244,6 @@ Proof: these tests establish the memo-retention rule:
     the worker routes to `reset_capabilities` and backfills forward instead of
     executing a long block-by-block rollback
     (`docs/benchmarks/index-rollback-rebuild-cutover.md`).
-  - Proof: `crates/index/src/runtime/recovery_tests.rs` tests
-    `index_ahead_of_restored_tip_is_reported_once_and_rewound` and
-    `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`.
 - **Connect walk**:
   - The worker loads bodies from `BlockBodyStore`, constructs bounded forward
     batches (`PreparedBatchLimits`), and commits row mutations and updated
@@ -354,31 +337,6 @@ Proof: these tests establish the memo-retention rule:
   storage failure or panic marks the worker as failed (`publish_failed`) and
   stops the worker. Block validation, UTXO commits, and chainstate progress
   continue unimpeded: the apply path never depends on index writes.
-  Proof: `crates/index/src/runtime/supervisor_tests.rs` tests
-  `blocked_open_abandonment_detaches_and_poisons`,
-  `shutdown_during_open_reports_abandonment_after_supervisor_exit`, and
-  `open_timeout_publishes_error_not_infinite_spin`;
-  `crates/index/src/runtime/query_tests.rs` test
-  `unusable_worker_makes_queries_unavailable`;
-  `crates/index/src/runtime/recovery_tests.rs` test
-  `undo_read_failure_is_not_a_missing_undo`, which proves a storage-error
-  undo read fails the worker with its own error while an absent record
-  resets and reseeds.
-  Reseeding sources (`IDX-07` artifact-or-retained-history, never the live
-  UTXO set): `crates/index/src/runtime/recovery_tests.rs`
-  `forward_script_live_follows_undo_present_missing_or_corrupt` (a
-  missing/corrupt undo resets only `ScriptLive` while siblings keep their
-  rows, then reseeds at the tip) and
-  `seed_first_leg_consumes_held_lease` (the forward leg consumes the bundle
-  pin with at most one live lease, stalled legs park it back, progress
-  releases it); `crates/index/src/runtime/seed_paused_tests.rs`
-  `seed_paused_write_permits_apply_and_retires_generation` (concurrent
-  applies land while the seed stream holds its pin, then retire to zero
-  leases), `catch_up_drops_subsumed_seed_lease_for_lower_start`
-  (single-holder drain), `seed_reorg_below_h_rolls_back_through_pinned_undo`
-  (sub-`H` reorg rewinds through the pinned undo), and
-  `seed_prune_while_paused_refuses_at_or_above_floor` (pruned history yields
-  scoped terminal `Unavailable` while the worker stays alive).
 
 ### `IDX-11`: Portable index bundle
 
@@ -530,37 +488,6 @@ Proof: these tests establish the memo-retention rule:
   cross-process cases (ahead-tip restore, divergent-base refusal, post-restore reorg,
   same-prefix wrong-full-id refusal) are covered by the private scoped run cited
   in Live gaps, not by a checked-in portable process suite.
-- Proof: the `crates/index/src/portable/manifest.rs`
-  tests `manifest_round_trips_through_json_and_validates`,
-  `unknown_fields_are_denied_at_every_level`,
-  `script_live_is_never_a_capability_and_script_history_is_refused`, and
-  `malformed_values_are_refused`; the `crates/index/src/portable/artifact.rs`
-  tests `header_is_73_bytes_with_a_big_endian_height_and_round_trips`,
-  `prefix_collisions_order_by_full_txid_and_fold_into_one_sorted_row`,
-  `framing_refuses_each_violation`, and
-  `hashing_reader_digest_equals_the_one_shot_digest`; the
-  `crates/index/src/portable/export.rs` publication unit tests (tempdir scope)
-  `failed_final_directory_sync_removes_the_manifest_and_its_artifact`,
-  `undurable_manifest_removal_keeps_the_artifact_it_names`, and
-  `committed_publication_keeps_both_files_and_never_replaces_an_entry`; the
-  `crates/node/tests/config_layered.rs` tests
-  `index_bundle_is_an_explicit_one_shot_request`,
-  `index_bundle_import_and_export_never_resolve_by_precedence`,
-  `index_bundle_requires_the_transaction_index_it_moves`, and
-  `index_bundle_rejects_empty_and_unusable_directories_on_every_surface`; the
-  `bin/bitcoin-rs/src/config.rs` tests
-  `index_bundle_directories_resolve_from_the_command_line_and_stay_exclusive`,
-  `empty_index_bundle_directories_are_refused_by_clap_and_the_environment`, and
-  `bitcoin_conf_cannot_request_a_bundle_or_relay_feature`; and the
-  `crates/index/tests/portable_bundle.rs` lifecycle tests
-  `export_then_restore_serves_the_same_queries_as_backfill`,
-  `damaged_bundles_are_refused_before_any_write_or_reset`,
-  `export_preserves_a_preexisting_destination`,
-  `cancelled_export_removes_only_its_own_staging`,
-  `cancelled_restore_writes_nothing_and_restart_completes`,
-  `missing_bodies_withhold_readiness_until_ordinary_backfill`,
-  `restore_below_a_restarted_receivers_tip_then_reconciles_forward`, and
-  `interrupted_import_is_cleared_on_restart_and_restore_retries`.
 
 ### `IDX-12`: Historical prefix queries (one-shot, server-selected)
 
@@ -676,48 +603,12 @@ consumer usage and defers to this clause for every consistency rule.
   | Positive floor on full script history | `Unavailable(Shared(HistoryUnproven { floor }))` |
   | Row, scan, body-read, and body-byte budgets, truncated scans, `BlockBodyMissing`, disabled capability, worker failure/stop, missing authority, lifecycle causes | `Unavailable(Shared(...))` with the identical wrapped variant |
   | Snapshot-open and body-read storage failures | `Storage(...)` |
-- Proof: `crates/index/src/runtime/query_tests.rs`
-  `historical_extension_during_read_keeps_same_anchor` (tip extension
-  mid-read keeps the same anchor),
-  `historical_wake_without_tip_move_stays_valid_while_strict_retries`
-  (a wake without a tip move stays valid for history while strict retries),
-  `historical_reorg_above_anchor_stays_valid` and
-  `historical_reorg_below_anchor_retries` plus
-  `historical_unknown_watermark_hash_retries` (reorg placement decides
-  valid versus `Retry`),
-  `historical_reset_completing_after_snapshot_stays_valid` and
-  `historical_no_covered_prefix_for_reset_claim` (reset mid-read versus
-  reset claim in the snapshot),
-  `historical_stale_watermark_anchors_at_fork_and_excludes_orphans` and
-  `historical_deep_stale_branch_exhausts_shared_ancestry_budget` (fork
-  anchor versus shared ancestry-budget exhaustion),
-  `historical_tx_positive_floor_scopes_absence_and_rejects_anchor_below_floor`,
-  `historical_full_history_positive_floor_is_unproven`, and
-  `historical_standalone_spender_scoped_none_above_floor` (floor scoping
-  and the positive-floor history split),
-  `historical_mixed_cap_script_anchors_at_sh_watermark` and
-  `historical_mixed_cap_tx_anchors_at_tx_watermark` (per-call capability
-  anchors), `historical_duplicate_txid_returns_earliest_verified_and_skips_stale`
-  (earliest verified occurrence),
-  `historical_budgets_truncation_and_missing_map_to_shared` and
-  `historical_budgets_health_and_capability_map_to_shared` (truncation,
-  missing body, worker failure, and disabled capability map to shared
-  `Unavailable`); `crates/index/src/runtime/query.rs`
-  `covered_anchor_rejects_watermark_height_mismatch` (a watermark whose
-  height disagrees with its hash retries instead of joining an uncovered
-  prefix).
 
 ### Compact-filter data and serving
 
 `index/filters.rs` selects BIP158 basic-filter scripts and owns BIP157 hash/header
 commitments. `bitcoin::bip158::GcsFilterWriter` owns deduplication and encoding
-(P=19, M=784931), without a second block decode. Proof: its pinned Core-vector
-and same-block-spend tests in `index/filters.rs`.
-Inputs are distinct nonempty output scripts excluding
-OP_RETURN, plus nonempty spent-prevout scripts. Same-block spends resolve from
-the parsed block before consulting the existing authoritative undo record.
-Genesis outputs and oversized scripts follow BIP158, not UTXO admission rules.
-There is no second UTXO set or consensus-validation path.
+(P=19, M=784931), without a second block decode.
 
 The existing format-5 `UtxoMeta` table gains an additive namespace:
 `01 46 || block_hash` stores `filter_hash || filter_header || serialized_filter`
@@ -742,35 +633,7 @@ partial filter or waiting for the index to synchronize.
 The query engine captures immutable block identities and one index snapshot
 without acquiring chain-transition authority. P2P resolves filter stop hashes
 against the applied chain; a competing headers-only branch does not change which
-filters are servable. Proof: `crates/p2p/src/chain_query.rs` test
-`compact_filters_follow_applied_chain_when_competing_headers_lead`.
-P2P streams at most one filter payload at a time under the send-headroom gate;
-header/checkpoint replies retain
-only commitments. Requests are bounded to 1,000 filters, 2,000 hashes, or 100,000
-checkpoint headers (below the 4 MB envelope). If the tip changes during streaming,
-already-sent filters still belong to the captured stop chain. A completed range
-is not replayed. A pass that only the outbound send-headroom gate stops after a
-prefix was sent parks the remainder, which starts after the last sent filter,
-keeps the stop height the prefix was computed against, and resumes without
-repeating a filter. Any other interrupted prefix, or a resumed range whose stop
-height has moved, closes the connection instead of silently abandoning the tail.
-Disabled, unavailable, unknown, non-basic and oversized requests
-receive no filter answer.
-For decoded non-basic types, unknown/unapplied stops, inverted ranges and
-oversized ranges, bitcoin-rs deliberately keeps the connection open without
-discouragement; Core 31.1 disconnects these requests. Proof:
-`crates/p2p/src/chain_query.rs` test
-`invalid_compact_filter_requests_are_ignored_without_querying_the_index` and
-`tools/compact-filter-interop/run.py` wire checks (response bytes and connection
-outcome are recorded separately).
-To bridge a just-announced tip and asynchronous publication, a valid P2P request
-can be deferred for up to five seconds while publication or send headroom is
-pending; time the node's aggregate outbound budget refused the request is not
-counted toward the five seconds, and time the index or the connection's own
-queue took is counted toward the five seconds. The existing socket poll retries one pending request per connection, so inbound traffic, ping
-and cancellation remain responsive. A second pending filter request or an expired
-deadline closes the connection. No response is replayed after streaming a payload;
-chain validation never waits and filters are never generated synchronously.
+filters are servable.
 
 Pinned Core vectors, durable reset/reopen tests, and the opt-in public-interface
 Core/Kyoto runner are described in
@@ -811,74 +674,3 @@ Core/Kyoto runner are described in
   unobserved, no power-loss campaign (SIGKILL bounds stop at process kill), completeness
   is checked only against covered bodies the receiver holds (an absent body
   withholds), and private receipts are not a checked-in portable process suite.
-
-## Proven by
-
-- `crates/index/tests/index_roundtrip.rs`
-  `commit_golden_blocks_writes_expected_electrs_rows`: electrs family
-  occupancy after one atomic `IndexWriter::commit_block` (`IDX-06`).
-- `crates/index/src/runtime/recovery_tests.rs`:
-  - `index_ahead_of_restored_tip_is_reported_once_and_rewound`
-  - `deep_rollback_rebuilds_and_publishes_rebuild_phase_until_caught_up`
-  - `pruned_history_rebuilds_from_the_frontier_and_absent_history_waits`
-  - Forward group scheduling (`IDX-06`):
-    `absent_prefix_body_holds_back_only_its_own_group`,
-    `shutdown_after_an_absent_body_does_not_run_a_higher_group`,
-    `deferred_history_grant_does_not_run_a_higher_group`,
-    `retained_prefix_commits_before_any_group_switch_and_never_outlives_a_fence_change`,
-    `run_loop_commits_a_retained_prefix_and_retries_an_absent_body_without_a_wake`.
-  - Forward undo anchors (`IDX-06`, `IDX-07`):
-    `forward_script_live_follows_undo_present_missing_or_corrupt`,
-    `anchor_failure_outranks_an_earlier_preparation_failure`,
-    `preparation_failure_keeps_its_height_after_committed_successes`,
-    `undo_read_failure_is_not_a_missing_undo`, and the existing
-    `unavailable_filter_history_preserves_sibling_indexes_and_filter_watermark`
-    for the filter side.
-- `crates/index/src/runtime/startup.rs` and
-  `crates/index/src/runtime/supervisor_tests.rs`: lifecycle
-  publication, open failure/timeout, and shutdown abandonment.
-- `crates/index/src/runtime/query_tests.rs`: query gating, snapshot
-  consistency, revision ABA detection, and
-  `failed_worker_makes_queries_unavailable` /
-  `stopped_worker_makes_queries_unavailable` worker-liveness refusal.
-- `crates/index/src/index/tests.rs`: confirmed-body
-  serving by height/hash (`IDX-03`, `RCV-01`).
-- `crates/chainstate/src/reorg.rs` and the `RCV-08` recovery evidence prove
-  bounded disconnect streaming under a retention lease; the departed branch
-  is not preloaded.
-- `crates/index/src/capabilities.rs` tests `missing_source_is_the_disabled_txindex_row`,
-  `attached_source_is_the_worker_row`: `getcapabilities` advertises one
-  txindex row from `derived_index_status` (`IDX-02`).
-- `crates/index/tests/portable_bundle.rs` (`IDX-11` lifecycle over real Fjall stores):
-  `export_then_restore_serves_the_same_queries_as_backfill`,
-  `damaged_bundles_are_refused_before_any_write_or_reset`,
-  `export_preserves_a_preexisting_destination`,
-  `cancelled_export_removes_only_its_own_staging`,
-  `cancelled_restore_writes_nothing_and_restart_completes`,
-  `missing_bodies_withhold_readiness_until_ordinary_backfill`, and
-  `interrupted_import_is_cleared_on_restart_and_restore_retries`; and
-  `crates/index/src/portable/export.rs` publication unit tests (tempdir scope):
-  `failed_final_directory_sync_removes_the_manifest_and_its_artifact`,
-  `undurable_manifest_removal_keeps_the_artifact_it_names`, and
-  `committed_publication_keeps_both_files_and_never_replaces_an_entry`.
-
-### Query-budget regression evidence
-
-`crates/index/src/runtime/query.rs` tests exercise the shared
-historical/live byte budget, independent row/scan/body-read admission limits,
-rejection of truncated scans, and non-consuming rejection of over-budget work
-(`IDX-03` and the project bounded-resources invariant). No query limit or
-persisted representation changes.
-
-### Store-open cancellation evidence
-
-The store-open wait polls node shutdown, runtime stop, and generation revocation
-at bounded intervals. Once the helper has started, cancellation and timeout are
-typed abandoned-open outcomes: startup poisons the namespace before releasing
-the worker's claim. Cancellation before helper creation may release normally.
-These paths do not cancel the underlying storage-engine call.
-
-Evidence for `IDX-07` abandonment and `IDX-08` shutdown:
-`crates/index/src/runtime/startup.rs` tests cover bounded
-cancellation, deadline precedence, disconnection, backend error propagation,
-namespace poisoning, and clean release. The query-budget limits and on-disk formats are unchanged.
