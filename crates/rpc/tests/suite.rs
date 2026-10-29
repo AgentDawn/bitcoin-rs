@@ -14,4 +14,5 @@ mod tip_wait_admission;
 mod transaction_methods;
 
 mod mining_fixture;
+#[allow(dead_code)]
 mod support;

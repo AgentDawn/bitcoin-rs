@@ -48,16 +48,9 @@ fn epoch_seconds(time: SystemTime) -> u64 {
 
 /// Resolves the finite expiry requested by `setban`.
 ///
-/// SETBAN-EXPIRY-01: zero relative bantime uses `DEFAULT_BAN_TIME_SECS`;
-/// absolute bantime is measured from `UNIX_EPOCH`. An unrepresentable expiry
-/// returns `RpcError::InvalidParameter` (-8) before any ban-list mutation.
-/// It must never become `BannedSubnet::banned_until = None`, which means a
-/// permanent ban. Signed-input policy is unchanged.
-///
-/// SETBAN-ABSOLUTE-01: Bitcoin Core v31.1 `src/rpc/net.cpp::setban` rejects
-/// absolute bantime below the current whole epoch second with
-/// `RpcError::InvalidParameter` (-8), before any ban-list mutation. Equality
-/// is allowed, including when `now` has subsecond precision.
+/// SETBAN-EXPIRY-01: zero relative bantime uses `DEFAULT_BAN_TIME_SECS`; absolute
+/// bantime is measured from `UNIX_EPOCH`. An unrepresentable expiry returns
+/// `RpcError::InvalidParameter` (-8) before any ban-list mutation.
 fn ban_until(now: SystemTime, bantime: u64, absolute: bool) -> Result<SystemTime, RpcError> {
     if absolute && bantime < epoch_seconds(now) {
         return Err(RpcError::InvalidParameter(
@@ -192,37 +185,10 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
 }
 
 /// Samples below which Core does not compute an offset at all.
-///
-/// `TimeOffsets::Median` in `node/timeoffsets.cpp`: "Only calculate the median
-/// if we have 5 or more offsets". Below it the answer is zero -- not because
-/// the clocks agree, but because too few samples is not a measurement.
 const MIN_TIME_OFFSET_SAMPLES: usize = 5;
 
 /// The node's clock offset, as the median of what its outbound peers claim.
-///
-/// Bitcoin Core samples each peer's declared time at handshake and reports the
-/// median of those samples. The figure exists to warn an operator that their
-/// own clock is wrong, so what matters is that no one else can produce that
-/// warning: hence outbound peers only, and hence a floor below which there is
-/// no answer at all.
-///
-/// With too few samples the offset is zero, which is also what Core answers.
-/// The zero is "not measured", not "the clocks agree" -- the two are
-/// indistinguishable in this field, in Core as here.
-///
-/// One difference from Core worth naming: Core medians over a rolling deque of
-/// the last 50 offsets it sampled, which outlives the connections that produced
-/// them. This medians over the peers connected now. The two agree while the
-/// peer set is stable and diverge after churn, where Core still remembers a
-/// departed peer's sample and this does not.
 fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
-    // **Outbound peers only.** Core's reason, in its own words at the call
-    // site in `net_processing.cpp`: "Don't use timedata samples from inbound
-    // peers to make it harder for others to create false warnings about our
-    // clock being out of sync." Anyone can open an inbound connection and
-    // declare any time they like; medianing over all of them hands that
-    // attacker the node's reported clock offset, and with it the operator's
-    // belief about whether the machine's clock is wrong.
     let mut offsets: Vec<i64> = peers
         .iter()
         .filter(|peer| !peer.inbound)
@@ -232,40 +198,13 @@ fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
         return 0;
     }
     offsets.sort_unstable();
-    // The element at `len / 2`, on an even count as on an odd one. Core takes
-    // exactly this and says why it does not interpolate: "approximate median is
-    // good enough, keep it simple". Averaging the two middle values would
-    // answer a number neither peer reported, and would differ from Core on
-    // every even sample count.
     offsets.get(offsets.len() / 2).copied().unwrap_or(0)
 }
 
 /// Renders every handshake-complete connection, including anonymous inbound
 /// overlay sessions.
-///
-/// `id` is the connection's own process-unique identity
-/// ([`bitcoin_rs_p2p::PeerLease::node_id`]) — Core's `nodeid`, not a position
-/// in this array. The distinction is observable: a positional index shifts
-/// for every peer behind a departed one and is reused by the next connection
-/// to register, so a caller that read an index and then acted on it could
-/// reach a different connection than the one it described. A connection
-/// identity names one connection for exactly as long as that connection is
-/// live, and it is the value `disconnectnode`'s `nodeid` selects. Sessions
-/// are still ordered by it, so the array keeps connection order.
-///
-/// The id is serialized at its full unsigned 64-bit width. The pinned
-/// `corepc_types::v31::PeerInfo::id` is a `u32`, but connection identities
-/// come from a counter that only rises and is never reused, so on a
-/// long-running node every id past the 2^32nd connection would fail the whole
-/// query, and narrowing or clamping it would alias two live connections.
-/// Rows are therefore rendered through [`PeerInfoWire`], which differs from
-/// the pinned type in the width of `id` alone. `disconnectnode` selects by
-/// the same 64-bit value.
 pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    // `sessions` carries the lease — role and manual flag — that `infos`
-    // strips, so `connection_type` and `relaytxes` can report the connection
-    // kind the operator actually opened.
     let sessions = ctx.network.peer_table.sessions();
     let rows = sessions
         .iter()
@@ -282,20 +221,16 @@ pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
     typed_to_sonic_omitting_nulls(&rows)
 }
 
-/// Whether we selected the peer, and the peer selected us, as a high-bandwidth
-/// compact-block relay. Flattened into the row, so the two keys stay adjacent
-/// top-level fields as in the pinned type.
 #[derive(serde::Serialize)]
 struct Bip152Flags {
     bip152_hb_to: bool,
     bip152_hb_from: bool,
 }
 
-/// One `getpeerinfo` row: `corepc_types::v31::PeerInfo` field for field, with
-/// the same keys, except that `id` is the connection's full `u64` identity
-/// rather than a `u32`. Unset optional fields are dropped by
-/// [`typed_to_sonic_omitting_nulls`], exactly as for the pinned type.
-/// `getpeerinfo_rows_match_the_pinned_v31_row` holds the two shapes together.
+/// One `getpeerinfo` row: `corepc_types::v31::PeerInfo` field for field, with the same
+/// keys, except that `id` is the connection's full `u64` identity rather than a `u32`.
+///
+/// Unset optional fields are dropped by
 #[derive(serde::Serialize)]
 struct PeerInfoWire {
     id: u64,
@@ -364,8 +299,6 @@ struct PeerInfoWire {
     session_id: String,
 }
 
-/// Renders one handshake-complete session as a `getpeerinfo` row. The row's
-/// `id` is the session lease's own `node_id()`, the only place it is read.
 fn peer_info_wire(
     session: &bitcoin_rs_p2p::PeerSession,
     peer: &bitcoin_rs_p2p::PeerInfo,
@@ -384,8 +317,6 @@ fn peer_info_wire(
             .into_iter()
             .map(str::to_owned)
             .collect(),
-        // Only full-relay connections carry the transaction relay
-        // stream; block-relay-only and inbound-nonrelay leases do not.
         relay_transactions: peer.relay_transactions
             && session.lease.role() == bitcoin_rs_p2p::PeerRole::FullRelay,
         last_send: i64::try_from(peer.counters.last_send()).unwrap_or(i64::MAX),
@@ -396,30 +327,16 @@ fn peer_info_wire(
         bytes_received: peer.counters.bytes_recv(),
         connection_time: i64_saturated(peer.conn_time),
         time_offset: peer.time_offset,
-        // No `pingtime`, `minping` or `pingwait`. This node never sends a
-        // ping, so it has never measured a round trip, and Core omits all
-        // three until it has one. Reporting `0.0` would state a round trip
-        // of zero seconds -- a placeholder in the shape of a measurement,
-        // and the best-looking latency a peer could possibly have.
         ping_time: None,
         minimum_ping: None,
         ping_wait: None,
         version: peer.version,
         subversion: peer.user_agent.clone(),
         inbound: peer.inbound,
-        // Core's `bip152_hb_to`/`bip152_hb_from` (v25+): whether WE have
-        // selected this peer as a high-bandwidth compact-block relay
-        // (the announcement worker's current set), and whether the peer
-        // has selected US (its `sendcmpct(true)` preference recorded at
-        // handshake). High-bandwidth peers announce new blocks as
-        // unsolicited `cmpctblock` instead of `inv`.
         bip152: Bip152Flags {
             bip152_hb_to: session.bip152_hb_to,
             bip152_hb_from: session.bip152_hb_from,
         },
-        // Core 31 does not emit `startingheight` at all -- the name does
-        // not appear anywhere in its source. corepc keeps the field
-        // `Option` for older versions, so `None` is what v31 looks like.
         starting_height: None,
         presynced_headers: Some(-1),
         synced_headers: Some(-1),
@@ -448,8 +365,6 @@ fn peer_info_wire(
                 bitcoin_rs_p2p::PeerRole::FullRelay => ConnectionType::OutboundFullRelay,
             }
         }),
-        // Core reports the BIP324 session id as hex in byte order, and an
-        // empty string for v1.
         transport_protocol_type: match peer.transport {
             bitcoin_rs_p2p::TransportProtocol::V1 => TransportProtocolType::V1,
             bitcoin_rs_p2p::TransportProtocol::V2 { .. } => TransportProtocolType::V2,
@@ -541,9 +456,6 @@ pub(crate) fn setnetworkactive(ctx: &Arc<Context>, params: &Value) -> Result<Val
 }
 pub(crate) fn ping(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    // Core's `ping` schedules a P2P ping; we don't have async-ping wiring yet,
-    // so we return null per the Core contract. Per-peer pingtime surfaces via
-    // getpeerinfo when measurements are available.
     Ok(Value::new_null())
 }
 
@@ -620,36 +532,9 @@ fn control_error_to_rpc_error(error: bitcoin_rs_p2p::P2pControlError) -> RpcErro
 }
 
 /// `disconnectnode ( "address" nodeid )`
-///
-/// Three selectors, one per way a caller can name a connection:
-///
-/// - `address` alone disconnects whatever connection is live there.
-/// - `nodeid` alone — or with an empty `address`, Core's spelling
-///   (`src/rpc/net.cpp`) — disconnects exactly that connection.
-/// - `address` and `nodeid` together disconnect the connection only when the
-///   live one at that address *is* the one `nodeid` names. Core rejects this
-///   combination; bitcoin-rs has always accepted it, so it stays a
-///   conjunction rather than becoming an error.
-///
-/// Every form targets a *connected* node: one that has completed its
-/// handshake and so appears in `getpeerinfo`. A vacant address, and a session
-/// still handshaking, both answer `NotFound`.
-///
-/// Readiness and selection are checked and applied under the peer table's own
-/// write lock ([`bitcoin_rs_p2p::PeerTable::disconnect_ready`],
-/// [`bitcoin_rs_p2p::PeerTable::disconnect_ready_node_id`] and
-/// [`bitcoin_rs_p2p::PeerTable::disconnect_ready_node_id_at`]). Reading a peer
-/// list here and then disconnecting by address would let a same-address
-/// replacement register in between, and the operator would lose a connection
-/// the call never named. Because the identity names a connection rather than
-/// a position, an anonymous inbound overlay session — which has no logical
-/// endpoint to name — is selectable by `nodeid` too.
 pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let bound = super::bind_named_params(params, &["address", "nodeid"])?;
     let array = params_array(&bound)?;
-    // A present, non-null address keeps `required_str`'s exact Core type
-    // error, so the address-only form's error text and precedence are what
-    // they were before `nodeid` became selectable on its own.
     let address = if array.first().is_some_and(|value| !value.is_null()) {
         Some(required_str(&bound, 0, "address is required")?)
     } else {
@@ -704,9 +589,6 @@ pub(crate) fn getconnectioncount(ctx: &Arc<Context>, params: &Value) -> Result<V
 
 pub(crate) fn getnettotals(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    // `PeerTable` is the single owner of traffic accounting: it measures each
-    // live connection and folds in the counters of every connection it drops,
-    // so the totals — like Core's — never decrease across disconnects.
     let (total_bytes_received, total_bytes_sent) = ctx.network.peer_table.traffic_totals();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -728,10 +610,10 @@ pub(crate) fn getnettotals(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
 
 /// `getnodeaddresses [count]` — returns known peer addresses.
 ///
-/// The address source is the live peer registry plus persisted `addnode add`
-/// entries, deduplicated by socket address.  `count` defaults to 1; `0`
-/// returns every known address.  Each entry follows Core's shape:
-/// `{ time, services, address, port, network }`.
+/// The address source is the live peer registry plus persisted `addnode add` entries,
+/// deduplicated by socket address.  `count` defaults to 1; `0` returns every known
+/// address.  Each entry follows Core's shape: `{ time, services, address, port, network
+/// }`.
 pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let count = optional_u64(params, 0, 1)?;
 
@@ -739,8 +621,6 @@ pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Val
     let mut seen: HashSet<bitcoin_rs_p2p::PeerEndpoint> = HashSet::new();
     let mut entries: Vec<v31::NodeAddress> = Vec::new();
 
-    // Live peers carry real service flags and handshake times. Unidentified
-    // peers have no known address to report.
     for peer in ctx.network.peer_table.infos() {
         let Some(endpoint) = peer.addr.endpoint() else {
             continue;
@@ -757,7 +637,6 @@ pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Val
         });
     }
 
-    // Persisted added nodes have no known services; advertise NODE_NETWORK.
     for addr in ctx.network.p2p.added_nodes() {
         if !seen.insert(addr) {
             continue;
@@ -771,7 +650,6 @@ pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Val
         });
     }
 
-    // Core semantics: count == 0 returns all, otherwise truncate to count.
     if count > 0 {
         let max = usize::try_from(count).unwrap_or(usize::MAX);
         if max < entries.len() {
@@ -979,9 +857,6 @@ mod ban_state_tests {
             entry.get("address").and_then(JsonValueTrait::as_str),
             Some("192.168.1.1/32")
         );
-        // Core's listbanned entries carry only address, ban_created,
-        // banned_until, ban_duration, and time_remaining — no ban_reason —
-        // and the pinned v31::Banned shape matches.
         assert!(
             entry.get("ban_reason").is_none(),
             "ban_reason must stay absent from listbanned entries: {entry:?}"
@@ -1287,10 +1162,6 @@ mod setban_absolute_time_tests {
     use super::ban_until;
     use crate::error::RpcError;
 
-    // SETBAN-ABSOLUTE-01 on `ban_until` above; independent reference:
-    // Bitcoin Core v31.1 `src/rpc/net.cpp::setban` compares banTime < GetTime().
-    // Synthetic clock values cover the strict whole-second boundary without
-    // sleeps or changing any process-global clock.
     #[test]
     fn absolute_bantime_compares_whole_epoch_seconds() -> Result<(), RpcError> {
         let now_seconds = 1_000;

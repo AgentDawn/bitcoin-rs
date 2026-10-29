@@ -15,20 +15,11 @@ use corepc_types::v31;
 
 pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
-    // One typed policy record derived under this handler's read guard from
-    // the pool's live limits and the enforced standardness settings; the
-    // handler holds no policy literals of its own, so the response cannot
-    // disagree with the pool even when its limits are reconfigured at
-    // runtime.
     let pool = ctx.mempool.gateway.read();
     let policy = pool.policy_snapshot();
     let stats = pool.stats();
     let maxmempool = pool.limits.max_total_bytes;
     let live_min_relay_sat_per_kvb = pool.min_relay_fee_sat_per_kvb();
-    // `mempoolminfee` is the Core rolling floor measured against total
-    // virtual size: it rises to an evicted chunk's rate on eviction, then
-    // decays while blocks arrive. This handler only reports it, so the
-    // quoted floor cannot drift from the one the admission preview enforces.
     let mempool_min_fee_sat_per_kvb =
         pool.min_fee_sat_per_kvb(bitcoin_rs_primitives::unix_time_secs());
     let info = v31::GetMempoolInfo {
@@ -52,7 +43,6 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         full_rbf: policy.full_rbf,
         permit_bare_multisig: policy.permit_bare_multisig,
         max_data_carrier_size: policy.max_data_carrier_size(),
-        // Both fields come from the cluster limits enforced by admission.
         limit_cluster_count: i64::from(policy.cluster_count),
         limit_cluster_size: i64_saturated(policy.cluster_size_vbytes),
         optimal: policy.optimal,
@@ -80,9 +70,6 @@ pub(crate) fn gettxspendingprevout(ctx: &Arc<Context>, params: &Value) -> Result
     let bound = spending_prevout_arguments(params)?;
     let array = super::params_array(bound.as_ref())?;
     super::ensure_at_most_params(bound.as_ref(), 2)?;
-    // Binding fills omitted positions with null. Preserve this method's
-    // existing missing-outputs error without conflating it with an explicit
-    // null supplied by the caller. Name/collision validation has already run.
     if params.is_object()
         && params.get("outputs").is_none()
         && params
@@ -171,7 +158,6 @@ pub(crate) fn gettxspendingprevout(ctx: &Arc<Context>, params: &Value) -> Result
             )));
         }
         Ok(v31::GetTxSpendingPrevoutItem {
-            // Core echoes the caller's spelling, including uppercase hex.
             txid: txid.to_owned(),
             vout: outpoint.vout,
             spending_txid: spender.as_ref().map(|(txid, _)| txid.to_string()),
@@ -254,8 +240,6 @@ pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     let verbose = optional_bool(params, 0, false)?;
     let include_sequence = optional_bool(params, 1, false)?;
     if verbose && include_sequence {
-        // Core's MempoolToJSON rejects this combination with
-        // RPC_INVALID_PARAMETER; the REST twin enforces the same rule.
         return Err(RpcError::InvalidParams(
             "Verbose results cannot contain mempool sequence values.",
         ));
@@ -368,8 +352,6 @@ fn mempool_entry_typed(
         )
     });
 
-    // No cluster diagram is tracked, so `chunk*` fields approximate a
-    // singleton cluster: the transaction's own weight and fee.
     let fees = v31::MempoolEntryFees {
         base: sat_to_btc(entry.fee),
         modified: signed_sat_to_btc(entry.modified_fee()),
@@ -418,7 +400,6 @@ mod mempoolminfee_pressure_tests {
     #[test]
     fn mempoolminfee_equals_minrelay_when_pool_below_pressure() {
         let ctx = Arc::new(Context::new());
-        // Empty pool, default limits: mempoolminfee == minrelaytxfee.
         let value =
             getmempoolinfo(&ctx, &json!([])).unwrap_or_else(|err| panic!("getmempoolinfo: {err}"));
         let Some(mempool_min) = value.get("mempoolminfee").and_then(JsonValueTrait::as_f64) else {
@@ -427,7 +408,6 @@ mod mempoolminfee_pressure_tests {
         let Some(min_relay) = value.get("minrelaytxfee").and_then(JsonValueTrait::as_f64) else {
             panic!("minrelaytxfee missing");
         };
-        // Both should equal the default 0.00001 BTC/kvB (1000 sat/kvB).
         assert!((mempool_min - min_relay).abs() < 1e-9);
     }
 }
@@ -610,19 +590,6 @@ mod spentby_tests {
         }
     }
 
-    /// A pool whose spend graph is not a chain:
-    ///
-    /// ```text
-    ///   root ──vout 0──> child_a ──vout 0──> child_c
-    ///        ──vout 1──> child_b
-    ///        ──vout 2──> child_b
-    ///   loner (spends nothing in the pool)
-    /// ```
-    ///
-    /// So `root` has two spenders, `child_a` one, and everything else none.
-    /// `child_b` spends two of the root's outputs, so a walk of the spend index
-    /// reaches it twice — the case a missing dedup shows up in, and the case a
-    /// fixture where every child spends one output cannot reach.
     fn graph_ctx() -> (Arc<Context>, Txid, Vec<String>) {
         let confirmed = OutPoint::new(Txid(Hash256::from_le_bytes(&[7_u8; 32])), 0);
         let root = tx_with(&[confirmed], 3, 1);
@@ -642,11 +609,6 @@ mod spentby_tests {
             5,
         );
 
-        // `spentby` is rendered in txid order, but the spend index answers in
-        // `EntryId` — that is, insertion — order. Insert the root's two spenders
-        // highest-txid-first so the two orders are opposite: a rendering that
-        // forgets to sort then produces a visibly different list, instead of
-        // passing because the fixture happened to be inserted in order already.
         let root_spenders = if child_a.txid() > child_b.txid() {
             [child_a, child_b]
         } else {
@@ -671,8 +633,8 @@ mod spentby_tests {
         (ctx, root_txid, expected)
     }
 
-    fn rendered_spentby(value: &serde_json::Value) -> Vec<String> {
-        let Some(array) = value.get("spentby").and_then(serde_json::Value::as_array) else {
+    fn rendered_spentby(value: &sonic_rs::Value) -> Vec<String> {
+        let Some(array) = value.get("spentby").and_then(|spentby| spentby.as_array()) else {
             panic!("spentby missing from {value}");
         };
         array
@@ -694,7 +656,7 @@ mod spentby_tests {
             .unwrap_or_else(|err| panic!("getmempoolentry failed: {err}"));
         let rendered = sonic_rs::to_string(&result)
             .unwrap_or_else(|err| panic!("re-encoding the response failed: {err}"));
-        let rendered: serde_json::Value = serde_json::from_str(&rendered)
+        let rendered: sonic_rs::Value = sonic_rs::from_str(&rendered)
             .unwrap_or_else(|err| panic!("re-parsing the response failed: {err}"));
         assert_eq!(rendered_spentby(&rendered), expected);
     }

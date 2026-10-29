@@ -1,15 +1,5 @@
 use super::*;
 
-/// Every topic this publisher publishes carries a compatibility claim,
-/// and every claimed topic is one this publisher can put on the wire.
-///
-/// The registry's ZMQ rows are the declared surface; the names here are
-/// the ones that go on the wire, so a topic added without a declared row
-/// is an undeclared surface — which is exactly what the table exists to
-/// make impossible. The comparison is feature-independent: the rows and
-/// this topic enum both exist in every build, and the `zmq` feature
-/// gating of the publisher itself is pinned by the handler and coverage
-/// gates.
 #[test]
 fn zmq_topic_names_match_the_compatibility_manifest() {
     let published: std::collections::BTreeSet<&str> = [
@@ -31,9 +21,6 @@ fn zmq_topic_names_match_the_compatibility_manifest() {
         "published ZMQ topics and the declared ZMQ rows must name the same set"
     );
 
-    // getzmqnotifications names each topic `pub<topic>`; the manifest
-    // row is keyed by the bare topic, so the wire-visible notifier
-    // name must derive from it exactly.
     for topic in [
         ZmqTopic::HashBlock,
         ZmqTopic::HashTx,
@@ -168,7 +155,6 @@ fn admitted_unconfirmed_rawtx_is_exact_and_not_repeated() -> anyhow::Result<()> 
     subscriber.set_subscribe(b"")?;
     subscriber.set_rcvtimeo(3_000)?;
     subscriber.connect(&address)?;
-    // A block sequence probe establishes the subscription before admission.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         publisher.publish_sequence(SequenceEvent::Connected(Hash256::from_le_bytes(&[0; 32])));
@@ -207,10 +193,6 @@ fn admitted_unconfirmed_rawtx_is_exact_and_not_repeated() -> anyhow::Result<()> 
     let raw = subscriber.recv_multipart(0)?;
     assert_eq!(raw[0].as_slice(), b"rawtx");
     assert_eq!(raw[1], expected);
-    // Per-topic transport counters (`ZmqTopic::index`): the warm-up loop above
-    // publishes `SequenceEvent::Connected`, which advances only the `Sequence`
-    // counter (index 4). This is the first `rawtx` publish, so the `RawTx`
-    // counter (index 3) is still 0 here.
     assert_eq!(raw[2], 0_u32.to_le_bytes());
     let added = subscriber.recv_multipart(0)?;
     assert_eq!(added[0].as_slice(), b"sequence");
@@ -251,9 +233,6 @@ fn rawtx_disabled_does_not_retain_admission_bodies() {
     let observer = std::sync::Arc::new(MempoolSequenceObserver::new(publisher));
     let capture = std::sync::Arc::new(CaptureCheck::default());
     let composite = bitcoin_rs_mempool::CompositeObserver::new();
-    // Rawtx disabled: neither leg registers body interest, so the commit
-    // retains nothing even though the sequence leg would publish rawtx
-    // had a subscriber been present at delivery.
     composite.add_leg("zmq", observer, bitcoin_rs_mempool::BodyInterest::Metadata);
     composite.add_leg(
         "capture",
@@ -448,8 +427,6 @@ fn policy_eviction_publishes_r_frames_with_contiguous_sequences() {
 }
 
 #[test]
-// End-to-end fan-out coverage in one readable sequence; splitting
-// would scatter the arrange-act-assert across helpers with no reuse.
 fn composite_observer_fans_out_to_sequence_then_mining_wake() {
     use bitcoin_rs_mempool::{
         AdmissionOrigin, BodyInterest, CompositeObserver, Mempool, MempoolGateway, MempoolLimits,

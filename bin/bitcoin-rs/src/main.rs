@@ -1,8 +1,3 @@
-//! `bitcoin-rs` — node binary entry point.
-//!
-//! Starts the configured `bitcoin-rs` node with crash recovery, signal handling,
-//! metrics/tracing setup, and graceful shutdown.
-
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
 
@@ -27,10 +22,6 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
-    // Foreground offline import shares the timed `{corpus_path}` contract:
-    // one regular file, never the indexed `sources` directory. All three
-    // flags must appear together; a partial set is a caller error, not a
-    // daemon run.
     let import = (cli.corpus.clone(), cli.manifest.clone(), cli.state.clone());
     let result = config::resolve(cli, std::env::vars_os()).and_then(|config| match import {
         (Some(corpus), Some(manifest), Some(state)) => {

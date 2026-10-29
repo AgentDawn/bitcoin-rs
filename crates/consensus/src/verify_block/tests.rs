@@ -47,23 +47,18 @@ fn witness_spend_tx() -> Tx {
     spend_tx(2, vec![vec![1; 32]])
 }
 
-/// A non-coinbase transaction whose fixed fields take 60 stripped bytes, so
-/// a `script_len`-byte output script makes it `60 + script_len` bytes.
 fn sized_spend_tx(seed: u8, script_len: usize, witness: Vec<Vec<u8>>) -> Tx {
     let mut tx = spend_tx(seed, witness);
     tx.outputs[0].script_pubkey = Script::from_bytes(vec![0x51; script_len]);
     tx
 }
 
-/// A non-coinbase transaction that serializes, witness stripped, to the
-/// size of two Merkle child hashes.
 fn sixty_four_byte_tx(seed: u8, witness: Vec<Vec<u8>>) -> Tx {
     let tx = sized_spend_tx(seed, 4, witness);
     assert_eq!(tx.base_size(), 64, "fixture must be a Merkle node's size");
     tx
 }
 
-/// A coinbase whose stripped serialization is exactly 64 bytes.
 fn sixty_four_byte_coinbase() -> Tx {
     let mut tx = coinbase_tx();
     tx.inputs[0].script_sig = Script::from_bytes(vec![1; 4]);
@@ -201,8 +196,6 @@ fn non_contextual_size_and_aggregate_legacy_sigops_have_core_boundaries() {
 fn non_contextual_checks_do_not_apply_witness_or_chain_context() {
     let mut coinbase = coinbase_tx();
     coinbase.outputs[0].script_pubkey = Script::from_bytes(vec![0; 300_000]);
-    // Invalid witness nonce/commitment and excessive full weight are not
-    // CheckBlock rules; witness does not affect the txid or stripped bound.
     coinbase.inputs[0].witness = Witness::from_stack(vec![vec![0; 3_000_000]]);
     let mut spend = spend_tx(1, vec![]);
     spend.lock_time = LockTime::from_consensus(499_999_999);
@@ -331,7 +324,6 @@ fn structural_block_rules_hold_under_both_activation_states() {
             vec![duplicated.clone(), duplicated.clone()],
             Err(ConsensusError::MissingCoinbase),
         ),
-        // Adjacent duplicate txids make the Merkle tree ambiguous.
         (
             vec![
                 coinbase_tx(),
@@ -341,8 +333,6 @@ fn structural_block_rules_hold_under_both_activation_states() {
             ],
             Err(ConsensusError::MerkleMutation),
         ),
-        // Non-adjacent duplicates are not a Merkle mutation; BIP30 owns
-        // that rejection at a later stage.
         (
             vec![
                 coinbase_tx(),
@@ -448,8 +438,6 @@ fn mutation_predicate_needs_a_missing_coinbase_and_an_exact_64_byte_tx() {
     }
 }
 
-/// Both entry points report the 64-byte mutation for `txs`, whose header
-/// commits to them, with segwit on and off.
 fn assert_sixty_four_byte_mutation(txs: Vec<Tx>, label: &str) {
     let block = block_with_transactions(txs);
     for segwit_active in [false, true] {
@@ -458,8 +446,6 @@ fn assert_sixty_four_byte_mutation(txs: Vec<Tx>, label: &str) {
             Err(ConsensusError::SixtyFourByteMutation),
             "rules, {label}, segwit_active {segwit_active}"
         );
-        // Without the early mutation return, a witness here would surface
-        // as UnexpectedWitness.
         assert_eq!(
             check_block_body_binding(&block, segwit_active),
             Err(ConsensusError::SixtyFourByteMutation),
@@ -651,7 +637,6 @@ fn mutation_flags_distinguish_padding_from_real_duplicate_pairs() {
         (vec![a, b, b], false),
         (vec![a, b, b, b], true),
         (one_to_six.clone(), false),
-        // Core's ambiguous pair: same root, only the tail copy mutated.
         ((1u8..=6).chain([5, 6]).map(txid).collect(), true),
         (vec![txid(0x2b); 3], true),
         (vec![txid(0x2b); 7], true),

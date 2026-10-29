@@ -34,11 +34,6 @@ fn active_origin_survives_failure_and_validated_provenance_survives_finalization
     );
 }
 
-// `rustix::fs::mkfifoat` is not available on Apple platforms, so the
-// macOS test hosts gate this fixture the same way the epoch-lock FIFO
-// test in `src/state/tests/events.rs` does. The code under test
-// (`open_regular_input`) keeps its platform-independent coverage
-// elsewhere.
 #[cfg(all(unix, not(target_vendor = "apple")))]
 #[test]
 fn input_fifo_is_rejected_without_waiting_for_a_writer() -> anyhow::Result<()> {
@@ -75,7 +70,7 @@ fn node_config(dir: &Path) -> crate::NodeConfig {
 }
 
 fn core_headers() -> anyhow::Result<Vec<bitcoin_rs_primitives::Header>> {
-    let raw: Vec<String> = serde_json::from_str(include_str!(
+    let raw: Vec<String> = sonic_rs::from_str(include_str!(
         "../../../utxo/tests/fixtures/core-v2/blocks200.json"
     ))?;
     raw.iter()
@@ -131,7 +126,6 @@ fn native_embedding_contract_and_shared_import_budget() -> anyhow::Result<()> {
             Err(SnapshotImportError::ImportInProgress)
         ));
     }
-    // The established embedding call still selects native v4 explicitly.
     assert!(state.activate_assumeutxo_snapshot_file(&core_path).is_err());
     state.activate_assumeutxo_snapshot_file(&native_path)?;
     assert!(matches!(
@@ -156,8 +150,6 @@ fn successful_snapshot_import_preserves_nonresident_fee_prioritisation() -> anyh
     use bitcoin_rs_mempool::PrioritisedTransaction;
     use bitcoin_rs_primitives::{Hash256, Txid};
 
-    // Core 31.1 AddChainstate transfers the existing empty CTxMemPool;
-    // its mapDeltas entries for absent transactions survive that transfer.
     for native in [false, true] {
         let dir = tempfile::tempdir()?;
         let (state, core_path, native_path) = snapshot_inputs(dir.path())?;
@@ -222,8 +214,6 @@ fn nonempty_mempool_refuses_both_formats_without_changing_state() -> anyhow::Res
         }],
         lock_time: LockTime::ZERO,
     });
-    // Stage membership through the existing test seam. The independent
-    // process case covers admission of a real spend on both implementations.
     gateway.insert_entry(
         AdmissionOrigin::Rpc,
         MempoolEntry::new(Arc::clone(&transaction), 100, 1_000, 0, 0, 0),
@@ -322,8 +312,6 @@ fn export_reproduces_the_core_snapshot_and_never_replaces_an_entry() -> anyhow::
     );
     assert_eq!(entry_names(&out)?, ["export.dat"]);
 
-    // The published file and an operator's file both survive a second
-    // export, and no temporary file is left beside them.
     assert!(matches!(
         state.snapshots.export(&output, &never),
         Err(SnapshotExportError::Exists(_))
@@ -338,7 +326,6 @@ fn export_reproduces_the_core_snapshot_and_never_replaces_an_entry() -> anyhow::
     assert_eq!(std::fs::read(&output)?, core_bytes);
     assert_eq!(entry_names(&out)?, ["export.dat", "operator.dat"]);
 
-    // A relative path resolves below the data directory.
     let relative = state.snapshots.export(Path::new("relative.dat"), &never)?;
     assert_eq!(
         std::fs::read(dir.path().join("node/relative.dat"))?,
@@ -352,8 +339,6 @@ fn export_reproduces_the_core_snapshot_and_never_replaces_an_entry() -> anyhow::
             .to_string_lossy()
     );
 
-    // Activation may replace entries in the recovery namespace, so an
-    // export cannot be placed there.
     let recovery = dir.path().join("node/assumeutxo/export.dat");
     assert!(matches!(
         state.snapshots.export(&recovery, &never),
@@ -379,8 +364,6 @@ fn interrupted_export_publishes_nothing_and_removes_its_staged_file() -> anyhow:
     ));
     assert_eq!(entry_names(&out)?, Vec::<String>::new());
 
-    // The second poll is the encoder's own, after the staged file exists
-    // and the chain locks are held.
     let polls = std::cell::Cell::new(0_u32);
     let stop = || {
         polls.set(polls.get() + 1);
@@ -401,13 +384,11 @@ fn interrupted_export_publishes_nothing_and_removes_its_staged_file() -> anyhow:
     ));
     assert_eq!(entry_names(&out)?, Vec::<String>::new());
 
-    // The locks were released: a later export succeeds.
     state
         .snapshots
         .export(&output, &LatchReader::fixture_never())?;
     assert_eq!(entry_names(&out)?, ["interrupted.dat"]);
 
-    // Node shutdown interrupts like the request latch does.
     state.chainstate().request_shutdown();
     assert!(matches!(
         state
@@ -426,8 +407,6 @@ fn stale_same_pid_temp_does_not_block_a_new_export() -> anyhow::Result<()> {
     state.snapshots.import(&core_path)?;
     let out = dir.path().join("out");
     std::fs::create_dir(&out)?;
-    // A SIGKILL orphan from the previous fixed-pattern name with our pid.
-    // It must be left alone (never unlinked) yet never block the retry.
     let stale = out.join(format!("export.dat.{}.incomplete", std::process::id()));
     std::fs::write(&stale, b"stale")?;
     let output = out.join("export.dat");
@@ -524,11 +503,6 @@ fn tip_identity(state: &crate::state::NodeState) -> Option<(u32, bitcoin_rs_prim
         .map(|tip| (tip.height, tip.hash))
 }
 
-// Activation is one linearizable writer: the lifecycle mutex plus the
-// durable-head compare-and-swap. The sealed state needs no further
-// consistency model because it has exactly one owner and no shared handle.
-// Both entries must install byte-identical statistics, and the restarted
-// node (which recomputes them from the archive) must agree.
 #[test]
 fn sealed_and_proofless_activation_install_identical_state_and_survive_restart()
 -> anyhow::Result<()> {
@@ -631,9 +605,6 @@ fn wrong_commitment_changes_nothing_and_a_valid_retry_activates() -> anyhow::Res
     Ok(())
 }
 
-// A set without proof is mutable through shared access (`replace_from`);
-// the sealed type exists to forbid exactly that. The proofless entry must
-// therefore recompute and refuse, leaving the node reusable.
 #[test]
 fn mutating_an_unproven_set_is_caught_by_the_single_verification() -> anyhow::Result<()> {
     let pinned = regtest_pin()?;
@@ -674,10 +645,6 @@ fn mutating_an_unproven_set_is_caught_by_the_single_verification() -> anyhow::Re
     Ok(())
 }
 
-// A directory at the final headers name makes archive publication fail
-// after coins.dat was published and before any durable head names either
-// file. The durable head is the sole authority, so the restarted node is
-// Uninitialized again and a retry overwrites the orphan coin archive.
 #[cfg(unix)]
 #[test]
 fn interrupted_activation_fails_closed_and_restart_retries_cleanly() -> anyhow::Result<()> {

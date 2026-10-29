@@ -29,7 +29,6 @@ use corepc_types::v31;
 
 const NONCE_RANGE: &str = "00000000ffffffff";
 
-/// Core v31.0 `src/rpc/mining.cpp` template-mode client-rule errors.
 const GBT_REQUIRE_SEGWIT: &str =
     r#"getblocktemplate must be called with the segwit rule set (call with {"rules": ["segwit"]})"#;
 const GBT_REQUIRE_SIGNET: &str = r#"getblocktemplate must be called with the signet rule set (call with {"rules": ["segwit", "signet"]})"#;
@@ -93,8 +92,6 @@ pub(crate) fn submitblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
 
 fn decode_submitted_block(hex: &str) -> Result<(BlockPayload, usize), RpcError> {
     let raw = Vec::<u8>::from_hex(hex).map_err(|_| block_decode_failed())?;
-    // See the API-15 contract for DecodeHexBlk compatibility behavior:
-    // one shared decode keeps the consumed prefix and discards the remainder.
     let (payload, consumed) =
         BlockPayload::from_prefix(Bytes::from(raw)).map_err(|_| block_decode_failed())?;
     Ok((payload, consumed))
@@ -109,8 +106,6 @@ const HEADER_BYTES: usize = Header::LEN;
 fn decode_block_header(hex: &str) -> Result<Header, RpcError> {
     let bytes = Vec::<u8>::from_hex(hex)
         .map_err(|_| RpcError::Deserialization("Block header decode failed".to_owned()))?;
-    // Core's DecodeHexBlockHeader unserializes CBlockHeader and ignores leftover
-    // bytes, so extra hex after 80 bytes is accepted. Fewer than 80 bytes fail.
     let Some(header_bytes) = bytes.get(..HEADER_BYTES) else {
         return Err(RpcError::Deserialization(
             "Block header decode failed".to_owned(),
@@ -139,7 +134,6 @@ pub(crate) fn prioritisetransaction(ctx: &Arc<Context>, params: &Value) -> Resul
         if array.len() > 3 {
             return Err(RpcError::InvalidParams("too many parameters"));
         }
-        // Core reads `fee_delta` from params[2] before rejecting a non-zero dummy.
         let fee_delta = array
             .get(2)
             .and_then(JsonValueTrait::as_i64)
@@ -166,7 +160,6 @@ pub(crate) fn prioritisetransaction(ctx: &Arc<Context>, params: &Value) -> Resul
     if let Some(dummy) = dummy
         && !dummy.is_null()
     {
-        // Core `MaybeArg<double>`: JSON 0 and 0.0 are both zero.
         let nonzero = dummy
             .as_i64()
             .map(|n| n != 0)
@@ -179,7 +172,6 @@ pub(crate) fn prioritisetransaction(ctx: &Arc<Context>, params: &Value) -> Resul
             ));
         }
     }
-    // See the authoritative API-24 contract for this network-dependent rule.
     let prioritised = if ctx.chain.chain_network == Network::Regtest {
         ctx.mempool
             .gateway
@@ -222,7 +214,6 @@ pub(crate) fn generatetoaddress(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let nblocks = required_u32(params, 0, "nblocks is required")?;
     let address = required_str(params, 1, "address is required")?;
     let max_tries = optional_u64(params, 2, GenerateRequest::DEFAULT_MAX_TRIES)?;
-    // CONTRACT: docs/contracts/external-api.md#API-29
     let payout = payout_script_from_address(
         address,
         convert::bitcoin_network(ctx.chain.chain_network),
@@ -308,7 +299,6 @@ pub(crate) fn getprioritisedtransactions(
         let _ = row.insert("fee_delta", json!(entry.fee_delta));
         let _ = row.insert("in_mempool", json!(entry.in_mempool));
         if let Some(modified_fee) = entry.modified_fee {
-            // CONTRACT: docs/contracts/external-api.md#API-28
             let sats = signed_sat_to_i64(modified_fee);
             let _ = row.insert("modified_fee", json!(sats));
         }
@@ -319,7 +309,9 @@ pub(crate) fn getprioritisedtransactions(
 
 /// Bitcoin Core `getnetworkhashps(nblocks=120, height=-1)`: both arguments are
 /// optional, extra positionals are rejected, and omitted/`null` params use the
-/// defaults. Invalid `nblocks`/`height` values are Core `-8`, not JSON-RPC `-32602`.
+/// defaults.
+///
+/// Invalid `nblocks`/`height` values are Core `-8`, not JSON-RPC `-32602`.
 fn parse_network_hash_ps_args(params: &Value) -> Result<(i64, i64), RpcError> {
     ensure_at_most_params(params, 2)?;
     let lookup = optional_i64(params, 0, 120)?;
@@ -391,8 +383,6 @@ fn parse_generateblock_transactions(
         ));
     };
     let mut transactions = Vec::with_capacity(entries.len());
-    // One lazy mining snapshot serves every pooled-txid argument; raw-tx
-    // argument lists pay nothing.
     let mut snapshot: Option<MempoolMiningSnapshot> = None;
     for entry in entries {
         let Some(text) = entry.as_str() else {
@@ -472,7 +462,6 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
     };
 
     if mode_text == "proposal" {
-        // API-12: proposal request parsing.
         let data = request
             .get("data")
             .and_then(JsonValueTrait::as_str)
@@ -515,7 +504,6 @@ fn parse_block_template_request(params: &Value) -> Result<BlockTemplateRequest, 
             .collect(),
         rules: rules.into_iter().map(MiningRule::new).collect(),
         long_poll_id,
-        // The BIP22/BIP23 surface never carries a coinbase budget.
         coinbase_budget: None,
     })
 }
@@ -562,7 +550,6 @@ pub(crate) fn required_gbt_rules(network: Network) -> &'static [&'static str] {
     }
 }
 
-/// Enforces the GBT client-rule negotiation contract (API-14).
 fn ensure_client_rules_for_template(
     network: Network,
     client_rules: &[MiningRule],
@@ -599,7 +586,6 @@ fn rule_is_mandatory(rule: &str) -> bool {
     matches!(rule, "segwit" | "signet")
 }
 
-/// See the API-08 contract for the template-readiness requirements.
 fn ensure_template_ready(ctx: &Context) -> Result<(), RpcError> {
     if ctx.chain.chain_network != Network::Mainnet {
         return Ok(());
@@ -681,10 +667,7 @@ fn render_block_template(template: &BlockTemplate) -> Result<Value, RpcError> {
         version_bits_required: i64::from(template.version_bits_required),
         previous_block_hash: candidate.previous_block_hash.to_string_be(),
         transactions: render_template_transactions(&candidate.transactions),
-        coinbase_aux: {
-            // Core `HexStr(COINBASE_FLAGS)`. v31's flags bytes are empty.
-            std::collections::BTreeMap::from([("flags".to_owned(), String::new())])
-        },
+        coinbase_aux: { std::collections::BTreeMap::from([("flags".to_owned(), String::new())]) },
         coinbase_value: i64_saturated(candidate.coinbase_value),
         long_poll_id: Some(candidate.template_id.as_str().to_owned()),
         target: compact_target_hex(candidate.bits),
@@ -710,12 +693,9 @@ fn render_mining_info(info: &MiningInfo) -> Result<Value, RpcError> {
     let next_bits = format!("{:08x}", info.next_bits);
     let next_target = compact_target_hex(info.next_bits);
     let next_height = u64::from(info.blocks) + 1;
-    // See docs/contracts/external-api.md#API-25 for the omission contract.
     typed_to_sonic_omitting_nulls(&v31::GetMiningInfo {
         blocks: u64::from(info.blocks),
         current_block_weight: info.last_candidate.map(|candidate| candidate.weight),
-        // Core's `currentblocktx` excludes the coinbase. `LastCandidateInfo`
-        // counts it because that is the candidate's transaction total.
         current_block_tx: info
             .last_candidate
             .and_then(|candidate| i64::try_from(candidate.transactions.saturating_sub(1)).ok()),

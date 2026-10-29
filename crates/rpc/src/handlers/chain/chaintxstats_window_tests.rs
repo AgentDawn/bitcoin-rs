@@ -7,20 +7,11 @@ use super::*;
 
 const REGTEST_BITS: u32 = 0x207f_ffff;
 
-/// Timestamps that are not in order, because block times are not.
-///
-/// A miner only has to beat the median of the previous eleven blocks, so a
-/// header may be stamped earlier than its parent. These dip twice, which is
-/// what separates a median-time window from a raw-timestamp one.
 const TIMES: [u32; 13] = [
     1_000_000, 1_000_600, 1_001_200, 1_000_900, 1_002_400, 1_003_000, 1_002_100, 1_004_200,
     1_004_800, 1_005_400, 1_006_000, 1_005_100, 1_007_200,
 ];
 
-/// Bitcoin Core's `GetMedianTimePast`, written out rather than borrowed.
-///
-/// The median of the block and its ten ancestors. A reference that called the
-/// block tree could not disagree with the block tree.
 fn median_time_past(times: &[u32], height: usize) -> u32 {
     let start = height.saturating_sub(10);
     let mut window = times[start..=height].to_vec();
@@ -39,19 +30,10 @@ fn header(previous: BlockHash, time: u32, nonce: u32) -> Header {
     }
 }
 
-/// A node whose active chain carries `times`, in both the tree and the log.
-///
-/// Each block is given `height + 1` transactions, so a window sum is a
-/// number the test can state in closed form.
 fn chain_ctx(times: &[u32]) -> Arc<Context> {
     chain_ctx_with_counter(times, None)
 }
 
-/// [`chain_ctx`], with the node's durable cumulative counter set.
-///
-/// The counter tracks the applied tip and nothing else, so a fixture that
-/// leaves it unset cannot tell "the shortcut is restricted to the tip" from
-/// "there is no shortcut to take".
 fn chain_ctx_with_counter(times: &[u32], chain_tx_count: Option<u64>) -> Arc<Context> {
     let ctx = Arc::new(Context::new());
     let mut previous = BlockHash::default();
@@ -125,7 +107,6 @@ fn window_interval_is_the_difference_of_two_median_times() {
     );
 }
 
-/// The rate follows the interval, so it follows the median times too.
 #[test]
 fn txrate_is_the_window_count_over_the_median_time_interval() {
     let ctx = chain_ctx(&TIMES);
@@ -133,7 +114,6 @@ fn txrate_is_the_window_count_over_the_median_time_interval() {
     let final_height = TIMES.len() - 1;
     let past_height = final_height - blocks;
 
-    // Heights `past_height + 1 ..= final_height`, each with height + 1 txs.
     let count: i64 = (past_height + 1..=final_height)
         .map(|height| i64::try_from(height).unwrap_or(0) + 1)
         .sum();
@@ -153,20 +133,11 @@ fn txrate_is_the_window_count_over_the_median_time_interval() {
     );
 }
 
-/// A rate must keep the full window count, not the low 32 bits.
-///
-/// Capping through `u32::try_from` locks `txrate` once the window's
-/// transactions pass `4_294_967_295`. Bitcoin Core divides the 64-bit
-/// count by the 64-bit interval; so does [`bitcoin_rs_primitives::u64_to_f64`].
 #[test]
 fn txrate_keeps_counts_above_u32_max() {
     const PAST: u64 = 3;
-    // `u32::MAX + 100`. Written as a literal because `u64::from` is not
-    // const-stable here; the inequality below is what keeps it honest.
     const END: u64 = 4_294_967_395;
     let ctx = Context::new();
-    // Four blocks so a one-block window is legal and the two MTP
-    // boundaries differ (three or fewer keep the same median).
     let tip = super::chaintxstats_durability_tests::insert_counted_chain(
         &ctx,
         &[1_000, 2_000, 3_000, 4_000],
@@ -221,8 +192,6 @@ fn a_zero_block_window_reports_no_window_fields() {
 
 #[test]
 fn txrate_is_omitted_when_the_window_does_not_advance() {
-    // Eleven identical times, so every median time in the chain is equal
-    // and any window between them is zero seconds long.
     let flat = [1_500_000_u32; 12];
     let result = stats(&chain_ctx(&flat), &json!([3]));
     assert_eq!(field(&result, "window_interval"), Some(0));
@@ -230,7 +199,6 @@ fn txrate_is_omitted_when_the_window_does_not_advance() {
     assert!(result.get("txrate").is_none(), "{result:?}");
 }
 
-/// An explicit count that reaches past genesis is refused, not clamped.
 #[test]
 fn a_block_count_past_the_chain_is_refused() {
     let ctx = chain_ctx(&TIMES);
@@ -241,11 +209,9 @@ fn a_block_count_past_the_chain_is_refused() {
             .unwrap_or_else(|| panic!("a {requested}-block window must be refused"));
         assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER, "{error:?}");
     }
-    // One below the height is the largest window that fits.
     assert!(getchaintxstats(&ctx, &json!([height - 1])).is_ok());
 }
 
-/// A negative count is refused rather than read as an unsigned number.
 #[test]
 fn a_negative_block_count_is_refused() {
     let error = getchaintxstats(&chain_ctx(&TIMES), &json!([-1]))
@@ -261,7 +227,6 @@ fn the_default_window_is_clamped_to_the_chain() {
     assert_eq!(field(&result, "window_block_count"), Some(height - 1));
 }
 
-/// The window ends where `blockhash` says, not always at the tip.
 #[test]
 fn a_blockhash_selects_the_block_the_window_ends_at() {
     let ctx = chain_ctx(&TIMES);
@@ -294,13 +259,6 @@ fn a_blockhash_selects_the_block_the_window_ends_at() {
     let expected = i64::from(median_time_past(&TIMES, chosen_height))
         - i64::from(median_time_past(&TIMES, chosen_height - 2));
     assert_eq!(field(&result, "window_interval"), Some(expected));
-    // The count is the cumulative one *through the chosen block*, not the
-    // tip's total. The durable counter tracks the tip alone, so this can
-    // only come from a log prefix that reaches genesis -- which this
-    // fixture has, and which a restarted node would not.
-    //
-    // The fixture gives block `h` exactly `h + 1` transactions, so the
-    // cumulative count through height 8 is 1 + 2 + ... + 9.
     let expected_txcount = (1..=i64::try_from(chosen_height).unwrap_or(0) + 1).sum::<i64>();
     assert_eq!(
         field(&result, "txcount"),
@@ -315,19 +273,12 @@ fn a_blockhash_selects_the_block_the_window_ends_at() {
     );
 }
 
-/// A block whose body this node has not applied is not the end of a window.
-///
-/// Membership used to be decided against the header tree's own best chain.
-/// Headers run ahead of validation for most of a sync, so that accepts a
-/// block this node has never verified -- and answers about it with the same
-/// confidence as one it has. Resolved from the applied tip, it is refused.
 #[test]
 fn a_header_only_block_above_the_applied_tip_is_refused() {
     let ctx = chain_ctx(&TIMES);
     let Some(tip) = ctx.chain.applied_tip.load_full() else {
         panic!("the fixture has an applied tip");
     };
-    // One more header on the same chain, with no record and no application.
     let ahead = {
         let mut tree = ctx.chain.block_tree.write();
         let Ok(tip_node) = tree.node(tip.tip_id) else {
@@ -347,17 +298,10 @@ fn a_header_only_block_above_the_applied_tip_is_refused() {
     assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER);
 }
 
-/// A restarted node cannot name a count it never counted.
-///
-/// The log is rebuilt empty on every open, so a prefix that does not reach
-/// genesis sums to a number that is not a chain total. Omitting is Core's
-/// own signal for an unknown count; under-reporting would read as a quiet
-/// chain and a fee estimator would believe it.
 #[test]
 fn a_log_that_does_not_reach_genesis_reports_no_count() {
     let ctx = chain_ctx(&TIMES);
     {
-        // Drop the genesis record, leaving the rest of the log intact.
         let mut blocks = ctx.chain.blocks.write();
         let kept: Vec<BlockRecord> = blocks.iter().skip(1).cloned().collect();
         blocks.clear();
@@ -377,16 +321,6 @@ fn a_log_that_does_not_reach_genesis_reports_no_count() {
     assert!(result.get("txcount").is_none(), "{result:?}");
 }
 
-/// The durable counter answers for the applied tip, and for nothing else.
-///
-/// It carries one number, the total through the tip. Handing that number
-/// back for a block six deep reports the whole chain's transactions as
-/// though they had all arrived by then -- an over-count that grows with the
-/// distance, and reads as a confident measurement.
-///
-/// The log is what knows the rest, and it knows them exactly: the fixture
-/// gives block `h` exactly `h + 1` transactions, so the count through `h`
-/// is `(h + 1)(h + 2) / 2` however the counter is set.
 #[test]
 fn the_durable_counter_does_not_answer_for_a_historical_block() {
     const TIP_TOTAL: u64 = 999_999;
@@ -401,8 +335,6 @@ fn the_durable_counter_does_not_answer_for_a_historical_block() {
         node.hash
     };
 
-    // The tip still answers from the counter, which is what makes the
-    // historical answer below a restriction rather than a removal.
     assert_eq!(
         field(&stats(&ctx, &json!([2])), "txcount"),
         Some(i64::try_from(TIP_TOTAL).unwrap_or(0)),
@@ -417,12 +349,6 @@ fn the_durable_counter_does_not_answer_for_a_historical_block() {
     );
 }
 
-/// A known durable tip total must not suppress a window the log can count.
-///
-/// The counter is one number, the total through the tip. Subtracting a
-/// log prefix from that number is only right when the two agree. The
-/// fixture sets them apart on purpose: mixing them would report
-/// `TIP_TOTAL - log_start` instead of the window the log actually holds.
 #[test]
 fn a_durable_tip_total_does_not_block_a_complete_log_window() {
     const TIP_TOTAL: u64 = 999_999;
@@ -455,7 +381,6 @@ fn a_durable_tip_total_does_not_block_a_complete_log_window() {
     );
 }
 
-/// A hash the node has never seen is not found.
 #[test]
 fn an_unknown_blockhash_is_not_found() {
     let unknown = Hash256::from_le_bytes(&[0x5c; 32]).to_string_be();
@@ -465,10 +390,6 @@ fn an_unknown_blockhash_is_not_found() {
     assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
 }
 
-/// A block the node knows but has reorged away from ends no window.
-///
-/// It keeps its height, so a check that only compared heights would accept
-/// it and then measure a window through a chain that does not exist.
 #[test]
 fn a_blockhash_off_the_active_chain_is_refused() {
     let ctx = chain_ctx(&TIMES);
@@ -498,11 +419,6 @@ fn a_blockhash_off_the_active_chain_is_refused() {
     assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER);
 }
 
-/// A window the record log does not cover reports no count.
-///
-/// The log is rebuilt empty on every open, so after a restart the sum over
-/// a window is a fraction of it. Reporting that fraction would read as a
-/// quiet chain, which is what a fee estimator would then believe.
 #[test]
 fn window_tx_count_is_omitted_when_the_log_does_not_cover_the_window() {
     let ctx = chain_ctx(&TIMES);

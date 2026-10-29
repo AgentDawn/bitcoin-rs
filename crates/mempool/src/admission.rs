@@ -1,9 +1,3 @@
-//! Shared preparation and bounded admission retry for RPC and peer producers.
-//!
-//! Chain facts are collected without gateway locks. The existing atomic gateway
-//! operation validates exact generation/sequence tokens before either a pool
-//! commit or a peer orphan/reject transition.
-
 use alloc::{sync::Arc, vec::Vec};
 #[cfg(test)]
 use bitcoin_rs_primitives::unix_time_secs;
@@ -18,20 +12,13 @@ use crate::{
 
 pub(crate) const MAX_ADMISSION_RETRIES: usize = 4;
 
-/// Which chain-generation a submission attempt must observe.
-/// Ordinary attempts require a stable even generation; re-admission uses the
-/// guard's reserved odd generation. Both compare the same live generation.
 #[derive(Clone, Copy)]
 pub(crate) enum AdmissionFence {
-    /// The even value returned by `stable_generation`.
     Stable,
-    /// The exact odd value held by an active `ChainChangeGuard`.
     ChainChange(u64),
 }
 
 impl AdmissionFence {
-    /// The generation this fence currently admits under, or `None` when
-    /// the chain moved (odd fence mismatched, or stable fence saw odd).
     pub(crate) fn current(self, gateway: &MempoolGateway) -> Option<u64> {
         match self {
             Self::Stable => gateway.stable_generation(),
@@ -40,101 +27,51 @@ impl AdmissionFence {
     }
 }
 
-/// Provisional applied-chain facts collected during one submission attempt.
-/// Height and MTP identify one sampled applied tip.
-/// The gateway must revalidate the captured generation before using these facts.
 #[derive(Clone, Debug, Default)]
 pub struct ChainAdmissionSnapshot {
-    /// Confirmed input outputs; unavailable inputs are absent.
     pub prevouts: Vec<(OutPoint, TxOut)>,
-    /// Per-confirmed-output chain metadata needed for BIP68 and coinbase
-    /// maturity checks. Pool parents are not included here.
     pub prevout_meta: HashMap<OutPoint, PrevoutMeta>,
-    /// Applied tip height; finality is checked at the next height.
     pub height: u32,
-    /// Applied tip's median time past (zero before genesis).
     pub locktime_cutoff: u32,
-    /// Whether CSV (BIP68/112/113) is active for the next block.
     pub csv_active: bool,
-    /// Script flags the next block will verify under, derived from the tip's
-    /// softfork state. The gateway re-verifies an admitted transaction under
-    /// these flags to fill the script-execution cache.
     pub next_block_script_flags: bitcoin_rs_script::VerifyFlags,
-    /// Positive live-coin evidence used for peer duplicate suppression and
-    /// native package deduplication. RPC cache membership is not admission.
     pub confirmed: bool,
 }
 
-/// Chain-origin metadata for one confirmed input.
-///
-/// Used to evaluate BIP68 relative locks and coinbase maturity at admission.
-/// The `MTP` value is the median-time-past of the block *before* the one that
-/// created the output, matching `bip68_prevout_mtp` in the block-connect path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrevoutMeta {
-    /// Height the spent output was created at.
     pub height: u32,
-    /// Median-time-past of the block before the one at `height`.
     pub mtp: u32,
-    /// Whether the spent output came from a coinbase transaction.
     pub coinbase: bool,
 }
 
-/// Narrow chain read capability.
-///
-/// Read fresh applied-tip facts without pool or lifecycle locks on each attempt.
-/// Height and MTP must identify one sampled applied tip.
-/// The chain owner brackets fact-changing mutations with a gateway chain-change
-/// reservation. The gateway revalidates the generation and pool sequence;
-/// snapshots may overlap transitions. `None` means facts are unavailable.
 pub trait AdmissionChain: Send + Sync {
-    /// Reads the chain inputs and applied-tip context needed by `tx`.
     fn snapshot(&self, tx: &Tx) -> Option<ChainAdmissionSnapshot>;
 }
 
-/// Surface-independent outcome. Peer-only holding is not a mempool mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubmitOutcome {
-    /// Atomic admission committed these ordered changes.
     Committed(MutationResult),
-    /// Current mempool membership, or a suppressed recent peer rejection.
     AlreadyKnown,
-    /// A peer transaction was already confirmed.
     AlreadyConfirmed,
-    /// A standard peer transaction is missing inputs. Its body is retained
-    /// subject to the orphan quota; P2P owns requesting these parent txids.
-    Held {
-        /// Missing parent transaction identifiers, without duplicates.
-        missing_parents: Vec<Txid>,
-    },
+    Held { missing_parents: Vec<Txid> },
 }
 
-/// Failure after the common preparation/retry operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SubmitError {
-    /// Policy refused the transaction.
     #[error(transparent)]
     Policy(#[from] AcceptanceRejectReason),
-    /// Consensus or policy script verification refused the transaction.
     #[error("consensus-verification-failed")]
     Consensus,
-    /// Every attempt observed changing or unavailable state.
     #[error("admission retry exhausted: chain or mempool changed during submission")]
     RetryExhausted,
 }
 
-/// One resident orphan's bounded retry result and the announcer selected for
-/// that retry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrphanRetry {
-    /// Transaction identifier for relay.
     pub txid: Txid,
-    /// Witness identifier of the exact body offered for re-admission.
     pub wtxid: Wtxid,
-    /// The announcer this retry was submitted as; never a socket or
-    /// connection handle. Other announcers of the same body stay recorded.
     pub source: PeerToken,
-    /// The same result a fresh submission receives.
     pub result: Result<SubmitOutcome, SubmitError>,
 }
 
@@ -142,8 +79,6 @@ pub(crate) fn can_hold_orphan(pool: &crate::Mempool, tx: &Tx, policy: &Standardn
     !has_unspendable_input(pool, tx) && is_standard_tx(tx, policy).is_ok()
 }
 
-/// A null input or an output index no known parent can ever supply: no
-/// parent arrival can repair it, so no block can carry the transaction.
 pub(crate) fn has_unspendable_input(pool: &crate::Mempool, tx: &Tx) -> bool {
     tx.inputs
         .iter()
@@ -151,7 +86,6 @@ pub(crate) fn has_unspendable_input(pool: &crate::Mempool, tx: &Tx) -> bool {
         || has_invalid_mempool_outpoint(pool, tx)
 }
 
-/// A known parent cannot later acquire an output without changing its txid.
 pub(crate) fn has_invalid_mempool_outpoint(pool: &crate::Mempool, tx: &Tx) -> bool {
     tx.inputs.iter().any(|input| {
         let outpoint = input.previous_output;
@@ -208,13 +142,6 @@ fn combine_input_facts(
     (prevouts, missing_parents)
 }
 
-/// Builds the one admission request for an attempt from the resolved chain
-/// facts, returning it with the txids of still-missing parents. Without
-/// chain facts, the empty/missing context and zero tip fields cannot
-/// authorize a commit: the gate checks the same generation and sequence
-/// first, then rejects the still-known invalid outpoint before policy or
-/// finality. Changed tokens rebuild a normal attempt, including chain
-/// lookup if the parent disappeared.
 fn build_admission_request(
     tx: Arc<Tx>,
     mempool_prevouts: Option<HashMap<OutPoint, TxOut>>,
@@ -327,8 +254,6 @@ pub(crate) fn batch_requests(
 }
 
 impl MempoolGateway {
-    /// Evaluates a bounded batch through the submission evaluator without
-    /// changing membership, sequence, fee history, orphan state or observers.
     #[expect(
         clippy::too_many_lines,
         reason = "keep batch capture, verification and retry fencing in one auditable owner"
@@ -458,8 +383,6 @@ impl MempoolGateway {
         Err(SubmitError::RetryExhausted)
     }
 
-    /// Prepares and submits one transaction, rebuilding all facts after a
-    /// transient token mismatch. Only peer-origin failures affect relay caches.
     pub fn submit_transaction(
         &self,
         tx: Arc<Tx>,
@@ -479,14 +402,6 @@ impl MempoolGateway {
         )
     }
 
-    /// Submits one locally originated transaction: RPC `sendrawtransaction`,
-    /// an Esplora broadcast, or the embedded `Node::broadcast`.
-    ///
-    /// Runs [`Self::submit_transaction`]. Holding an orphan and reporting a
-    /// confirmed transaction are peer-only outcomes, so a local submission
-    /// answers current membership as success with no changes and keeps a
-    /// missing input a refusal.
-    ///
     /// # Errors
     ///
     /// Returns the gateway's refusal; nothing is inserted when this fails.
@@ -507,30 +422,6 @@ impl MempoolGateway {
         }
     }
 
-    /// Re-admits transactions displaced by disconnected blocks through the
-    /// shared admission evaluator while `change` holds the chain fence.
-    /// `txs` must arrive parents before children. A refused candidate, and any
-    /// later candidate spending it or spending a txid an earlier commit
-    /// removed, is withheld so a refused parent never leaves a partial family.
-    /// A guard issued by a different gateway admits nothing and returns an
-    /// empty result: the odd value alone is not authority.
-    ///
-    /// Every candidate is admitted with `LimitEnforcement::Deferred`,
-    /// the equivalent of Core passing `bypassLimits = true` to
-    /// `AcceptToMemoryPool` from its disconnect walk — derived from the held
-    /// `ChainChangeGuard`, not the caller-declared origin. The mempool fee
-    /// floor and the per-acceptance size trim are therefore not applied here:
-    /// a disconnected transaction satisfied them on the way in, and trimming
-    /// per admission would shed a parent before the child that spends it is
-    /// re-admitted. Consensus and script verification, duplicate and
-    /// evicted-parent rejection, ancestry accounting, the replacement fee
-    /// rules, and the topology gates Core still runs under `bypassLimits` —
-    /// cluster limits, TRUC, and ephemeral-spend checks — all still apply.
-    ///
-    /// POST: the pool may exceed its `max_total_bytes` ceiling when this
-    /// returns. The caller owns the one size trim over the settled pool; see
-    /// [`MempoolGateway::enforce_size_limit`] and `settle_node_reorg` in the
-    /// node crate.
     pub fn reconsider_disconnected(
         &self,
         change: &crate::gateway::ChainChangeGuard,
@@ -675,10 +566,6 @@ impl MempoolGateway {
         Err(SubmitError::RetryExhausted)
     }
 
-    /// Reports a post-admission full refusal if an admitted member is no longer
-    /// resident (e.g. removed by expiry or concurrent capacity trim). Admission plans
-    /// publish acceptance before expiry in one atomic commit, with capacity
-    /// computed after expiry. Reorg bypass is unchanged.
     pub(crate) fn check_admitted_residency(
         &self,
         origin: AdmissionOrigin,
@@ -697,9 +584,6 @@ impl MempoolGateway {
         Ok(())
     }
 
-    /// Processes the current bounded ready set once. Work remains resident
-    /// when generation changes, and no call immediately consumes its own retry
-    /// again.
     pub fn retry_orphans(&self, chain: &dyn AdmissionChain, time: u64) -> Vec<OrphanRetry> {
         let ready = {
             let _pool = self.pool.read();
@@ -744,8 +628,6 @@ impl MempoolGateway {
         results
     }
 
-    /// Applies the orphan retention policy to one snapshot of live
-    /// connections.
     pub fn maintain_orphans(
         &self,
         time: u64,
@@ -755,9 +637,6 @@ impl MempoolGateway {
         self.lifecycle.lock().orphans.maintain(time, &live_peers)
     }
 
-    /// Called for committed connect/disconnect, including ones with no pool
-    /// mutation. The caller keeps the chain-change generation fenced until
-    /// consumers settle.
     pub fn chain_changed(&self, available_parents: &[Txid]) {
         let _pool = self.pool.read();
         let mut lifecycle = self.lifecycle.lock();
@@ -767,11 +646,6 @@ impl MempoolGateway {
         }
     }
 
-    /// Records a committed snapshot replacement while admission remains fenced.
-    /// A snapshot can supply inputs for any resident orphan. Schedule one bounded
-    /// reconsideration through the existing ready set; normal retries validate and
-    /// admit only after the chain-change guard settles. This is native snapshot
-    /// policy, not Bitcoin Core's reject-cache-only active-tip notification.
     pub fn snapshot_changed(&self) {
         let _pool = self.pool.read();
         let mut lifecycle = self.lifecycle.lock();
@@ -779,7 +653,6 @@ impl MempoolGateway {
         lifecycle.orphans.mark_all_ready();
     }
 
-    /// Inventory membership includes resident orphans and recent peer rejects.
     #[must_use]
     pub fn have_tx(&self, hash: Hash256, wtxid: bool) -> bool {
         let pool = self.pool.read();
@@ -796,14 +669,12 @@ impl MempoolGateway {
             || (wtxid && lifecycle.orphans.get(Wtxid::from(hash)).is_some())
     }
 
-    /// Returns an accepted mempool transaction body by txid.
     #[must_use]
     pub fn get_tx(&self, txid: Txid) -> Option<Tx> {
         let pool = self.pool.read();
         pool.transaction_by_txid(&txid).map(|tx| (*tx).clone())
     }
 
-    /// Returns an accepted or resident orphan transaction body by witness txid.
     #[must_use]
     pub fn get_tx_by_wtxid(&self, wtxid: Wtxid) -> Option<Tx> {
         let pool = self.pool.read();
@@ -817,30 +688,18 @@ impl MempoolGateway {
             .map(|held| (*held.tx).clone())
     }
 
-    /// Number of resident orphan transaction bodies.
-    ///
-    /// Test seam: peer-eviction assertions in this crate's and the node's
-    /// suites read it; production inventory suppression goes through
-    /// `have_tx`/`rejects_inventory`, never a count.
     #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn orphan_count(&self) -> usize {
         self.lifecycle.lock().orphans.len()
     }
 
-    /// Number of retained rejection hashes with transaction or witness scope.
-    ///
-    /// Test seam: reject-cache assertions only.
     #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn recent_rejects_count(&self) -> usize {
         self.lifecycle.lock().rejects_len()
     }
 
-    /// Whether a hash belongs to the bounded recent peer rejection cache.
-    ///
-    /// Test seam: reject-cache assertions only; production checks
-    /// `rejects_inventory`/`rejects_transaction` for scope.
     #[cfg(any(test, feature = "test-seam"))]
     #[must_use]
     pub fn is_rejected(&self, hash: Hash256) -> bool {

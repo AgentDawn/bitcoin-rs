@@ -88,7 +88,6 @@ fn insert_parent(gateway: &MempoolGateway, parent: Tx, origin: AdmissionOrigin) 
     assert!(inserted.is_ok());
 }
 
-// MPL-04: parent readiness belongs to the commit, not observer delivery.
 #[test]
 fn parent_commit_without_observers_retries_orphan_with_original_source() {
     for origin in [
@@ -129,7 +128,6 @@ fn parent_commit_without_observers_retries_orphan_with_original_source() {
     }
 }
 
-// MPL-04: local failures do not populate peer lifecycle state.
 #[test]
 fn rpc_missing_inputs_does_not_create_peer_lifecycle_state() {
     for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Esplora] {
@@ -145,7 +143,6 @@ fn rpc_missing_inputs_does_not_create_peer_lifecycle_state() {
     }
 }
 
-// POL-01: a local resubmission of a member succeeds without changes.
 #[test]
 fn local_submission_answers_membership_as_success_without_changes() {
     for origin in [LocalOrigin::Rpc, LocalOrigin::Esplora] {
@@ -169,7 +166,6 @@ fn local_submission_answers_membership_as_success_without_changes() {
     }
 }
 
-// MPL-04: nonexistent outputs of resident parents cannot become orphans.
 #[test]
 fn nonexistent_mempool_output_is_rejected_without_holding_or_mutating() {
     for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Peer(source())] {
@@ -195,18 +191,12 @@ fn nonexistent_mempool_output_is_rejected_without_holding_or_mutating() {
     }
 }
 
-/// Every identity the reconstruction walk offers, in visit order.
 fn reconstruction_identities(gateway: &MempoolGateway) -> Vec<(Txid, Wtxid)> {
     let mut seen = Vec::new();
     gateway.for_each_reconstruction_identity(|txid, wtxid| seen.push((txid, wtxid)));
     seen
 }
 
-/// A standard-shaped spend of `outpoint` whose output script is
-/// nonstandard and whose owned memory, as the pool's own
-/// `transaction_heap_usage` reports it, is exactly `heap` bytes. The
-/// padding is derived from that accounting owner, never from struct sizes
-/// copied into the test.
 fn nonstandard_with_heap_usage(outpoint: OutPoint, marker: u8, heap: usize) -> Tx {
     let build = |padding: usize| {
         let mut tx = standard_spend(outpoint, marker);
@@ -236,8 +226,6 @@ fn funded_coin() -> (OutPoint, Coins) {
     (coin, chain)
 }
 
-// BIP152 extras: a held orphan stays reconstructable after the orphan
-// pool releases it, and never becomes inventory or a served body.
 #[test]
 fn held_orphan_is_retained_for_reconstruction_only() {
     let gateway = gateway();
@@ -272,7 +260,6 @@ fn held_orphan_is_retained_for_reconstruction_only() {
     );
 }
 
-// BIP152 extras: a promoted orphan is offered once, as a pool entry.
 #[test]
 fn promoted_orphan_is_offered_once_and_served_from_the_pool() {
     let gateway = gateway();
@@ -303,7 +290,6 @@ fn promoted_orphan_is_offered_once_and_served_from_the_pool() {
     );
 }
 
-// BIP152 extras: two witness variants of one txid are two identities.
 #[test]
 fn witness_variants_of_one_txid_are_retained_distinctly() {
     let gateway = gateway();
@@ -346,7 +332,6 @@ fn witness_variants_of_one_txid_are_retained_distinctly() {
     );
 }
 
-// BIP152 extras: the ring holds 100 bodies and drops the oldest first.
 #[test]
 fn peer_orphans_beyond_the_ring_capacity_drop_the_oldest_first() {
     let gateway = gateway();
@@ -381,8 +366,6 @@ fn peer_orphans_beyond_the_ring_capacity_drop_the_oldest_first() {
     );
 }
 
-// BIP152 extras: a body offered by the walk can be evicted before its
-// lookup; the lookup then answers `None` and never another body.
 #[test]
 fn ring_body_evicted_between_walk_and_lookup_is_absent() {
     let gateway = gateway();
@@ -415,8 +398,6 @@ fn ring_body_evicted_between_walk_and_lookup_is_absent() {
     assert_eq!(gateway.reconstruction_tx_by_txid(offered.txid()), None);
 }
 
-// BIP152 extras: only the typed policy class below the owned-memory gate
-// is kept. The boundary bodies come from the pool's own heap accounting.
 #[test]
 fn peer_policy_refusal_is_retained_only_below_the_memory_gate() {
     let (coin, chain) = funded_coin();
@@ -445,9 +426,6 @@ fn peer_policy_refusal_is_retained_only_below_the_memory_gate() {
     }
 }
 
-// BIP152 extras: the gate follows owned memory, not wire bytes. Two bodies
-// with one consensus serialization (one wtxid) fall on opposite sides of
-// the gate when only the spare capacity of their input vector differs.
 #[test]
 fn peer_policy_refusal_gate_follows_owned_memory_not_wire_size() {
     let (coin, chain) = funded_coin();
@@ -482,10 +460,6 @@ fn peer_policy_refusal_gate_follows_owned_memory_not_wire_size() {
     }
 }
 
-// BIP152 extras: the gate counts reserved script capacity, not just wire
-// bytes. Bodies with one consensus serialization (one wtxid) fall on
-// opposite sides of the gate when only spare script capacity differs;
-// charging length here would retain the roomy bodies.
 #[test]
 fn peer_policy_refusal_gate_counts_script_spare_capacity() {
     let (coin, chain) = funded_coin();
@@ -530,10 +504,6 @@ fn peer_policy_refusal_gate_counts_script_spare_capacity() {
     }
 }
 
-// BIP152 extras: the gate counts reserved witness capacity, outer stack
-// and items alike. The witness variants carry different bytes than the
-// control, so only the heap accounting and the retention verdicts are
-// compared; charging length here would retain both roomy bodies.
 #[test]
 fn peer_policy_refusal_gate_counts_witness_spare_capacity() {
     let (coin, chain) = funded_coin();
@@ -574,13 +544,11 @@ fn peer_policy_refusal_gate_counts_witness_spare_capacity() {
     }
 }
 
-// BIP152 extras: refusals made for local callers are never retained.
 #[test]
 fn local_origin_policy_refusal_is_not_retained() {
     let (coin, chain) = funded_coin();
     for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Esplora] {
         let gateway = gateway();
-        // Below the memory gate, so only the origin refuses retention.
         let tx = Arc::new(nonstandard_with_heap_usage(
             coin,
             3,
@@ -596,7 +564,6 @@ fn local_origin_policy_refusal_is_not_retained() {
     }
 }
 
-// BIP152 extras: a consensus failure is invalid data, not a policy refusal.
 #[test]
 fn consensus_refusal_is_not_retained_for_reconstruction() {
     let gateway = gateway();
@@ -623,8 +590,6 @@ fn consensus_refusal_is_not_retained_for_reconstruction() {
     assert_eq!(reconstruction_identities(&gateway), vec![]);
 }
 
-// BIP152 extras: a spend of an output no resident parent has can never be
-// in a block, so its refusal is not retained.
 #[test]
 fn unspendable_pool_outpoint_refusal_is_not_retained_for_reconstruction() {
     let gateway = gateway();
@@ -647,7 +612,6 @@ fn unspendable_pool_outpoint_refusal_is_not_retained_for_reconstruction() {
     assert_eq!(gateway.reconstruction_tx_by_wtxid(invalid.wtxid()), None);
 }
 
-// MPL-04: changed pool facts must rebuild a normal chain lookup.
 #[test]
 fn no_chain_invalid_attempt_rebuilds_after_its_parent_leaves_the_pool()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -792,7 +756,6 @@ fn assert_verified_admission_rebuilds_after_change(
     Ok(())
 }
 
-// MPL-04: arrival resolves missing ancestry without retaining invalid outputs.
 #[test]
 fn absent_parent_is_held_but_its_nonexistent_output_is_rejected_on_retry() {
     let gateway = gateway();
@@ -824,7 +787,6 @@ fn absent_parent_is_held_but_its_nonexistent_output_is_rejected_on_retry() {
     assert_eq!(gateway.retry_orphans(&Coins(vec![]), 3), []);
 }
 
-// MPL-04: only the resident body's claim may mutate its lifecycle state.
 #[test]
 fn stale_invalid_outpoint_claim_cannot_reject_a_refreshed_orphan() {
     let gateway = gateway();
@@ -894,7 +856,6 @@ fn stale_invalid_outpoint_claim_cannot_reject_a_refreshed_orphan() {
     assert_eq!(gateway.recent_rejects_count(), 0);
 }
 
-// MPL-04: witness rejection does not poison another body with the same txid.
 #[test]
 fn rejected_witness_does_not_suppress_a_valid_body_with_the_same_txid() {
     let gateway = gateway();
@@ -928,7 +889,6 @@ fn rejected_witness_does_not_suppress_a_valid_body_with_the_same_txid() {
     ));
 }
 
-// MPL-04: stripped-body rejects cannot suppress txid inventory or valid admission.
 #[test]
 fn rejected_stripped_body_does_not_suppress_its_valid_witness_variant() {
     use bitcoin::hashes::{Hash as _, sha256};
@@ -974,7 +934,6 @@ fn rejected_stripped_body_does_not_suppress_its_valid_witness_variant() {
     assert!(gateway.have_tx(Hash256::from(valid.wtxid()), true));
 }
 
-// MPL-04: shared preparation carries BIP141 accounting into committed entries.
 #[test]
 fn submission_carries_prepared_fee_size_and_weighted_sigops_into_entry() {
     for origin in [AdmissionOrigin::Rpc, AdmissionOrigin::Peer(source())] {
@@ -995,14 +954,12 @@ fn submission_carries_prepared_fee_size_and_weighted_sigops_into_entry() {
         };
         assert_eq!(entry.fee, 1_000);
         assert_eq!(u64::from(entry.bip141_vsize), child.vsize());
-        // The sole legacy CHECKSIG in the output costs four BIP141 units.
         assert_eq!(entry.sigop_cost, 4);
         assert_eq!(entry.time, now);
         assert_eq!(entry.height, 1);
     }
 }
 
-// MPL-04: chain notifications clear rejects but cannot consume odd-generation work.
 #[test]
 fn chain_change_with_no_pool_mutation_clears_rejects_and_preserves_odd_ready_work() {
     let gateway = gateway();
@@ -1051,7 +1008,6 @@ fn chain_change_with_no_pool_mutation_clears_rejects_and_preserves_odd_ready_wor
     assert!(matches!(retried[0].result, Ok(SubmitOutcome::Committed(_))));
 }
 
-// MPL-04: exhausted retries remain resident and retry only on a later poll.
 #[test]
 fn exhausted_ready_retry_stays_bounded_and_is_retried_on_later_poll() {
     let gateway = gateway();
@@ -1104,7 +1060,6 @@ impl AdmissionChain for ParentArrivesDuringPreparation {
     }
 }
 
-// MPL-04: preparation cannot lose a parent commit between resolution and holding.
 #[test]
 fn parent_commit_between_resolution_and_hold_cannot_lose_the_only_wake() {
     let gateway = gateway();
@@ -1158,7 +1113,6 @@ impl AdmissionChain for TipChangesDuringPreparation {
     }
 }
 
-// MPL-04: changed generation invalidates rejection facts before publication.
 #[test]
 fn changed_chain_rebuilds_invalid_facts_before_recording_peer_rejection() {
     let gateway = gateway();
@@ -1186,7 +1140,6 @@ impl AdmissionChain for Confirmed {
     }
 }
 
-// MPL-04: confirmed-chain facts suppress peers, not RPC admission by cache lookup.
 #[test]
 fn confirmed_lookup_suppresses_peers_but_is_not_rpc_membership() {
     let gateway = gateway();
@@ -1213,7 +1166,6 @@ fn confirmed_lookup_suppresses_peers_but_is_not_rpc_membership() {
     ));
 }
 
-// MPL-04: only standard, non-coinbase missing-input bodies may be held.
 #[test]
 fn coinbase_and_nonstandard_missing_transactions_are_not_held() {
     let gateway = gateway();
@@ -1279,7 +1231,6 @@ impl AdmissionChain for ReplaceOrphanDuringSnapshot {
     }
 }
 
-// MPL-04: retired retry claims cannot commit, hold, reject, or requeue work.
 #[test]
 fn refreshed_or_evicted_retry_claim_cannot_commit_hold_reject_or_requeue() {
     for refresh in [true, false] {
@@ -1352,7 +1303,6 @@ fn refreshed_or_evicted_retry_claim_cannot_commit_hold_reject_or_requeue() {
     }
 }
 
-// MPL-04: base-invalid outpoints reject without orphan retention or pool mutation.
 #[test]
 fn known_parent_invalid_output_is_rejected_without_orphan_retention() {
     let gateway = gateway();
@@ -1398,7 +1348,6 @@ fn known_parent_invalid_output_is_rejected_without_orphan_retention() {
     );
 }
 
-// MPL-04: parent arrival retires impossible orphan inputs through atomic rejection.
 #[test]
 fn orphan_retry_removes_known_invalid_outpoint_after_parent_arrival() {
     let gateway = gateway();
@@ -1449,8 +1398,6 @@ fn witness_spend() -> (Arc<Tx>, Coins) {
     (tx, chain)
 }
 
-/// POL-01 / BIP141: package prevouts retain the scripts used by accounting.
-/// <https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#sigops>
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -1562,9 +1509,6 @@ fn package_prevouts_preserve_sigops_without_mutating_the_pool()
     Ok(())
 }
 
-/// POL-01 / BIP141 P2WSH: the witness script must match the output's
-/// SHA256 commitment and succeed. Core v31.1 applies `PolicyScriptChecks`
-/// before test-accept success (validation.cpp `AcceptSingleTransaction`).
 #[test]
 fn preview_matches_submission_and_has_no_side_effects() -> Result<(), Box<dyn std::error::Error>> {
     struct Observer(AtomicUsize);
@@ -1650,8 +1594,6 @@ fn preview_matches_submission_and_has_no_side_effects() -> Result<(), Box<dyn st
     Ok(())
 }
 
-/// Core applies maxfeerate only to an admission-valid result; both entry
-/// points must report the script failure before the RPC fee guard.
 #[test]
 fn preview_and_submission_check_scripts_before_maxfeerate() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1681,8 +1623,6 @@ fn preview_and_submission_check_scripts_before_maxfeerate() -> Result<(), Box<dy
     Ok(())
 }
 
-/// MPL-04: provisional preview facts are discarded after any relevant
-/// source changes; the same four-attempt bound applies to preview.
 #[test]
 fn preview_retries_chain_pool_and_policy_changes() -> Result<(), Box<dyn std::error::Error>> {
     struct ChangingRead {
@@ -1752,11 +1692,8 @@ fn preview_retries_chain_pool_and_policy_changes() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-// MPL-04: witness-scoped rejects preserve txid inventory and alternative witnesses.
 #[test]
 fn witness_rejection_preserves_valid_variant_and_legacy_inventory() {
-    // BIP141 P2WSH commits to SHA256(witnessScript), excluding witness
-    // data from txid. Rejection must not suppress a correct script body.
     for stripped in [false, true] {
         let gateway = gateway();
         let (valid, chain) = witness_spend();
@@ -1800,7 +1737,6 @@ fn witness_rejection_preserves_valid_variant_and_legacy_inventory() {
     }
 }
 
-// MPL-04: a rejected witness cannot retire a different resident body or its retry.
 #[test]
 fn fresh_invalid_witness_preserves_a_different_resident_orphan_variant() {
     let gateway = gateway();
@@ -1852,8 +1788,6 @@ fn fresh_invalid_witness_preserves_a_different_resident_orphan_variant() {
     );
 }
 
-/// A parent paying a P2WSH `OP_DROP OP_TRUE` script, so that two
-/// different witnesses of one transaction are both valid.
 fn p2wsh_parent_and_variants() -> (Tx, Arc<Tx>, Arc<Tx>) {
     use bitcoin::hashes::{Hash as _, sha256};
 
@@ -1941,8 +1875,6 @@ fn same_txid_different_witnesses_both_survive_and_retry_after_parent() {
     assert!(gateway.read().contains_txid(&first.txid()));
 }
 
-// MPL-04 and Core COutPoint::IsNull: zero-hash vout 0 is an ordinary
-// non-null outpoint, so missing-parent requests, indexing and coin lookup agree.
 #[test]
 fn zero_hash_output_zero_is_requested_and_retried_as_an_ordinary_outpoint() {
     use bitcoin::hashes::Hash as _;
@@ -1983,8 +1915,6 @@ fn zero_hash_output_zero_is_requested_and_retried_as_an_ordinary_outpoint() {
     assert_eq!(gateway.orphan_count(), 0);
 }
 
-// MPL-04 / Core CheckTransaction: a true null prevout in any non-coinbase
-// input is invalid and must not consume orphan capacity.
 #[test]
 fn null_input_in_a_non_coinbase_transaction_is_not_held() {
     let reference = bitcoin::OutPoint::null();
@@ -2074,9 +2004,6 @@ fn assert_input_structure_rejection(mut tx: Tx, coins: Coins) {
     assert_eq!(gateway.read().sequence_number(), 0);
 }
 
-// MPL-04; Core v31.1 CheckTransaction rejects duplicate/null outpoints
-// independently of witness bytes and without requiring previous outputs:
-// https://github.com/bitcoin/bitcoin/blob/v31.1/src/consensus/tx_check.cpp
 #[test]
 fn input_structure_duplicate_rejection_is_shared_across_witnesses() {
     let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[91; 32])), 0);
@@ -2136,12 +2063,8 @@ impl crate::MempoolObserver for ReorgRecording {
     }
 }
 
-/// One committed batch: its origin and the per-transaction outcomes it
-/// produced.
 type ReorgBatch = (AdmissionOrigin, Vec<(Txid, crate::MutationOutcome)>);
 
-/// Records each committed batch with its origin and outcomes, keeping
-/// batch boundaries so a test can pin publication order.
 #[derive(Default)]
 struct ReorgBatchLog(Mutex<Vec<ReorgBatch>>);
 
@@ -2180,12 +2103,6 @@ fn funded_chain(outpoint: OutPoint, value: u64) -> Coins {
     )])
 }
 
-/// Seeds a live rolling floor with a real capacity eviction, then clears
-/// the filler as mined removals so the witness family below starts from
-/// an empty pool while the stamped floor holds inside the ten-second
-/// decay grace at `now`. Either a committed trim or a valid Full refusal
-/// raises the floor through the production `TrimToSize` bump path gated
-/// by validity and max-fee; occupancy alone never does.
 fn seed_rolling_floor_via_capacity_eviction(gateway: &Arc<MempoolGateway>, now: u64) {
     let markers = [100u8, 101, 102, 103, 104];
     let funded = Coins(
@@ -2236,8 +2153,6 @@ fn seed_rolling_floor_via_capacity_eviction(gateway: &Arc<MempoolGateway>, now: 
     );
 }
 
-/// MPL-04: the guard's odd fence re-admits a dependency-ordered batch
-/// through the shared evaluator, publishing `Reorg` in order.
 #[test]
 #[expect(clippy::expect_used)]
 fn reconsider_disconnected_admits_parent_then_child_under_the_guard() {
@@ -2269,8 +2184,6 @@ fn reconsider_disconnected_admits_parent_then_child_under_the_guard() {
     );
 }
 
-/// MPL-04: a parent that is not final at the lower tip is refused and its
-/// descendant withheld, so no partial family is left behind.
 #[test]
 #[expect(clippy::expect_used)]
 fn reconsider_disconnected_withholds_descendants_of_a_refused_parent() {
@@ -2294,8 +2207,6 @@ fn reconsider_disconnected_withholds_descendants_of_a_refused_parent() {
     assert!(observer.0.lock().is_empty());
 }
 
-/// MPL-04: reorg re-admission runs script verification like any other
-/// admission — a bad-witness candidate is refused, not force-inserted.
 #[test]
 #[expect(clippy::expect_used)]
 fn reconsider_disconnected_refuses_a_script_failure() {
@@ -2316,8 +2227,6 @@ fn reconsider_disconnected_refuses_a_script_failure() {
     assert!(gateway.read().is_empty());
 }
 
-/// Reorg re-admission is not new fee evidence: the estimator must not see
-/// the re-entered transaction, matching Core's `validForFeeEstimation=false`.
 #[test]
 #[expect(clippy::expect_used)]
 fn reconsider_disconnected_does_not_register_with_the_estimator() {
@@ -2361,8 +2270,6 @@ fn reconsider_disconnected_does_not_register_with_the_estimator() {
     assert_ne!(gateway.read().estimator_history(), before);
 }
 
-/// A disconnected family re-enters whole below the rolling floor, and the
-/// pool is trimmed once only after the walk and the resident sweep.
 #[test]
 #[expect(clippy::expect_used)]
 fn reconsider_disconnected_admits_below_floor_then_trims_once() {
@@ -2446,9 +2353,6 @@ fn reconsider_disconnected_admits_below_floor_then_trims_once() {
     assert_reorg_publication_order(&log.0.lock(), &[parent_txid, child_txid], child_txid);
 }
 
-/// Pins the batch log for one reorg settlement: every reorg admission
-/// precedes the single policy-eviction batch, the trim publishes as Reorg
-/// shedding `trimmed_txid`, and nothing commits after it.
 #[expect(clippy::expect_used)]
 fn assert_reorg_publication_order(batches: &[ReorgBatch], admissions: &[Txid], trimmed_txid: Txid) {
     let is_eviction = |(_, changes): &ReorgBatch| {
@@ -2505,10 +2409,6 @@ fn assert_reorg_publication_order(batches: &[ReorgBatch], admissions: &[Txid], t
     );
 }
 
-/// The deferral is scoped to the reorg origin: with a live rolling floor
-/// from a real capacity eviction, the same child offered as fresh relay
-/// is refused, so the gates are live and only the fenced reorg origin
-/// defers them.
 #[test]
 #[expect(clippy::expect_used)]
 fn reconsider_control_refuses_fresh_relay_below_floor() {
@@ -2562,9 +2462,6 @@ fn reconsider_control_refuses_fresh_relay_below_floor() {
     );
 }
 
-/// The sweep removes residents the lower tip no longer supports �� a
-/// missing-input parent together with its descendant, and a resident whose
-/// locktime is no longer final — while a supported entry stays.
 #[test]
 #[expect(clippy::expect_used)]
 fn remove_for_reorg_sweeps_only_unsupported_residents() {
@@ -2627,7 +2524,6 @@ fn remove_for_reorg_sweeps_only_unsupported_residents() {
     assert_eq!(gateway.read().len(), 1);
 }
 
-/// A moved fence sweeps nothing: the commit re-checks the exact odd value.
 #[test]
 #[expect(clippy::expect_used)]
 fn remove_for_reorg_refuses_a_moved_generation() {
@@ -2650,10 +2546,6 @@ fn remove_for_reorg_refuses_a_moved_generation() {
     assert!(gateway.read().contains_txid(&parent_txid));
 }
 
-/// The admission gate compares the token through the fence: an even
-/// token is refused while the generation is odd, an odd token under the
-/// stable fence is refused too — the integer alone is not authority —
-/// and the guard's chain-change fence admits only its own odd value.
 #[test]
 #[expect(clippy::expect_used)]
 fn admission_state_accepts_only_the_current_generation() {
@@ -2722,7 +2614,6 @@ fn admission_state_accepts_only_the_current_generation() {
     change.finish().expect("finish");
 }
 
-/// A guard issued by another gateway carries no authority here:
 #[test]
 #[expect(clippy::expect_used)]
 fn reorg_methods_refuse_a_guard_from_another_gateway() {
@@ -2747,7 +2638,6 @@ fn reorg_methods_refuse_a_guard_from_another_gateway() {
     guard_b.finish().expect("finish b");
 }
 
-/// A gateway whose observer keeps every committed batch.
 fn batch_logged_gateway() -> (Arc<ReorgBatchLog>, Arc<MempoolGateway>) {
     let log = Arc::new(ReorgBatchLog::default());
     let leg: Arc<dyn crate::MempoolObserver> = log.clone();
@@ -2760,7 +2650,6 @@ fn batch_logged_gateway() -> (Arc<ReorgBatchLog>, Arc<MempoolGateway>) {
     (log, gateway)
 }
 
-/// A funded standard spend that is admissible as fresh relay.
 fn independent_spend(marker: u8) -> (Arc<Tx>, Coins) {
     let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[marker; 32])), 0);
     let tx = standard_spend(outpoint, marker);
@@ -2836,8 +2725,6 @@ fn expiry_capacity_ordering_under_pressure() {
     }
 }
 
-/// Residents stamped with time zero are older than the mempool lifetime
-/// against any wall clock, without sleeping.
 fn insert_stale(gateway: &MempoolGateway, tx: Arc<Tx>) {
     let vsize = u32::try_from(tx.vsize()).unwrap_or(80);
     let inserted = gateway.insert_entry(
@@ -2854,9 +2741,6 @@ fn expired(txid: Txid) -> (Txid, crate::MutationOutcome) {
     )
 }
 
-// Core `LimitMempoolSize` expiry: an accepted admission removes entries
-// older than the mempool lifetime, ordered inside the same atomic batch
-// as its acceptance.
 #[test]
 fn committed_admission_publishes_acceptance_before_expiry_atomically() {
     let (log, gateway) = batch_logged_gateway();
@@ -2892,9 +2776,6 @@ fn committed_admission_publishes_acceptance_before_expiry_atomically() {
     );
 }
 
-// Expiry removes descendants with an expired ancestor: the child accepted
-// above a stale parent is gone before the caller sees success, so the
-// submission is refused as full while its commit stays published.
 #[test]
 fn child_of_a_stale_parent_expires_with_it_and_is_refused_as_full() {
     for package in [false, true] {
@@ -2975,8 +2856,6 @@ fn child_of_a_stale_parent_expires_with_it_and_is_refused_as_full() {
     }
 }
 
-// Re-admission after a disconnect never expires: neither the reorg origin
-// nor the chain-change fence reaches the expiry pass.
 #[test]
 #[expect(clippy::expect_used)]
 fn reorg_origin_and_chain_change_fence_never_expire() {
@@ -3007,8 +2886,6 @@ fn reorg_origin_and_chain_change_fence_never_expire() {
     );
 }
 
-// The chain-change fence alone skips expiry even for a non-reorg origin:
-// without this arm, dropping it would expire the stale entry here.
 #[test]
 #[expect(clippy::expect_used)]
 fn chain_change_fence_skips_expiry_for_a_non_reorg_origin() {

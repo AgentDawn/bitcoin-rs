@@ -1,8 +1,4 @@
 //! Minimal SOCKS5 client (RFC 1928, username/password auth per RFC 1929).
-//!
-//! Overlay hostnames are carried as SOCKS domain names (`ATYP=0x03`) and
-//! are resolved by the proxy, never by the system resolver. There is no
-//! direct-TCP fallback: every failure is a transport error.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -12,12 +8,9 @@ use bitcoin::secp256k1::rand::{RngCore, thread_rng};
 
 use crate::endpoint::DialFailure;
 
-/// Target of a SOCKS `CONNECT`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SocksTarget {
-    /// Literal IP target (no name resolution anywhere).
     Ip(SocketAddr),
-    /// Domain target resolved by the proxy (`ATYP=0x03`).
     Domain(String, u16),
 }
 
@@ -97,8 +90,6 @@ fn random_credentials() -> ([u8; 16], [u8; 16]) {
 }
 
 fn authenticate_isolated(stream: &mut TcpStream, deadline: Instant) -> Result<(), DialFailure> {
-    // The handshake must not offer or accept SOCKS no-auth (0x00).
-    // Only RFC1929 username/password auth (0x02) is offered.
     write_all_deadline(stream, &[0x05, 0x01, 0x02], deadline)?;
     let mut selection = [0u8; 2];
     read_exact_deadline(stream, &mut selection, deadline)?;
@@ -108,13 +99,9 @@ fn authenticate_isolated(stream: &mut TcpStream, deadline: Instant) -> Result<()
         )));
     }
     match selection[1] {
-        0x00 => {
-            // Isolation-required dials must not silently downgrade
-            // to an unauthenticated, non-isolated stream.
-            Err(DialFailure::Transport(invalid(
-                "socks proxy selected no-authentication for an isolation-required dial",
-            )))
-        }
+        0x00 => Err(DialFailure::Transport(invalid(
+            "socks proxy selected no-authentication for an isolation-required dial",
+        ))),
         0x02 => {
             let (user, password) = random_credentials();
             let mut auth = [0u8; AUTH_LEN];
@@ -170,8 +157,6 @@ fn read_connect_reply(stream: &mut TcpStream, deadline: Instant) -> Result<(), D
             reply_kind(head[1]),
             format!("socks connect failed with reply code {}", head[1]),
         );
-        // Only 0x05 (ConnectionRefused) is genuine peer evidence;
-        // route/network unreachable, TTL expired, and local proxy failures are Transport.
         return Err(match head[1] {
             0x05 => DialFailure::PeerUnreachable(error),
             _ => DialFailure::Transport(error),
@@ -196,14 +181,6 @@ fn read_connect_reply(stream: &mut TcpStream, deadline: Instant) -> Result<(), D
     Ok(())
 }
 
-/// Dial `target` through the SOCKS5 proxy at `proxy`.
-///
-/// When `isolate` is set, RFC 1929 authentication with fresh per-dial
-/// credentials is required (Tor stream isolation). Otherwise no-auth is
-/// used. The whole exchange is bounded by `timeout` socket deadlines.
-/// Local proxy failures are [`DialFailure::Transport`]; only a proxy
-/// report that the peer itself is unreachable is
-/// [`DialFailure::PeerUnreachable`].
 pub(crate) fn socks_connect(
     proxy: SocketAddr,
     target: &SocksTarget,
@@ -255,8 +232,6 @@ pub(crate) fn socks_connect(
 
     read_connect_reply(&mut stream, deadline)?;
 
-    // The bridged stream carries the connection from here; per-socket
-    // deadlines were for the handshake only.
     stream
         .set_read_timeout(None)
         .map_err(DialFailure::Transport)?;

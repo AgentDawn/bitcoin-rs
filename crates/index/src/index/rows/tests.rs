@@ -6,7 +6,6 @@ use bitcoin_rs_storage::{BatchOp, BufferedWriteBatch, ColumnFamily};
 use super::*;
 use crate::types::{HashPrefixRow, ScriptHash, ScriptLiveRow, TxPosition};
 
-/// Reads the target family of one recorded operation.
 fn op_cf(op: &BatchOp) -> ColumnFamily {
     match op {
         BatchOp::Put { cf, .. } | BatchOp::Delete { cf, .. } | BatchOp::DeleteRange { cf, .. } => {
@@ -38,9 +37,11 @@ fn positioned_rows() -> Vec<PositionedRow> {
     ]
 }
 
-// Contract: `docs/benchmarks/scriptindex-format.md`, § Logical vs physical bytes
-// (rows 163-181), together with `crates/index/src/index/rows.rs`'s
-// `for_each_row_group` contract: one stored key retains all numeric positions.
+/// Byte contract (`docs/benchmarks/scriptindex-format.md` § Logical vs physical
+/// bytes): `tx_lookup` 42 = 24 prefix + 18 pos; `script_history` 84; headers 80;
+/// `script_live` 86; filters 101.
+///
+/// Family total equals `encoded_bytes`; physical put bytes match the family total.
 #[test]
 fn family_bytes_accounting() -> Result<(), IndexError> {
     let outpoint1 = OutPoint::new(Txid(Hash256::from_le_bytes(&[1; 32])), 0);
@@ -67,24 +68,16 @@ fn family_bytes_accounting() -> Result<(), IndexError> {
     let family = rows.encoded_bytes_by_family()?;
     let total_bytes = rows.encoded_bytes()?;
 
-    // Total equivalence contract: family total must equal encoded_bytes.
     assert_eq!(family.total()?, total_bytes);
 
-    // Verify each family accounts for its exact logical bytes:
-    // tx_lookup: 2 distinct keys * 12 bytes prefix + 3 positions * 6 bytes = 24 + 18 = 42.
     assert_eq!(family.tx_lookup, 42);
-    // script_history: funding (24 prefix + 18 pos) + spending (24 prefix + 18 pos) = 84.
     assert_eq!(family.script_history, 84);
-    // headers: 1 header * 80 bytes = 80.
     assert_eq!(family.headers, 80);
-    // script_live: 2 distinct live ops * 43 bytes = 86.
     assert_eq!(family.script_live, 86);
-    // filters: 1 filter row * (34 key + 64 header/hash + 3 filter bytes) = 101.
     assert_eq!(family.filters, 101);
 
     assert_eq!(total_bytes, 42 + 84 + 80 + 86 + 101);
 
-    // Put rows into a write batch and verify physical put bytes match family total.
     let mut puts = BufferedWriteBatch::default();
     put_rows(&mut puts, &rows);
     let emitted_bytes: usize = puts
@@ -98,7 +91,6 @@ fn family_bytes_accounting() -> Result<(), IndexError> {
         .sum();
     assert_eq!(emitted_bytes, total_bytes);
 
-    // PreparedBatch accumulator preservation.
     let mut batch =
         super::super::prepared::PreparedBatch::new(super::super::prepared::PreparedBatchLimits {
             max_rows: 100,
@@ -192,7 +184,6 @@ fn family_byte_histograms_recording() {
         Some(&vec![101.0])
     );
 
-    // Zero-size semantics: families with 0 bytes are not emitted.
     let partial_family = IndexRowBytes {
         tx_lookup: 100,
         script_history: 0,
@@ -319,11 +310,6 @@ fn groups_preserve_distinct_keys_and_numeric_positions() {
     assert_eq!(empty_groups, 0);
 }
 
-// Contract: `docs/benchmarks/scriptindex-format.md`, § Logical vs physical
-// bytes (rows 163-181), and `crates/index/src/index/rows.rs`'s
-// `PendingRows::encoded_bytes`/`delete_rows` contracts: emitted logical bytes
-// match row accounting, and shared block-header identity is retained unless
-// explicitly requested for deletion.
 #[test]
 fn row_accounting_matches_emitted_bytes_and_shared_header_deletion() -> Result<(), IndexError> {
     let mut rows = PendingRows {
@@ -388,11 +374,6 @@ fn row_accounting_matches_emitted_bytes_and_shared_header_deletion() -> Result<(
     Ok(())
 }
 
-// Contract: `crates/index/src/index/rows.rs`, `LiveOp` and
-// `apply_live_ops` documentation (lines 8-18 and 153-160): forward application
-// is last-operation-wins, while rollback is the exact inverse using the
-// first forward operation. This is the small-sequence regression for that
-// forward/rollback coalescing requirement.
 #[test]
 fn live_coalescing_matches_first_and_last_operations_for_all_small_sequences() {
     let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[0; 32])), 0);

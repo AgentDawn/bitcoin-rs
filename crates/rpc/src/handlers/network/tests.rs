@@ -73,8 +73,6 @@ fn getnetworkinfo_reports_zero_connections_on_fresh_context() {
 fn getnetworkinfo_reports_configured_overlay_state_without_probing()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut ctx = Context::new();
-    // Dead proxy/SAM addresses on purpose: reporting must reflect
-    // configuration, never a live probe.
     let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
         bitcoin_rs_p2p::P2pServiceConfig {
             overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
@@ -144,11 +142,6 @@ fn getnetworkinfo_reports_configured_overlay_state_without_probing()
     Ok(())
 }
 
-/// A Tor control connection publishes an inbound onion service; it does
-/// not carry dial capability. A node with control alone cannot originate
-/// an onion connection, so `networks.onion` must report unreachable and
-/// limited, with no proxy to claim. Inbound publication is reported in
-/// `localaddresses`, which this must leave alone.
 #[test]
 fn getnetworkinfo_does_not_call_onion_reachable_with_control_only()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -194,10 +187,6 @@ fn getnetworkinfo_does_not_call_onion_reachable_with_control_only()
         Some(""),
         "control port is not a SOCKS proxy and must not be reported as one"
     );
-    // `localaddresses` keeps its own owner: it lists published service
-    // endpoints, and configuration alone publishes none. Reporting a
-    // configured-but-unregistered service here would be a fabricated
-    // address, and dropping the field would hide the real one.
     let Some(addresses) = result
         .get("localaddresses")
         .and_then(JsonContainerTrait::as_array)
@@ -211,10 +200,6 @@ fn getnetworkinfo_does_not_call_onion_reachable_with_control_only()
     Ok(())
 }
 
-/// The dial route the onion network actually uses — `onion_proxy` — is what
-/// makes it reachable. The general `proxy` alone does not route onion
-/// (`OverlayConfig::connect` requires `onion_proxy`; it is never inherited
-/// from `proxy`), so it leaves onion unreachable and reports no onion proxy.
 #[test]
 fn getnetworkinfo_calls_onion_reachable_with_an_outbound_socks_route()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -286,7 +271,6 @@ fn getnetworkinfo_calls_onion_reachable_with_an_outbound_socks_route()
 #[test]
 fn getnetworkinfo_reports_default_overlays_unconfigured_and_unreachable()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Default context: overlays unconfigured and unreachable.
     let plain = getnetworkinfo(&Arc::new(Context::new()), &json!(null))?;
     let Some(plain_networks) = plain.get("networks").and_then(JsonContainerTrait::as_array) else {
         return Err("plain networks array missing".into());
@@ -406,8 +390,6 @@ fn getnetworkinfo_reports_onlynet_and_credential_isolation()
         onion.get("proxy").and_then(JsonValueTrait::as_str),
         Some("127.0.0.1:9050")
     );
-    // Credential isolation follows `randomize_credentials`; I2P never
-    // randomizes. With the flag off, the onion route reports false.
     assert_eq!(
         onion
             .get("proxy_randomize_credentials")

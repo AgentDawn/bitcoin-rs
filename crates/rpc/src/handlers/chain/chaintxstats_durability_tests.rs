@@ -65,9 +65,6 @@ fn restarted_ctx(chain_tx_count: Option<u64>) -> Arc<Context> {
     ctx
 }
 
-/// Builds a chain of `blocks` applied blocks with no per-node transaction
-/// counts, publishes the last as the applied tip, and returns each height's
-/// hash so a fixture can name the branch it must match.
 pub(super) fn insert_uncounted_chain(ctx: &Arc<Context>, blocks: usize) -> Vec<Hash256> {
     let mut parent = None;
     let mut prev = BlockHash::default();
@@ -234,11 +231,6 @@ fn historical_stats_survive_an_empty_block_log() {
     );
 }
 
-/// The record log is mutable without transition exclusion: a reorg leaves
-/// records whose heights still line up while their hashes belong to a
-/// branch the reader did not select. Such a prefix is not a total for this
-/// chain, so the count stays unknown rather than borrowing another branch's
-/// transactions.
 #[test]
 fn getchaintxstats_rejects_mismatched_log_prefix() {
     let ctx = Arc::new(Context::new());
@@ -252,7 +244,6 @@ fn getchaintxstats_rejects_mismatched_log_prefix() {
         time: 1_000_u32.saturating_add(height.saturating_mul(10)),
     };
 
-    // A prefix that matches the selected branch answers both figures.
     for (index, hash) in branch.iter().enumerate() {
         let height = u32::try_from(index).unwrap_or(u32::MAX);
         ctx.chain.add_block(record(height, *hash));
@@ -274,7 +265,6 @@ fn getchaintxstats_rejects_mismatched_log_prefix() {
         "one log answers both window ends"
     );
 
-    // The same log with the height-1 record displaced onto another branch.
     ctx.chain.blocks.write().clear();
     let displaced = Hash256::from_le_bytes(&[0xee_u8; 32]);
     for (index, hash) in branch.iter().enumerate() {
@@ -297,8 +287,6 @@ fn getchaintxstats_rejects_mismatched_log_prefix() {
     );
 }
 
-/// Builds genesis, a lost equal-work sibling, and the winning branch with
-/// its child, returning (genesis hash, lost hash, winning tip snapshot).
 fn reorg_fixture(ctx: &Context) -> (Hash256, Hash256, TipSnapshot) {
     let mut tree = ctx.chain.block_tree.write();
     let genesis = Header {

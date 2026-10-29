@@ -3,7 +3,6 @@ use crate::packages::SendPackages;
 use crate::peer::{Peer, PeerState};
 use crate::wire::{Message, PeerError};
 
-/// Advance a peer by one inbound message.
 pub(crate) fn step<S>(peer: &mut Peer<S>, message: &Message) -> Result<(), PeerError> {
     match message {
         Message::Version(version) => receive_version(peer, version.clone()),
@@ -22,8 +21,6 @@ pub(crate) fn step<S>(peer: &mut Peer<S>, message: &Message) -> Result<(), PeerE
         }
         Message::WtxidRelay => {
             ensure_negotiating_or_ready(peer)?;
-            // BIP339 requires negotiation before verack. Once Ready, keep
-            // the published per-connection relay preference unchanged.
             if peer.state == PeerState::Ready {
                 return Ok(());
             }
@@ -71,16 +68,6 @@ fn receive_version<S>(
 }
 
 /// Record one BIP434 `feature` announcement.
-///
-/// PRE: `announcement` decoded within the codec bounds.
-/// POST: the peer sent it after its `version`, at protocol version
-///   [`FEATURE_VERSION`] or above, and before its `verack`; otherwise the
-///   result is a protocol violation and the peer is unchanged. Unknown
-///   identifiers (printable or not) and invalid payloads for a recognised
-///   identifier are ignored, not punished. The first valid payload of a
-///   recognised identifier is retained and later ones are ignored.
-/// INVARIANT: `Peer::remote_features` only ever holds
-///   [`FeatureAnnouncement::is_supported`] announcements, one per identifier.
 fn receive_feature<S>(
     peer: &mut Peer<S>,
     announcement: &FeatureAnnouncement,
@@ -99,16 +86,8 @@ fn receive_feature<S>(
 }
 
 /// Record one BIP331 `sendpackages`.
-///
-/// PRE: `send_packages` decoded; any `versions` value is well formed.
-/// POST: the peer sent it after its `version` and before its `verack`;
-///   otherwise the result is a protocol violation and the peer is unchanged.
-///   Only the known `PKG_RELAY_*` bits of the first message are kept: `0`,
 ///   unknown bits and later messages are ignored, not punished. BIP331 has no
 ///   protocol-version floor and no BIP434 mapping.
-/// INVARIANT: this records the peer's offer only. [`Peer::package_relay_versions`]
-///   is the one place that combines it with `verack`, `wtxidrelay`, `fRelay`
-///   and our own `sendpackages`.
 fn receive_send_packages<S>(
     peer: &mut Peer<S>,
     send_packages: SendPackages,
@@ -118,11 +97,6 @@ fn receive_send_packages<S>(
     Ok(())
 }
 
-/// The peer's protocol version, when it is inside its own pre-`verack`
-/// negotiation window: after its `version`, before its `verack`.
-///
-/// The window is the peer's `verack`, not our [`PeerState`]: the inbound
-/// handshake resets the state to `VersionExchange` after accepting `version`.
 fn ensure_version_to_verack_window<S>(peer: &Peer<S>) -> Result<u32, PeerError> {
     let Some(remote_version) = peer.remote_version.as_ref() else {
         return Err(PeerError::Misbehavior(

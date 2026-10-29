@@ -7,9 +7,6 @@ use super::*;
 
 type TestError = Box<dyn std::error::Error>;
 
-/// A block tree grown with mined regtest headers. Every header carries a
-/// unique time, so siblings under one parent are distinct blocks of equal
-/// work.
 struct Fixture {
     tree: BlockTree,
     genesis: NodeId,
@@ -52,7 +49,6 @@ impl Fixture {
         self.child_with(parent, NodeStatus::HeaderValid)
     }
 
-    /// `len` headers in a row above `from`; the blocks, lowest first.
     fn branch(&mut self, from: NodeId, len: usize) -> Result<Vec<Block>, TestError> {
         let mut blocks = Vec::with_capacity(len);
         let mut parent = from;
@@ -64,8 +60,6 @@ impl Fixture {
         Ok(blocks)
     }
 
-    /// A main chain of `len` blocks above genesis; `chain[i]` has height
-    /// `i + 1`.
     fn main_chain(&mut self, len: usize) -> Result<Vec<Block>, TestError> {
         self.branch(self.genesis, len)
     }
@@ -79,7 +73,6 @@ fn peer(port: u16) -> PeerSource {
     PeerSource::for_test(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
-/// The retained tips in `tree`, best first.
 fn candidates(retainer: &StaleTipRetainer, tree: &BlockTree) -> Vec<Hash256> {
     let mut state = retainer.state.lock();
     state.prune(tree);
@@ -100,7 +93,6 @@ fn held_by(retainer: &StaleTipRetainer, hash: Hash256) -> Option<usize> {
 fn seed_ranks_recent_side_leaves_and_skips_active_and_invalid() -> Result<(), TestError> {
     let mut fixture = Fixture::new()?;
     let main = fixture.main_chain(30)?;
-    // Height 25 -> 27 and height 10 -> 13: the first has more work.
     let near = fixture.branch(main[24].id, 2)?;
     let far = fixture.branch(main[9].id, 3)?;
     fixture.child_with(main[14].id, NodeStatus::Invalid)?;
@@ -125,8 +117,6 @@ fn seed_without_an_active_tip_retains_nothing() {
 fn seed_applies_the_recent_window_at_its_boundary() -> Result<(), TestError> {
     let mut fixture = Fixture::new()?;
     let main = fixture.main_chain(1005)?;
-    // Active tip height 1005: a stale tip at height 5 is exactly 1000
-    // behind, one at height 4 is 1001 behind.
     let inside = fixture.child(main[3].id)?;
     let outside = fixture.child(main[2].id)?;
 
@@ -167,12 +157,9 @@ fn learn_replaces_a_retained_parent_and_ignores_replays() -> Result<(), TestErro
     assert!(retainer.learn(&fixture.tree, side[1].hash, None));
     assert_eq!(candidates(&retainer, &fixture.tree), vec![side[1].hash]);
 
-    // Replays of the held tip and of a header below it add nothing.
     assert!(!retainer.learn(&fixture.tree, side[1].hash, None));
     assert!(!retainer.learn(&fixture.tree, side[0].hash, None));
 
-    // One announcement carrying two more headers supersedes the held tip
-    // without the intermediate header ever being learned.
     assert!(retainer.learn(&fixture.tree, side[3].hash, None));
     assert_eq!(candidates(&retainer, &fixture.tree), vec![side[3].hash]);
     Ok(())
@@ -218,8 +205,6 @@ fn a_branch_switch_demotes_the_old_tip_into_the_set_and_prunes_the_new_one() -> 
     let mut fixture = Fixture::new()?;
     let main = fixture.main_chain(20)?;
     let old_tip = main[19];
-    // Three blocks above height 18 reach height 21 and outweigh the old
-    // tip, which the tree demotes.
     let heavier = fixture.branch(main[17].id, 3)?;
     assert_eq!(
         fixture.tree.tip().map(|tip| tip.hash),
@@ -237,8 +222,6 @@ fn a_branch_switch_demotes_the_old_tip_into_the_set_and_prunes_the_new_one() -> 
     assert!(live.learn(&fixture.tree, old_tip.hash, None));
     assert_eq!(candidates(&live, &fixture.tree), vec![old_tip.hash]);
 
-    // The old branch regains the lead: its tip is no longer stale and the
-    // overtaken tip takes its place once the caller reports the demotion.
     let regained = fixture.branch(old_tip.id, 2)?;
     assert_eq!(
         fixture.tree.tip().map(|tip| tip.hash),
@@ -269,7 +252,6 @@ fn invalidating_a_side_branch_retires_its_tip() -> Result<(), TestError> {
 fn tips_leave_the_set_as_the_active_chain_moves_past_the_window() -> Result<(), TestError> {
     let mut fixture = Fixture::new()?;
     let mut main = fixture.main_chain(10)?;
-    // Height 9, so it stays while the active tip is at most 1009.
     let side = fixture.child(main[7].id)?;
     let retainer = StaleTipRetainer::default();
     assert!(retainer.learn(&fixture.tree, side.hash, None));
@@ -304,12 +286,10 @@ fn capacity_evicts_the_weakest_oldest_and_refuses_weaker_newcomers() -> Result<(
     assert_eq!(held.len(), MAX_RETAINED_STALE_TIPS);
     assert_eq!(held, expected, "the six oldest equal-work tips left");
 
-    // Less work than every held tip: refused, nothing displaced.
     let weaker = fixture.child(main[29].id)?;
     assert!(!retainer.learn(&fixture.tree, weaker.hash, None));
     assert_eq!(candidates(&retainer, &fixture.tree), expected);
 
-    // More work: ranks first and displaces the weakest, oldest tip.
     let stronger = fixture.child(main[59].id)?;
     assert!(retainer.learn(&fixture.tree, stronger.hash, None));
     let held = candidates(&retainer, &fixture.tree);
@@ -344,12 +324,9 @@ fn announcers_are_never_echoed_and_sent_tips_are_not_repeated() -> Result<(), Te
         "recorded once per peer"
     );
 
-    // A second announcer of a held tip learns nothing new but is recorded.
     assert!(!retainer.learn(&fixture.tree, side[0].hash, Some(c)));
     assert!(retainer.knows(c, side[0].hash));
 
-    // The branch grows: the longer tip is new to everyone, including the
-    // peers that knew its parent, which is gone from the set.
     assert!(retainer.learn(&fixture.tree, side[1].hash, Some(b)));
     assert!(retainer.knows(b, side[1].hash));
     assert!(!retainer.knows(a, side[1].hash));
@@ -404,8 +381,6 @@ fn relay_opens_once_with_at_most_ten_tips_and_then_offers_only_new_ones() -> Res
     );
     assert!(!retainer.knows(peer, expected[0]), "offering marks nothing");
 
-    // Offering is not delivery: the selected backlog is offered again
-    // until the sends are acknowledged (a saturated send marks nothing).
     let retry = retainer.pending_for(peer, |_| true);
     assert_eq!(retry, expected, "unacked selected tips are offered again");
     for hash in &expected {
@@ -417,7 +392,6 @@ fn relay_opens_once_with_at_most_ten_tips_and_then_offers_only_new_ones() -> Res
         "acked selected tips leave no extra old beyond the cap"
     );
 
-    // A tip learned afterwards is offered, exactly once it is marked.
     let fresh = fixture.child(main[49].id)?;
     assert!(retainer.learn(&fixture.tree, fresh.hash, None));
     retainer.prune(&fixture.tree);
@@ -430,7 +404,6 @@ fn relay_opens_once_with_at_most_ten_tips_and_then_offers_only_new_ones() -> Res
     retainer.mark_known(peer, fresh.hash);
     assert_eq!(retainer.pending_for(peer, |_| true), []);
 
-    // A reconnecting peer is a new peer: it is opened again.
     retainer.forget_peer(peer);
     assert_eq!(
         retainer.pending_for(peer, |_| true).len(),

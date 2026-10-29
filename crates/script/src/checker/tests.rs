@@ -4,6 +4,7 @@ use bitcoin_rs_primitives::{
     Amount, Hash256, LockTime, OutPoint, Script, Sequence, SighashCache, Tx, TxIn, TxOut, Txid,
     Witness, deserialize,
 };
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _};
 
 use super::{
     LOCKTIME_THRESHOLD, SEQUENCE_FINAL, SEQUENCE_LOCKTIME_DISABLE_FLAG,
@@ -272,15 +273,13 @@ fn check_sequence_follows_bip112() {
 
 #[test]
 fn sighash_json_corpus_legacy_path() {
-    // The tracked corpus, not the untracked `.references` checkout of Core:
-    // this test must grade against the same rows on every machine.
     let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../consensus/tests/vectors/sighash.json");
     let json_str = std::fs::read_to_string(&corpus)
         .unwrap_or_else(|error| panic!("sighash.json unreadable at {}: {error}", corpus.display()));
     let json_str = json_str.as_str();
-    let data: serde_json::Value =
-        serde_json::from_str(json_str).unwrap_or_else(|e| panic!("sighash.json parse: {e}"));
+    let data: sonic_rs::Value =
+        sonic_rs::from_str(json_str).unwrap_or_else(|e| panic!("sighash.json parse: {e}"));
 
     let rows = data.as_array().expect("sighash.json is an array");
     let mut tested = 0_u32;
@@ -292,38 +291,33 @@ fn sighash_json_corpus_legacy_path() {
 
         let tx_hex = arr
             .first()
-            .and_then(serde_json::Value::as_str)
+            .and_then(sonic_rs::Value::as_str)
             .expect("tx hex");
         let script_hex = arr
             .get(1)
-            .and_then(serde_json::Value::as_str)
+            .and_then(sonic_rs::Value::as_str)
             .expect("script hex");
         let input_index = usize::try_from(
             arr.get(2)
-                .and_then(serde_json::Value::as_u64)
+                .and_then(sonic_rs::Value::as_u64)
                 .expect("input index"),
         )
         .expect("input index fits in usize");
         let hashtype_raw = arr
             .get(3)
-            .and_then(serde_json::Value::as_i64)
+            .and_then(sonic_rs::Value::as_i64)
             .expect("hashtype");
         let expected_hex = arr
             .get(4)
-            .and_then(serde_json::Value::as_str)
+            .and_then(sonic_rs::Value::as_str)
             .expect("expected hash");
 
         let tx_bytes = hex_decode(tx_hex);
         let tx = deserialize::<Tx>(&tx_bytes)
             .unwrap_or_else(|e| panic!("tx decode at row {tested}: {e}"));
 
-        // Core's SignatureHash removes OP_CODESEPARATOR (0xab) from
-        // script_code before hashing; our legacy_signature_hash expects
-        // the pre-processed script. Match Core's SerializeScriptCode.
         let script_code = remove_all(&hex_decode(script_hex), &[OP_CODESEPARATOR]).0;
 
-        // The hashtype in sighash.json is a signed 32-bit integer;
-        // Core casts `int nHashType` to `uint32_t` (bit-preserving).
         #[expect(
             clippy::as_conversions,
             clippy::cast_possible_truncation,

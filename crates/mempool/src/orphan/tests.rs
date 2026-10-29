@@ -28,7 +28,6 @@ fn tx(marker: u8, parent: Txid) -> Arc<Tx> {
         }],
     })
 }
-/// One body with a different witness keeps its txid and changes its wtxid.
 fn re_witnessed(body: &Tx, item: u8) -> Arc<Tx> {
     let mut changed = (*body).clone();
     changed.inputs[0].witness = Witness::from_stack(vec![vec![item]]);
@@ -99,15 +98,10 @@ fn readiness_is_deduplicated_and_removed_with_eviction() {
     pool.mark_ready(child.wtxid(), source(1));
     pool.remove(child.wtxid());
     assert!(pool.get(child.wtxid()).is_none());
-    // `take_ready` drops claims for absent bodies and clears
-    // `ready_ids`, so the public surface cannot observe stale
-    // readiness. Assert both owner-local indexes the way
-    // `clear_rejects` is probed below.
     assert!(pool.ready_ids.is_empty());
     assert!(pool.ready.is_empty());
     assert!(pool.take_ready().is_empty());
 }
-// MPL-04: aggregate orphan weight is bounded independently of count.
 #[test]
 fn aggregate_weight_evicts_fifo_even_when_count_quota_has_room() {
     let parent = tx(9, Txid::default()).txid();
@@ -144,7 +138,6 @@ fn aggregate_weight_evicts_fifo_even_when_count_quota_has_room() {
     );
 }
 
-// MPL-04 contract: docs/contracts/mempool-mutations.md (orphan lifecycle).
 #[test]
 fn maintenance_expires_old_bodies_and_cleans_every_index() {
     let parent = tx(9, Txid::default()).txid();
@@ -163,7 +156,6 @@ fn maintenance_expires_old_bodies_and_cleans_every_index() {
     assert_eq!(pool.total_weight(), current.weight());
 }
 
-// MPL-04 contract: docs/contracts/mempool-mutations.md (orphan lifecycle).
 #[test]
 fn maintenance_uses_exact_connection_identity() {
     let parent = tx(9, Txid::default()).txid();
@@ -178,7 +170,6 @@ fn maintenance_uses_exact_connection_identity() {
     assert!(pool.get(predecessor.wtxid()).is_none());
     assert!(pool.get(successor.wtxid()).is_some());
 
-    // MPL-04: retention expires at the DEFAULT_ORPHAN_TIMEOUT_SECS boundary.
     assert_eq!(pool.maintain(119 + DEFAULT_ORPHAN_TIMEOUT_SECS, &live), 1);
     assert_eq!(pool.len(), 0);
     assert_eq!(pool.total_weight(), 0);
@@ -187,8 +178,6 @@ fn maintenance_uses_exact_connection_identity() {
     assert!(pool.peer_usage.is_empty());
 }
 
-/// `MPL-04`: a base-invalid rejection retires every resident variant of
-/// that txid and its weight; unrelated residents stay.
 #[test]
 fn transaction_scoped_rejection_releases_the_resident_variants_weight() {
     let parent = tx(9, Txid::default()).txid();
@@ -213,7 +202,6 @@ fn transaction_scoped_rejection_releases_the_resident_variants_weight() {
     assert_eq!(state.orphans.len(), 1);
 }
 
-// MPL-04 contract: docs/contracts/mempool-mutations.md (orphan lifecycle).
 #[test]
 fn witness_refresh_does_not_extend_expiry() {
     let parent = tx(9, Txid::default()).txid();
@@ -223,9 +211,6 @@ fn witness_refresh_does_not_extend_expiry() {
     pool.insert(Arc::clone(&first), source(2), 119);
 
     let live = HashSet::from([source(1), source(2)]);
-    // MPL-04: expiry stays anchored at the first arrival (time 0). The
-    // re-announcement must not buy another timeout window, so the body
-    // still expires exactly at the timeout boundary.
     assert_eq!(pool.maintain(120, &live), 1);
     assert!(pool.get(first.wtxid()).is_none());
 }
@@ -249,8 +234,6 @@ fn rejects_are_bounded_and_chain_reset_clears_both_indexes() {
     assert!(!state.is_rejected(Hash256::from(second.txid())));
 }
 
-/// MPL-04 exact-body residency: rejecting a different witness body with
-/// the same txid must preserve every resident variant and its ready work.
 #[test]
 fn rejecting_another_witness_preserves_the_resident_body_and_ready_work() {
     let parent = tx(9, Txid::default()).txid();
@@ -293,8 +276,6 @@ fn rejecting_another_witness_preserves_the_resident_body_and_ready_work() {
     assert_eq!(state.rejects_len(), 2);
 }
 
-/// TXR-06: two peers holding different witnesses of one txid coexist, and
-/// a disconnect removes only the departed peer's announcement.
 #[test]
 fn same_wtxid_keeps_all_announcers_and_disconnect_removes_one() {
     let parent = tx(9, Txid::default()).txid();
@@ -323,9 +304,6 @@ fn same_wtxid_keeps_all_announcers_and_disconnect_removes_one() {
     assert!(pool.peer_usage.is_empty());
 }
 
-/// TXR-06: global-limit relief trims the peer with the highest `DoS` score
-/// first, so a peer within its allowance cannot be blamed for another's
-/// reserved usage.
 #[test]
 fn eviction_trims_the_highest_peer_score_before_protected_peer() {
     let parent = tx(9, Txid::default()).txid();

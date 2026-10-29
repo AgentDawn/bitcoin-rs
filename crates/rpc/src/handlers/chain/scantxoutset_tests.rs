@@ -19,8 +19,6 @@ fn test_txid(seed: u64) -> Hash256 {
     Hash256::from_le_bytes(&bytes)
 }
 
-/// P2PKH script for the burn address these fixtures scan for: base58check
-/// decodes to version 0 with an all-zero 20-byte hash160.
 fn burn_p2pkh_script() -> Vec<u8> {
     let mut script = vec![0x76, 0xa9, 0x14];
     script.extend_from_slice(&[0_u8; 20]);
@@ -660,10 +658,8 @@ fn scan_expansion_budget_counts_ranges_paths_and_duplicates() -> anyhow::Result<
     for objects in [
         json!([{"desc":single,"range":1024}]),
         json!([{"desc":multi,"range":512}]),
-        json!([multi]), // Default 0..=1000 applies to each path.
+        json!([multi]),
         json!([{"desc":single,"range":512},{"desc":single,"range":512}]),
-        // The trailing object takes the total over budget before the
-        // earlier descriptor can attempt an impossible hardened derive.
         json!([{"desc":format!("wpkh({SCAN_XPUB}/*h)"),"range":1023},"raw(51)"]),
     ] {
         let error = scantxoutset(&ctx, &json!(["start", objects]))
@@ -803,7 +799,6 @@ fn ranged_descriptor_matches_fixed_descriptors() {
         .unwrap_or_else(|err| panic!("derive ranged scripts: {err}"));
     assert_eq!(scripts.len(), 3);
 
-    // Also test scan_descriptor on a fixed form
     let single = scan_descriptor_range(&fixed_0, Network::Mainnet, None, || Ok(false))
         .unwrap_or_else(|err| panic!("scan_descriptor fixed form: {err}"))
         .pop()
@@ -854,10 +849,6 @@ fn multipath_expansion_uses_index_major_branch_inner_order() {
     let scripts = scan_descriptor_range(&desc, Network::Mainnet, Some((0, 2)), || Ok(false))
         .unwrap_or_else(|err| panic!("scan_descriptor_range failed: {err}"));
     assert_eq!(scripts.len(), 6);
-    // Multipath expansion must be index-major / branch-inner:
-    // index 0: /0/0, /1/0
-    // index 1: /0/1, /1/1
-    // index 2: /0/2, /1/2
     let descs: Vec<&str> = scripts.iter().map(|s| s.desc.as_str()).collect();
     assert!(
         descs[0].contains("/0/0]"),
@@ -896,14 +887,12 @@ fn ranged_descriptor_budget_bounds_and_omitted_multipath_default() {
     let ctx = Arc::new(Context::new());
     let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
 
-    // [0, 1023] is 1024 scripts: within budget, succeeds
     let ok = scantxoutset(
         &ctx,
         &json!(["start", [{"desc": format!("wpkh({xpub}/0/*)"), "range": [0, 1023]}]]),
     );
     assert!(ok.is_ok(), "range [0, 1023] must succeed: {ok:?}");
 
-    // [0, 1024] is 1025 scripts: fails before derivation
     let err_1024 = scantxoutset(
         &ctx,
         &json!(["start", [{"desc": format!("wpkh({xpub}/0/*)"), "range": [0, 1024]}]]),
@@ -918,7 +907,6 @@ fn ranged_descriptor_budget_bounds_and_omitted_multipath_default() {
         "unexpected scan error: {err_1024}"
     );
 
-    // Omitted range on multipath descriptor defaults to [0, 1000] (1001 indices * 2 paths = 2002 scripts): fails
     let err_multipath = scantxoutset(&ctx, &json!(["start", [format!("wpkh({xpub}/<0;1>/*)")]]))
         .err()
         .unwrap_or_else(|| panic!("omitted multipath default must fail on 2002 scripts"));

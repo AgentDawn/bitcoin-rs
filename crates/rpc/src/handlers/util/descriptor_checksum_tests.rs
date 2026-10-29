@@ -13,7 +13,6 @@ fn getdescriptorinfo_emits_8_char_bech32_checksum() {
         panic!("checksum missing: {result:?}");
     };
     assert_eq!(checksum.len(), 8, "checksum must be 8 chars: {checksum}");
-    // All chars should be in the bech32 charset.
     for ch in checksum.chars() {
         assert!(
             BIP380_CHECKSUM_CHARSET.iter().any(|b| char::from(*b) == ch),
@@ -22,12 +21,6 @@ fn getdescriptorinfo_emits_8_char_bech32_checksum() {
     }
 }
 
-/// The BIP380 vector, so the checksum is not certified by its own output.
-///
-/// Every other test here compares this implementation against itself. This
-/// one compares it against the specification: the descriptor and checksum
-/// are the worked example in BIP380, and Core answers the same eight
-/// characters for it.
 #[test]
 fn the_checksum_matches_the_bip380_vector() {
     const DESCRIPTOR: &str = "raw(deadbeef)";
@@ -41,7 +34,6 @@ fn the_checksum_matches_the_bip380_vector() {
         Some(CHECKSUM)
     );
 
-    // And the same descriptor with its checksum attached is accepted.
     let with_checksum = getdescriptorinfo(&ctx, &json!([format!("{DESCRIPTOR}#{CHECKSUM}")]))
         .unwrap_or_else(|err| panic!("a correct checksum must be accepted: {err}"));
     assert_eq!(
@@ -52,28 +44,16 @@ fn the_checksum_matches_the_bip380_vector() {
     );
 }
 
-/// A checksum that does not match is refused, not replaced.
-///
-/// This used to split the text on its last `#`, throw the supplied checksum
-/// away, and answer with a freshly computed one -- so a caller who mistyped
-/// a descriptor was told it was fine and handed a different descriptor than
-/// the one they meant. Catching that typo is the checksum's entire purpose.
-///
-/// Core's three refusals, from `CheckChecksum` in `script/descriptor.cpp`,
-/// each with the message Core gives.
 #[test]
 fn a_checksum_that_does_not_match_is_refused() {
     let ctx = Arc::new(Context::new());
 
     for (input, expected) in [
-        // Right length, wrong value.
         (format!("addr({ADDRESS})#qqqqqqqq"), "does not match"),
-        // Present but not eight characters.
         (
             format!("addr({ADDRESS})#short"),
             "Expected 8 character checksum",
         ),
-        // More than one `#` is a malformed descriptor, not an odd checksum.
         (
             format!("addr({ADDRESS})#aaaaaaaa#bbbbbbbb"),
             "Multiple '#' symbols",
@@ -90,11 +70,6 @@ fn a_checksum_that_does_not_match_is_refused() {
     }
 }
 
-/// A descriptor with no checksum is still analysed.
-///
-/// Core calls `Parse` without `require_checksum` here, so the field is
-/// optional -- unlike `deriveaddresses`, where it is not. The two call
-/// sites differ on purpose and this pins that they still do.
 #[test]
 fn getdescriptorinfo_does_not_require_a_checksum() {
     let ctx = Arc::new(Context::new());
@@ -109,16 +84,6 @@ fn getdescriptorinfo_does_not_require_a_checksum() {
     );
 }
 
-/// The canonical descriptor carries a checksum, as Core's does.
-///
-/// `DescriptorImpl::ToString` ends in `return AddChecksum(ret)`, so every
-/// descriptor Core hands back is ready to be pasted into the next call.
-/// This returned the bare form, so a caller copying it out got something
-/// `deriveaddresses` then refuses for having no checksum.
-///
-/// The checksum on the canonical form is of the *canonical* string, and the
-/// separate `checksum` field is of the *input*. They differ whenever the
-/// parse rewrites anything, which is what the second half checks.
 #[test]
 fn the_canonical_descriptor_carries_its_own_checksum() {
     let ctx = Arc::new(Context::new());
@@ -134,14 +99,11 @@ fn the_canonical_descriptor_carries_its_own_checksum() {
     assert_eq!(body, format!("addr({ADDRESS})"));
     assert_eq!(sum.len(), 8);
 
-    // Round trip: what comes out must be accepted by the call that demands
-    // a checksum, which is the whole point of putting one there.
     let derived = deriveaddresses(&ctx, &json!([canonical]))
         .unwrap_or_else(|err| panic!("the canonical form must be usable as-is: {err}"));
     assert_eq!(derived, json!([ADDRESS]));
 }
 
-/// A descriptor that names an output cannot produce a spend for it.
 #[test]
 fn an_address_descriptor_is_not_solvable() {
     let ctx = Arc::new(Context::new());
@@ -181,7 +143,6 @@ fn a_key_descriptor_is_solvable() {
 #[test]
 fn a_private_key_is_reported_and_not_echoed_back() {
     let ctx = Arc::new(Context::new());
-    // BIP32 test vector 1, master private key.
     let xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
     let with_key = format!("wpkh({xprv}/0/0)");
     let result = getdescriptorinfo(&ctx, &json!([with_key]))
@@ -206,7 +167,6 @@ fn a_private_key_is_reported_and_not_echoed_back() {
     );
 }
 
-/// Text that is not a descriptor is refused with Core's code.
 #[test]
 fn a_descriptor_that_does_not_parse_is_refused() {
     let ctx = Arc::new(Context::new());
@@ -216,12 +176,6 @@ fn a_descriptor_that_does_not_parse_is_refused() {
     assert_eq!(error.code(), RpcError::CORE_NOT_FOUND, "{error:?}");
 }
 
-/// BIP 384 / Core `doc/descriptors.md`: `combo(KEY)` is the top-level
-/// collection of `pk`/`pkh` (and, for a compressed key, `wpkh`/`sh(wpkh)`).
-///
-/// A single-path combo must omit `multipathexpansion`. A private key is
-/// reported and replaced by its public form, same as Core's
-/// `provider.keys.size() > 0` plus `DescriptorImpl::ToString`.
 #[test]
 fn combo_is_canonicalized_and_private_keys_are_redacted() {
     let ctx = Arc::new(Context::new());
@@ -253,8 +207,6 @@ fn combo_is_canonicalized_and_private_keys_are_redacted() {
         "single-path combo must omit multipath_expansion: {result:?}"
     );
 
-    // BIP32 test vector 1 master private key, so the redaction is against
-    // a published vector rather than this function's own output.
     let xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
     let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
     let private = getdescriptorinfo(&ctx, &json!([format!("combo({xprv}/0/0)")]))
@@ -278,8 +230,6 @@ fn combo_is_canonicalized_and_private_keys_are_redacted() {
     );
 }
 
-/// A supplied checksum is verified, then the body is analysed. `combo` is
-/// not miniscript, so the parser must see `combo(KEY)` and not `combo(KEY)#sum`.
 #[test]
 fn checksummed_combo_is_analysed() {
     let ctx = Arc::new(Context::new());
@@ -295,8 +245,6 @@ fn checksummed_combo_is_analysed() {
     assert_eq!(without, with);
 }
 
-/// Core's `getdescriptorinfo` expands a multipath descriptor into one
-/// entry per path and returns the first as `descriptor`.
 #[test]
 fn combo_multipath_is_expanded() {
     let ctx = Arc::new(Context::new());
@@ -331,9 +279,6 @@ fn combo_multipath_is_expanded() {
     );
 }
 
-/// rust-bitcoin decodes both WIF prefixes; Core refuses a WIF whose
-/// version byte is not this chain's. The network lives on the secret in
-/// the keymap, not on the public `Single` key.
 #[test]
 fn combo_rejects_a_wif_from_another_network() {
     let ctx = Arc::new(Context::new());
@@ -348,8 +293,6 @@ fn combo_rejects_a_wif_from_another_network() {
     );
 }
 
-/// Same network check as derivation: a testnet extended key is not valid
-/// descriptor info on a mainnet node.
 #[test]
 fn combo_rejects_a_testnet_extended_key_on_mainnet() {
     let ctx = Arc::new(Context::new());

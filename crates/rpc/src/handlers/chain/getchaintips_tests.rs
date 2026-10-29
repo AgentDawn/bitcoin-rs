@@ -153,7 +153,6 @@ fn getchaintips_emits_branchlen_one_for_non_active_sibling_of_active_tip()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = Arc::new(Context::new());
 
-    // Build: genesis (active) -> sibling (header-only). Active tip stays at genesis.
     let sibling_height = {
         let mut tree = ctx.chain.block_tree.write();
         let genesis = synthetic_header(BlockHash::default(), 1_000_000);
@@ -198,9 +197,6 @@ fn getchaintips_emits_branchlen_one_for_non_active_sibling_of_active_tip()
     Ok(())
 }
 
-/// A chain whose headers run ahead of what has been applied.
-///
-/// Returns the context, the applied tip's id, and the header tip's id.
 fn ctx_with_headers_ahead(
     applied_height: u32,
     header_height: u32,
@@ -222,8 +218,6 @@ fn ctx_with_headers_ahead(
         for height in 0..=header_height {
             let header = synthetic_header(previous, 1_000_000 + height * 600);
             previous = header.compute_hash();
-            // Applied blocks are Active; the headers past the applied tip
-            // have never been connected.
             let status = if height <= applied_height {
                 NodeStatus::Active
             } else {
@@ -266,12 +260,6 @@ fn field<'a>(tip: &'a sonic_rs::Value, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{key} missing from {tip:?}"))
 }
 
-/// The tip the node has connected is reported, even when it is not a leaf.
-///
-/// During initial sync the applied tip never is one: the header tree
-/// already describes its descendants. Listing only leaves left the chain
-/// this node had actually validated out of the answer entirely, while the
-/// unvalidated header tip was labelled "active" in its place.
 #[test]
 fn the_applied_tip_is_reported_even_when_headers_run_ahead()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -300,10 +288,6 @@ fn the_applied_tip_is_reported_even_when_headers_run_ahead()
     Ok(())
 }
 
-/// A header the node has not connected is not the active chain.
-///
-/// It is reported as `headers-only` with the distance it runs ahead, which
-/// is what tells an operator the node is behind its own headers.
 #[test]
 fn a_header_tip_ahead_of_the_applied_tip_is_headers_only() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -326,7 +310,6 @@ fn a_header_tip_ahead_of_the_applied_tip_is_headers_only() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// The active tip's own branch length is zero: it forks from itself.
 #[test]
 fn the_active_tip_has_no_branch_length() -> Result<(), Box<dyn std::error::Error>> {
     let (ctx, _applied, _header) = ctx_with_headers_ahead(3, 6)?;
@@ -341,13 +324,6 @@ fn the_active_tip_has_no_branch_length() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// A branch that was the chain and is not any more reads as a valid fork.
-///
-/// This is the state a reorg leaves: the abandoned tip keeps its height and
-/// its data, and Core reports it as `valid-fork` with the distance back to
-/// the fork point. This node reports `headers-only`, and the assertion
-/// below says why -- displacing a header is the only thing the block tree
-/// records, and that is a fact about headers rather than about validation.
 #[test]
 fn a_branch_left_behind_by_a_reorg_is_reported_as_headers_only()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -365,9 +341,6 @@ fn a_branch_left_behind_by_a_reorg_is_reported_as_headers_only()
         let a2_id = tree.insert_node(Some(a1_id), a2, NodeStatus::Active)?;
         let abandoned_height = tree.node(a2_id)?.height;
 
-        // A longer branch from a1. The second block carries more work than
-        // a2, so the tree publishes it and demotes a2 to Stale -- the same
-        // sequence a real reorg follows.
         let mut b2 = synthetic_header(a1_hash, 1_001_100);
         b2.nonce = 77;
         let b2_id = tree.insert_node(Some(a1_id), b2, NodeStatus::HeaderValid)?;
@@ -385,7 +358,6 @@ fn a_branch_left_behind_by_a_reorg_is_reported_as_headers_only()
             (b3_id, node.height, node.chainwork, node.hash),
         )
     };
-    // The node followed the reorg: the new branch is what it has applied.
     let (tip_id, height, chainwork, hash) = new_tip;
     ctx.chain.applied_tip.store(Some(Arc::new(TipSnapshot {
         tip_id,
@@ -402,13 +374,6 @@ fn a_branch_left_behind_by_a_reorg_is_reported_as_headers_only()
         panic!("the abandoned tip is missing: {tips:?}");
     };
 
-    // **Not `valid-fork`.** This fixture never applied a2's block -- it
-    // only inserted headers -- and the tree kept no record that anything
-    // did. `Stale` says the header was displaced, which is a fact about the
-    // header tree and not about validation; on a header-first node most
-    // stale nodes are headers whose bodies never arrived at all. Core's
-    // `valid-fork` means "fully validated, since reorganised", so emitting
-    // it here would claim a validation that did not happen.
     assert_eq!(field(abandoned, "status"), "headers-only");
     assert_eq!(
         abandoned.get("branchlen").and_then(JsonValueTrait::as_u64),
@@ -418,23 +383,6 @@ fn a_branch_left_behind_by_a_reorg_is_reported_as_headers_only()
     Ok(())
 }
 
-/// An invalidated block is never reported as the chain being followed.
-///
-/// `reorg::invalidate_block` marks the subtree invalid under the tree's
-/// write lock and releases it, then disconnects and republishes
-/// `applied_tip`. Between those two a caller holds a tree view that says
-/// "invalid" and an applied tip that still names the block, and deciding on
-/// the tip first labels a block the node has just rejected as `active` --
-/// an operator reading that sees the node following a chain it has thrown
-/// away.
-///
-/// The window cannot be closed by ordering, because the two facts are
-/// published separately. What removes the wrong answer is preferring the
-/// one that cannot go stale: a block that is invalid was invalid before
-/// this call and stays invalid after it.
-///
-/// The fixture *is* that window, reproduced exactly: the subtree is
-/// invalidated and the applied tip is left where invalidation found it.
 #[test]
 fn an_invalidated_applied_tip_is_not_reported_as_active() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -457,7 +405,6 @@ fn an_invalidated_applied_tip_is_not_reported_as_active() -> Result<(), Box<dyn 
     };
     ctx.chain.applied_tip.store(Some(Arc::new(tip.clone())));
 
-    // Before: the applied tip is the chain being followed.
     let before = tips_of(&ctx);
     let Some(active) = before
         .iter()
@@ -470,7 +417,6 @@ fn an_invalidated_applied_tip_is_not_reported_as_active() -> Result<(), Box<dyn 
         Some(u64::from(tip.height))
     );
 
-    // The invalidation's first half, with the tip not yet republished.
     {
         let mut tree = ctx.chain.block_tree.write();
         tree.invalidate_subtree(tip.tip_id)?;
@@ -499,9 +445,8 @@ fn an_invalidated_applied_tip_is_not_reported_as_active() -> Result<(), Box<dyn 
 
 /// Tips come back highest first, with no special place for the active one.
 ///
-/// Core orders by height descending. A fork longer than the active chain
-/// is what an operator is looking for, and sorting the active tip to the
-/// front would bury it.
+/// Core orders by height descending. A fork longer than the active chain is what an
+/// operator is looking for, and sorting the active tip to the front would bury it.
 #[test]
 fn tips_are_ordered_by_height_descending() -> Result<(), Box<dyn std::error::Error>> {
     let (ctx, _applied, _header) = ctx_with_headers_ahead(3, 6)?;

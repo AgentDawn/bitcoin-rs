@@ -2,10 +2,6 @@ use super::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-// The two serialized `staletip` payloads from the BIP332 "Test Vectors"
-// section (signet 19-block branch, BCH-fork 18-block branch). The expected
-// hashes below are the BIP's table values; `assert_published_vector`
-// re-derives the stale tip from the payload bytes alone.
 const SIGNET_STALE_BRANCH_HEX: &str = concat!(
     "1c7e50802a59c42d780861d2c154a87cb02ff42305a933af2ede2f6012000000",
     "130000002067aa2937b235e209f1ad40f37b17dcad8ca02d1fb9cf4c4928902e",
@@ -99,10 +95,6 @@ fn announcement_of(count: usize, have_block: bool) -> StaleTipAnnouncement {
     }
 }
 
-/// Asserts the decoder reproduces one published vector end to end: field
-/// counts, the BIP's fork point and tip hashes (the tip hash is re-derived
-/// by hashing the reconstructed chain, so every header byte is covered),
-/// and a byte-identical re-encode.
 fn assert_published_vector(
     hex: &str,
     payload_len: usize,
@@ -252,8 +244,6 @@ fn decoder_rejects_empty_branch_and_nonminimal_counts() {
     let with_count = |count: &[u8]| [fork.as_slice(), count, &[0]].concat();
 
     assert_eq!(decode(&with_count(&[0x00])), Err(StaleTipError::NoHeaders));
-    // Every wider encoding of a value that fits a narrower one is refused,
-    // including the in-range counts 1 and 20.
     for count in [
         &[0xfd, 0x01, 0x00][..],
         &[0xfd, 0x14, 0x00],
@@ -269,7 +259,6 @@ fn decoder_rejects_empty_branch_and_nonminimal_counts() {
             "count bytes {count:02x?}"
         );
     }
-    // A count prefix with its operand cut off.
     for count in [
         &[0xfd][..],
         &[0xfd, 0x14],
@@ -287,8 +276,6 @@ fn decoder_rejects_empty_branch_and_nonminimal_counts() {
 #[test]
 fn over_limit_count_is_reported_before_any_body_is_read_or_sized() {
     let fork = [9_u8; 32];
-    // Counts that would size multi-gigabyte buffers if trusted, with no
-    // body at all: the decoder must answer from the count alone.
     let cases: [(&[u8], usize); 6] = [
         (&[21], 21),
         (&[0xfc], 0xfc),
@@ -308,8 +295,6 @@ fn over_limit_count_is_reported_before_any_body_is_read_or_sized() {
         );
         assert!(error.is_policy_limit());
     }
-    // The largest u64 count saturates instead of overflowing the length
-    // arithmetic.
     let huge = [fork.as_slice(), &[0xff; 9]].concat();
     assert_eq!(
         decode(&huge),

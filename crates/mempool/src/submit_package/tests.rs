@@ -8,7 +8,6 @@ use bitcoin_rs_primitives::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Records every published envelope in order.
 #[derive(Default)]
 struct Seen(parking_lot::Mutex<Vec<MutationEnvelope>>);
 
@@ -46,7 +45,6 @@ fn coin(tag: u32) -> OutPoint {
     OutPoint::new(Txid(Hash256::from_le_bytes(&bytes)), 0)
 }
 
-/// A chain that confirms each tagged coin at 100,000 sat behind an anyone-can-spend script.
 fn funded(tags: &[u32]) -> Coins {
     Coins(
         tags.iter()
@@ -71,12 +69,10 @@ fn output(value: u64) -> TxOut {
     }
 }
 
-/// A version-2 spend of confirmed coins behind the bare anyone-can-spend script.
 fn spend_coins(inputs: &[OutPoint], outputs: &[u64]) -> Tx {
     spend_with(inputs, outputs, &Witness::new())
 }
 
-/// A version-2 spend of outputs made by `output`, which need the script as witness.
 fn spend_outputs(inputs: &[OutPoint], outputs: &[u64]) -> Tx {
     spend_with(inputs, outputs, &Witness::from_stack(vec![vec![0x51]]))
 }
@@ -118,7 +114,6 @@ fn ids(txs: &[Tx]) -> Vec<Hash256> {
     txs.iter().map(|tx| Hash256::from(tx.txid())).collect()
 }
 
-/// A zero-conflict chain of `length` transactions, each paying 1,000 sat.
 fn chain_of(length: usize) -> Vec<Tx> {
     let mut txs: Vec<Tx> = Vec::with_capacity(length);
     let mut value = 100_000_u64;
@@ -146,7 +141,6 @@ fn peer_ancestor_package_commits_an_unpaid_chain_under_its_paying_subject() -> T
     let subject = spend_outputs(&[OutPoint::new(parent.txid(), 0)], &[96_000]);
     let now = unix_time_secs();
 
-    // The unpaid prefix fails the aggregate floor alone. Nothing about it is cached.
     assert_eq!(
         gateway.submit_peer_package(
             &[grandparent.clone(), parent.clone()],
@@ -186,7 +180,6 @@ fn peer_ancestor_package_commits_an_unpaid_chain_under_its_paying_subject() -> T
     let outsider = spend_coins(&[coin(2)], &[100_000]);
     assert_eq!(gateway.ancestor_package_wtxids(outsider.wtxid()), None);
 
-    // Bodies come back in the requested order, repeats included, all or none.
     let requested = [subject.wtxid(), grandparent.wtxid(), subject.wtxid()];
     let bodies = gateway
         .resident_package(&requested)
@@ -206,7 +199,6 @@ fn peer_ancestor_package_commits_an_unpaid_chain_under_its_paying_subject() -> T
             .is_some_and(|bodies| bodies.is_empty())
     );
 
-    // A replay finds every member resident: no mutation and no new envelope.
     assert!(
         gateway
             .submit_peer_package(&package, source(), now, &chain)?
@@ -330,7 +322,6 @@ fn refused_peer_package_rolls_back_and_caches_only_the_member_it_refused() -> Te
     assert_eq!(gateway.recent_rejects_count(), 1);
     assert_eq!(gateway.orphan_count(), 0);
 
-    // The parent rolled back with its child, so the valid package still commits whole.
     let result = gateway.submit_peer_package(&[parent, child], source(), now, &chain)?;
     assert_eq!(result.len(), 2);
     assert_eq!(seen.0.lock().len(), 1);
@@ -361,12 +352,9 @@ fn peer_package_with_an_unavailable_input_holds_the_orphan_and_reports_the_first
     assert_eq!(gateway.orphan_count(), 1);
     assert_eq!(gateway.recent_rejects_count(), 0);
     assert!(gateway.have_tx(Hash256::from(orphaned.wtxid()), true));
-    // An orphan is never served as part of an ancestor package or its bodies.
     assert_eq!(gateway.ancestor_package_wtxids(orphaned.wtxid()), None);
     assert!(gateway.resident_package(&[orphaned.wtxid()]).is_none());
 
-    // Rows are judged in dependency order: the first refusal wins, and a
-    // later member that was never evaluated is not cached.
     let first = spend_outputs(&[coin(9)], &[100_000]);
     let second = spend_outputs(&[OutPoint::new(first.txid(), 0)], &[200_000]);
     let fresh = self::gateway(0, None);
@@ -400,7 +388,6 @@ fn peer_package_admits_exactly_the_count_bound_atomically_and_serves_no_more() -
         "ancestors then the tip"
     );
 
-    // One more descendant makes the tip's package 26 deep: nothing is served.
     let next = spend_outputs(&[OutPoint::new(tip.txid(), 0)], &[74_000]);
     let extended = gateway.submit_peer_package(
         std::slice::from_ref(&next),

@@ -35,12 +35,10 @@ fn parse_rejects_bad_tor_checksum_and_payload() {
         bitcoin_rs_primitives::endpoint::base32_encode(&payload)
     );
     assert_eq!(parse_endpoint(&bad), None);
-    // Short onion, uppercase, zero port, unknown suffix.
     assert_eq!(parse_endpoint("abc.onion:8333"), None);
     let good = format_endpoint(tor_endpoint());
     assert_eq!(parse_endpoint(&good.replace("8333", "0")), None);
     assert_eq!(parse_endpoint(&good.to_uppercase()), None);
-    // I2P payload of wrong decoded length (51 chars is invalid length class).
     assert_eq!(
         parse_endpoint(&format!("{}.b32.i2p:8333", "a".repeat(51))),
         None
@@ -49,7 +47,6 @@ fn parse_rejects_bad_tor_checksum_and_payload() {
         parse_endpoint(&format!("{}.b32.i2p:8333", "a".repeat(53))),
         None
     );
-    // Valid I2P: 52 chars of 'a' decode to 32 zero bytes.
     assert_eq!(
         parse_endpoint(&format!("{}.b32.i2p:8333", "a".repeat(52))),
         Some(PeerEndpoint::I2p {
@@ -196,7 +193,6 @@ fn classification_matrix_ordinary_hostnames() {
 
 #[test]
 fn i2p_port_zero_is_valid_but_tor_and_ip_are_not() {
-    // I2P SAM accepts port 0 (unspecified/default service port).
     let i2p_zero = format!("{}.b32.i2p:0", "a".repeat(52));
     assert_eq!(
         classify_endpoint(&i2p_zero),
@@ -213,7 +209,6 @@ fn i2p_port_zero_is_valid_but_tor_and_ip_are_not() {
         })
     );
 
-    // Tor v3 and IP still require a nonzero port.
     let tor_zero = format_endpoint(tor_endpoint()).replace("8333", "0");
     assert_eq!(
         classify_endpoint(&tor_zero),
@@ -238,7 +233,6 @@ fn addrv2_accepts_i2p_port_zero_only() {
             port: 0
         })
     );
-    // Every other network with port 0 is still rejected.
     for addr in [AddrV2::Ipv4(Ipv4Addr::LOCALHOST), AddrV2::TorV3([3u8; 32])] {
         assert_eq!(
             endpoint_from_addrv2(&AddrV2Message {
@@ -334,16 +328,13 @@ fn route_table_denial_prefilters_unroutable_endpoints() {
         hash: [7u8; 32],
         port: 8333,
     };
-    // Unrestricted direct routes dial IP without denial.
     let open = RouteTable::default();
     assert_eq!(open.denial(&ip), None);
-    // Missing overlay routes deny without spending a dial.
     assert_eq!(
         open.denial(&tor_endpoint()),
         Some(RouteDenial::NoOnionRoute)
     );
     assert_eq!(open.denial(&i2p), Some(RouteDenial::NoI2pRoute));
-    // `onlynet` denies first, even for otherwise routable endpoints.
     let onion_only = RouteTable {
         onlynet: vec![NetworkLabel::Onion],
         ..RouteTable::default()
@@ -354,7 +345,6 @@ fn route_table_denial_prefilters_unroutable_endpoints() {
 #[test]
 fn direct_tcp_classifies_only_refusal_as_peer_unreachable() -> Result<(), Box<dyn std::error::Error>>
 {
-    // Unused local port yields ConnectionRefused -> PeerUnreachable
     let unused_port: SocketAddr = "127.0.0.1:1".parse()?;
     let Err(error) = connect_peer_stream(
         PeerEndpoint::Ip(unused_port),
@@ -380,7 +370,6 @@ fn direct_tcp_classifies_only_refusal_as_peer_unreachable() -> Result<(), Box<dy
         }
     }
 
-    // Non-routable address with tiny timeout yields TimedOut or NetworkUnreachable -> Transport
     let blackhole: SocketAddr = "192.0.2.1:8333".parse()?;
     let Err(error) = connect_peer_stream(
         PeerEndpoint::Ip(blackhole),

@@ -10,8 +10,6 @@ fn fake_socks_no_auth(connect_reply: u8) -> io::Result<(SocketAddr, mpsc::Receiv
     fake_socks(false, connect_reply)
 }
 
-/// One fake SOCKS server exchange. Returns the exact request bytes it
-/// received for the CONNECT command.
 fn fake_socks(
     auth_required: bool,
     connect_reply: u8,
@@ -74,7 +72,6 @@ fn fake_socks(
         let _ = tx.send(full);
         if connect_reply == 0x00 {
             stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x20, 0x8d])?;
-            // Keep the bridged stream open briefly.
             std::thread::sleep(Duration::from_millis(200));
         } else {
             let mut reply = vec![0x05, connect_reply, 0x00, 0x01];
@@ -111,8 +108,6 @@ fn tor_dial_uses_exact_domain_transcript() -> Result<(), Box<dyn std::error::Err
 #[test]
 fn isolation_dial_refuses_no_auth_selection_and_sends_no_connect()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Fake proxy that offers only no-auth selection even when the
-    // client offered credentials: the dial must fail before CONNECT.
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let proxy = listener.local_addr()?;
     let (tx, rx) = mpsc::channel();
@@ -125,7 +120,6 @@ fn isolation_dial_refuses_no_auth_selection_and_sends_no_connect()
         stream.read_exact(&mut methods)?;
         assert_eq!(methods, vec![0x02], "isolation dial must offer only 0x02");
         stream.write_all(&[0x05, 0x00])?;
-        // Any further byte would be a CONNECT or auth attempt.
         let mut byte = [0u8; 1];
         let extra = stream.read(&mut byte).unwrap_or(0);
         let _ = tx.send(extra);
@@ -197,8 +191,6 @@ fn refused_connect_is_a_transport_error() -> Result<(), Box<dyn std::error::Erro
 
 #[test]
 fn unresolvable_onion_never_falls_back_to_direct_tcp() -> Result<(), Box<dyn std::error::Error>> {
-    // The onion name is intentionally unresolvable by any system
-    // resolver; with a refusing proxy the dial must fail at the proxy.
     let (proxy, _rx) = fake_socks_auth(0x05)?;
     let onion = format!("{}.onion", "z".repeat(56));
     let Err(error) = socks_connect(
@@ -227,7 +219,6 @@ fn nonzero_rsv_is_rejected_as_invalid_data() -> Result<(), Box<dyn std::error::E
         stream.read_exact(&mut head)?;
         let mut rest = [0u8; 6];
         stream.read_exact(&mut rest)?;
-        // Reply with VER=5, REP=0, RSV=1 (nonzero!), ATYP=1
         stream.write_all(&[0x05, 0x00, 0x01, 0x01, 127, 0, 0, 1, 0x20, 0x8d])?;
         Ok(())
     });
@@ -275,21 +266,18 @@ fn slow_trickle_handshake_exceeds_absolute_deadline() -> Result<(), Box<dyn std:
         let (mut stream, _) = listener.accept()?;
         let mut greeting = [0u8; 3];
         let _ = stream.read_exact(&mut greeting);
-        // Delay 800ms before greeting reply: exceeds 200ms deadline with generous margin.
         std::thread::sleep(Duration::from_millis(800));
         let _ = stream.write_all(&[0x05, 0x00]);
         let mut head = [0u8; 4];
         let _ = stream.read_exact(&mut head);
         let mut rest = [0u8; 6];
         let _ = stream.read_exact(&mut rest);
-        // Delay another 800ms before connect reply
         std::thread::sleep(Duration::from_millis(800));
         let _ = stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x20, 0x8d]);
         Ok(())
     });
     let target: SocketAddr = "127.0.0.1:8333".parse()?;
     let started = Instant::now();
-    // Total timeout 200ms: each step takes 800ms, so total exceeds absolute deadline.
     let Err(error) = socks_connect(
         proxy,
         &SocksTarget::Ip(target),
@@ -327,15 +315,11 @@ fn partial_byte_trickle_does_not_extend_deadline() -> Result<(), Box<dyn std::er
         let (mut stream, _) = listener.accept()?;
         let mut greeting = [0u8; 3];
         let _ = stream.read_exact(&mut greeting);
-        // Send greeting reply immediately so greeting phase finishes in <1ms.
         let _ = stream.write_all(&[0x05, 0x00]);
         let mut head = [0u8; 4];
         let _ = stream.read_exact(&mut head);
         let mut rest = [0u8; 6];
         let _ = stream.read_exact(&mut rest);
-        // Trickle connect reply 1 byte at a time every 80ms.
-        // Each individual inter-byte pause is well below the 200ms total timeout,
-        // but cumulatively (10 bytes = 800ms) they exceed 200ms.
         for byte in [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x20, 0x8d] {
             std::thread::sleep(Duration::from_millis(80));
             if stream.write_all(&[byte]).is_err() {
@@ -346,8 +330,6 @@ fn partial_byte_trickle_does_not_extend_deadline() -> Result<(), Box<dyn std::er
     });
     let target: SocketAddr = "127.0.0.1:8333".parse()?;
     let started = Instant::now();
-    // Total timeout 200ms: after 2 bytes (160ms), remaining budget is ~40ms.
-    // The 3rd byte delayed by 80ms must trip the deadline.
     let Err(error) = socks_connect(
         proxy,
         &SocksTarget::Ip(target),

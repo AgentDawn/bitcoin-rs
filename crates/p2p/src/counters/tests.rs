@@ -527,8 +527,6 @@ fn a_cancelled_stream_stops_a_payload_that_keeps_arriving() -> IoResult<()> {
         let lease = crate::PeerLease::new(tx).with_transport_alive(Some(Arc::clone(&alive)));
         let mut stream = CountingStream::new(server, Arc::new(PeerCounters::default()))
             .stop_reading_when(lease.clone());
-        // One byte every 5 ms for about a second, then EOF: without the
-        // cancellation check the read below ends in `UnexpectedEof`.
         let trickle = std::thread::spawn(move || {
             for _ in 0..200 {
                 if client.write_all(&[0]).is_err() {

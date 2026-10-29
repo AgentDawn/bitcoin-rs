@@ -13,7 +13,7 @@ use bitcoin_rs_primitives::{
     Tx, TxIn, TxOut, Txid, Witness, consensus_bytes,
 };
 use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
-use serde_json::{Value, json};
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
 
 use super::projection::Projection;
 use super::public::{
@@ -26,8 +26,6 @@ use crate::context::{
 use crate::handlers::Handler;
 use crate::rest::Response;
 
-/// Canonical public Esplora lives at `/api`. Tests that omit the prefix
-/// are naming that surface, not a second listener root.
 fn route(handler: &Handler, path: &str, query: &str) -> Response {
     dispatch(handler, &api(path), query)
 }
@@ -88,7 +86,6 @@ fn transaction(input: Option<OutPoint>, output: TxOut) -> Tx {
     }
 }
 
-/// A native one-transaction block standing in for the network genesis.
 fn fixture_genesis() -> Block {
     let mut block = Block {
         header: Header {
@@ -112,9 +109,6 @@ fn fixture_genesis() -> Block {
 }
 
 fn transaction_with_funded_input(ctx: &Context, input_value: u64) -> (Tx, Tx) {
-    // OP_TRUE: an anyone-can-spend funding script, so the broadcast
-    // fixture's empty scriptSig satisfies script verification. The output
-    // stays P2WPKH: standardness only allows known output templates.
     let spendable = vec![0x51];
     let script = [vec![0x00, 0x14], vec![0x11; 20]].concat();
     let funding = transaction(
@@ -420,8 +414,6 @@ impl crate::context::ScriptIndexQuery for MonitoredScriptIndex {
 }
 
 fn contract_fixture() -> Result<(Handler, Tx, Block, String), Box<dyn std::error::Error>> {
-    // p2wpkh scriptPubKey for key hash [2; 20]; the address string rides
-    // the sanctioned rust-bitcoin Address seam.
     let target = {
         let mut script = Vec::with_capacity(22);
         script.push(0x00);
@@ -638,9 +630,6 @@ fn bitcoin_esplora_surface_matches_documented_routes_and_content_types()
     );
     assert_eq!(broadcast.content_type, "text/plain");
 
-    // Package relay is conditional in API.md (Bitcoin Core 28+). This node
-    // has no atomic package-admission capability, so it must not advertise
-    // sequential sendrawtransaction calls as that endpoint.
     let package = route_post(&handler, "/txs/package", b"[]");
     assert_eq!(package.status, 404);
     Ok(())
@@ -653,7 +642,7 @@ fn bitcoin_esplora_representations_match_the_documented_schemas()
     fn keys(value: &Value) -> std::collections::BTreeSet<&str> {
         value
             .as_object()
-            .map(|object| object.keys().map(String::as_str).collect())
+            .map(|object| object.iter().map(|(key, _)| key).collect())
             .unwrap_or_default()
     }
 
@@ -661,7 +650,7 @@ fn bitcoin_esplora_representations_match_the_documented_schemas()
     let txid = transaction.txid().to_string();
     let block_hash = block.block_hash().to_string();
     let transaction_value: Value =
-        serde_json::from_slice(&route(&handler, &format!("/tx/{txid}"), "").body)?;
+        sonic_rs::from_slice(&route(&handler, &format!("/tx/{txid}"), "").body)?;
     assert_eq!(
         keys(&transaction_value),
         [
@@ -711,7 +700,7 @@ fn bitcoin_esplora_representations_match_the_documented_schemas()
     );
 
     let block_value: Value =
-        serde_json::from_slice(&route(&handler, &format!("/block/{block_hash}"), "").body)?;
+        sonic_rs::from_slice(&route(&handler, &format!("/block/{block_hash}"), "").body)?;
     assert_eq!(
         keys(&block_value),
         [
@@ -735,7 +724,7 @@ fn bitcoin_esplora_representations_match_the_documented_schemas()
     assert!(block_value["previousblockhash"].is_null());
 
     let summary: Value =
-        serde_json::from_slice(&route(&handler, &format!("/address/{address}"), "").body)?;
+        sonic_rs::from_slice(&route(&handler, &format!("/address/{address}"), "").body)?;
     assert_eq!(
         keys(&summary),
         ["address", "chain_stats", "mempool_stats"]
@@ -756,15 +745,15 @@ fn bitcoin_esplora_representations_match_the_documented_schemas()
     assert_eq!(summary["chain_stats"]["spent_txo_count"], json!(0));
 
     let utxos: Value =
-        serde_json::from_slice(&route(&handler, &format!("/address/{address}/utxo"), "").body)?;
+        sonic_rs::from_slice(&route(&handler, &format!("/address/{address}/utxo"), "").body)?;
     assert_eq!(utxos[0]["status"]["confirmed"], json!(true));
     assert_eq!(utxos[0]["status"]["block_height"], json!(0));
 
     let outspend: Value =
-        serde_json::from_slice(&route(&handler, &format!("/tx/{txid}/outspend/0"), "").body)?;
+        sonic_rs::from_slice(&route(&handler, &format!("/tx/{txid}/outspend/0"), "").body)?;
     assert_eq!(outspend, json!({"spent":false}));
 
-    let mempool: Value = serde_json::from_slice(&route(&handler, "/mempool", "").body)?;
+    let mempool: Value = sonic_rs::from_slice(&route(&handler, "/mempool", "").body)?;
     assert_eq!(
         keys(&mempool),
         ["count", "fee_histogram", "total_fee", "vsize"]
@@ -951,15 +940,6 @@ fn composed_response_retries_when_the_applied_tip_identity_changes() {
     }
 }
 
-/// Membership, the next-best lookup, and the block list's start and every
-/// height lookup describe one captured applied publication, so a reorg
-/// landing mid-response cannot mix two branches.
-///
-/// The genesis has two competing children: `a1` is one applied tip; `b2`
-/// leads a longer branch. Under `a1` the list is `[a1, genesis]` and `a1`
-/// is in the best chain with no next best; under `b2` it is
-/// `[b2, b1, genesis]` and `a1` is off it. Any other combination straddles
-/// two publications.
 #[test]
 #[expect(clippy::too_many_lines)]
 fn block_status_and_block_list_never_straddle_two_applied_branches()
@@ -1061,10 +1041,6 @@ fn block_status_and_block_list_never_straddle_two_applied_branches()
     let mut seen_b = false;
     let mut accepted = 0_usize;
     let mut attempts = 0_usize;
-    // Sampling runs until both branches have answered, not for a fixed
-    // count: the swapper's first store publishes the b2 tip, but thread
-    // startup is the scheduler's call, so a fixed budget can expire before
-    // the b2 branch is ever published.
     while !(accepted >= 200 && seen_a && seen_b) {
         attempts += 1;
         assert!(
@@ -1072,8 +1048,6 @@ fn block_status_and_block_list_never_straddle_two_applied_branches()
             "a publication was never observed, so coherence proved nothing"
         );
         let status_response = route(&handler, &status_path, "");
-        // A tip change inside the projection's own validation window is
-        // that guard's documented retry, not a torn response.
         if status_response.status == 503 {
             continue;
         }
@@ -1083,7 +1057,7 @@ fn block_status_and_block_list_never_straddle_two_applied_branches()
             "status body: {}",
             String::from_utf8_lossy(&status_response.body)
         );
-        let status: Value = serde_json::from_slice(&status_response.body)?;
+        let status: Value = sonic_rs::from_slice(&status_response.body)?;
         match status.get("in_best_chain").and_then(Value::as_bool) {
             Some(true) => {
                 assert!(
@@ -1106,7 +1080,7 @@ fn block_status_and_block_list_never_straddle_two_applied_branches()
             "list body: {}",
             String::from_utf8_lossy(&list_response.body)
         );
-        let list: Value = serde_json::from_slice(&list_response.body)?;
+        let list: Value = sonic_rs::from_slice(&list_response.body)?;
         let ids: Vec<String> = list
             .as_array()
             .expect("block list")
@@ -1166,13 +1140,13 @@ fn internal_mempool_routes_return_live_transactions() {
         ))
         .expect("mempool entry accepted");
     let handler = Handler::new(Arc::clone(&ctx));
-    let body = serde_json::to_vec(&vec![txid.to_string()]).expect("txids serialize");
+    let body = sonic_rs::to_vec(&vec![txid.to_string()]).expect("txids serialize");
 
     let post = backend_route_post(&handler, "/internal/mempool/txs", &body);
     assert_eq!(post.status, 200);
     let paged = backend_route(&handler, "/internal/mempool/txs", "max_txs=1");
     assert_eq!(paged.status, 200);
-    let values: Value = serde_json::from_slice(&paged.body).expect("mempool response json");
+    let values: Value = sonic_rs::from_slice(&paged.body).expect("mempool response json");
     assert_eq!(values[0]["txid"], json!(txid.to_string()));
 }
 
@@ -1181,8 +1155,8 @@ fn mempool_backend_extension_surface_uses_the_same_projections()
 -> Result<(), Box<dyn std::error::Error>> {
     let (handler, transaction, block, address) = contract_fixture()?;
     let txid = transaction.txid().to_string();
-    let ids = serde_json::to_vec(&vec![txid.clone()])?;
-    let outpoints = serde_json::to_vec(&vec![format!("{txid}:0")])?;
+    let ids = sonic_rs::to_vec(&vec![txid.clone()])?;
+    let outpoints = sonic_rs::to_vec(&vec![format!("{txid}:0")])?;
 
     for (path, body) in [
         ("/internal/txs", ids.as_slice()),
@@ -1374,15 +1348,13 @@ fn broadcast_transaction_is_immediately_visible_as_unconfirmed() {
     assert_eq!(broadcast.status, 200);
     let response = route(&handler, &format!("/tx/{txid}"), "");
     assert_eq!(response.status, 200);
-    let value: Value = serde_json::from_slice(&response.body).expect("transaction json");
+    let value: Value = sonic_rs::from_slice(&response.body).expect("transaction json");
     assert_eq!(value["status"], json!({"confirmed":false}));
 }
 
 #[test]
 fn history_cursors_follow_api_09_on_both_esplora_surfaces() -> Result<(), Box<dyn std::error::Error>>
 {
-    // API-09 and WF-02 own exact textual cursor equality and restart
-    // behavior. The expected page comes from the cursor-free public route.
     let (handler, transaction, _, address) = contract_fixture()?;
     let txid = transaction.txid().to_string();
     let script_hash = ScriptHash::new(&transaction.outputs[0].script_pubkey)
@@ -1399,8 +1371,8 @@ fn history_cursors_follow_api_09_on_both_esplora_surfaces() -> Result<(), Box<dy
             let path = format!("{prefix}/{target}/txs/chain");
             let first = dispatch(&handler, &path, "");
             assert_eq!(first.status, 200);
-            let first_page: Value = serde_json::from_slice(&first.body)?;
-            assert_eq!(first_page.as_array().map(Vec::len), Some(1));
+            let first_page: Value = sonic_rs::from_slice(&first.body)?;
+            assert_eq!(first_page.as_array().map(|array| array.len()), Some(1));
             for cursor in [
                 "00".repeat(32),
                 "not-a-txid".to_owned(),
@@ -1415,10 +1387,10 @@ fn history_cursors_follow_api_09_on_both_esplora_surfaces() -> Result<(), Box<dy
             }
             let end = dispatch(&handler, &format!("{path}/{txid}"), "");
             assert_eq!(end.status, 200);
-            assert_eq!(serde_json::from_slice::<Value>(&end.body)?, json!([]));
+            assert_eq!(sonic_rs::from_slice::<Value>(&end.body)?, json!([]));
             let mempool = dispatch(&handler, &format!("{prefix}/{target}/txs/mempool"), "");
             assert_eq!(mempool.status, 200);
-            assert_eq!(serde_json::from_slice::<Value>(&mempool.body)?, json!([]));
+            assert_eq!(sonic_rs::from_slice::<Value>(&mempool.body)?, json!([]));
             assert_eq!(
                 dispatch(&handler, &format!("{path}/{txid}/extra"), "").status,
                 404
@@ -1452,11 +1424,10 @@ fn history_mempool_sentinel_keeps_the_fifty_transaction_bound() {
             .insert_entry(MempoolEntry::new(tx, 100, 100, 0, 0, 0))
             .expect("insert mempool fixture");
     }
-    // API-09: the router's empty sentinel selects only the mempool page.
     let mempool = history(&ctx, ScriptHash::new(&target), Some(""), false);
     assert_eq!(mempool.status, 200);
-    let values: Value = serde_json::from_slice(&mempool.body).expect("mempool page json");
-    assert_eq!(values.as_array().map(Vec::len), Some(50));
+    let values: Value = sonic_rs::from_slice(&mempool.body).expect("mempool page json");
+    assert_eq!(values.as_array().map(|array| array.len()), Some(50));
     assert!(
         values
             .as_array()
@@ -1512,17 +1483,15 @@ fn history_hydrates_only_the_requested_chain_page() {
 
     let response = history(&ctx, ScriptHash::new(&target), None, false);
     assert_eq!(response.status, 200);
-    let values: Value = serde_json::from_slice(&response.body).expect("history response json");
-    assert_eq!(values.as_array().map(Vec::len), Some(CHAIN_PAGE));
+    let values: Value = sonic_rs::from_slice(&response.body).expect("history response json");
+    assert_eq!(values.as_array().map(|array| array.len()), Some(CHAIN_PAGE));
     assert_eq!(calls.load(Ordering::Relaxed), CHAIN_PAGE);
 
-    // API-09 fixes the chain page at 25 rows and excludes the known cursor.
-    // Heights 30..6 are page one, 5..1 page two, independent of txid order.
     let cursor = records[5].txid.to_string();
     let second = history(&ctx, ScriptHash::new(&target), Some(&cursor), false);
     assert_eq!(second.status, 200);
-    let second: Value = serde_json::from_slice(&second.body).expect("second page json");
-    assert_eq!(second.as_array().map(Vec::len), Some(5));
+    let second: Value = sonic_rs::from_slice(&second.body).expect("second page json");
+    assert_eq!(second.as_array().map(|array| array.len()), Some(5));
     assert_eq!(second[0]["txid"], records[4].txid.to_string());
     assert_eq!(second[4]["txid"], records[0].txid.to_string());
     assert_eq!(calls.load(Ordering::Relaxed), 30);
@@ -1536,8 +1505,6 @@ fn history_hydrates_only_the_requested_chain_page() {
     assert_eq!(end.body, b"[]");
     assert_eq!(calls.load(Ordering::Relaxed), 30);
 
-    // A ready post-reorg index no longer contains this previously valid
-    // cursor. Its history must restart using the same bounded renderer.
     ctx.indexes.script_index = Some(Arc::new(StaticScriptIndex {
         history: records
             .into_iter()
@@ -1609,7 +1576,6 @@ fn chain_history_does_not_enumerate_script_live_or_poll_mempool() {
         calls: Arc::clone(&tx_calls),
     }));
 
-    // Insert an unconfirmed transaction paying target into mempool.
     let mempool_tx = Arc::new(transaction(
         None,
         TxOut {
@@ -1624,11 +1590,13 @@ fn chain_history_does_not_enumerate_script_live_or_poll_mempool() {
         .insert_entry(MempoolEntry::new(mempool_tx, 100, 100, 0, 0, 0))
         .expect("insert mempool entry");
 
-    // 1. Fetching chain history must NOT call unspent_outputs (ScriptLive scan).
     let chain_resp = history(&ctx, script_hash, None, false);
     assert_eq!(chain_resp.status, 200);
-    let chain_val: Value = serde_json::from_slice(&chain_resp.body).expect("chain json");
-    assert_eq!(chain_val.as_array().map(Vec::len), Some(CHAIN_PAGE));
+    let chain_val: Value = sonic_rs::from_slice(&chain_resp.body).expect("chain json");
+    assert_eq!(
+        chain_val.as_array().map(|array| array.len()),
+        Some(CHAIN_PAGE)
+    );
     assert_eq!(
         unspent_calls.load(Ordering::Relaxed),
         0,
@@ -1636,7 +1604,6 @@ fn chain_history_does_not_enumerate_script_live_or_poll_mempool() {
     );
     assert_eq!(history_calls.load(Ordering::Relaxed), 1);
     assert_eq!(tx_calls.load(Ordering::Relaxed), CHAIN_PAGE);
-    // All transactions returned are confirmed.
     assert!(
         chain_val
             .as_array()
@@ -1645,7 +1612,6 @@ fn chain_history_does_not_enumerate_script_live_or_poll_mempool() {
             .all(|tx| tx["status"]["confirmed"] == true)
     );
 
-    // 2. Fetching page 2 with cursor also does not call unspent_outputs.
     let cursor = history_records[5].txid.to_string();
     let chain_page2 = history(&ctx, script_hash, Some(&cursor), false);
     assert_eq!(chain_page2.status, 200);
@@ -1655,27 +1621,25 @@ fn chain_history_does_not_enumerate_script_live_or_poll_mempool() {
         "chain page 2 must not enumerate ScriptLive"
     );
 
-    // 3. Mempool-only route with sentinel "" does NOT call confirmed history.
     let mempool_resp = history(&ctx, script_hash, Some(""), false);
     assert_eq!(mempool_resp.status, 200);
-    let mempool_val: Value = serde_json::from_slice(&mempool_resp.body).expect("mempool json");
-    assert_eq!(mempool_val.as_array().map(Vec::len), Some(1));
+    let mempool_val: Value = sonic_rs::from_slice(&mempool_resp.body).expect("mempool json");
+    assert_eq!(mempool_val.as_array().map(|array| array.len()), Some(1));
     assert_eq!(
         history_calls.load(Ordering::Relaxed),
         2,
         "mempool-only query must not invoke confirmed history (still 2 from chain queries)"
     );
 
-    // 4. Wallet-facing UTXO query retains its semantics and calls unspent_outputs.
     let utxo_resp = Projection::new(&ctx)
         .script_utxos(script_hash)
         .expect("utxos");
     assert_eq!(
         unspent_calls.load(Ordering::Relaxed),
-        2, // 1 from mempool_activity_for above, 1 from script_utxos
+        2,
         "utxo endpoint retains ScriptLive scan"
     );
-    assert_eq!(utxo_resp.len(), 2); // 1 confirmed + 1 mempool
+    assert_eq!(utxo_resp.len(), 2);
 }
 
 #[test]
@@ -1683,7 +1647,6 @@ fn chain_history_does_not_enumerate_script_live_or_poll_mempool() {
 fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
     let target = vec![0x51];
     let script_hash = ScriptHash::new(&target);
-    // 60 transactions: 3 transactions per height across heights 1..=20.
     let mut transactions = Vec::with_capacity(60);
     let mut history_records = Vec::with_capacity(60);
     for height in 1_u32..=20 {
@@ -1706,8 +1669,6 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut ctx = Context::new();
 
-    // Simulate pruned/missing blocks: only add blocks for heights 12..=20.
-    // Heights 1..=11 are absent initially.
     for height in 12_u32..=20 {
         ctx.chain
             .add_block(bitcoin_rs_index::block_log::BlockRecord::synthetic(
@@ -1726,19 +1687,18 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
         calls: Arc::clone(&calls),
     }));
 
-    // Page 1 (first 25): transactions from heights 20 down to 12.
-    // Even though blocks for heights 1..=11 are missing from ctx.chain,
-    // Page 1 succeeds because confirmation resolution is truly bounded to the requested page!
     let page1 = history(&ctx, script_hash, None, false);
     assert_eq!(
         page1.status, 200,
         "Page 1 must succeed even when unselected past blocks are pruned"
     );
-    let page1_vals: Value = serde_json::from_slice(&page1.body).expect("page1 json");
-    assert_eq!(page1_vals.as_array().map(Vec::len), Some(CHAIN_PAGE));
+    let page1_vals: Value = sonic_rs::from_slice(&page1.body).expect("page1 json");
+    assert_eq!(
+        page1_vals.as_array().map(|array| array.len()),
+        Some(CHAIN_PAGE)
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 25);
 
-    // Re-populate all blocks 1..=20 in ascending order so subsequent pages can resolve.
     ctx.chain.blocks.write().clear();
     for height in 1_u32..=20 {
         ctx.chain
@@ -1748,8 +1708,6 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
             ));
     }
 
-    // Full multi-page traversal:
-    // Page 1: 25 items
     let page1_txids: Vec<String> = page1_vals
         .as_array()
         .expect("page1 json array")
@@ -1758,11 +1716,13 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
         .collect();
     let cursor1 = page1_txids.last().expect("page1 last txid").clone();
 
-    // Page 2: next 25 items
     let page2 = history(&ctx, script_hash, Some(&cursor1), false);
     assert_eq!(page2.status, 200);
-    let page2_vals: Value = serde_json::from_slice(&page2.body).expect("page2 json");
-    assert_eq!(page2_vals.as_array().map(Vec::len), Some(CHAIN_PAGE));
+    let page2_vals: Value = sonic_rs::from_slice(&page2.body).expect("page2 json");
+    assert_eq!(
+        page2_vals.as_array().map(|array| array.len()),
+        Some(CHAIN_PAGE)
+    );
     let page2_txids: Vec<String> = page2_vals
         .as_array()
         .expect("page2 json array")
@@ -1771,11 +1731,10 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
         .collect();
     let cursor2 = page2_txids.last().expect("page2 last txid").clone();
 
-    // Page 3: remaining 10 items (60 - 50 = 10)
     let page3 = history(&ctx, script_hash, Some(&cursor2), false);
     assert_eq!(page3.status, 200);
-    let page3_vals: Value = serde_json::from_slice(&page3.body).expect("page3 json");
-    assert_eq!(page3_vals.as_array().map(Vec::len), Some(10));
+    let page3_vals: Value = sonic_rs::from_slice(&page3.body).expect("page3 json");
+    assert_eq!(page3_vals.as_array().map(|array| array.len()), Some(10));
     let page3_txids: Vec<String> = page3_vals
         .as_array()
         .expect("page3 json array")
@@ -1784,13 +1743,10 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
         .collect();
     let cursor3 = page3_txids.last().expect("page3 last txid").clone();
 
-    // Page 4: empty final page
     let page4 = history(&ctx, script_hash, Some(&cursor3), false);
     assert_eq!(page4.status, 200);
     assert_eq!(page4.body, b"[]");
 
-    // Verify complete and stable traversal:
-    // Total 60 distinct transactions returned across pages 1, 2, 3.
     let mut all_traversed = Vec::new();
     all_traversed.extend(page1_txids);
     all_traversed.extend(page2_txids);
@@ -1806,7 +1762,6 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
         "stable pagination must contain 0 duplicates"
     );
 
-    // Verify API-09 cursor restart rules:
     for invalid_cursor in [
         "00".repeat(32),
         "not-a-txid".to_owned(),
@@ -1826,7 +1781,6 @@ fn chain_history_pagination_traversal_multi_page_and_pruned_blocks() {
 fn chain_history_deduplicates_multiple_outputs_in_same_transaction() {
     let target = vec![0x51];
     let script_hash = ScriptHash::new(&target);
-    // Single transaction with 3 outputs paying target.
     let tx = Tx {
         version: 2,
         inputs: vec![TxIn {
@@ -1875,8 +1829,8 @@ fn chain_history_deduplicates_multiple_outputs_in_same_transaction() {
 
     let response = history(&ctx, script_hash, None, false);
     assert_eq!(response.status, 200);
-    let val: Value = serde_json::from_slice(&response.body).expect("json");
-    assert_eq!(val.as_array().map(Vec::len), Some(1));
+    let val: Value = sonic_rs::from_slice(&response.body).expect("json");
+    assert_eq!(val.as_array().map(|array| array.len()), Some(1));
     assert_eq!(val[0]["txid"], txid.to_string());
 }
 
@@ -1938,7 +1892,7 @@ fn address_statistics_read_no_transactions_beyond_the_script_index() {
         None,
     );
     assert_eq!(summary.status, 200);
-    let value: Value = serde_json::from_slice(&summary.body).expect("summary json");
+    let value: Value = sonic_rs::from_slice(&summary.body).expect("summary json");
     assert_eq!(value["chain_stats"]["funded_txo_count"], json!(30));
     assert_eq!(value["chain_stats"]["funded_txo_sum"], json!(465));
     assert_eq!(value["chain_stats"]["spent_txo_count"], json!(29));
@@ -1946,12 +1900,9 @@ fn address_statistics_read_no_transactions_beyond_the_script_index() {
 
     let per_transaction = address_transaction_summary(&ctx, script_hash);
     assert_eq!(per_transaction.status, 200);
-    let rows: Value = serde_json::from_slice(&per_transaction.body).expect("summary rows json");
-    assert_eq!(rows.as_array().map(Vec::len), Some(30));
+    let rows: Value = sonic_rs::from_slice(&per_transaction.body).expect("summary rows json");
+    assert_eq!(rows.as_array().map(|array| array.len()), Some(30));
 
-    // Both endpoints answer from index rows alone. Reading one transaction
-    // per history entry escapes the script index's per-query budget, so a
-    // long-history address turns one request into unbounded storage I/O.
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
@@ -2203,7 +2154,7 @@ fn history_resolves_shared_parents_once_per_page() {
         calls.store(0, Ordering::Relaxed);
         let response = history(&ctx, ScriptHash::new(&[0x51]), cursor.as_deref(), false);
         assert_eq!(response.status, 200);
-        let values: Vec<Value> = serde_json::from_slice(&response.body).expect("page");
+        let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("page");
         assert_eq!(calls.load(Ordering::Relaxed), expected.len() + 1);
         assert_eq!(values.len(), expected.len());
         for (value, tx) in values.iter().zip(expected.iter().rev()) {
@@ -2246,13 +2197,12 @@ fn history_resolves_shared_parents_once_per_page() {
     calls.store(0, Ordering::Relaxed);
     let mixed = history(&ctx, ScriptHash::new(&[0x51]), None, true);
     assert_eq!(mixed.status, 200);
-    let mixed: Vec<Value> = serde_json::from_slice(&mixed.body).expect("mixed page");
+    let mixed: Vec<Value> = sonic_rs::from_slice(&mixed.body).expect("mixed page");
     assert_eq!(mixed.len(), CHAIN_PAGE + 1);
     assert_eq!(mixed[0]["txid"], unconfirmed.txid().to_string());
     assert_eq!(mixed[0]["status"]["confirmed"], false);
     assert_eq!(mixed[0]["fee"], 50);
     assert_eq!(calls.load(Ordering::Relaxed), CHAIN_PAGE + 1);
-    // A later request must not retain a successful parent lookup.
     ctx.indexes.esplora_tx_index = Some(Arc::new(CountingTxIndex {
         transactions,
         calls,
@@ -2303,12 +2253,9 @@ fn batch_reuses_selected_transactions_and_mempool_parents() {
     );
     assert!(!values[0].status.confirmed);
     assert_eq!(
-        serde_json::to_value(&values[0]).expect("first"),
-        serde_json::to_value(&values[1]).expect("duplicate")
+        sonic_rs::to_value(&values[0]).expect("first"),
+        sonic_rs::to_value(&values[1]).expect("duplicate")
     );
-    // A transaction captured for the response can supply another row's
-    // prevouts even after it has left the live pool. No body clone or
-    // second index query is needed for that already verified parent.
     let ctx = Context::new();
     let values = Projection::new(&ctx)
         .transaction_values([(&child, None), (&parent, None)], None)
@@ -2357,14 +2304,12 @@ fn block_page_reuses_parent_outside_the_selected_page() {
     }));
     let response = block_txs(&ctx, &record.hash.to_string(), 1);
     assert_eq!(response.status, 200);
-    let values: Vec<Value> = serde_json::from_slice(&response.body).expect("block page");
+    let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("block page");
     assert_eq!(values.len(), 1);
     assert_eq!(values[0]["txid"], child.txid().to_string());
     assert_eq!(values[0]["fee"], parent.outputs[0].value.to_sat() - 100);
     assert_eq!(values[0]["status"]["block_hash"], record.hash.to_string());
     assert_eq!(calls.load(Ordering::Relaxed), 0);
-    // Header identity alone cannot authenticate transaction bodies.
-    // Keep that header but replace both sides of a parent/child pair.
     let mut corrupt = block.clone();
     corrupt.txs[0].outputs[0].value = Amount::from_sat(999);
     corrupt.txs[1].inputs[0].previous_output = OutPoint::new(corrupt.txs[0].txid(), 0);
@@ -2397,8 +2342,6 @@ fn block_page_reuses_parent_outside_the_selected_page() {
     }
     ctx.indexes.esplora_tx_index = None;
     assert_eq!(block_txs(&ctx, &record.hash.to_string(), 1).status, 503);
-    // Reused block bodies must pass the same identity check as an index
-    // fallback read; a decodable body under the wrong key is corruption.
     block.header.nonce = block.header.nonce.wrapping_add(1);
     ctx.chain.block_body_source = Some(Arc::new(BlockBodies {
         bodies: vec![(0, record.hash, consensus_bytes(&block))],
@@ -2414,8 +2357,6 @@ fn block_transactions_reject_corrupt_witness_commitments() {
     child.inputs[0].witness = vec![vec![0x42]].into();
     let mut block = fixture_genesis();
     block.txs[0].inputs[0].witness = vec![vec![0; 32]].into();
-    // The coinbase wtxid is zero in the witness tree. Its reserved value
-    // is also zero, so the two folds below bind the child's witness.
     let mut leaves = vec![[0; 32], *child.wtxid().as_bytes()];
     let root = bitcoin_rs_consensus::compute_merkle_root(&mut leaves).expect("witness root");
     let commitment = double_sha256(&[root.as_slice(), &[0; 32]].concat());
@@ -2450,7 +2391,7 @@ fn block_transactions_reject_corrupt_witness_commitments() {
     }));
     let response = block_txs(&ctx, &record.hash.to_string(), 1);
     assert_eq!(response.status, 200);
-    let values: Vec<Value> = serde_json::from_slice(&response.body).expect("block page");
+    let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("block page");
     assert_eq!(values[0]["vin"][0]["witness"], json!(["42"]));
     for (tx_index, witness) in [(1, vec![vec![0x43]]), (0, vec![vec![1; 32]]), (0, vec![])] {
         let mut corrupt = block.clone();
@@ -2467,8 +2408,6 @@ fn block_transactions_reject_corrupt_witness_commitments() {
 #[test]
 fn block_witness_binding_observes_activation() {
     let mut block = fixture_genesis();
-    // Before activation, an OP_RETURN resembling a witness commitment
-    // does not require a reserved value. Afterwards its absence is corrupt.
     block.txs[0].outputs.push(TxOut {
         value: Amount::ZERO,
         script_pubkey: [&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed], &[0; 32][..]]
@@ -2536,8 +2475,6 @@ fn block_parent_reuse_checks_readiness_only_when_needed() {
         checks: Arc::clone(&checks),
         synced: true,
     }));
-    // An external parent uses its ordinary checked lookup. Merely having
-    // non-coinbase inputs must not open a separate readiness snapshot.
     let values = Projection::new(&ctx)
         .transaction_values(
             [(&child, None)],
@@ -2559,8 +2496,6 @@ fn block_parent_reuse_checks_readiness_only_when_needed() {
     assert_eq!(values[0].fee, 25);
     assert_eq!(values[1].fee, 25);
     assert_eq!(checks.load(Ordering::Relaxed), 1);
-    // A successful index_info response with synced=false is still not
-    // authority to bypass the normal unavailable parent lookup.
     ctx.indexes.esplora_tx_index = Some(Arc::new(ReadinessIndex {
         parent: parent.clone(),
         checks: Arc::clone(&checks),
@@ -2622,7 +2557,7 @@ fn backend_mempool_get_bounds_prevouts_without_limiting_rows() {
         calls.store(0, Ordering::Relaxed);
         let response = backend_route(&handler, path, query);
         assert_eq!(response.status, 200);
-        let rows: Vec<Value> = serde_json::from_slice(&response.body).expect("rows");
+        let rows: Vec<Value> = sonic_rs::from_slice(&response.body).expect("rows");
         assert_eq!(rows.len(), count);
         for (row, tx) in rows.iter().zip(txs.iter().skip(start)) {
             assert_eq!(row["txid"], tx.txid().to_string());
@@ -2649,7 +2584,6 @@ fn backend_mempool_get_bounds_prevouts_without_limiting_rows() {
             0,
         ))
         .expect("unavailable parent fixture");
-    // An error after completed batches must never return partial success.
     assert_eq!(
         backend_route(&handler, "/internal/mempool/txs", "").status,
         503
@@ -2714,7 +2648,7 @@ fn backend_mempool_get_keeps_captured_parents_across_batches() {
     let handler = Handler::new(Arc::clone(&ctx));
     let response = backend_route(&handler, "/internal/mempool/txs", "");
     assert_eq!(response.status, 200);
-    let rows: Vec<Value> = serde_json::from_slice(&response.body).expect("rows");
+    let rows: Vec<Value> = sonic_rs::from_slice(&response.body).expect("rows");
     assert_eq!(rows.len(), txs.len());
     for (row, tx) in rows.iter().zip(&txs) {
         assert_eq!(row["txid"], tx.txid().to_string());
@@ -2733,7 +2667,7 @@ fn backend_transaction_batches_share_duplicate_bodies_and_preserve_rows() {
     let second = paying_transaction(&[OutPoint::null()], &[(175, vec![0x52])]);
     let missing = Txid::default();
     let ids = [first.txid(), missing, second.txid(), first.txid()].repeat(30);
-    let body = serde_json::to_vec(&ids.iter().map(ToString::to_string).collect::<Vec<_>>())
+    let body = sonic_rs::to_vec(&ids.iter().map(ToString::to_string).collect::<Vec<_>>())
         .expect("request");
     let calls = Arc::new(AtomicUsize::new(0));
     let mut ctx = Context::new();
@@ -2750,7 +2684,7 @@ fn backend_transaction_batches_share_duplicate_bodies_and_preserve_rows() {
     let handler = Handler::new(Arc::clone(&ctx));
     let response = backend_route_post(&handler, "/internal/txs", &body);
     assert_eq!(response.status, 200);
-    let rows: Vec<Value> = serde_json::from_slice(&response.body).expect("batch");
+    let rows: Vec<Value> = sonic_rs::from_slice(&response.body).expect("batch");
     let expected = ids.iter().filter(|id| **id != missing).collect::<Vec<_>>();
     assert_eq!(rows.len(), expected.len());
     for (row, id) in rows.iter().zip(&expected) {
@@ -2774,7 +2708,7 @@ fn backend_transaction_batches_share_duplicate_bodies_and_preserve_rows() {
     calls.store(0, Ordering::Relaxed);
     let response = backend_route_post(&handler, "/internal/mempool/txs", &body);
     assert_eq!(response.status, 200);
-    let mempool: Vec<Value> = serde_json::from_slice(&response.body).expect("pool batch");
+    let mempool: Vec<Value> = sonic_rs::from_slice(&response.body).expect("pool batch");
     assert_eq!(mempool.len(), rows.len());
     for (mut row, expected) in mempool.into_iter().zip(rows) {
         assert_eq!(row["status"]["confirmed"], false);
@@ -2862,14 +2796,12 @@ fn parent_query_errors_and_republication_never_yield_a_cached_success() {
         .write()
         .insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 1, 0, 0))
         .expect("child");
-    // The read-only backend POST also fences transaction selection,
-    // before the request-local parent renderer starts its own work.
     let handler = Handler::new(Arc::new(ctx));
     assert_eq!(route(&handler, &format!("/tx/{child_id}"), "").status, 503);
     let response = backend_route_post(
         &handler,
         "/internal/txs",
-        &serde_json::to_vec(&[parent.txid().to_string()]).expect("request"),
+        &sonic_rs::to_vec(&[parent.txid().to_string()]).expect("request"),
     );
     assert_eq!(response.status, 503);
 }
@@ -2877,9 +2809,6 @@ fn parent_query_errors_and_republication_never_yield_a_cached_success() {
 #[test]
 fn stale_block_transactions_do_not_inherit_active_chain_status()
 -> Result<(), Box<dyn std::error::Error>> {
-    // Null-prevout coinbase shape: a zero-input tx cannot be consensus
-    // encoded into a decodable body (the 0x00 vin count reads as the
-    // segwit marker, matching Core), so required_block would reject it.
     let transaction = transaction(
         Some(OutPoint::null()),
         TxOut {
@@ -2920,10 +2849,6 @@ fn stale_block_transactions_do_not_inherit_active_chain_status()
             stale_block.header,
             NodeStatus::HeaderValid,
         )?;
-        // BlockTree::insert_node now publishes the best-work header on
-        // insert and only reorgs on strictly greater chainwork. The stale
-        // block had equal work and was inserted first, so it became the
-        // active tip. Give the active chain a lower target so it wins.
         let active = Header {
             version: 1,
             prev_blockhash: genesis.compute_hash(),
@@ -2947,33 +2872,24 @@ fn stale_block_transactions_do_not_inherit_active_chain_status()
         "block_txs failed: {}",
         String::from_utf8_lossy(&response.body)
     );
-    let rendered: Value = serde_json::from_slice(&response.body)?;
+    let rendered: Value = sonic_rs::from_slice(&response.body)?;
     assert_eq!(rendered[0]["status"], json!({"confirmed":false}));
     Ok(())
 }
 
 thread_local! {
-    /// One-shot halves for a summary request after its aggregate snapshot is captured.
-    /// Installed per-thread so unrelated requests are not held.
     static MEMPOOL_SUMMARY_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
         const { RefCell::new(None) };
-    /// The one-shot halves for a mempool activity read between its two pool
-    /// views. Installed per serving thread so unrelated requests are not gated.
     static MEMPOOL_ACTIVITY_GATE: RefCell<Option<(Sender<()>, Receiver<()>)>> =
         const { RefCell::new(None) };
 }
 
-/// How long the gated thread waits for release before continuing anyway, so
-/// a failed assertion cannot hang the suite.
 const GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Records the gate halves used to pause summary encoding. Call on the serving thread.
 fn arm_mempool_summary_gate(entered: Sender<()>, release: Receiver<()>) {
     MEMPOOL_SUMMARY_GATE.with(|slot| *slot.borrow_mut() = Some((entered, release)));
 }
 
-/// Stops and joins a busy helper thread even when an assertion unwinds, so
-/// a failed check never leaves a spinning thread for later tests.
 struct SwapperGuard {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -2988,7 +2904,6 @@ impl Drop for SwapperGuard {
     }
 }
 
-/// Pauses after capturing stats and aggregated bins, before JSON encoding.
 pub(crate) fn gate_mempool_summary_for_tests() {
     let armed = MEMPOOL_SUMMARY_GATE.with(|slot| slot.borrow_mut().take());
     let Some((entered, release)) = armed else {
@@ -3001,7 +2916,6 @@ fn arm_mempool_activity_gate(entered: Sender<()>, release: Receiver<()>) {
     MEMPOOL_ACTIVITY_GATE.with(|slot| *slot.borrow_mut() = Some((entered, release)));
 }
 
-/// Pauses after funders are captured and before the spender read.
 pub(crate) fn gate_mempool_activity_for_tests() {
     let armed = MEMPOOL_ACTIVITY_GATE.with(|slot| slot.borrow_mut().take());
     let Some((entered, release)) = armed else {
@@ -3011,8 +2925,6 @@ pub(crate) fn gate_mempool_activity_for_tests() {
     let _ = release.recv_timeout(GATE_TIMEOUT);
 }
 
-/// A v2 transaction with one input per `inputs` and the given
-/// `(value, scriptPubKey)` outputs, in order.
 fn paying_transaction(inputs: &[OutPoint], outputs: &[(u64, Vec<u8>)]) -> Tx {
     Tx {
         version: 2,
@@ -3037,13 +2949,10 @@ fn paying_transaction(inputs: &[OutPoint], outputs: &[(u64, Vec<u8>)]) -> Tx {
     }
 }
 
-/// A funding outpoint that no other fixture transaction spends.
 fn unconfirmed_outpoint(marker: u8) -> OutPoint {
     OutPoint::new(Txid(Hash256::from_le_bytes(&[marker; 32])), 0)
 }
 
-/// One planned mempool entry: the transaction plus the policy facts the
-/// mempool routes report for it.
 #[derive(Clone)]
 struct Seed {
     transaction: Tx,
@@ -3057,8 +2966,6 @@ impl Seed {
         self.transaction.txid()
     }
 
-    /// The route's output total for this entry: saturated sum of its
-    /// output values.
     fn value(&self) -> u64 {
         self.transaction.outputs.iter().fold(0_u64, |sum, output| {
             sum.saturating_add(output.value.to_sat())
@@ -3066,7 +2973,6 @@ impl Seed {
     }
 }
 
-/// `ctx` with every `seed` admitted, in order.
 fn seed_mempool(ctx: Context, seeds: &[Seed]) -> Arc<Context> {
     for seed in seeds {
         ctx.mempool
@@ -3086,9 +2992,6 @@ fn seed_mempool(ctx: Context, seeds: &[Seed]) -> Arc<Context> {
     Arc::new(ctx)
 }
 
-/// The public summary captures stats and pre-aggregated fee-rate bins under
-/// one pool view, then releases the guard before JSON encoding. The gate
-/// parks after that capture so a writer can acquire the pool lock.
 #[test]
 fn mempool_projection_releases_read_guard_before_encoding() {
     let target = vec![0x51_u8];
@@ -3136,9 +3039,7 @@ fn mempool_projection_releases_read_guard_before_encoding() {
         "the summary held the pool read guard during JSON encoding"
     );
     assert_eq!(response.status, 200);
-    // The captured per-rate vsize sums preserve the descending histogram:
-    // the two 10 sat/vB entries share 300 vbytes.
-    let rendered: Value = serde_json::from_slice(&response.body).expect("summary json");
+    let rendered: Value = sonic_rs::from_slice(&response.body).expect("summary json");
     assert_eq!(
         rendered,
         json!({
@@ -3150,9 +3051,6 @@ fn mempool_projection_releases_read_guard_before_encoding() {
     );
 }
 
-/// One seeded pool shared by the projection parity tests: a funder with two
-/// target outputs and one unrelated output, the spender of its first target
-/// output, and eight fillers.
 struct ParityFixture {
     ctx: Arc<Context>,
     handler: Handler,
@@ -3165,8 +3063,6 @@ fn parity_fixture() -> ParityFixture {
     const TOP: u64 = 1_700_000_050;
     let target = vec![0x51_u8];
     let unrelated = vec![0x52_u8];
-    // The overlay must drop the funder's spent output, keep its other
-    // target output, and append the spender's own.
     let funder = paying_transaction(
         &[unconfirmed_outpoint(1)],
         &[
@@ -3190,11 +3086,6 @@ fn parity_fixture() -> ParityFixture {
             time: TOP,
         },
     ];
-    // Two fillers share the top acceptance time, so the recent list has to
-    // break a `(time, txid)` tie; twelve entries are two wider than the ten
-    // the route emits, so the oldest pair drops out. The first four fillers
-    // join the funder and spender in the 10 sat/vB bin, so six entries merge
-    // into one histogram bucket.
     for index in 0..10_u8 {
         let vsize = 100 + u32::from(index) * 10;
         seeds.push(Seed {
@@ -3227,8 +3118,6 @@ fn parity_fixture() -> ParityFixture {
     }
 }
 
-/// The bytes `path` returns on both Esplora prefixes, asserting the two
-/// surfaces agree and answer as JSON.
 fn routed_bytes(fixture: &ParityFixture, path: &str) -> Vec<u8> {
     let public = route(&fixture.handler, path, "");
     let backend = backend_route(&fixture.handler, path, "");
@@ -3247,8 +3136,6 @@ fn routed_bytes(fixture: &ParityFixture, path: &str) -> Vec<u8> {
     public.body
 }
 
-/// Indices of `seeds` in the order the recent list emits them: descending
-/// `(time, txid)`.
 fn descending_recent(seeds: &[Seed]) -> Vec<usize> {
     let mut order = (0..seeds.len()).collect::<Vec<_>>();
     order.sort_by(|left, right| {
@@ -3261,9 +3148,6 @@ fn descending_recent(seeds: &[Seed]) -> Vec<usize> {
     order
 }
 
-/// Every mempool projection the two Esplora prefixes share, on one seeded
-/// pool: identical bytes, and the same counts, bins, tie order, and listed
-/// ids the routes emitted before the capture was split out of the guard.
 #[test]
 fn esplora_mempool_summary_recent_and_txids_match_the_seeded_pool()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -3273,7 +3157,7 @@ fn esplora_mempool_summary_recent_and_txids_match_the_seeded_pool()
         let rate = seed.fee.saturating_mul(1_000) / u64::from(seed.vsize);
         *bins.entry(rate).or_insert(0_u64) += u64::from(seed.vsize);
     }
-    let summary: Value = serde_json::from_slice(&routed_bytes(&fixture, "/mempool"))?;
+    let summary: Value = sonic_rs::from_slice(&routed_bytes(&fixture, "/mempool"))?;
     assert_eq!(
         summary,
         json!({
@@ -3295,7 +3179,7 @@ fn esplora_mempool_summary_recent_and_txids_match_the_seeded_pool()
         })
     );
 
-    let recent: Vec<Value> = serde_json::from_slice(&routed_bytes(&fixture, "/mempool/recent"))?;
+    let recent: Vec<Value> = sonic_rs::from_slice(&routed_bytes(&fixture, "/mempool/recent"))?;
     assert_eq!(
         recent,
         descending_recent(&fixture.seeds)
@@ -3313,8 +3197,7 @@ fn esplora_mempool_summary_recent_and_txids_match_the_seeded_pool()
             .collect::<Vec<Value>>()
     );
 
-    let mut listed: Vec<String> =
-        serde_json::from_slice(&routed_bytes(&fixture, "/mempool/txids"))?;
+    let mut listed: Vec<String> = sonic_rs::from_slice(&routed_bytes(&fixture, "/mempool/txids"))?;
     listed.sort();
     let mut expected = fixture
         .seeds
@@ -3326,15 +3209,12 @@ fn esplora_mempool_summary_recent_and_txids_match_the_seeded_pool()
     Ok(())
 }
 
-/// The script UTXO overlay and the script activity that one funder plus its
-/// spender produce, on the same seeded pool: the spent output is gone, the
-/// pool's own order is kept, and both prefixes answer with the same bytes.
 #[test]
 fn esplora_script_overlay_and_activity_match_the_seeded_pool()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = parity_fixture();
     let unconfirmed = json!({ "confirmed": false });
-    let utxos: Value = serde_json::from_slice(&routed_bytes(
+    let utxos: Value = sonic_rs::from_slice(&routed_bytes(
         &fixture,
         &format!("/scripthash/{}/utxo", fixture.script_hash),
     ))?;
@@ -3356,9 +3236,6 @@ fn esplora_script_overlay_and_activity_match_the_seeded_pool()
         ])
     );
 
-    // The history route needs a transaction index this fixture does not
-    // carry, so the projection that feeds it is the observable: the funder
-    // and the spender, each selected once, in descending `(time, txid)`.
     let activity = Projection::new(&fixture.ctx)
         .script_activity(ScriptHash::new(&fixture.target))
         .expect("script activity resolves");

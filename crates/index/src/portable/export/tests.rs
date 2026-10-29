@@ -20,7 +20,6 @@ fn injected(dir: &Path) -> IndexBundleError {
     io_error(dir, io::Error::other("injected directory fsync failure"))
 }
 
-/// Fails only the first directory fsync: the publication's final commit.
 fn fail_first_sync(dir: &Path) -> Result<(), IndexBundleError> {
     let call = calls();
     SYNC_CALLS.with(|count| count.set(call + 1));
@@ -36,7 +35,6 @@ fn fail_every_sync(dir: &Path) -> Result<(), IndexBundleError> {
     Err(injected(dir))
 }
 
-/// Creates the artifact and manifest the way `export` does.
 fn stage(publication: &mut Publication, dir: &Path) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let artifact = dir.join(BundleFamily::TxLookup.file_name());
     let mut file = publication.create_new(&artifact)?;
@@ -89,7 +87,6 @@ fn undurable_manifest_removal_keeps_the_artifact_it_names() -> TestResult {
     Ok(())
 }
 
-/// Small page size over a multi-page family: pages concatenate in
 /// stored-key order with no overlap, gap, or repeat.
 #[test]
 fn paged_stream_preserves_row_order_across_small_pages() {
@@ -119,8 +116,6 @@ fn paged_stream_preserves_row_order_across_small_pages() {
     );
 }
 
-/// Cancellation trips mid-stream: the poll fires every
-/// `CANCEL_POLL_RECORDS` visited rows even across page boundaries.
 #[test]
 fn paged_stream_stops_at_cancellation() {
     let fake = PagedFake::new(5_000);
@@ -151,9 +146,6 @@ fn paged_stream_stops_at_cancellation() {
     );
 }
 
-/// A cancelled sort aborts instead of running to completion: without
-/// the run-generation, merge, and copy polls this large file would sort
-/// fully and return `Ok`, blocking shutdown.
 #[test]
 fn external_sort_aborts_when_cancelled() -> TestResult {
     let mut file = tempfile::tempfile()?;
@@ -174,9 +166,6 @@ fn external_sort_aborts_when_cancelled() -> TestResult {
     Ok(())
 }
 
-/// Enumeration charges positions before staging: over-limit totals fail
-/// with `ExportTooLarge` before any write or sort, while corrupt values
-/// fail with `SourceRow` exactly as the later resolve check would.
 #[test]
 fn enumeration_charges_positions_before_staging() -> TestResult {
     let valid = TxPositionValue::encode(&[TxPosition::new(0, 1), TxPosition::new(1, 1)]);
@@ -209,7 +198,6 @@ fn enumeration_charges_positions_before_staging() -> TestResult {
     Ok(())
 }
 
-/// An empty family completes with no rows and no error.
 #[test]
 fn paged_stream_accepts_an_empty_family() {
     let fake = PagedFake::new(0);
@@ -227,8 +215,6 @@ fn paged_stream_accepts_an_empty_family() {
     assert_eq!(fake.pages.load(Ordering::SeqCst), 1);
 }
 
-/// A page that returns no rows without completing can make no
-/// progress: the loop refuses instead of spinning.
 #[test]
 fn paged_stream_refuses_a_page_that_makes_no_progress() {
     let fake = PagedFake {
@@ -251,11 +237,6 @@ fn paged_stream_refuses_a_page_that_makes_no_progress() {
     );
 }
 
-/// In-memory `TxIndexSnapshot` that honors a page limit exactly like the
-/// storage seam: key order, first row always returned, byte accounting
-/// after it. Row lookups are never served: the page loop under test
-/// never calls them, and calling one is an explicit typed error rather
-/// than a panic.
 struct PagedFake {
     rows: Vec<(HashPrefixRow, Vec<u8>)>,
     pages: AtomicUsize,

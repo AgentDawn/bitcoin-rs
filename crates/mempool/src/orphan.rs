@@ -1,65 +1,43 @@
-//! Gateway-owned peer orphan lifecycle.
-//!
-//! Retention, witness identity, and retry invariants are owned by `MPL-04`
-//! in `docs/contracts/mempool-mutations.md`.
-
 use crate::mutation::PeerToken;
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use bitcoin_rs_primitives::{Hash256, Tx, Txid, Wtxid};
 use hashbrown::{HashMap, HashSet};
 
 const DEFAULT_ORPHAN_QUOTA: usize = 100;
-/// Aggregate BIP141 weight budget for resident orphan bodies.
 const DEFAULT_MAX_ORPHAN_WEIGHT: u64 = 10_000_000;
-/// Resident peer bodies are reconsidered for at most two minutes.
 const DEFAULT_ORPHAN_TIMEOUT_SECS: u64 = 2 * 60;
 const DEFAULT_REJECT_CAP: usize = 100_000;
-/// Announcements one peer may hold before its usage score passes one.
 const DEFAULT_PEER_ANNOUNCEMENTS: usize = 100;
-/// Orphan weight one peer may reserve before its usage score passes one.
 const DEFAULT_PEER_ANNOUNCEMENT_WEIGHT: u128 = 1_000_000;
-/// Latency one peer may accumulate before its latency score passes one.
 const DEFAULT_PEER_LATENCY: u128 = 1_000;
 
-/// Whether a failure applies to the base transaction or only this witness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RejectScope {
     Transaction,
     Witness,
 }
 
-/// One resident orphan body and every peer that announced it.
 #[derive(Clone, Debug)]
 pub(crate) struct HeldOrphan {
     pub(crate) tx: Arc<Tx>,
-    /// Exact-connection tokens that announced this body. A body stays resident
-    /// while at least one announcer remains live.
     pub(crate) announcers: HashSet<PeerToken>,
-    /// First-seen wall-clock timestamp supplied by the admission caller.
     arrival_time: u64,
 }
 
-/// One queued reconsideration of a resident body for one selected announcer.
 #[derive(Debug)]
 struct OrphanRetryClaim {
     wtxid: Wtxid,
     announcer: PeerToken,
 }
 
-/// Per-peer consumption of orphan residency, charged once per announcement.
 #[derive(Clone, Debug, Default)]
 struct PeerUsage {
     announcements: usize,
     weight: u64,
     latency: u64,
-    /// This peer's announcements in the order it made them. A body's global
-    /// FIFO slot predates every later announcer, so per-peer eviction order
-    /// cannot ride on shared insertion order.
     announced: VecDeque<Wtxid>,
 }
 
-/// One peer's allowance for each resource an announcement consumes. A peer at
-/// or below every allowance scores at most one.
 #[derive(Clone, Copy, Debug)]
 struct PeerAllowance {
     announcements: u128,
@@ -78,9 +56,6 @@ impl PeerAllowance {
 }
 
 impl PeerUsage {
-    /// Core's per-peer `DoS` rank: the largest share of any allowance this peer
-    /// consumes. Each share is scaled by the other two allowances so the
-    /// comparison stays in exact integers.
     fn rank(&self, allowance: &PeerAllowance) -> u128 {
         let announcements = u128::try_from(self.announcements)
             .unwrap_or(u128::MAX)
@@ -145,31 +120,21 @@ impl OrphanPool {
         self.entries.len()
     }
 
-    /// Residency of one exact witness identity. A txid never identifies a
-    /// resident body: two bodies can share one txid.
     pub(crate) fn get(&self, wtxid: Wtxid) -> Option<&HeldOrphan> {
         self.entries.get(&wtxid)
     }
 
-    /// One arbitrary resident variant of a txid, for tests and retry
-    /// selection only. Inventory suppression must never consult it.
     #[cfg(test)]
     fn get_by_txid(&self, txid: Txid) -> Option<&HeldOrphan> {
         self.entries.values().find(|held| held.tx.txid() == txid)
     }
 
-    /// PRE: `claim` and `announcer` name one pair this pool issued.
     pub(crate) fn is_current(&self, claim: &HeldOrphan, announcer: &PeerToken) -> bool {
         self.entries.get(&claim.tx.wtxid()).is_some_and(|current| {
             current.announcers.contains(announcer) && Arc::ptr_eq(&current.tx, &claim.tx)
         })
     }
 
-    /// PRE: `wtxid` may name a resident body; `announcer` is an exact
-    /// connection token.
-    /// POST: the pair is recorded exactly once. The body, its first-seen time,
-    /// its FIFO position and the resident weight stay unchanged. False when
-    /// the body is absent or the pair was already recorded.
     fn add_announcer(&mut self, wtxid: Wtxid, announcer: PeerToken) -> bool {
         let charge = {
             let Some(held) = self.entries.get_mut(&wtxid) else {
@@ -184,7 +149,6 @@ impl OrphanPool {
         true
     }
 
-    /// Stores one peer-origin body together with the peer that announced it.
     pub(crate) fn insert(&mut self, tx: Arc<Tx>, announcer: PeerToken, time: u64) {
         let wtxid = tx.wtxid();
         if self.entries.contains_key(&wtxid) {
@@ -215,8 +179,6 @@ impl OrphanPool {
         self.evict_to_limits();
     }
 
-    /// Removes the body with this exact witness identity, every announcer of
-    /// it, and every index entry that named it.
     pub(crate) fn remove(&mut self, wtxid: Wtxid) -> Option<HeldOrphan> {
         let entry = self.entries.remove(&wtxid)?;
         self.total_weight = self.total_weight.saturating_sub(entry.tx.weight());
@@ -230,7 +192,6 @@ impl OrphanPool {
         Some(entry)
     }
 
-    /// Removes every resident body whose txid equals `txid`.
     pub(crate) fn remove_transaction_variants(&mut self, txid: Txid) {
         let variants: Vec<Wtxid> = self
             .entries
@@ -243,8 +204,6 @@ impl OrphanPool {
         }
     }
 
-    /// PRE: `wtxid` may name a resident body; `preferred` may be one of its
-    /// announcers.
     pub(crate) fn mark_ready(&mut self, wtxid: Wtxid, preferred: PeerToken) {
         let announcer = {
             let Some(held) = self.entries.get(&wtxid) else {
@@ -264,8 +223,6 @@ impl OrphanPool {
         }
     }
 
-    /// Makes every resident body spending an output of `parent` eligible for
-    /// reconsideration.
     pub(crate) fn parent_ready(&mut self, parent: Txid) {
         let claims: Vec<(Wtxid, PeerToken)> = self
             .by_parent
@@ -285,9 +242,6 @@ impl OrphanPool {
         }
     }
 
-    /// Schedules one reconsideration for every currently resident witness identity.
-    /// Existing residency limits bound the temporary list, and `mark_ready` merges
-    /// it with pending work without duplicating a body or resetting its lifetime.
     pub(crate) fn mark_all_ready(&mut self) {
         let claims: Vec<_> = self
             .entries
@@ -299,8 +253,6 @@ impl OrphanPool {
         }
     }
 
-    /// Claim one bounded snapshot. Bodies remain resident across transient
-    /// failures.
     pub(crate) fn take_ready(&mut self) -> Vec<(HeldOrphan, PeerToken)> {
         self.ready_ids.clear();
         self.ready
@@ -317,7 +269,6 @@ impl OrphanPool {
             .collect()
     }
 
-    /// Removes expired bodies and the announcements of departed connections.
     pub(crate) fn maintain(&mut self, now: u64, live_peers: &HashSet<PeerToken>) -> usize {
         let expired: Vec<Wtxid> = self
             .entries
@@ -352,7 +303,6 @@ impl OrphanPool {
         removed
     }
 
-    /// Drops one peer's announcement of one body.
     fn remove_announcer(&mut self, wtxid: Wtxid, announcer: PeerToken) -> bool {
         let charge = {
             let Some(held) = self.entries.get_mut(&wtxid) else {
@@ -375,8 +325,6 @@ impl OrphanPool {
         false
     }
 
-    /// Restores both global bounds by trimming announcements of the highest
-    /// scoring peer.
     fn evict_to_limits(&mut self) {
         while self.entries.len() > self.quota || self.total_weight > self.max_weight {
             let Some(victim) = self.highest_scoring_peer() else {
@@ -403,10 +351,6 @@ impl OrphanPool {
             .map(|(peer, _)| *peer)
     }
 
-    /// Drops the victim's oldest announcement in the order the victim made
-    /// it, preferring work that is not ready for reconsideration. Entries the
-    /// victim no longer announces are pruned here, so the scan stays
-    /// proportional to the victim's live announcements.
     fn trim_oldest_announcement(&mut self, victim: PeerToken) -> bool {
         let target = {
             let mut ready_candidate: Option<Wtxid> = None;
@@ -468,14 +412,12 @@ impl OrphanPool {
         }
     }
 
-    /// Core's per-body latency charge: one per body plus one per ten inputs.
     fn latency_score(tx: &Tx) -> u64 {
         u64::try_from(tx.inputs.len() / 10)
             .unwrap_or(u64::MAX - 1)
             .saturating_add(1)
     }
 
-    /// Deterministic announcer choice: the earliest minted connection token.
     fn select_announcer(announcers: &HashSet<PeerToken>) -> Option<PeerToken> {
         announcers
             .iter()
@@ -525,7 +467,6 @@ impl Default for AdmissionLifecycle {
     }
 }
 impl AdmissionLifecycle {
-    /// Caches one refusal and retires the resident work it covers.
     pub(crate) fn reject(&mut self, tx: &Tx, scope: RejectScope) {
         match scope {
             RejectScope::Witness => {
@@ -555,8 +496,6 @@ impl AdmissionLifecycle {
             self.reject_order.push_back(hash);
         }
     }
-    /// Base-invalid failures suppress all witnesses; other failures suppress
-    /// only the body actually checked. A stripped body's wtxid may equal txid.
     pub(crate) fn rejects_transaction(&self, txid: Txid, wtxid: Wtxid) -> bool {
         self.rejects.get(&Hash256::from(txid)) == Some(&RejectScope::Transaction)
             || self.rejects.contains_key(&Hash256::from(wtxid))

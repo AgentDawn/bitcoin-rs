@@ -15,14 +15,9 @@ use thiserror::Error;
 use crate::handshake::run_inbound_handshake;
 use crate::peer::Peer;
 
-/// Handshake and idle-write ceiling. Matches Bitcoin Core's 60s inactivity
-/// window for a peer that never completes version/verack.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(1);
-/// Read timeout used while polling handshake and message reads.
 const STREAM_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Applies the peer-socket policy: `TCP_NODELAY`, blocking I/O, and the
-/// handshake/poll timeouts.
 fn configure_peer_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_nonblocking(false)?;
@@ -33,27 +28,14 @@ fn configure_peer_stream(stream: &TcpStream) -> io::Result<()> {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Maximum backoff for transient accept errors (ECONNABORTED, EMFILE, …).
-/// Bounded so the listener recovers quickly once the pressure clears.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
-/// How often an otherwise quiet connection is probed with one `ping`: Core's
-/// `PING_INTERVAL` is 2 * 60 seconds (`net_processing.cpp:125`).
 const PING_INTERVAL: Duration = Duration::from_mins(2);
 
-/// How long send or receive silence may last before the connection ends:
-/// Core's `TIMEOUT_INTERVAL` is 20 * 60 seconds (`net.h:59`), enforced by its
-/// `InactivityCheck` (`net.cpp:2043-2090`).
 const TIMEOUT_INTERVAL: Duration = Duration::from_mins(20);
 
-/// Blocks of tip staleness (in target-spacing units) within which Core will
-/// still connect to a `NODE_NETWORK_LIMITED` peer:
-/// `NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` (`net_processing.cpp:161`).
 const NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS: u64 = 144;
 
-/// Proof-of-work target spacing used to express the local tip age in blocks
-/// (Core `nPowTargetSpacing`, 600 seconds on every bitcoin-rs network;
-/// `bitcoin_rs_primitives::Network::target_spacing_seconds`).
 const POW_TARGET_SPACING_SECS: u64 = 600;
 
 type ChainQueryHandle = Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>;
@@ -66,140 +48,57 @@ type SyncWakeHandle = Option<Sender<()>>;
 
 type PeerReadyHandle = Option<Arc<dyn Fn(crate::PeerSource) + Send + Sync>>;
 
-/// Optional node-owned handles passed to [`crate::P2pService::start`].
 #[derive(Clone, Default)]
 pub struct ListenerExtras {
-    /// Mempool / orphan / recent-rejects view for the `inv` filter and
-    /// transaction `getdata` serving.
     pub tx_inventory: TxInventoryHandle,
     /// Compact-block short-ID hints (the shared mempool gateway) for BIP152
-    /// reconstruction.
     pub compact_hints: CompactHintsHandle,
-    /// Bounded ingress for decoded `tx` bodies and charged `pkgtxns` frames
-    /// from Ready peers.
     pub inbound_tx: Option<Sender<crate::InboundBody>>,
-    /// The node's one ledger of retained `pkgtxns` bytes. `None` means
-    /// package bodies are never accepted for admission.
     pub package_capacity: Option<crate::PackageCapacity>,
-    /// Chain-owned initial-block-download latch paired with the node's
-    /// configured consensus network. `None` means transaction relay is open
-    /// (callers without a chain, and tests). While `Some` and active,
-    /// tx-typed `inv` vectors are not requested and `tx` bodies are dropped
-    /// before ingress (Core 31.1 `net_processing.cpp:4401`, `:4716`). The
-    /// network travels with the latch because the wire magic is not an
-    /// identity: a `--p2p-magic` override can carry another network's bytes.
     pub ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
-    /// Block-download orchestrator, used to route block inventory announcements
-    /// and to ask whether an inbound body was requested.
-    /// When `None`, announcements are ignored and inbound bodies are treated
-    /// as unsolicited.
     pub block_sync: Option<Arc<crate::sync::BlockSync>>,
-    /// Block announcer for outbound block announcements and peer capability tracking.
     pub block_announcer: Option<Arc<crate::block_announce::BlockAnnouncer>>,
 }
 
-/// The opt-in relay capabilities a node offers in every handshake.
-///
-/// Every switch defaults off, so a node that never opts in advertises
-/// nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RelayOffers {
     /// Whether this node offers BIP331 ancestor package relay: `sendpackages`
-    /// is written between `version` and `verack` of every handshake only when
-    /// set, so a disabled node never advertises the capability.
     pub package_relay: bool,
     /// Whether this node announces BIP332 stale-tip relay in its BIP434
-    /// `feature` negotiation. Final policy; this crate applies no network
-    /// check.
     pub stale_tip_relay: bool,
     /// The `prefers_blocks` byte of the BIP332 announcement. Read only with
-    /// [`Self::stale_tip_relay`].
     pub stale_tip_prefers_blocks: bool,
 }
 
-/// Share the wiring for one P2P start epoch.
-///
-/// The listener, every outbound dial, and every connection thread they
-/// spawn read the same stores, sinks, and start token through clones of
-/// this value.
-///
-/// PRE: Construct the required handles before any worker starts.
-/// POST: Each clone refers to the same stores and start token.
-/// INVARIANT: Count socket bytes once. Read the IBD decision lazily.
 #[derive(Clone)]
 pub struct ConnectionShared {
-    /// Authoritative live-peer table shared with the node.
     pub peer_table: Arc<crate::PeerTable>,
-    /// Manual subnet bans shared with the RPC `setban` handler.
     pub banned: crate::BannedReader,
-    /// Shared P2P-owned auxiliary address book.
     pub(crate) address_book: Option<Arc<crate::addrman::AddressBook>>,
-    /// A short-lived automatic handshake probe; never published as a work peer.
     pub(crate) feeler: bool,
-    /// Network kill-switch behind `setnetworkactive`.
     pub activity: Arc<crate::NetworkActivity>,
-    /// Start-scoped cancellation token. Tests that never cancel pass a
-    /// token that stays `false`.
     pub session_cancel: bitcoin_rs_chain::LatchReader,
-    /// Callback run after a connection publishes its ready metadata.
     pub peer_ready: PeerReadyHandle,
-    /// Network magic of every framed message.
     pub magic: Magic,
-    /// Sink for `headers` messages and body-carried headers.
     pub headers_tx: Sender<crate::InboundHeaders>,
-    /// Sink for full block bodies.
     pub blocks_tx: Sender<crate::InboundBlock>,
-    /// Read-only active-chain view for `getheaders` and `getdata` serving.
     pub chain_query: ChainQueryHandle,
-    /// Wakes block sync after a header or block reaches its sink.
     pub wake_tx: SyncWakeHandle,
-    /// Mempool / orphan / recent-rejects view for the `inv` filter and
-    /// transaction `getdata` serving.
     pub tx_inventory: TxInventoryHandle,
     /// Compact-block short-ID hints for BIP152 reconstruction.
     pub compact_hints: CompactHintsHandle,
-    /// Bounded ingress for decoded `tx` bodies and charged `pkgtxns` frames
-    /// from Ready peers.
     pub inbound_tx: Option<Sender<crate::InboundBody>>,
-    /// The node's one ledger of retained `pkgtxns` bytes; see
-    /// [`ListenerExtras::package_capacity`].
     pub package_capacity: Option<crate::PackageCapacity>,
-    /// Chain-owned initial-block-download latch paired with the node's
-    /// configured consensus network. `None` means transaction relay is open.
-    /// The network travels with the latch because the wire magic is not an
-    /// identity: a `--p2p-magic` override can carry another network's bytes.
     pub ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
-    /// Block-download orchestrator for this start epoch.
     pub block_sync: Option<Arc<crate::sync::BlockSync>>,
-    /// Block announcer for outbound block announcements and peer capability tracking.
     pub block_announcer: Option<Arc<crate::block_announce::BlockAnnouncer>>,
-    /// Inbound connection capacity: the automatic-connection maximum minus
-    /// the outbound slot counts. At this count an inbound newcomer evicts an
-    /// inbound connection or is refused (Core `m_max_inbound`, `net.h:1118`,
-    /// applied at `net.cpp:1819-1826`).
     pub max_inbound: usize,
-    /// The services this node advertises in every `version`, inbound or
-    /// outbound: `WITNESS | NETWORK` normally, `WITNESS | NETWORK_LIMITED`
-    /// when pruned (Core `init.cpp:2022-2026`).
     pub local_services: ServiceFlags,
     /// Whether connections try BIP324 v2: inbound detects v1 and v2, and
-    /// outbound starts v2 to manual peers and to addresses advertising
-    /// `NODE_P2P_V2`, falling back to v1 once when unanswered. `false` keeps
-    /// every connection on v1.
     pub v2_transport: bool,
-    /// The opt-in relay capabilities offered in every handshake. Default
-    /// offers nothing; the P2P service copies it from its resolved
-    /// configuration.
     pub relay_offers: RelayOffers,
     pub(crate) overlay: Arc<crate::overlay::OverlayTransport>,
-    /// Aggregate outbound queued-byte budget every connection of this start
-    /// epoch counts against. The P2P service owns the `Arc`; clones of this
-    /// struct share it, so inbound, outbound, and manual connections of one
-    /// node draw from one aggregate while independent services stay
-    /// independent.
     pub(crate) shared_outbound: Arc<crate::connection::SharedOutboundBudget>,
-    /// Transport routes for outbound dials (SOCKS proxies, SAM session,
-    /// onlynet restriction). Default routes dial direct IP only.
     pub dial_routes: crate::DialRoutes,
 }
 
@@ -219,14 +118,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Construct the complete wiring for one start epoch.
-    ///
-    /// PRE: The stores belong to the same P2P start epoch. `extras` carries
-    /// the node-owned transaction handles; pass [`ListenerExtras::default`]
-    /// when they are absent.
-    /// POST: Every field is set from the arguments; a caller cannot obtain
-    /// a half-wired value.
-    /// INVARIANT: `None` for `ibd` means transaction relay is open.
     #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -272,16 +163,8 @@ impl ConnectionShared {
         }
     }
 
-    /// Offers the opt-in relay capabilities this start epoch enabled.
-    ///
-    /// PRE: `peer` has written nothing yet; call before the handshake starts.
-    /// POST: with [`RelayOffers::package_relay`] set, `peer` will send one
     ///   `sendpackages` carrying both BIP331 version bits during the
-    ///   handshake; with [`RelayOffers::stale_tip_relay`] set, it announces
     ///   BIP332 with [`RelayOffers::stale_tip_prefers_blocks`] as the
-    ///   feature's data byte; otherwise `peer` offers nothing.
-    /// INVARIANT: both the inbound and the outbound handshake go through
-    ///   here, so the offer cannot depend on direction.
     fn offer_relay_capabilities<S>(&self, peer: &mut Peer<S>, role: crate::PeerRole) {
         if self.relay_offers.package_relay && role.relays_transactions() {
             peer.offer_package_relay(
@@ -294,8 +177,6 @@ impl ConnectionShared {
     }
 
     /// Records the BIP332 `prefers_blocks` byte `peer` announced back.
-    ///
-    /// POST: stored with the peer's table entry only when this node offered
     ///   stale-tip relay and `peer` announced BIP332; otherwise nothing.
     fn note_peer_stale_tip_relay<S>(
         &self,
@@ -312,8 +193,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Remove the session `endpoint` identifies (or the unidentified
-    /// session when `None`) if `lease` is still its current connection.
     fn remove_session(&self, endpoint: Option<crate::PeerEndpoint>, lease: &crate::PeerLease) {
         match endpoint {
             Some(endpoint) => {
@@ -325,9 +204,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Installs the owning service's aggregate outbound budget, replacing
-    /// the fresh per-epoch default so all of the service's connections draw
-    /// from one aggregate.
     #[must_use]
     pub(crate) fn with_shared_outbound(
         mut self,
@@ -388,14 +264,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Routes one block-typed inventory hash into header sync.
-    ///
-    /// PRE: `source` identifies the current connection and `hash` is a block
-    /// inventory hash.
-    /// POST: the sync layer records the connection's best-known block and
-    /// schedules `getheaders`; no block body request is emitted here.
-    /// INVARIANT: block inventory never bypasses header admission and the
-    /// download-window budget.
     fn announce_block(&self, source: crate::PeerSource, hash: bitcoin_rs_primitives::Hash256) {
         let Some(sync) = self.block_sync.as_ref() else {
             return;
@@ -404,17 +272,6 @@ impl ConnectionShared {
         wake_sync(self.wake_tx.as_ref());
     }
 
-    /// Routes the block vectors of one inbound `notfound` to the body fetch
-    /// each answers.
-    ///
-    /// PRE: `source` is the connection that sent `items`.
-    /// POST: a block vector `source` owns the request for releases that
-    /// request without blame, and the sync loop is woken to replan it
-    /// through the ordinary scheduler. Transaction and package vectors are
-    /// left to their own request lifecycles
-    /// ([`Self::update_transaction_requests`]).
-    /// INVARIANT: only the exact owning connection releases, so an unsolicited
-    /// or stale-session `notfound` changes nothing and wakes nothing.
     fn block_not_found(
         &self,
         source: crate::PeerSource,
@@ -434,8 +291,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Publish ready metadata and the connection's negotiated package bits
-    /// before notifying consumers that the peer is ready.
     fn publish_info_and_notify_ready_with_package(
         &self,
         peer_addr: impl Into<crate::PeerRemote>,
@@ -489,25 +344,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Enqueues a decoded block body into ingress, then forwards its carried
-    /// header to header admission.
-    ///
-    /// The body is queued first so the header can never reach `headers_tx`
-    /// while the body is still unsent: request scheduling runs after both
-    /// drains, so the staged-or-received body suppresses a duplicate
-    /// `getdata` for a tip learned only by delivery.
-    ///
-    /// PRE: `lease` belongs to the connection that delivered `block`.
-    /// POST: when [`crate::PeerLease::admit_block_forward`] admits the body,
-    ///   the body reaches the shared inbound block channel and then its
-    ///   header reaches the headers sink; a refused body drops both with a
-    ///   counter record, so a peer over its unsolicited bound cannot grow
-    ///   the header queue either.
-    /// INVARIANT: one connection holds at most
-    ///   [`crate::connection::MAX_UNSOLICITED_BLOCK_FORWARDS`] unsolicited
-    ///   bodies in the shared channel at once, and a body the download
-    ///   window owns is never dropped for that bound, so requested sync
-    ///   traffic always arrives.
     fn send_block(
         &self,
         lease: &crate::PeerLease,
@@ -516,23 +352,6 @@ impl ConnectionShared {
     ) {
         let peer_addr = peer_addr.into();
         let source = lease.source(peer_addr.endpoint());
-        // Every body carries its own header; route it through the headers
-        // sink too so tips learned only by body delivery (`inv` getdata,
-        // compact reconstruction, or an unsolicited push) reach header
-        // admission. Without a tree node the body can never become the
-        // apply frontier's expected block, and no announced-tip credit
-        // reaches the delivering peer. The headers drain runs before the
-        // blocks drain each tick, so the body lands already expected. The
-        // forward is not a `headers` response: it must not consume an
-        // outstanding `getheaders` request's pending state.
-        //
-        // The body goes on its channel before the header goes on its own on
-        // purpose: a tip learned only by body delivery arrives untracked
-        // (the `inv` getdata is never marked pending), so if the header
-        // reached the tree while the body still sat outside `received`, the
-        // same tick would schedule a duplicate fetch for it. Queueing the
-        // body first means the tick that admits the header always marks the
-        // body received first.
         let header = payload.block().header;
         let hash = bitcoin_rs_primitives::Hash256::from(header.compute_hash());
         let requested = self
@@ -540,9 +359,6 @@ impl ConnectionShared {
             .as_ref()
             .is_some_and(|sync| sync.owns_body_fetch(source, hash));
         let Some(credit) = lease.admit_block_forward(source, hash, requested) else {
-            // The connection is over its unsolicited bound: drop the header
-            // too, or a flood of refused bodies still grows the header queue
-            // without limit.
             metrics::counter!("node.sync.dropped_unsolicited_blocks").increment(1);
             return;
         };
@@ -551,16 +367,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Queues an admitted body on the shared inbound block channel.
-    ///
-    /// PRE: `forward_credit` admits this body into the ingress path.
-    /// POST: `true` when the body is queued; `false` when it was dropped
-    ///   because the session was cancelled or the channel disconnected. A
-    ///   caller that pairs the body with a header must send the header only
-    ///   on `true`, or sync admits a block announcement whose body never
-    ///   arrives — and whose forward credit never releases.
-    /// INVARIANT: backpressure waits here, never in the admission step, and
-    ///   the credit is released when sync drops the body it holds.
     fn forward_block(
         &self,
         payload: bitcoin_rs_primitives::BlockPayload,
@@ -593,9 +399,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Only transaction inventory and matching notfound replies wake download
-    /// policy from the wire. Ping, headers and other traffic cannot amplify a
-    /// gateway census; the relay worker owns the paced background poll.
     fn update_transaction_requests(&self, source: crate::PeerSource, message: &crate::Message) {
         let Some(inventory) = &self.tx_inventory else {
             return;
@@ -622,7 +425,6 @@ impl ConnectionShared {
         }
     }
 
-    /// Forwards a decoded transaction into the node's ingress channel.
     fn send_tx(&self, source: crate::PeerSource, tx: bitcoin_rs_primitives::Tx) {
         let body = crate::InboundBody::from(crate::InboundTx::new(tx, source));
         let dropped = if let Some(channel) = &self.inbound_tx {
@@ -660,18 +462,6 @@ impl ConnectionShared {
 }
 
 impl ConnectionShared {
-    /// Accepts one raw `pkgtxns` frame for admission and queues it, still
-    /// encoded, on the node's ingress channel.
-    ///
-    /// PRE: the sender negotiated package relay and transaction relay is
-    ///   open; `payload` is the frame as read, never decoded.
-    /// POST: `Ok` means the frame is queued with its charge and claim, or
-    ///   that nothing was accepted (unsolicited, refused, or ingress
-    ///   unavailable) and nothing is held. `Err` is a sender protocol
-    ///   violation.
-    /// INVARIANT: this thread decodes nothing. A package that cannot be
-    ///   queued (session cancelled, channel full or closed) is released
-    ///   through the one pre-admission release before the call returns.
     fn send_package(
         &self,
         source: crate::PeerSource,
@@ -722,30 +512,17 @@ impl ConnectionShared {
     }
 }
 
-/// Errors returned by the P2P listener accept loop.
 #[derive(Debug, Error)]
 pub enum ListenerError {
-    /// Failed to bind the TCP listener.
     #[error("bind {addr}: {source}")]
     Bind {
-        /// Address the listener attempted to bind.
         addr: std::net::SocketAddr,
-        /// Underlying bind or listener setup failure.
         source: io::Error,
     },
-    /// Accept loop returned a fatal I/O error.
     #[error("accept: {0}")]
     Accept(#[from] io::Error),
 }
 
-/// Bind the requested listening address.
-///
-/// Callers that report startup success must bind here first so an occupied
-/// address fails before workers are spawned.
-///
-/// PRE: `addr` identifies the requested local endpoint.
-/// POST: Return a nonblocking listener or [`ListenerError::Bind`].
-/// INVARIANT: Bind before starting listener workers.
 pub fn bind_listener(addr: std::net::SocketAddr) -> Result<TcpListener, ListenerError> {
     let listener =
         TcpListener::bind(addr).map_err(|source| ListenerError::Bind { addr, source })?;
@@ -755,38 +532,8 @@ pub fn bind_listener(addr: std::net::SocketAddr) -> Result<TcpListener, Listener
     Ok(listener)
 }
 
-/// Run the accept loop on a bound listener.
-///
-/// On each accepted connection, spawns a thread that runs the inbound
-/// handshake followed by a message-dispatch loop. Socket flags come from
-/// `configure_peer_stream`. The handshake uses
-/// `HANDSHAKE_TIMEOUT`; after handshake, the message loop
-/// polls inbound reads every `STREAM_POLL_INTERVAL`, probing
-/// a quiet peer with one `ping` per `PING_INTERVAL` and ending the
-/// connection once a direction is silent past `TIMEOUT_INTERVAL`.
-/// The thread terminates on:
-///   - successful handshake then inactivity (no send or receive for
-///     `TIMEOUT_INTERVAL`)
-///   - wire / FSM error
-///   - explicit FSM disconnect transition
-///
-/// Transient `accept` errors (ECONNABORTED, EMFILE/ENFILE under fd
-/// pressure, etc.) are logged at warn and the loop continues after a
-/// bounded backoff, matching Bitcoin Core's tolerant accept loop so inbound
-/// P2P stays alive through temporary resource exhaustion.
-///
-/// Per-connection threads are NOT joined by the outer shutdown — they
-/// outlive the listener by up to the timeout. On exit (clean or error),
-/// the peer is removed from the authoritative peer table.
-///
-/// PRE: The listener is bound and nonblocking. Wiring is complete.
-/// POST: Return when `shutdown` or `shared.session_cancel` is set.
-/// INVARIANT: Apply the ban and activity checks to each accepted socket.
-///
 /// # Errors
-///
 /// Returns [`ListenerError::Accept`] when the listener cannot report its
-/// local address.
 #[expect(clippy::needless_pass_by_value)]
 pub fn serve(
     listener: TcpListener,
@@ -835,7 +582,6 @@ fn accept_connections(
     }
 }
 
-/// Admit every transport through the same policy, capacity and session path.
 pub(crate) fn admit_inbound(stream: TcpStream, peer_addr: PeerEndpoint, shared: &ConnectionShared) {
     admit_inbound_with_epoch(stream, peer_addr, shared, None);
 }
@@ -871,12 +617,6 @@ fn admit_inbound_remote(
         tracing::debug!(?endpoint, "p2p inbound rejected: network inactive");
         return;
     }
-    // Reserve the inbound slot atomically with the capacity
-    // test and any eviction before any thread exists: a separate
-    // count followed by an unconstrained spawn races concurrent
-    // accepts. Registration stays identity-checked, so the
-    // reservation itself is the handshaking-peer accounting
-    // Core's connman performs (`net.cpp:1819-1826`).
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::QueuedFrame>();
     let lease = crate::PeerLease::new_inbound(outbound_tx)
         .with_shared_budget(&shared.shared_outbound)
@@ -910,19 +650,6 @@ fn admit_inbound_remote(
     spawn_handshake_thread(stream, peer_addr, shared.clone(), lease, outbound_rx);
 }
 
-/// Spawn one automatic outbound connection dial of `role`.
-///
-/// The thread connects to `addr`, performs the outbound P2P handshake with
-/// `role`, and enters the same message loop the inbound path uses. Errors
-/// during connect or handshake bubble up via the `JoinHandle`'s `Result`; a
-/// failed thread spawn yields a handle that reports the spawn I/O error.
-///
-/// PRE: Wiring is complete for this start epoch, and `role` is the role the
-///   dialer chose for this connection.
-/// POST: The handle reports connection completion or its error.
-/// INVARIANT: Preserve registration, cancellation, and teardown order. The
-///   role is fixed at spawn: the handshake advertises it and every relay
-///   decision reads it back from the lease.
 #[must_use]
 pub fn spawn_outbound_connection(
     addr: PeerEndpoint,
@@ -932,15 +659,6 @@ pub fn spawn_outbound_connection(
     spawn_dial(addr, shared, role, false, false)
 }
 
-/// Spawn one operator-pinned outbound connection dial of `role`: an address
-/// the operator named, which Core marks `MANUAL` and spares from its
-/// chain-sync and excess-slot eviction rules.
-///
-/// PRE: Wiring is complete for this start epoch, and `role` is the role the
-///   dialer chose for this connection.
-/// POST: The handle reports connection completion or its error.
-/// INVARIANT: The lease records the pinned origin at spawn, and the eviction
-///   rules read it back from there.
 #[must_use]
 pub(crate) fn spawn_pinned_outbound_connection(
     addr: PeerEndpoint,
@@ -975,8 +693,6 @@ pub(crate) fn spawn_dial(
     }
 }
 
-/// Admits one outbound connection to `addr` and dials it, retrying once over
-/// v1 when a v2 attempt goes unanswered.
 fn run_outbound_connection(
     addr: PeerEndpoint,
     shared: &ConnectionShared,
@@ -1004,8 +720,6 @@ fn run_outbound_connection(
             ));
         }
     }
-    // Core starts BIP324 on every manual connection, and on an automatic one
-    // only when the address advertises `NODE_P2P_V2`.
     let try_v2 = shared.v2_transport
         && (manual
             || shared
@@ -1015,9 +729,6 @@ fn run_outbound_connection(
     match dial(addr, shared, role, manual, count_failure, try_v2)? {
         Dialed::Done => Ok(()),
         Dialed::V1Retry => {
-            // The peer closed a v2 attempt without sending a byte, as a v1-only
-            // node does: retry once over v1, as Core does. The unanswered
-            // attempt is not evidence against the peer.
             tracing::debug!(
                 peer_addr = %addr,
                 "p2p v2 handshake unanswered; retrying with v1 transport protocol"
@@ -1027,15 +738,11 @@ fn run_outbound_connection(
     }
 }
 
-/// How one outbound dial ended.
 enum Dialed {
-    /// The connection completed or ended; nothing to retry.
     Done,
-    /// A v2 attempt went unanswered, so a v1 retry may succeed.
     V1Retry,
 }
 
-/// Connects to `addr` and runs the connection to completion, opening with a
 /// BIP324 handshake when `try_v2` is set.
 #[expect(
     clippy::too_many_lines,
@@ -1053,8 +760,6 @@ fn dial(
         shared.is_session_cancelled() || !shared.activity.is_active()
     });
     if let Some(book) = &shared.address_book {
-        // Record direct attempts, routed success and explicit remote refusals.
-        // Local proxy/router setup failures are not evidence against the peer.
         if addr.address().ip().is_some() && shared.overlay.config.proxy.is_none()
             || connection.is_ok()
             || connection
@@ -1073,14 +778,10 @@ fn dial(
         return Err(crate::wire::PeerError::Protocol("p2p startup cancelled"));
     }
 
-    // Wrapped before registration and the handshake, so failed socket
-    // posture cannot leave a dead peer in live-connection accounting.
     let counters = std::sync::Arc::new(crate::PeerCounters::default());
     let stream = crate::CountingStream::from_connected(stream, counters)
         .map_err(crate::wire::PeerError::Io)?;
 
-    // Register the connection before the handshake so live-connection
-    // accounting covers handshaking peers exactly like Core's connman.
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::QueuedFrame>();
     let lease = match (role, manual) {
         (crate::peer_info::PeerRole::FullRelay, false) => crate::PeerLease::new(outbound_tx),
@@ -1114,8 +815,6 @@ fn dial(
         return Ok(Dialed::Done);
     }
 
-    // One deadline covers the transport and the version handshake, as
-    // Core's single `-peertimeout` does.
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut stream = stream;
     let negotiated = if try_v2 {
@@ -1173,9 +872,6 @@ fn dial(
         addr,
         shared,
     ) {
-        // `remove_current` cancels as a side effect, so revocation must be
-        // read before it: a pre-cancelled lease means an external shutdown,
-        // while a live lease means this handshake failed on its own.
         let revoked = lease.is_cancelled();
         if !revoked {
             shared.note_misbehavior(addr, &lease, &error);
@@ -1224,15 +920,6 @@ fn dial(
     run_connected_session(&mut peer, addr, shared, lease, outbound_rx, info).map(|()| Dialed::Done)
 }
 
-/// Drives the outbound handshake until the peer is ready.
-///
-/// PRE: `peer` wraps a connected outbound stream, `lease` belongs to it,
-///   and `shared` holds this dial's chain query and service policy.
-/// POST: a feeler has an accepted VERSION; an ordinary `peer` is `Ready`,
-///   post-verack messages are sent, and the remote offered desirable services ([`has_all_desirable_service_flags`]).
-/// INVARIANT: This function counts no bytes; the stream that `peer` wraps
-///   owns byte accounting. The service check runs once the remote `version`
-///   is decoded and before the peer can be published as usable.
 fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,
     nonce: u64,
@@ -1261,8 +948,6 @@ fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
             && matches!(accepted, crate::Message::Version(_))
             && let Some(version) = peer.remote_version.as_ref()
         {
-            // Record received services even when the ordinary service gate rejects
-            // this VERSION. Metadata does not imply handshake success or Good.
             let _ = shared
                 .peer_table
                 .with_current(lease.source(Some(endpoint)), || {
@@ -1274,8 +959,6 @@ fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
                     }
                 });
         }
-        // Feelers establish address liveness from an accepted native VERSION.
-        // They neither require ordinary services nor wait for VERACK/ready work.
         if shared.feeler && peer.remote_version.is_some() {
             return Ok(());
         }
@@ -1294,9 +977,6 @@ fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
     Ok(())
 }
 
-/// Local applied-tip age in target-spacing units, shared by selection and admission.
-/// Returns `u64::MAX` without a chain view/tip, preserving full-history eligibility.
-/// Read the chain view before acquiring the address-book lock.
 pub(crate) fn approximate_best_block_depth(query: Option<&dyn crate::ChainQuery>) -> u64 {
     let Some(tip_time) = query.and_then(crate::ChainQuery::best_block_time) else {
         return u64::MAX;
@@ -1304,18 +984,6 @@ pub(crate) fn approximate_best_block_depth(query: Option<&dyn crate::ChainQuery>
     unix_time_secs().saturating_sub(u64::from(tip_time)) / POW_TARGET_SPACING_SECS
 }
 
-/// Returns the service flags required from an outbound peer.
-///
-/// PRE: `remote_services` is the flags received in `version`;
-///   `best_block_depth` is the local approximate tip age in target-spacing
-///   units (`approximate_best_block_depth`).
-/// POST: a peer with NETWORK and WITNESS is accepted; a LIMITED peer is
-///   accepted only when it also has WITNESS and `best_block_depth < 144`;
-///   every other service set is rejected.
-/// INVARIANT: this is the only outbound desirable-service predicate
-///   (Core `HasAllDesirableServiceFlags` / `GetDesirableServiceFlags`,
-///   `net_processing.cpp:1857-1872`, applied to outbound connections at
-///   `net_processing.cpp:3864-3871`); inbound peers are exempt.
 #[must_use]
 pub fn has_all_desirable_service_flags(
     remote_services: ServiceFlags,
@@ -1355,8 +1023,6 @@ fn spawn_handshake_thread(
         });
 
     if let Err(error) = spawn_result {
-        // The accept loop reserved this lease for the thread; with no
-        // thread running, the reservation must release its capacity.
         spawn_shared.remove_session(peer_addr.endpoint(), &reservation);
         reservation.cancel();
         tracing::warn!(
@@ -1368,7 +1034,6 @@ fn spawn_handshake_thread(
 }
 
 /// The transport an inbound connection speaks: BIP324 when this node speaks
-/// v2 and the peer opens with a key, v1 otherwise.
 fn negotiate_inbound(
     stream: &mut crate::CountingStream<TcpStream>,
     shared: &ConnectionShared,
@@ -1404,8 +1069,6 @@ fn run_handshake(
         shared.peer_table.remove_current(peer_addr, &lease);
         return Err(error);
     }
-    // The accept loop reserved this lease: every exit from here on must
-    // release it, or a failed setup would consume an admission slot forever.
     if let Err(error) = configure_peer_stream(&stream).map_err(crate::wire::PeerError::Io) {
         shared.remove_session(peer_addr.endpoint(), &lease);
         lease.cancel();
@@ -1413,8 +1076,6 @@ fn run_handshake(
     }
 
     let counters = std::sync::Arc::new(crate::PeerCounters::default());
-    // Eviction cancels the lease from the accept loop; reads then fail even
-    // mid-payload, as Core closes an evicted connection at once.
     let stream = match crate::CountingStream::from_connected(stream, counters)
         .map(|stream| stream.stop_reading_when(lease.clone()))
         .map_err(crate::wire::PeerError::Io)
@@ -1436,18 +1097,12 @@ fn run_handshake(
     };
     let counters = std::sync::Arc::clone(stream.counters());
 
-    // The accept loop already reserved this lease in the table — live
-    // connection accounting covers handshaking peers exactly like Core's
-    // connman — so the inbound path never registers an unrestricted
-    // connection here.
     if shared.is_session_cancelled() {
         shared.remove_session(peer_addr.endpoint(), &lease);
         lease.cancel();
         return Ok(());
     }
 
-    // One deadline covers the transport and the version handshake, as
-    // Core's single `-peertimeout` does.
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut stream = stream;
     let negotiated = match negotiate_inbound(&mut stream, shared, &lease, handshake_deadline) {
@@ -1481,9 +1136,6 @@ fn run_handshake(
         &lease,
         handshake_deadline,
     ) {
-        // `remove_current` cancels as a side effect, so revocation must be
-        // read before it: a pre-cancelled lease means an external shutdown,
-        // while a live lease means this handshake failed on its own.
         let revoked = lease.is_cancelled();
         if !revoked {
             shared.note_misbehavior(peer_addr, &lease, &error);
@@ -1513,10 +1165,6 @@ fn run_handshake(
         peer.version_received_time.unwrap_or(conn_time),
         counters,
     );
-    // Identity comes from the accept path, never from the carrying
-    // socket: identified overlay inbound keeps its endpoint; Tor inbound
-    // (endpoint `None`) stays unidentified with `network = Onion`, and no
-    // remote onion address is fabricated from the loopback forward.
     if let Some(identified) = endpoint {
         info.endpoint = Some(identified);
         info.network = identified.net();
@@ -1547,15 +1195,6 @@ fn publish_connected_peer(
     ready
 }
 
-/// Runs one established connection to completion.
-///
-/// Teardown invariant (both exit paths, in this order):
-/// `PeerTable::remove_current` → `lease.cancel()` → `stream.shutdown(Both)` →
-/// `drop(lease)` → `writer.join()`. `cancel()` raises the writer's close
-/// signal so an idle writer wakes deterministically even when foreign lease
-/// clones (registration handles, concurrent pings) are still alive; the
-/// shutdown unblocks a writer blocked mid-`write_all`. Connection threads
-/// are intentionally not joined by outer listener shutdown.
 fn run_connected_session(
     peer: &mut Peer<crate::CountingStream<TcpStream>>,
     peer_addr: impl Into<crate::PeerRemote>,
@@ -1566,9 +1205,6 @@ fn run_connected_session(
 ) -> Result<(), crate::wire::PeerError> {
     let peer_addr = peer_addr.into();
     let endpoint = peer_addr.endpoint();
-    // BIP339 announcement preference is the peer's received wtxidrelay,
-    // independently of our own advertisement. Publish it atomically with the
-    // completed handshake so relay never chooses a type during negotiation.
     info.wtxid_relay = peer.wtxid_relay.peer_supported();
     info.send_headers = peer.capabilities.send_headers;
     info.transport = peer.transport();
@@ -1662,24 +1298,6 @@ fn run_connected_session(
     loop_result
 }
 
-/// Applies a connection's relay role to one inbound message.
-///
-/// PRE: `role` is the connection's role and `message` arrived on it.
-/// POST: return the message for dispatch, `None` to drop it unheard, or the
-///   protocol error that ends the connection.
-/// INVARIANT: a block-relay-only connection carries blocks and headers and
-///   nothing else. A `tx` message or a transaction `inv` is a protocol
-///   violation and ends the connection, as Core's `RejectIncomingTxs`
-///   requires (`net_processing.cpp:4706-4711`, and the `inv` branch at
-///   `net_processing.cpp:4385-4390`). A `getdata` from such a connection is
-///   answered with block inventory alone: transaction inventory is stripped
-///   before dispatch, and a request that asked for nothing else is dropped
-///   unheard, so the role cannot obtain a transaction body through
-///   `getdata`. `addr` and `addrv2` are dropped
-///   without punishment, because Core declines address relay for such a
-///   peer rather than faulting it (`SetupAddressRelay`,
-///   `net_processing.cpp:5952-5970`). A full-relay connection is never
-///   restricted.
 fn enforce_relay_role(
     role: crate::peer_info::PeerRole,
     message: crate::Message,
@@ -1736,70 +1354,26 @@ fn enforce_relay_role(
     Ok(Some(message))
 }
 
-/// What one connection's keepalive ledger asks the message loop to do.
 #[derive(Debug, PartialEq, Eq)]
 enum KeepaliveAction {
-    /// Nothing is due.
     Idle,
-    /// Queue one `ping` for the peer.
     Ping,
-    /// End the connection: one direction has been silent past
-    /// [`TIMEOUT_INTERVAL`].
     Expired,
 }
 
-/// One connection's liveness ledger: when it last heard, last spoke, and
-/// last probed.
-///
-/// PRE: [`Keepalive::record_recv`] runs for every message the loop reads;
-///   every admitted `PeerLease::send` stamps the shared `last_send` the loop
-///   folds in via [`Keepalive::observe_send`].
-/// POST: [`Keepalive::next_action`] orders a `ping` once [`PING_INTERVAL`]
-///   of quiet has passed since the previous probe, and an `Expired` end
-///   once either direction has been silent past [`TIMEOUT_INTERVAL`]; while
-///   the loop has a `getdata` parked it reads nothing, so only the send
-///   direction can expire.
-/// INVARIANT: the decision is a pure function of the recorded instants, the
-///   open shared stall, and the caller's `now`, and one ledger belongs to one
-///   connection thread, so a peer is never judged on another connection's
-///   traffic. Durations come from the monotonic clock, so a wall-clock
-///   adjustment cannot shorten or lengthen a timeout.
-///
-/// # Shared stalls
-///
-/// While the node's aggregate outbound budget refuses this session's work
-/// (a deferred request, a parked `getdata` tail, a probe, the one-message
-/// read hold) the session reads nothing and sends nothing through no fault
-/// of the peer. The aggregate counts this session's own queued bytes with
-/// everyone else's: one slow peer can hold close to the bulk limit while
-/// others pause, with no fairness quota. The interval of such a refusal is
-/// a stall: it is not counted as silence in either direction, nor as the
-/// age of a parked tail. Local saturation, a dead writer and genuine
-/// silence outside a stall keep their rules.
 struct Keepalive {
-    /// The instant the loop last read a message from the peer.
     last_recv: Instant,
-    /// The instant the loop last queued a message for the peer.
     last_send: Instant,
-    /// The instant of the last probe this ledger ordered. Never shifted by a
-    /// stall: the probe cadence is wall-clock.
     last_ping: Option<Instant>,
-    /// Start of the open stall; `None` outside one.
     stall: Option<Instant>,
-    /// Set by a pass whose work the aggregate budget refused; consumed by
-    /// [`Keepalive::settle_pass`].
     shared_refused: bool,
 }
 
-/// `last` moved forward by the part of the stall `[since, now]` that lies
-/// after it, so the time measured from `last` to `now` leaves the stalled
-/// time out.
 fn past_stall(last: Instant, since: Instant, now: Instant) -> Instant {
     last + now.saturating_duration_since(last.max(since))
 }
 
 impl Keepalive {
-    /// Starts a ledger for a connection whose loop begins at `now`.
     fn starting(now: Instant) -> Self {
         Self {
             last_recv: now,
@@ -1810,30 +1384,17 @@ impl Keepalive {
         }
     }
 
-    /// Records that this pass's work was refused by `refusal`. Only an
-    /// aggregate refusal is a stall; a local one is the connection's own
-    /// queue state and keeps its rules.
     fn note_refusal(&mut self, refusal: crate::connection::Refusal) {
         if refusal == crate::connection::Refusal::Shared {
             self.shared_refused = true;
         }
     }
 
-    /// `last` as the ledger judges it at `now`: with the open stall left out.
     fn excluding_stall(&self, last: Instant, now: Instant) -> Instant {
         self.stall
             .map_or(last, |since| past_stall(last, since, now))
     }
 
-    /// Closes one loop pass at `now`: opens a stall when the pass was
-    /// refused by the aggregate and none is open, and closes the open one
-    /// when it was not, moving the ledger's instants and the parked marker
-    /// past it.
-    ///
-    /// PRE: every refusal of the pass was reported through
-    /// [`Keepalive::note_refusal`] before this call.
-    /// POST: `last_recv`, `last_send` and `parked_since` exclude the closed
-    /// stall; the pass flag is clear.
     fn settle_pass(&mut self, now: Instant, parked_since: &mut Option<Instant>) {
         let blocked = std::mem::take(&mut self.shared_refused);
         match (self.stall, blocked) {
@@ -1850,60 +1411,33 @@ impl Keepalive {
         }
     }
 
-    /// Credits the peer with one message read at `now`.
     fn record_recv(&mut self, now: Instant) {
         self.last_recv = now;
     }
 
-    /// Credits this node with one message queued at `now`.
     fn record_send(&mut self, now: Instant) {
         self.last_send = now;
     }
 
-    /// Folds a send timestamp recorded outside this loop (every admitted
-    /// `PeerLease::send`) into the ledger.
     fn observe_send(&mut self, sent: Instant) {
         if sent > self.last_send {
             self.last_send = sent;
         }
     }
 
-    /// Records a probe actually queued at `now`: the interval counts from
-    /// the send, not the decision, so a probe skipped for a saturated queue
-    /// stays owed instead of being consumed unsent.
     fn record_probe(&mut self, now: Instant) {
         self.last_ping = Some(now);
         self.record_send(now);
     }
 
-    /// Returns the action owed at `now`, ordering at most one probe per
-    /// [`PING_INTERVAL`] and an end once either direction is silent past
-    /// [`TIMEOUT_INTERVAL`].
-    ///
-    /// INVARIANT: Core's `InactivityCheck` (`net.cpp:2043-2090`) ends a
-    ///   connection when the send timeout or the receive timeout fires, so
-    ///   either direction alone expiring is enough here.
-    ///
-    /// A writer stuck on a full socket does not wait out the send silence:
-    /// [`HANDSHAKE_TIMEOUT`] bounds one blocking write at one
-    /// minute, so this branch only covers a peer that takes our writes and
-    /// never answers them.
     fn next_action(&self, now: Instant) -> KeepaliveAction {
         self.decide(now, true)
     }
 
-    /// [`Keepalive::next_action`] for a loop that holds an unserved `getdata`
-    /// and so reads nothing: the peer's silence is then the loop's own doing,
-    /// and receive silence does not expire the connection. Send silence
-    /// still does, and the parked tail has its own lifetime bound in the
-    /// loop.
     fn next_action_while_parked(&self, now: Instant) -> KeepaliveAction {
         self.decide(now, false)
     }
 
-    /// The one decision behind both entry points. `receive_silence_expires`
-    /// is false only for [`Keepalive::next_action_while_parked`]; the probe
-    /// rule does not depend on it.
     fn decide(&self, now: Instant, receive_silence_expires: bool) -> KeepaliveAction {
         let last_recv = self.excluding_stall(self.last_recv, now);
         let last_send = self.excluding_stall(self.last_send, now);
@@ -1931,9 +1465,6 @@ mod keepalive_tests {
     use super::{Keepalive, KeepaliveAction, PING_INTERVAL, TIMEOUT_INTERVAL};
     use std::time::{Duration, Instant};
 
-    /// A fresh connection carries no probe obligation: a ping is owed only
-    /// once a direction has been idle for an interval, then at most once per
-    /// interval while it stays idle.
     #[test]
     fn probes_owe_one_ping_per_idle_interval() {
         let t0 = Instant::now();
@@ -1982,8 +1513,6 @@ mod keepalive_tests {
         );
     }
 
-    /// A loop that stopped reading to hold a `getdata` tail cannot hear the
-    /// peer, so the peer's silence is not its fault.
     #[test]
     fn parked_loop_does_not_expire_on_receive_silence() {
         let t0 = Instant::now();
@@ -2039,28 +1568,10 @@ mod keepalive_tests {
     }
 }
 
-/// Pays for one pass's outbound messages out of reservations taken before
-/// the messages exist, so a body is loaded, and a reply is built, only while
-/// the queue space it will occupy is already owned.
-///
-/// The sink holds at most one production credit (a worst-case frame,
-/// reserved by [`ProductionSink::headroom`]) and at most one reply credit
-/// (reserved by the loop before it dispatched a request-scoped message).
-/// [`ProductionSink::send`] spends the production credit first, then the
-/// reply credit; the spent credit shrinks to the exact wire length and
-/// travels with the queued frame. A credit the pass never spends (a lookup
-/// that found nothing, a request that needed no reply) is returned when the
-/// sink drops.
-///
-/// INVARIANT: `headroom` is idempotent: a held production credit is reused,
-/// never replaced, so a run of misses charges the aggregate once.
 struct ProductionSink<'a> {
     lease: &'a crate::PeerLease,
-    /// At most one live production credit.
     production: std::cell::Cell<Option<crate::connection::OutboundCredit>>,
-    /// The request-scoped reply credit, if the loop reserved one.
     reply: std::cell::Cell<Option<crate::connection::OutboundCredit>>,
-    /// The kind of the last refusal [`ProductionSink::headroom`] returned.
     refused: std::cell::Cell<Option<crate::connection::Refusal>>,
 }
 
@@ -2074,11 +1585,6 @@ impl<'a> ProductionSink<'a> {
         }
     }
 
-    /// Reserves, or reuses, the worst-case frame the next body will occupy.
-    ///
-    /// POST: `true` when a production credit is held; `false` when the
-    /// connection or the node cannot take one (the kind is recorded for
-    /// [`ProductionSink::refusal`]) or the lease is cancelled.
     fn headroom(&self) -> bool {
         if self.lease.is_cancelled() {
             return false;
@@ -2099,11 +1605,6 @@ impl<'a> ProductionSink<'a> {
         }
     }
 
-    /// Queues `message` under the held reservation.
-    ///
-    /// PRE: the pass reserved a credit that covers `message`.
-    /// POST: the credit is spent. An unreserved send is a caller bug and is
-    /// refused rather than queued uncharged.
     fn send(&self, message: crate::Message) -> Result<(), crate::wire::PeerError> {
         let Some(credit) = self.production.take().or_else(|| self.reply.take()) else {
             debug_assert!(false, "an outbound message was sent without a reservation");
@@ -2116,23 +1617,15 @@ impl<'a> ProductionSink<'a> {
             .map_err(|_| closed_queue())
     }
 
-    /// Takes the kind of the last refusal [`ProductionSink::headroom`] saw.
     fn refusal(&self) -> Option<crate::connection::Refusal> {
         self.refused.take()
     }
 }
 
-/// The lease is gone: the session ends without a peer fault.
 const fn closed_queue() -> crate::wire::PeerError {
     crate::wire::PeerError::Protocol("outbound queue closed")
 }
 
-/// Full wire bytes the reply to `message` can occupy, or `None` when the
-/// message is answered with nothing the loop must reserve for.
-///
-/// The bound covers the largest reply the loop can build for the message,
-/// so the reservation is taken before the request is dispatched and the
-/// spent credit shrinks to the actual frame.
 fn reply_bound(message: &crate::Message, getaddr_answerable: bool) -> Option<usize> {
     let payload = match message {
         crate::Message::Ping(_) => 8,
@@ -2140,23 +1633,17 @@ fn reply_bound(message: &crate::Message, getaddr_answerable: bool) -> Option<usi
         crate::Message::GetAddr if getaddr_answerable => {
             3 + crate::wire::MAX_ADDR_MESSAGE_COUNT * 33
         }
-        // `getblocktxn`: hash, count, one index per short id; or a one-item
-        // `getdata` fallback.
         crate::Message::CmpctBlock(cmpct) => {
             (32 + 9 + 5 * cmpct.compact_block.short_ids.len()).max(1 + 36)
         }
         crate::Message::BlockTxn(_) => 1 + 36,
-        // A shallow answer is blocktxn; a deep answer may be the full block.
         crate::Message::GetBlockTxn(_) => crate::peer::MAX_BLOCK_SERIALIZED_SIZE_USIZE,
-        // One `pkgtxns` of up to one frame, or exactly one `notfound`.
         crate::Message::GetPkgTxns(_) => crate::wire::MAX_MESSAGE_PAYLOAD,
         _ => return None,
     };
     Some(crate::wire::HEADER_LEN + payload.min(crate::wire::MAX_MESSAGE_PAYLOAD))
 }
 
-/// Requests whose reply is a bulk body, reserved from the connection's
-/// production headroom rather than as a small request-scoped reply.
 fn reserves_production(message: &crate::Message) -> bool {
     matches!(
         message,
@@ -2164,9 +1651,6 @@ fn reserves_production(message: &crate::Message) -> bool {
     )
 }
 
-/// Compact-block reconstruction messages (`CmpctBlock`, `BlockTxn`,
-/// `GetBlockTxn`) and package body requests (`GetPkgTxns`) defer on local
-/// queue saturation rather than disconnecting.
 fn defers_on_local(message: &crate::Message) -> bool {
     matches!(
         message,
@@ -2177,8 +1661,6 @@ fn defers_on_local(message: &crate::Message) -> bool {
     )
 }
 
-/// Whether the loop answers `getaddr` from the address book on this
-/// connection now.
 fn getaddr_answerable(
     lease: &crate::PeerLease,
     shared: &ConnectionShared,
@@ -2190,34 +1672,13 @@ fn getaddr_answerable(
         && shared.address_book.is_some()
 }
 
-/// What one retry of a deferred request left for the session loop to do.
 enum DeferredStep {
-    /// No request is deferred.
     NoneHeld,
-    /// The request still waits for its reply reservation.
     Waiting,
-    /// The session ends: the request outlived [`TIMEOUT_INTERVAL`] outside a
-    /// shared stall, or the writer has returned.
     Ended,
-    /// The reply is reserved: dispatch the request once under it.
     Ready(crate::Message, Option<crate::connection::OutboundCredit>),
 }
 
-/// Retries the one request whose reply could not be reserved when it was
-/// read.
-///
-/// PRE: nothing else is parked on `peer`: reading stops while a request is
-/// deferred, so a `getdata` tail cannot be parked beside it. `now` is the
-/// loop's clock reading for this pass.
-/// POST: `Ready` carries the request and its reservation, and the pause
-/// marker is cleared; otherwise the request stays deferred and this pass
-/// waited at most [`STREAM_POLL_INTERVAL`] on the budget.
-/// INVARIANT: only the aggregate's refusal feeds the stall. A
-/// local refusal keeps the existing per-peer high-water policy for
-/// unconditional replies and closes the connection. A conditional compact
-/// reply (`CmpctBlock`/`BlockTxn`) with a live writer defers instead: it
-/// waits without opening a stall, so its local wait counts toward the
-/// timeout, and a dead writer still ends the session.
 fn retry_deferred_request<S>(
     peer: &mut Peer<S>,
     lease: &crate::PeerLease,
@@ -2275,31 +1736,6 @@ fn retry_deferred_request<S>(
     }
 }
 
-/// Dispatches one Ready connection's inbound messages until it ends.
-///
-/// PRE: `lease` is the registered lease of the connection `peer` wraps, and
-/// `shared` is the wiring of the start epoch that accepted or dialed it.
-/// POST: Return `Ok` on disconnect, lease revocation, or an expired
-/// keepalive (one direction silent past [`TIMEOUT_INTERVAL`]); return the
-/// error that ended the connection otherwise.
-/// INVARIANT: Every sink write goes through `shared`, so sinks observe the
-/// start epoch's cancellation token.
-///
-/// Every outbound message is paid for before it exists. A body is served
-/// only while the pass holds a worst-case reservation, and a request-scoped
-/// reply (`pong`, `headers`, `addr`, a compact-block follow-up) only under a
-/// reservation taken before the request is dispatched. When the node's
-/// aggregate budget refuses that reservation the request is deferred, the
-/// loop reads nothing until it is reserved, and the refused time is not
-/// counted as silence ([`Keepalive`]). The aggregate never ends a session.
-///
-/// `ibd` is the transaction-relay gate, read lazily per relevant message.
-/// PRE: use the node-owned IBD decision. POST: a closed gate requests no
-/// announced transaction and enqueues no transaction body. INVARIANT: block
-/// processing and peer punishment are unchanged. Opening the gate needs no
-/// reconnect, and unrelated messages never read it.
-// The transaction-relay gate adds one documented parameter and one lazy
-// closure to an already-large dispatch loop.
 #[expect(clippy::too_many_lines)]
 fn run_message_loop<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,
@@ -2318,8 +1754,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 
     let mut keepalive = Keepalive::starting(Instant::now());
     let budget = lease.budget_handle();
-    // When the current pause (a `getdata` tail, the one-message read hold,
-    // or a deferred request) first began; `None` while nothing is paused.
     let mut parked_since: Option<Instant> = None;
     let mut compact_reconstruction = crate::compact_blocks::Reconstruction::new();
     let mut address_budget = 32_u64;
@@ -2327,8 +1761,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     let mut staletip_budget = 10_u32;
     let mut last_staletip_refill = Instant::now();
     let mut answered_getaddr = false;
-    // The one `getaddr` an outbound relay connection asks for. It stays owed
-    // while the node's aggregate budget is full and is sent on a later pass.
     let mut getaddr_owed = !lease.is_inbound()
         && lease.role().relays_transactions()
         && shared
@@ -2356,12 +1788,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
         match action {
             KeepaliveAction::Idle => {}
             KeepaliveAction::Ping => {
-                // A probe the connection's own queue cannot take would close
-                // the lease for our own queue state, not for the peer's
-                // silence; skip it while the local queue has no production
-                // headroom and let the timeout rule judge the connection on
-                // its next due probe. The node aggregate is different: its
-                // refusal keeps the probe owed and closes nothing.
                 if budget.local_production_headroom() {
                     match lease.send(crate::Message::Ping(generate_nonce(peer_addr))) {
                         Ok(()) => keepalive.record_probe(Instant::now()),
@@ -2383,20 +1809,13 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 
         if getaddr_owed {
             match lease.send(crate::Message::GetAddr) {
-                // The aggregate is full: the request stays owed.
                 Err(crate::OutboundRefusal::Saturated(_)) => {}
-                // The lease is cancelled; the loop ends at its top.
                 Ok(()) | Err(crate::OutboundRefusal::Closed(_)) => getaddr_owed = false,
             }
         }
 
         compact_reconstruction.prune(Instant::now());
 
-        // Retry publication on the existing socket poll, keeping ping, inbound
-        // traffic and lease cancellation responsive while the index catches up.
-        // The request waits its allowance out for publication or for this
-        // connection's own queue; time the node aggregate refused it is not
-        // charged.
         if let Some(chain) = shared.chain_query.as_deref()
             && let Some(mut parked) = peer.pending_filter_request.take()
         {
@@ -2422,11 +1841,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             }
         }
 
-        // A request whose reply could not be reserved is retried before the
-        // peer is heard again; so is a parked `getdata`, which is answered
-        // before anything else is read: the loop reads nothing until the
-        // tail is served, so a peer cannot queue more work behind one it is
-        // not draining.
         let mut resumed = None;
         let step = match retry_deferred_request(
             peer,
@@ -2460,8 +1874,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
         }
 
         let (message, _raw, reply) = if let Some((message, reply)) = resumed {
-            // Already read, role-checked and counted as received; no body of
-            // its own, so there are no wire bytes to carry.
             (message, bytes::Bytes::new(), reply)
         } else {
             let read_result = peer.read_message();
@@ -2473,18 +1885,12 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 return Ok(());
             }
             match read_result {
-                // A v2 decoy or an undefined short id is not receive activity:
-                // no recv credit, no trace, and the idle checks above still run.
                 Ok(None) => continue,
                 Ok(Some((message, raw))) => {
                     keepalive.record_recv(Instant::now());
                     let Some(message) = enforce_relay_role(lease.role(), message)? else {
                         continue;
                     };
-                    // Reserve the reply before the request is dispatched:
-                    // nothing is built, and nothing is queued uncharged, for
-                    // a reply the queue cannot take. A refusal defers the
-                    // request; it is dispatched once, after the reservation.
                     let bound = reply_bound(
                         &message,
                         getaddr_answerable(lease, shared, answered_getaddr),
@@ -2539,8 +1945,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             command = ?std::mem::discriminant(&message),
             "p2p message received",
         );
-        // Publish announced identities before dispatch can consult the
-        // gateway or invoke callbacks while the relay worker runs.
         if let crate::Message::Inv(items) = &message {
             shared
                 .peer_table
@@ -2572,10 +1976,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             }
             return Err(error);
         }
-        // The download an `ancpkginfo` asked for goes to its request owner
-        // under this connection's exact source, unchanged. An `ancpkginfo`
-        // that asked for nothing (or while relay is closed) releases its
-        // solicitation instead; never both.
         if let Some(request) = peer.take_package_request() {
             if tx_relay_open() {
                 shared.peer_table.request_package_transactions(
@@ -2600,8 +2000,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 inventory,
             );
         }
-        // A first filter attempt that stopped records why, so the retry
-        // charges its deadline only for publication or the local queue.
         if matches!(
             message,
             crate::Message::GetCFilters(_)
@@ -2611,9 +2009,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
         {
             parked.last = crate::peer::FilterHalt::from_refusal(sink.refusal());
         }
-        // A `getdata` that filled the queue to its last slot leaves no room
-        // for the reply to the next request. Hold reads until the queue can
-        // take one message.
         if matches!(message, crate::Message::GetData(_))
             && !budget.may_charge(crate::wire::HEADER_LEN)
         {
@@ -2707,17 +2102,11 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             {
                 answered_getaddr = true;
                 if let Some(book) = &shared.address_book {
-                    // BIP155: a peer that negotiated `sendaddrv2`
-                    // answers in `addrv2`, carrying overlay endpoints
-                    // only for transports this node has enabled; legacy
-                    // `addr` stays IP-only by construction.
                     let reply = if peer.capabilities.addr_v2 {
                         crate::Message::AddrV2(book.gossip_addrv2(crate::addrman::now()))
                     } else {
                         crate::Message::Addr(addr_v1_rows(&book.gossip(crate::addrman::now())))
                     };
-                    // Sent under the reservation taken before dispatch; a
-                    // closed lease ends the loop at its top.
                     let _ = sink.send(reply);
                 }
             }
@@ -2749,16 +2138,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                             if let Some(sync) = &shared.block_sync {
                                 sync.stale_tips().note_heard(source, tip_hash);
                             }
-                            // Route through the identified peer — not sourceless —
-                            // so the same minimum-work/fault policy applies with
-                            // peer accountability: below the floor a valid page
-                            // defers instead of admitting past the hold, while a
-                            // broken page admits directly and carries the peer
-                            // fault (see `body_carried_header_needs_admission`).
-                            // The batch stays non-wire (`false`): it is not a
-                            // `getheaders` response, so it must neither consume
-                            // the pending request nor feed a live download-twice
-                            // cursor with a foreign side-branch page.
                             shared.send_headers(source, headers, false);
                         }
                     }
@@ -2775,8 +2154,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 tx_relay_open(),
             ),
             crate::Message::PkgTxnsPayload(payload) => {
-                // Dispatch has already required the negotiated `pkgtxns` bit;
-                // the body is charged and queued only after it, still encoded.
                 if peer.package_relay_versions() & crate::packages::PKG_RELAY_PKGTXNS == 0 {
                     return Err(crate::wire::PeerError::Protocol(
                         "pkgtxns without negotiated package relay",
@@ -2802,10 +2179,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     .remote_preference()
                     .is_some_and(|preference| preference.version == send_cmpct.version) =>
             {
-                // Only a version we advertise negotiates BIP152 relay.
-                // The high-bandwidth push preference is a separate
-                // per-peer choice and must not gate compact-fetch
-                // eligibility.
                 shared.peer_table.note_compact_relay(lease.source(endpoint));
                 shared.peer_table.note_compact_announcement(
                     lease.source(peer_addr.endpoint()),
@@ -2831,44 +2204,13 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     }
 }
 
-/// What one pass over a parked `getdata` left for the session loop to do.
 #[derive(Debug, PartialEq, Eq)]
 enum ParkedStep {
-    /// Nothing is parked or held: the loop reads the peer.
     NotParked,
-    /// A tail is still parked, or reads are held until the queue can take
-    /// the reply to the peer's next request: the loop repeats its checks
-    /// without reading.
     StillParked,
-    /// The session ends: the tail outlived [`TIMEOUT_INTERVAL`], the writer
-    /// has returned, or the lease was cancelled while serving.
     Ended,
 }
 
-/// Advances a parked `getdata` by one pass without blocking longer than
-/// [`STREAM_POLL_INTERVAL`].
-///
-/// PRE: `lease` is the connection `peer` wraps and `parked_since` is the
-/// loop's own marker: set while a `getdata` is parked and after one that
-/// answered into a queue with no send capacity left.
-/// POST: With nothing parked and no marker, returns `NotParked`. Otherwise
-/// the marker records when the pause began, and an old pause (past
-/// [`TIMEOUT_INTERVAL`], not counting time the node aggregate refused it) or
-/// a dead writer ends the session. With a tail or parked misses, the pass is
-/// one [`advance_parked_getdata`]. With neither, the answer is complete but
-/// the queue may still be full of it, and the pass holds reads until a
-/// one-message charge succeeds: the reply to the peer's next request is
-/// reserved before it is dispatched, so reading it first would only defer
-/// it. Once the probe charge is accepted it is returned at once, the marker
-/// clears and the loop reads.
-/// INVARIANT: this reads nothing from the peer and holds no pool, table, or
-/// socket lock while it waits; the wait is bounded, so lease cancellation,
-/// the keepalive's send check, and the pause's age are rechecked at least
-/// once per [`STREAM_POLL_INTERVAL`]. Every message is queued under a
-/// reservation, so the pause itself never cancels the lease, and the
-/// aggregate's refusal is reported to `keepalive` as a stall, never as an
-/// error. Only a `getdata` establishes the hold; a connection that never
-/// sent one keeps the plain saturation policy.
 fn step_parked_getdata<S>(
     peer: &mut Peer<S>,
     shared: &ConnectionShared,
@@ -2887,8 +2229,6 @@ fn step_parked_getdata<S>(
         return Ok(ParkedStep::Ended);
     }
     if !parked {
-        // A one-message probe that matches this hold's predicate. The probe
-        // credit is returned at once; nothing is sent.
         return match budget.try_charge(crate::wire::HEADER_LEN) {
             Ok(probe) => {
                 drop(probe);
@@ -2910,22 +2250,6 @@ fn step_parked_getdata<S>(
     }
 }
 
-/// One pass over a parked `getdata` that neither reads nor sleeps past
-/// [`STREAM_POLL_INTERVAL`].
-///
-/// PRE: something is parked on `peer`, and `budget` is `lease`'s.
-/// POST: the misses found before the halt are sent in one `notfound` on the
-/// first pass that can reserve exactly that message; a refusal keeps them.
-/// The tail resumes only once the misses are out, and then only while a
-/// worst-case reservation is held for each body; the pass waits on the
-/// budget when either is refused. Passes recur on every wake and at least
-/// once per [`STREAM_POLL_INTERVAL`], so capacity that returns is noticed
-/// within one interval. The peer hears the misses before any later item of
-/// its request.
-/// INVARIANT: nothing is queued without a reservation, so the pause is
-/// never a disconnect of this connection for its own queue state or for the
-/// node's. A send that finds the lease cancelled propagates; the caller
-/// ([`step_parked_getdata`]) maps a cancelled lease to a plain session end.
 fn advance_parked_getdata<S>(
     peer: &mut Peer<S>,
     shared: &ConnectionShared,
@@ -2939,23 +2263,11 @@ fn advance_parked_getdata<S>(
     resume_parked_getdata(peer, shared, lease, keepalive, budget)
 }
 
-/// Full wire bytes of a `notfound` that lists `items` inventory vectors.
 fn notfound_wire_bound(items: usize) -> usize {
     let count = u64::try_from(items).unwrap_or(u64::MAX);
     crate::wire::HEADER_LEN + bitcoin_rs_primitives::varint::encode(count).len() + 36 * items
 }
 
-/// Sends the misses parked with a tail as one `notfound`.
-///
-/// PRE: nothing; the reservation happens here, so no state can change
-/// between a check and the send.
-/// POST: `true` when no misses remain parked (none were, or the one
-/// `notfound` that lists them was queued under an exact reservation made
-/// before it was built). `false` when the reservation was refused: nothing
-/// was sent, the misses stay parked, the refusal kind was reported to
-/// `keepalive`, and the pass waited on the budget.
-/// INVARIANT: the list is taken only after its reservation succeeded, so a
-/// refusal loses nothing and builds nothing.
 fn report_parked_misses<S>(
     peer: &mut Peer<S>,
     lease: &crate::PeerLease,
@@ -2982,27 +2294,10 @@ fn report_parked_misses<S>(
     Ok(true)
 }
 
-/// Whether a tail parked at `since` has outlived [`TIMEOUT_INTERVAL`], the
-/// longest a connection may owe the peer answers it cannot queue. Callers
-/// pass `since` with any open shared stall already excluded.
 fn parked_tail_expired(since: Instant, now: Instant) -> bool {
     now.saturating_duration_since(since) > TIMEOUT_INTERVAL
 }
 
-/// Serves the parked tail from its first item. The new tail and the misses
-/// that follow are stored back on `peer`.
-///
-/// PRE: `peer` has a parked tail, and the misses parked before the halt
-/// have been sent.
-/// POST: everything the gate does not stop again is answered in request
-/// order; whatever the gate stops is the stored tail and misses. When the
-/// gate stopped it, the refusal kind is reported to `keepalive` and the pass
-/// waited on the budget for production room.
-/// INVARIANT: every body is loaded while the sink holds a worst-case
-/// reservation, so a refused reservation materializes nothing and sends
-/// nothing, and a halt neither disconnects nor loses an item: `serve_getdata`
-/// returns the refused item as the head of the tail. The reservation is
-/// reused across lookups that send nothing.
 fn resume_parked_getdata<S>(
     peer: &mut Peer<S>,
     shared: &ConnectionShared,
@@ -3035,7 +2330,6 @@ fn resume_parked_getdata<S>(
     Ok(())
 }
 
-/// Legacy addr messages can represent only IP endpoints; do not invent addresses.
 fn addr_v1_rows(
     rows: &[bitcoin::p2p::address::AddrV2Message],
 ) -> Vec<(u32, bitcoin::p2p::address::Address)> {
@@ -3056,8 +2350,6 @@ fn addr_v1_rows(
         })
         .collect()
 }
-/// Consume a bounded, replenishing per-connection gossip allowance before
-/// touching the book. Source-group limits survive peer reconnects in the book.
 fn learn_addresses(
     shared: &ConnectionShared,
     lease: &crate::PeerLease,
@@ -3081,20 +2373,6 @@ fn learn_addresses(
     }
 }
 
-/// Handles one `cmpctblock`/`blocktxn` wire message for a connection. A
-/// compact announcement is itself a tip announcement: its embedded header
-/// is offered to admission even when reconstruction pends or falls back,
-/// so the announced tip reaches the tree and the ordinary window
-/// machinery can fetch the body.
-///
-/// PRE: `message` came from the connection that `sink`'s lease identifies,
-/// and the loop reserved `sink`'s reply credit for it ([`reply_bound`]).
-/// POST: Forward the outcome through `shared`: a finished block to the
-/// block sink, a follow-up request to the same connection under the reply
-/// credit through the single linearizable enqueue.
-/// INVARIANT: A compact header forward is never a `headers` response; the
-/// follow-up (if any) leaves only inside the `enqueue_owned_body_fetch`
-/// closure, which publishes ownership atomically with the send.
 fn process_compact_wire_message(
     message: &crate::Message,
     compact_reconstruction: &mut crate::compact_blocks::Reconstruction,
@@ -3106,9 +2384,6 @@ fn process_compact_wire_message(
 ) {
     let peer_addr = peer_addr.into();
     let lease = sink.lease;
-    // Reconstruction scans the whole mempool, so a compact block must first
-    // earn it with its header; anything else is only a header announcement.
-    // Without a chain view nothing qualifies.
     if let crate::Message::CmpctBlock(cmpct) = message
         && let Some(header) = crate::compact_blocks::native_header(&cmpct.compact_block.header)
         && !shared.block_sync.as_ref().is_some_and(|sync| {
@@ -3132,9 +2407,6 @@ fn process_compact_wire_message(
         compact_hints,
         Instant::now(),
     );
-    // A compact announcement is itself a tip announcement: when the outcome
-    // emits no body (`Complete` already forwards its header via `send_block`),
-    // this forward is the only path the embedded header takes to admission.
     let announced_header = if let crate::Message::CmpctBlock(cmpct) = message
         && !matches!(outcome, crate::compact_blocks::Outcome::Complete(_))
     {
@@ -3142,11 +2414,6 @@ fn process_compact_wire_message(
     } else {
         None
     };
-    // Ownership is published only once the follow-up actually leaves on the
-    // connection: a failed send enqueues nothing, and publishing anyway
-    // would suppress recovery of that block from another peer. Exactly one
-    // enqueue site exists; there is no direct follow-up send outside the
-    // closure and no second enqueue.
     let source = lease.source(peer_addr.endpoint());
     if let Some((hash, follow_up)) = handle_compact_outcome(outcome, sink, peer_addr, shared)
         && let Some(sync) = shared.block_sync.as_ref()
@@ -3159,21 +2426,6 @@ fn process_compact_wire_message(
 }
 
 /// Applies one BIP152 receive-side outcome: a finished block enters the
-/// ordinary block sink exactly like a `block` message; a missing list or an
-/// unrecoverable reconstruction becomes a `Some((hash, message))` follow-up
-/// the caller sends exactly once inside `enqueue_owned_body_fetch` —
-/// the node's download window resolves both by hash on arrival, so no
-/// request ownership is lost or duplicated.
-///
-/// PRE: `outcome` came from a message of the connection `sink`'s lease
-/// identifies, and `sink` holds the reply reservation taken for it.
-/// POST: A finished block reaches `shared`'s block sink and the answer is
-/// `None`; a follow-up is returned unsent for the single enqueue site and
-/// `Idle` returns `None`.
-/// INVARIANT: This function never sends the follow-up itself; the caller
-/// owns the one send inside the enqueue closure. Linearizability
-/// (exact-source peer-table guard across the scheduler lock, send, and
-/// publication) lives in `enqueue_owned_body_fetch`, not here.
 fn handle_compact_outcome(
     outcome: crate::compact_blocks::Outcome,
     sink: &ProductionSink<'_>,
@@ -3215,7 +2467,6 @@ fn handle_compact_outcome(
 }
 
 /// Feeds one receive-side BIP152 message into the loop's reconstruction
-/// state and returns the outcome.
 fn process_compact_message(
     reconstruction: &mut crate::compact_blocks::Reconstruction,
     message: &crate::Message,
@@ -3235,19 +2486,6 @@ fn process_compact_message(
     }
 }
 
-/// Spawns a per-connection writer thread that drains queued outbound messages
-/// and writes them to the peer. Decoupling writes from the blocking inbound
-/// read ensures a momentarily silent peer can never delay outbound sends (the
-/// next `getdata` during IBD). Exits on the lease close signal, when every
-/// sender drops, or on write failure. Every exit shuts down the socket so the
-/// reader half cannot outlive a failed writer.
-///
-/// PRE: `stream` is a clone of the connection's counted stream, and
-/// `outbound_rx`, `close_rx`, and `budget` belong to the same lease.
-/// `net_trace` is the connection's probe context, `None` on probe-free
-/// connections.
-/// POST: Return the writer thread's handle, or the spawn error.
-/// INVARIANT: The counted stream accounts every sent byte once.
 fn spawn_connection_writer(
     mut stream: crate::CountingStream<TcpStream>,
     mut transport: crate::transport::SendTransport,
@@ -3261,10 +2499,6 @@ fn spawn_connection_writer(
     std::thread::Builder::new()
         .name(format!("bitcoin-rs-p2p-writer-{peer_addr}"))
         .spawn(move || {
-            // A session parked on this queue waits for releases that can no
-            // longer come; the guard tells it however the writer ends,
-            // including a panic, and returns the charge of every frame the
-            // writer never wrote.
             let _exit = WriterExit {
                 budget: Arc::clone(&budget),
                 outbound_rx: &outbound_rx,
@@ -3280,15 +2514,6 @@ fn spawn_connection_writer(
         })
 }
 
-/// Ends a connection's writer: marks the budget's writer dead so a parked
-/// session wakes, then drops every frame still queued. Runs whether the
-/// writer returned or unwound.
-///
-/// A queued frame owns its charge, so dropping it here returns the bytes to
-/// the connection and to the node aggregate at once. Nothing is reclaimed
-/// by counting: a frame is either written (and dropped by the burst) or
-/// dropped here or with the channel, and each drop releases exactly its own
-/// charge.
 struct WriterExit<'a> {
     budget: Arc<crate::connection::OutboundBudget>,
     outbound_rx: &'a crossbeam_channel::Receiver<crate::QueuedFrame>,
@@ -3301,11 +2526,6 @@ impl Drop for WriterExit<'_> {
     }
 }
 
-/// Drains ready control messages behind `first` into one writev burst.
-///
-/// A bulk payload is never coalesced: it returns as a leftover so the writer
-/// emits it as its own frame after the control burst (or immediately when it
-/// is `first`). Each frame keeps its charge while it is in the burst.
 fn collect_write_burst(
     first: crate::QueuedFrame,
     outbound_rx: &crossbeam_channel::Receiver<crate::QueuedFrame>,
@@ -3325,15 +2545,6 @@ fn collect_write_burst(
     (burst, None)
 }
 
-/// Writes `first` and any immediately ready follow-up control messages.
-///
-/// Returns `false` when a write fails so the caller can exit the writer loop.
-///
-/// PRE: `first` and every frame queued behind it carry their own charge.
-/// POST: the burst's frames drop, and so release their charges, as soon as
-/// the write returned, whether it succeeded or failed; a leftover bulk
-/// frame drops with this call if the write failed.
-/// INVARIANT: A bulk payload is never coalesced into a control burst.
 fn write_ready_burst(
     first: crate::QueuedFrame,
     outbound_rx: &crossbeam_channel::Receiver<crate::QueuedFrame>,
@@ -3371,17 +2582,6 @@ fn write_ready_burst(
     true
 }
 
-/// Writer loop body shared by the spawned writer thread and deterministic
-/// tests: receives one frame or the close signal, coalesces a ready burst
-/// of control messages into one writev, and drops the burst after the write,
-/// which releases each frame's charge. Exits on the close signal, sender
-/// drop, or write error — never by polling.
-///
-/// PRE: `outbound_rx` and `close_rx` belong to one lease.
-/// POST: Return after the close signal, the last sender drop, or a write
-/// error. Frames still queued are the caller's to drop ([`WriterExit`]).
-/// INVARIANT: The writer counts no bytes; the stream it writes to owns byte
-/// accounting.
 fn run_writer_loop(
     outbound_rx: &crossbeam_channel::Receiver<crate::QueuedFrame>,
     mut close_rx: crossbeam_channel::Receiver<()>,
@@ -3407,11 +2607,6 @@ fn run_writer_loop(
     }
 }
 
-/// Forwards a decoded transaction into ingress while the relay gate is open.
-///
-/// PRE: `relay_open` was read from the node-owned IBD handle for this
-/// message. POST: a closed gate enqueues no body and never punishes the peer.
-/// INVARIANT: the gate is read per message, so opening it needs no reconnect.
 fn forward_tx_if_relay_open(
     shared: &ConnectionShared,
     source: crate::PeerSource,
@@ -3448,8 +2643,6 @@ fn generate_nonce(peer_addr: impl Into<crate::PeerRemote>) -> u64 {
     hasher.finish()
 }
 
-/// Wiring for unit tests: an active network, a start token that stays
-/// `false`, no bans, no ready callback, no node handles, and mainnet magic.
 #[cfg(test)]
 fn test_shared(
     peer_table: Arc<crate::PeerTable>,
@@ -3607,16 +2800,12 @@ mod outbound_tests {
         Ok(())
     }
 
-    /// An outbound dial entry point: either origin the service can choose.
     type Dial = fn(
         PeerEndpoint,
         crate::listener::ConnectionShared,
         PeerRole,
     ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>>;
 
-    /// Register one outbound dial against a listener that accepts and then
-    /// hangs up, so the handshake stalls exactly where the lease is already
-    /// published, and return that session.
     #[expect(
         clippy::expect_used,
         reason = "a helper that cannot build its fixture has nothing to report"
@@ -3656,9 +2845,6 @@ mod outbound_tests {
         session
     }
 
-    /// The eviction rules read the dial origin off the lease, so it must
-    /// survive from the entry point that chose it: a pinned dial carries
-    /// Core's `ConnectionType::MANUAL`, an automatic dial does not.
     #[test]
     fn the_dial_origin_survives_to_the_lease() {
         let pinned = registered_session(spawn_pinned_outbound_connection);
@@ -3693,9 +2879,6 @@ mod relay_role_tests {
         )])
     }
 
-    /// The role gate disconnects a transaction announcement, keeps block
-    /// traffic, ignores address gossip, and never restricts a full-relay
-    /// connection.
     #[test]
     fn relay_role_gate_splits_transaction_and_block_traffic() {
         let error = enforce_relay_role(PeerRole::BlockRelayOnly, tx_inv())
@@ -3793,8 +2976,6 @@ mod resilient_accept_tests {
 
     use super::{ACCEPT_ERROR_INJECT, bind_listener, serve, test_shared};
 
-    /// A transient accept error must not kill the listener thread — the loop
-    /// logs, backs off, and continues until shutdown.
     #[test]
     fn serve_survives_transient_accept_error() {
         let listener = bind_listener(
@@ -3817,7 +2998,6 @@ mod resilient_accept_tests {
 
         std::thread::sleep(Duration::from_millis(300));
 
-        // The listener must still be alive — connect a real client to prove it.
         let _client = TcpStream::connect(addr).expect("listener should still accept");
 
         shutdown.store(true, Ordering::Relaxed);
@@ -3863,10 +3043,6 @@ mod inbound_admission_tests {
         let _first = TcpStream::connect(addr)?;
         let mut second = TcpStream::connect(addr)?;
         let second_addr = second.local_addr()?;
-        // The refusal closes the socket as part of the same accept step that
-        // admitted the first, so the EOF is the synchronization point. The
-        // read bound only guards a hang: an admitted socket would sit in the
-        // handshake read for the full `HANDSHAKE_TIMEOUT` (60 s) first.
         second.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut byte = [0u8; 1];
         let read = second.read(&mut byte)?;
@@ -3954,7 +3130,6 @@ mod writer_setup_cleanup_tests {
             .peer_table
             .register(crate::PeerEndpoint::Ip(peer_addr), lease.clone());
 
-        // Lease must be registered before the failure.
         assert!(
             shared
                 .peer_table
@@ -4344,8 +3519,6 @@ mod address_tests {
         assert_eq!(
             rows.as_slice(),
             &[AddrV2Message {
-                // The book stores the advertised time minus its 2 h
-                // re-learn penalty for a non-self source.
                 time: timestamp - 2 * 60 * 60,
                 services,
                 addr: AddrV2::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
@@ -4444,7 +3617,6 @@ mod feeler_tests {
                 if revoked == 0 {
                     sent.expect("VERSION only");
                 }
-                // No VERACK is sent; a feeler closes after native VERSION acceptance.
                 while let Ok(Some((message, _))) = peer.read_message() {
                     assert!(
                         !matches!(message, crate::Message::GetAddr | crate::Message::Verack),
@@ -4472,8 +3644,8 @@ mod feeler_tests {
             );
             book.save();
             let bytes = std::fs::read(path).expect("book");
-            let stored: serde_json::Value =
-                serde_json::from_slice(&bytes[..bytes.len() - 32]).expect("JSON");
+            let stored: sonic_rs::Value =
+                sonic_rs::from_slice(&bytes[..bytes.len() - 32]).expect("JSON");
             assert_eq!(
                 stored["records"][0]["tried"],
                 revoked == 0,
@@ -4572,8 +3744,8 @@ mod feeler_tests {
             );
             book.save();
             let bytes = std::fs::read(directory.path().join("peers-f9beb4d9.dat")).expect("book");
-            let stored: serde_json::Value =
-                serde_json::from_slice(&bytes[..bytes.len() - 32]).expect("JSON");
+            let stored: sonic_rs::Value =
+                sonic_rs::from_slice(&bytes[..bytes.len() - 32]).expect("JSON");
             let record = &stored["records"][0];
             assert_eq!(record["services"], services);
             assert_eq!(record["last_success"], if prior_good { 10_000 } else { 0 });
@@ -4588,7 +3760,7 @@ mod feeler_tests {
     fn manual_dial_bypasses_known_incomplete_stored_services() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let address = listener.local_addr().expect("address");
-        drop(listener); // Local refused TCP distinguishes an attempted dial from service rejection.
+        drop(listener);
         let mut shared = test_shared(
             Arc::new(crate::PeerTable::new()),
             crossbeam_channel::unbounded().0,

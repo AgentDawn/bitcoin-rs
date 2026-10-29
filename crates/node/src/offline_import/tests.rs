@@ -87,12 +87,6 @@ fn state_writer_refuses_to_clobber() {
 fn connect_batch_relieve_journal_retention_pressure() {
     use bitcoin_rs_chain::regtest_fixture;
 
-    // The foreground import runs no maintenance worker, so retention
-    // pressure must be relieved inline: a batch connect that the journal
-    // refuses publishes one synchronous checkpoint (compacting the
-    // journal, including the pressure below) and retries the uncommitted
-    // block once. Without the relief this second connect would abort the
-    // import exactly like the proved refusal below.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config =
         crate::NodeConfig::default_for_network(bitcoin_rs_primitives::Network::Regtest);
@@ -110,10 +104,6 @@ fn connect_batch_relieve_journal_retention_pressure() {
         .expect("genesis");
     state.publish_checkpoint().expect("baseline checkpoint");
 
-    // Inflate the measured journal size past the retention budget: the
-    // next apply is refused before any tip mutation while the pressure
-    // stands. The relief checkpoint compacts every superseded segment,
-    // so this same file is gone before the retry runs.
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -244,9 +234,6 @@ fn manifest_network_matches_configured_identity() {
 #[test]
 fn offline_import_pins_full_validation_mode() {
     use bitcoin_rs_chainstate::ValidationMode;
-    // The pin refuses to inherit: every incoming live mode maps to Full,
-    // so an operator default (AssumeValid) or a fast sync posture can
-    // never leak script skipping into the certified state.
     for inherited in [
         ValidationMode::Full,
         ValidationMode::AssumeValid,
@@ -264,55 +251,39 @@ fn binding_entry(height: u32, hash: &str) -> ManifestBlock {
 }
 
 fn header_hash_hex(header: &[u8; HEADER_LEN]) -> String {
-    // Same computation the binding check performs, so the fixture hash
-    // is pinned to the indexed display order rather than the helper.
     bitcoin_rs_primitives::encode::double_sha256(header).to_string()
 }
 
 #[test]
 fn connected_records_stay_bound_to_the_manifest() {
-    // The per-record binding covers every record the import connects, so
-    // a corrupted payload of the right length is still refused.
     let header = [7u8; HEADER_LEN];
     let doc_hash = header_hash_hex(&header);
     let good = binding_entry(3, &doc_hash);
     let mut payload = header.to_vec();
     check_payload_against_entry(&good, &payload).expect("bound record");
-    // Uppercase manifest hashes normalize the same way.
     let upper = binding_entry(3, &doc_hash.to_ascii_uppercase());
     check_payload_against_entry(&upper, &payload).expect("case-insensitive");
-    // One flipped payload bit diverges from the indexed entry.
     payload[10] ^= 0x01;
     assert!(check_payload_against_entry(&good, &payload).is_err());
-    // A wrong entry hash refuses even with intact bytes.
     let wrong = binding_entry(3, &"ab".repeat(32));
     assert!(check_payload_against_entry(&wrong, &header).is_err());
-    // A runt that framing would already reject never binds.
     let runt = binding_entry(3, &doc_hash);
     assert!(check_payload_against_entry(&runt, &header[..HEADER_LEN - 1]).is_err());
 }
 
 #[test]
 fn offline_import_refuses_stale_persisted_index_namespace() {
-    // No namespace, or an empty one, holds nothing stale.
     let fresh = tempfile::tempdir().expect("tempdir");
     refuse_stale_persisted_indexes(fresh.path()).expect("absent namespace");
     std::fs::create_dir(fresh.path().join("txindex")).expect("empty namespace");
     refuse_stale_persisted_indexes(fresh.path()).expect("empty namespace");
-    // Rows left by an earlier index-enabled run refuse, even though the
-    // config posture gate already passed with indexes off.
     std::fs::write(fresh.path().join("txindex").join("CURRENT"), b"stale").expect("seed stale row");
     assert!(refuse_stale_persisted_indexes(fresh.path()).is_err());
-    // A stray non-directory artifact is state this import will not
-    // revalidate either.
     let stray = tempfile::tempdir().expect("tempdir");
     std::fs::write(stray.path().join("txindex"), b"stale").expect("seed stray file");
     assert!(refuse_stale_persisted_indexes(stray.path()).is_err());
 }
 
-/// Two real regtest blocks (genesis plus one mined child) framed as a
-/// Core archive with a matching manifest, so the provenance tests run the
-/// real entry point instead of asserting on helpers alone.
 struct TwoBlockArchive {
     blocks: Vec<bitcoin_rs_primitives::Block>,
     corpus: Vec<u8>,
@@ -388,9 +359,6 @@ fn write_archive_fixture(
 
 #[test]
 fn offline_import_fresh_dir_validates_and_records_provenance() {
-    // Fresh data directory: every record is connected under the pinned
-    // `Full` mode, the tip certifies, and the provenance record binds the
-    // certified tip for later resumes.
     let archive = two_block_archive();
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().join("node");
@@ -414,9 +382,6 @@ fn offline_import_fresh_dir_validates_and_records_provenance() {
 
 #[test]
 fn offline_import_certified_dir_resumes_idempotently() {
-    // The provenance record this importer wrote at certification lets a
-    // rerun skip the already-validated prefix: the tip is current, so no
-    // block is reconnected, but the archive is still walked and rebound.
     let archive = two_block_archive();
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().join("node");
@@ -449,12 +414,6 @@ fn offline_import_certified_dir_resumes_idempotently() {
 
 #[test]
 fn offline_import_refuses_tip_without_provenance() {
-    // A data directory whose tip came from anywhere but this importer
-    // (here: blocks connected directly, as a live `AssumeValid`/`Fast`
-    // run would leave them) carries no provenance record, so the import
-    // refuses instead of skipping unexecuted scripts into a full-validation
-    // certificate. The corpus path is never even opened: the tip check
-    // runs first.
     let archive = two_block_archive();
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().join("node");
@@ -467,8 +426,6 @@ fn offline_import_refuses_tip_without_provenance() {
             ))
             .expect("connect");
         }
-        // No provenance written; dropping releases the data-dir lock so
-        // the entry point below can reopen the directory.
     }
     let (corpus, manifest) = write_archive_fixture(dir.path(), &archive);
     let error = run_offline_import(
@@ -491,10 +448,7 @@ fn network_magic_refuses_non_hex_without_panicking() {
         parse_magic_hex("f9beb4d9").expect("hex"),
         [0xf9, 0xbe, 0xb4, 0xd9]
     );
-    // Eight bytes but multibyte UTF-8: refused, not sliced off a char
-    // boundary.
     assert!(parse_magic_hex("\u{e9}\u{e9}f9be").is_err());
-    // Sign prefixes `from_str_radix` would accept are not hex digits.
     assert!(parse_magic_hex("+fbeb4d9").is_err());
     assert!(parse_magic_hex("f9beb4d").is_err());
 }

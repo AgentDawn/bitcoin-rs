@@ -32,9 +32,6 @@ use bitcoin_rs_index::block_log::{BlockLog, BlockRecord, cumulative_tx_count_thr
 
 pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    // One applied publication answers the whole response: `sync_progress_at`
-    // projects the shared facts and the wire-only bits/target pair below read
-    // the same view, so no field can describe a tip another field does not.
     let applied = ctx.chain.applied_view();
     let progress = ctx.chain.sync_progress_at(&applied);
     let tip_bits = applied
@@ -83,7 +80,6 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     Ok(response)
 }
 
-/// Keep transport mapping at the RPC boundary; the node retains typed causes.
 fn snapshot_error(error: crate::context::SnapshotControlError) -> RpcError {
     use crate::context::SnapshotControlError;
     match error {
@@ -138,8 +134,6 @@ pub(crate) fn dumptxoutset(
     let params = super::bind_named_params(params, &["path", "type"])?;
     super::ensure_at_most_params(&params, 2)?;
     let path = required_str(&params, 0, "path is required")?;
-    // Core 31.1 gives `type` the default "", which it rejects like any other
-    // value that is neither "latest" nor "rollback".
     let snapshot_type = match params_array(&params)?.get(1) {
         Some(value) if !value.is_null() => value
             .as_str()
@@ -190,27 +184,10 @@ pub(crate) fn getdifficulty(ctx: &Arc<Context>, params: &Value) -> Result<Value,
 
 pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    // Tree guard first, then the tip -- and that order is load-bearing rather
-    // than incidental. A connect inserts its node under the tree's write lock
-    // and publishes the applied tip afterwards, so while this read guard is
-    // held no new node can appear, and any tip published in the meantime names
-    // a node that was already in the tree when the guard was taken. Loading the
-    // tip first would allow the reverse: a tip whose node this view has never
-    // seen, and every lookup below it answering `None` for a block the node has
-    // certainly connected.
     let tree = ctx.chain.block_tree.read();
-    // The active chain is the one this node has *connected*, not the one its
-    // headers describe. Header-first sync runs the header tree thousands of
-    // blocks ahead of the applied tip during initial sync, and calling that
-    // lead "active" reports a chain the node has not validated -- while the
-    // chain it has validated goes unreported. Bitcoin Core asks
-    // `ActiveChain().Tip()`, which is the connected tip.
     let active_tip = ctx.chain.applied_tip.load_full();
     let active_tip_id = active_tip.as_ref().map(|tip| tip.tip_id);
 
-    // Core reports the active tip whether or not it is a leaf, and during
-    // initial sync it is not one: the headers already describe its
-    // descendants, so nothing here would list it.
     let mut tip_ids = tree.leaf_node_ids();
     if let Some(active_id) = active_tip_id {
         if !tip_ids.contains(&active_id) {
@@ -221,10 +198,6 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     for leaf_id in tip_ids {
         let is_active = Some(leaf_id) == active_tip_id;
         let Ok(node) = tree.node(leaf_id) else {
-            // The applied-tip snapshot is the authority on the active tip even
-            // when the tree holds no row for it (fresh wiring, pruned rows):
-            // Core's `active_chain.Contains` marks that tip active regardless.
-            // A non-active id without a row cannot be a tip.
             if !is_active {
                 continue;
             }
@@ -239,46 +212,9 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             });
             continue;
         };
-        // `NodeStatus` is not a validation record. `BlockTree::insert_node`
-        // stamps whichever node carries the most work `Active` and demotes the
-        // one it displaced to `Stale`, so on a header-first node every accepted
-        // header on the best chain is `Active` while its block sits
-        // unconnected. Reading it as "this block was validated" is what made a
-        // header tip report itself as the active chain.
-        //
-        // What is decidable: a block is connected exactly when it is the
-        // applied tip or an ancestor of it, and a leaf is never an ancestor of
-        // anything. So every leaf but the applied tip is unconnected *now*, and
-        // the only question left is whether it ever was.
         let status = match node.status {
-            // **Invalid first, ahead of being the applied tip.** The two can
-            // both be true at once, and only for as long as it takes an
-            // invalidation to finish: `reorg::invalidate_block` marks the
-            // subtree invalid under the tree's write lock and releases it, and
-            // republishes `applied_tip` afterwards, when the disconnect has
-            // run. A call landing in between holds a tree view that says
-            // "invalid" and an applied tip that still names the block -- and
-            // deciding on the tip first labels a block the node has just
-            // rejected as the chain it is following. There is no ordering that
-            // removes the window, because the two are published separately;
-            // what removes the wrong answer is preferring the fact that cannot
-            // be stale. A block that is invalid was invalid before this call
-            // and stays invalid after it.
             NodeStatus::Invalid => ChainTipsStatus::Invalid,
             _ if is_active => ChainTipsStatus::Active,
-            // Everything else is a leaf whose block is not connected now, and
-            // the tree keeps no evidence that it ever was.
-            //
-            // `Stale` is not that evidence, which is the trap: the tree demotes
-            // whichever header it displaced, whether or not the block behind it
-            // was ever received, let alone applied. On a header-first node most
-            // stale nodes are headers whose bodies never arrived. Calling those
-            // `valid-fork` -- Core's "fully validated, since reorganised" --
-            // claims a validation that never happened.
-            //
-            // So `valid-fork` is never emitted. Core's `valid-headers` is not
-            // either: it means the body is present and unvalidated, which this
-            // node cannot reach because it applies a block as it arrives.
             NodeStatus::Stale | NodeStatus::Active | NodeStatus::HeaderValid => {
                 ChainTipsStatus::HeadersOnly
             }
@@ -295,22 +231,14 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             status,
         });
     }
-    // Core orders by height descending, with no special place for the active
-    // tip -- a longer fork is listed above it, which is the thing an operator
-    // is looking for. Ties break on the hash, so the order is the same on
-    // every call rather than following slab layout.
     tips.sort_by(|a, b| b.height.cmp(&a.height).then_with(|| a.hash.cmp(&b.hash)));
     typed_to_sonic(&v31::GetChainTips(tips))
 }
 
 pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    // Bitcoin Core's default: one month of ten-minute blocks.
-    const DEFAULT_WINDOW: u64 = 30 * 24 * 6; // ~1 month of 10-min blocks
+    const DEFAULT_WINDOW: u64 = 30 * 24 * 6;
 
     let array = params_array(params)?;
-    // One capture answers selection, applied identity, and count alike. The
-    // capture is a lock-free load, so a block transition in progress cannot
-    // stall this response.
     let applied = ctx.chain.applied_view();
     let tip_hash = match array.get(1).filter(|value| !value.is_null()) {
         None => applied.hash(ctx.chain.chain_network),
@@ -373,9 +301,6 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         window_interval: window_open.then(|| i64_saturated(stats.window_interval)),
         tx_rate,
     })?;
-    // The applied tip always answers `txcount` (0 when nobody counted it);
-    // a historical block omits it when the count is unknown, and so does a
-    // call that selected nothing.
     if (!stats.selected || (!stats.is_applied_tip && stats.total_tx_count.is_none()))
         && let Some(object) = result.as_object_mut()
     {
@@ -384,21 +309,11 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     Ok(result)
 }
 
-/// The figures a `getchaintxstats` response is built from.
-///
-/// `total_tx_count` and `window_tx_count` are `Option` because a count nobody
-/// measured is omitted rather than reported as a zero that reads as real. The
-/// applied tip is the one block that always answers `txcount` (with `0` when
-/// it is the unknown case); any other block omits the field when the count
-/// cannot be found.
 struct ChainTxStats {
-    /// Whether a block answered the selection at all.
     selected: bool,
-    /// Whether the selected block is the applied tip.
     is_applied_tip: bool,
     /// Cumulative transactions through the selected block, when known.
     total_tx_count: Option<u64>,
-    /// The selected block's header time.
     tip_time: u32,
     /// Transactions inside the window, when the window is open and known.
     window_tx_count: Option<u64>,
@@ -406,13 +321,6 @@ struct ChainTxStats {
     window_interval: u64,
 }
 
-/// The selected branch's hash at every height down to genesis, in one walk.
-///
-/// PRE: `tree` is the guard the request holds; `branch_tip` is a node of it.
-/// POST: `hashes[h]` is that branch's hash at height `h` through the tip;
-///   heights above the tip stay zero-filled, which no applied record can match.
-/// INVARIANT: reads only the guarded tree, so the answer cannot shift while
-///   the caller verifies a mutable log against it.
 fn branch_hashes(
     tree: &bitcoin_rs_chain::BlockTree,
     branch_tip: bitcoin_rs_chain::NodeId,
@@ -433,16 +341,6 @@ fn branch_hashes(
     Some(hashes)
 }
 
-/// The record log's cumulative count through `height`, but only while that
-/// prefix describes the selected branch.
-///
-/// PRE: `tree` is the guard the request holds; `branch_tip` is a node of it at
-///   or above `height`.
-/// POST: the genesis-to-`height` prefix sum, or `None` when the log does not
-///   reach `height` or any record in the prefix disagrees with the branch.
-/// INVARIANT: the log is mutable without transition exclusion — a reorg
-///   displaces its records — so a prefix that no longer matches the selected
-///   branch is reported as unknown rather than as a chain total.
 fn log_prefix_count(
     log: &BlockLog,
     tree: &bitcoin_rs_chain::BlockTree,
@@ -464,19 +362,6 @@ fn log_prefix_count(
     Some(total)
 }
 
-/// The cumulative transaction count through `node_id`, when it is known.
-///
-/// The node's own count answers when the block was counted; the count
-/// published with the captured tip answers for that tip alone; a record-log
-/// prefix that still matches the selected branch answers for any height it
-/// holds back to genesis. `None` when nobody knows.
-///
-/// PRE: `tree` is the guard the request holds; `applied` is its capture, and
-///   `node_id` lies on the branch `branch` indexes lazily on first use.
-/// POST: the count from the first source that can name it.
-/// INVARIANT: the published count is used only for the captured applied tip,
-///   the call never reloads that publication, and one shared branch index —
-///   built at most once per request — serves every log prefix checked.
 fn count_through(
     ctx: &Context,
     tree: &bitcoin_rs_chain::BlockTree,
@@ -497,13 +382,6 @@ fn count_through(
     log_prefix_count(&log, tree, node_id, branch, node.height)
 }
 
-/// Transactions inside the window, from one source for both ends.
-///
-/// The published tip count is a chain total and cannot name the ancestor, so
-/// it does not participate here. Mixing it with a log prefix would report
-/// `published_tip - log_start` whenever the two disagreed. The tree answers
-/// when both nodes were counted; otherwise one log, read under one guard,
-/// answers both ends together. `None` when neither source can.
 fn window_tx_count_between(
     ctx: &Context,
     tree: &bitcoin_rs_chain::BlockTree,
@@ -524,17 +402,6 @@ fn window_tx_count_between(
     Some(end_count.saturating_sub(start_count))
 }
 
-/// Computes the figures behind a `getchaintxstats` response against a block
-/// tree the caller already holds a read guard on.
-///
-/// `window_interval` is the difference of the median-time-past of the window's
-/// two boundary blocks, matching Bitcoin Core: raw header timestamps are not
-/// ordered, so their difference cannot measure an elapsed time.
-///
-/// PRE: `tree` is the guard the request holds; `applied` is its capture.
-/// POST: the figures for `tip_hash` over `window_block_count` blocks.
-/// INVARIANT: applied identity comes from `applied` alone, so the response
-///   cannot straddle two publications or wait on the transition mutex.
 fn window_stats(
     ctx: &Context,
     tree: &bitcoin_rs_chain::BlockTree,
@@ -547,9 +414,6 @@ fn window_stats(
             .tip()
             .and_then(|tip| tree.node(tip.tip_id).ok().map(|node| node.header.time))
             .unwrap_or(0);
-        // The applied tip answers `txcount` even when its node is not in the
-        // tree (the count is simply unknown, reported as 0). Only a call with
-        // no applied tip at all selects nothing and omits the field.
         let is_applied_tip = applied.tip().is_some_and(|tip| tip.hash == tip_hash);
         return Ok(ChainTxStats {
             selected: is_applied_tip,
@@ -635,8 +499,6 @@ pub(crate) fn getblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         None
     };
     let record = if verbosity >= 2 && ctx.chain.block_undo_source.is_some() {
-        // Undo reads use the bounded owner; avoid a legacy metadata read
-        // before acquiring the shared materialization permit.
         ctx.chain.header_record(hash)
     } else {
         ctx.chain.block_by_hash(hash)
@@ -1041,8 +903,6 @@ pub(crate) fn verifychain(
 ) -> Result<Value, RpcError> {
     super::ensure_at_most_params(params, 2)?;
     let array = params_array(params)?;
-    // A request that arrives after the handler stopped reports interruption
-    // before touching any chain state.
     if cancellation.is_triggered() {
         return Err(RpcError::Misc("Block verification interrupted".to_owned()));
     }
@@ -1053,29 +913,20 @@ pub(crate) fn verifychain(
         if !value.is_number() {
             return Err(super::wrong_type(index + 1, name, value, "number"));
         }
-        // An unsigned value beyond `i64::MAX` saturates, so it meets the
-        // range check below instead of silently becoming the default.
         value
             .as_i64()
             .or_else(|| value.as_u64().map(|_| i64::MAX))
             .ok_or_else(|| RpcError::Misc("JSON integer out of range".to_owned()))
     };
-    // Core reads both parameters with `getInt`: anything outside the signed
-    // 32-bit range is out of range, and the level then clamps to `0..=4`.
     let checklevel = i32::try_from(parameter(0, "checklevel", 3)?)
         .map_err(|_| RpcError::Misc("JSON integer out of range".to_owned()))?
         .clamp(0, 4);
     let depth = parameter(1, "nblocks", 6)?;
-    // Core treats a non-positive depth as the whole chain; a depth outside
-    // the signed 32-bit range never reaches that rule.
     let nblocks = match i32::try_from(depth) {
         Ok(depth) => u32::try_from(depth).unwrap_or(0),
         Err(_) => return Err(RpcError::Misc("JSON integer out of range".to_owned())),
     };
     let level = u8::try_from(checklevel).unwrap_or(4);
-    // A chainstate closed for recovery cannot be declared verified, not even
-    // over an empty window; the verifier enforces the same fail-closed rule
-    // for the startup path and for a closure that lands mid-walk.
     if ctx.chain.closed_for_recovery.is_triggered() {
         return Err(RpcError::Misc(
             "Chainstate is unavailable for verification".to_owned(),
@@ -1084,11 +935,6 @@ pub(crate) fn verifychain(
     if ctx.chain.applied_tip.load_full().is_none() {
         return typed_to_sonic(&v31::VerifyChain(true));
     }
-    // One owner verifies: the node-owned chain control answers from the
-    // shared recent-blocks verifier, so RPC never walks storage itself.
-    // Without that verifier the chain cannot be declared verified. The
-    // request latch travels with the call so an in-flight cancellation
-    // interrupts the walk instead of passing or failing as damage.
     let verified = ctx
         .chain
         .chain_control
@@ -1113,8 +959,6 @@ pub(crate) fn verifychain(
 }
 
 pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    // See docs/benchmarks/muhash-rpc.md for the authoritative measured contract.
-    // This implementation scans the in-memory UtxoSet.
     let array = if params.is_null() {
         None
     } else {
@@ -1143,11 +987,6 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         ));
     }
     let want_muhash = hash_type == "muhash";
-    // Capture the tip, scan, then re-check the tip: a connect landing between
-    // capture and scan would otherwise report the pre-connect height and
-    // bestblock over post-connect UTXOs. The scan stays outside the chain
-    // transition lock so connect and disconnect are not delayed for the whole
-    // set walk; only a contested chain pays the locked final attempt.
     let scan = |view: &AppliedView| {
         ctx.chain.utxo.with_stable_view(|stable| {
             let stats = bitcoin_rs_utxo::stats::scan_coin_stats(stable, view.height(), want_muhash)
@@ -1306,8 +1145,6 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             },
         );
     }
-    // Core answers a named request with only that index; an unknown name
-    // yields an empty object, as does a name for a disabled index.
     let selected = match index_name {
         None => indexes,
         Some(name) => {
@@ -1322,18 +1159,12 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
 }
 
 /// bitcoin-rs extension `getcapabilities`.
-///
-/// Reports every compiled capability with its compiled/enabled state and
-/// live lifecycle status. Extension surface, not Core parity; declared as
-/// `Status::Extension` in the compatibility manifest.
 pub(crate) fn getcapabilities(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let snapshot = bitcoin_rs_index::txindex_snapshot(ctx.indexes.derived_index_status.as_deref());
     Ok(json!({ "capabilities": snapshot.capabilities }))
 }
 
-// Aggregate bounds apply before descriptor expansion; the UTXO owner separately
-// bounds traversal, matches, duration and cancellation checkpoints.
 const MAX_SCAN_DESCRIPTOR_BYTES: usize = 16_384;
 const MAX_SCAN_INPUT_BYTES: usize = 1_048_576;
 const MAX_SCAN_ANCESTRY_STEPS: usize = 2_000_000;
@@ -1455,8 +1286,6 @@ fn scantxoutset_scan(
         complete = false;
         scan.unspents.clear();
     }
-    // At most 10,000 coins. Core orders COutPoint by internal txid bytes,
-    // then by output index; cancellation is rechecked after the bounded sort.
     scan.unspents.sort_unstable_by_key(|coin| {
         let outpoint = coin.outpoint;
         let txid = outpoint.txid;
@@ -1480,8 +1309,6 @@ fn scantxoutset_scan(
     Ok(result)
 }
 
-/// Resolves only requested creation heights from the retained branch in one
-/// bounded walk. A reorg cannot turn this into one full walk per matched coin.
 fn scan_ancestry(
     ctx: &Context,
     scan: &bitcoin_rs_utxo::UtxoScan,
@@ -1578,8 +1405,6 @@ fn parse_scan_scripts(
         }
         descriptors.push(descriptor);
     }
-    // Admit the whole request's work before deriving any public keys. Count
-    // duplicate expansions too: deduplication bounds retained scripts, not CPU.
     let mut scripts = std::collections::BTreeMap::new();
     let mut script_bytes = 0usize;
     for descriptor in descriptors {
@@ -1647,8 +1472,6 @@ fn scan_unspents(
         let desc = descs
             .get(utxo.txout.script_pubkey.as_slice())
             .ok_or_else(|| RpcError::Internal("scan matched an unknown script".into()))?;
-        // Include repeated attribution and hex expansion as well as fixed
-        // JSON/numeric overhead before materializing this output.
         response_bytes += desc.len() + utxo.txout.script_pubkey.len() * 2 + 1024;
         if response_bytes > MAX_SCAN_RESPONSE_BYTES {
             return Err(RpcError::Misc(
@@ -1710,21 +1533,7 @@ fn parse_hash(value: &str) -> Result<Hash256, RpcError> {
 
 /// The block's depth in the **active chain**, or `-1` when it is not in the
 /// active chain at all.
-///
-/// This is Bitcoin Core's `chain.Contains(pindex) ? chain.Height() -
-/// pindex->nHeight + 1 : -1`, and the membership test is the whole point.
-/// Height alone cannot answer it: a block that lost a reorg keeps its height,
-/// so deriving the answer from height reports a *positive* confirmation count
-/// for a block that is no longer in the chain — and anything gating on
-/// `confirmations >= N` reads that as buried.
-///
-/// The chain asked is the **applied** chain, not the header chain. Core's
-/// `m_chain` is the connected, fully-validated chain, and header-first sync
-/// keeps headers ahead of it; a block whose header is known but which has not
-/// been connected is not in it, so it is `-1` rather than `0`.
 pub(super) fn confirmations(ctx: &Context, view: &AppliedView, hash: Hash256, height: u32) -> i64 {
-    // Membership comes from the response's one captured publication; depth
-    // comes from the shared render helper so every surface agrees.
     let Some(tip) = view.tip() else {
         return -1;
     };
@@ -1750,8 +1559,6 @@ fn block_verbose_typed(
 ) -> Result<Value, RpcError> {
     let header = decode_header(record)?;
     let hash = Hash256::from(record.hash);
-    // One capture serves confirmations and the next-applied-block hash, so the
-    // two cannot describe different applied publications.
     let view = ctx.chain.applied_view();
     let block_confirmations = confirmations(ctx, &view, hash, record.height);
     let mediantime = ctx.chain.median_time_past_for_hash(hash).unwrap_or(0);
@@ -1841,9 +1648,6 @@ fn block_verbose_typed(
             ctx.chain.chain_network,
         )?
     };
-    // The pinned coinbase DTO narrows this unsigned wire field to i32; the
-    // overwrite restores the native unsigned wire value.
-    // Both typed block envelopes must already contain this object.
     let coinbase = value
         .as_object_mut()
         .ok_or_else(|| RpcError::Internal("typed block response is not an object".to_owned()))?
@@ -1955,8 +1759,6 @@ fn render_detailed_block(
             crate::tx_render::transaction_json_with_spends(tx, network, None, coins, verbosity >= 3)
         })
         .collect::<Result<Vec<_>, RpcError>>()?;
-    // Header/common fields retain the pinned DTO. Transaction values use the
-    // existing Core renderer because its wire version spans all u32 values.
     let mut value = typed_to_sonic_omitting_nulls(base)?;
     let _ = value.insert("tx", json!(tx));
     Ok(value)
@@ -2064,8 +1866,6 @@ mod pruneblockchain_tests {
         }
     }
 
-    /// Regtest-shaped genesis header for header-only fixtures; only its
-    /// self-consistent identity matters, never its field values.
     fn fixture_genesis_header() -> Header {
         Header {
             version: 1,
@@ -2216,7 +2016,6 @@ fn compute_branchlen(
         return leaf_height;
     };
 
-    // Walk parents from leaf until we hit a node also on the active chain.
     let mut cursor = leaf_id;
     loop {
         let Ok(node) = tree.node(cursor) else {
@@ -2339,7 +2138,6 @@ mod dumptxoutset_tests {
     };
     use crate::handlers::Handler;
 
-    /// Records the delegated path and answers with a chosen outcome.
     struct Exporter {
         seen: Mutex<Option<PathBuf>>,
         failure: Option<fn() -> SnapshotControlError>,
@@ -2428,8 +2226,6 @@ mod dumptxoutset_tests {
 
     #[test]
     fn only_the_latest_type_is_served_and_refusals_never_reach_the_control() {
-        // Core 31.1 gives `type` no usable default: missing, null and empty
-        // are refused like any value other than the one served.
         for params in [
             json!(["out.dat"]),
             json!(["out.dat", null]),
@@ -2487,7 +2283,6 @@ mod dumptxoutset_tests {
             assert_eq!(error.code(), code, "{error}");
         }
 
-        // The request latch handed to the control is the handler's stop latch.
         let (exporter, handler) = Exporter::handler(None);
         handler.stop();
         let error = handler

@@ -72,14 +72,6 @@ fn context_with_tip(
     ctx
 }
 
-/// Makes `ctx` know `block` the way a running node does: header in the block
-/// tree, record in the log.
-///
-/// A record on its own is not a node's state. `apply_block` puts the header
-/// in the tree first and pushes the record after, through the same handles,
-/// and the record carries no header of its own — the tree is where one
-/// lives. A fixture that pushes only a record is asking `getblock` to answer
-/// from half the state a node would have.
 fn seed_block(ctx: &Arc<Context>, block: &Block, record: BlockRecord) {
     {
         let mut tree = ctx.chain.block_tree.write();
@@ -88,8 +80,6 @@ fn seed_block(ctx: &Arc<Context>, block: &Block, record: BlockRecord) {
     ctx.chain.add_block(record);
 }
 
-/// A minimal native genesis stand-in: one coinbase transaction whose txid
-/// is the merkle root, so the block hash derives from the fixture itself.
 fn fixture_genesis() -> Block {
     let coinbase = Tx {
         version: 1,
@@ -118,10 +108,6 @@ fn fixture_genesis() -> Block {
     }
 }
 
-/// The fixture block plus a second transaction with an input and output
-/// count that differs from the coinbase, so per-transaction projections
-/// cannot pass by repeating the coinbase. `getblock` decodes a stored body
-/// without resolving inputs, so the outpoints need not be spendable.
 fn fixture_block_with_spend() -> Block {
     let mut block = fixture_genesis();
     let Some(coinbase) = block.txs.first() else {
@@ -301,7 +287,6 @@ fn getblock_populates_real_header_fields_from_stored_record()
 
     assert_eq!(block_json.get("size").as_u64(), Some(block_size));
     assert_eq!(block_json.get("strippedsize").as_u64(), Some(block_size));
-    // Witness-free fixture: weight is exactly 4x total size (Core formula).
     assert_eq!(block_json.get("weight").as_u64(), Some(block_size * 4));
     let tx_value = block_json.get("tx");
     let tx = tx_value
@@ -450,8 +435,6 @@ fn getblock_verbosity_2_emits_every_transaction_of_the_stored_body() {
 
 #[test]
 fn verbose_block_and_raw_consumers_preserve_unsigned_transaction_versions() {
-    // Core 31.1 CTransaction::version is uint32_t; CBlockHeader::nVersion
-    // remains int32_t. Literal expected values independently pin that split.
     let mut block = fixture_block_with_spend();
     block.header.version = -1;
     block.txs[0].version = u32::MAX;
@@ -609,12 +592,6 @@ fn gettxoutsetinfo_rejects_trailing_parameters() {
     assert_eq!(trailing.code(), RpcError::INVALID_PARAMS, "{trailing}");
 }
 
-/// One publication supplies the scan height and the reported height and
-/// hash, so a tip that lands mid-scan cannot split the response pair.
-///
-/// The swapper moves only the applied-tip cell: the UTXO set is constant,
-/// so this pins the tip pair, not an atomic UTXO-to-tip coupling, which is
-/// not claimed.
 #[test]
 fn gettxoutsetinfo_pairs_one_height_with_one_hash_across_a_swap() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -657,10 +634,6 @@ fn gettxoutsetinfo_pairs_one_height_with_one_hash_across_a_swap() {
 
     let mut seen_a = false;
     let mut seen_b = false;
-    // Sampling runs until both publications have answered, not for a fixed
-    // count: the swapper's first store publishes the new tip, but thread
-    // startup is the scheduler's call, so a fixed budget can expire before
-    // the new publication is ever observed.
     for iteration in 0..100_000 {
         let result = gettxoutsetinfo(&ctx, &json!(null))
             .unwrap_or_else(|error| panic!("gettxoutsetinfo failed: {error}"));
@@ -697,26 +670,11 @@ fn gettxoutsetinfo_pairs_one_height_with_one_hash_across_a_swap() {
     );
 }
 
-/// A genesis, an applied child at height 1, and a competing branch off the
-/// same genesis whose *header* chain reaches height 2.
-///
-/// ```text
-///   genesis ──> applied            (height 1, the applied tip)
-///           └─> fork ──> fork_tip  (heights 1 and 2, headers only)
-/// ```
-///
-/// `fork` sits at height 1 exactly like `applied` does, which is the state
-/// a height-only confirmation count cannot tell apart.
 struct Fork {
     ctx: Arc<Context>,
-    /// Height 1, on the applied chain.
     applied: Hash256,
-    /// Height 1 as well, on the branch that lost.
     fork: Hash256,
-    /// Height 2, header-only — never connected.
     header_tip: Hash256,
-    /// The headers behind `applied` and `fork`, so a test can build log
-    /// records that actually decode.
     applied_header: Header,
     fork_header: Header,
 }
@@ -803,12 +761,6 @@ fn confirmations_count_applied_depth_and_answer_minus_one_off_the_chain()
     Ok(())
 }
 
-/// Confirmations and the next-applied-block hash describe one publication.
-///
-/// The genesis has two competing children: `a1` is one applied tip; `b2`
-/// leads a longer branch. Reporting `a1` while the applied tip swaps
-/// between the two must never pair one branch's confirmation count with
-/// the other branch's next-block hash.
 #[test]
 fn verbose_block_facts_never_straddle_two_applied_publications()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -854,9 +806,6 @@ fn verbose_block_facts_never_straddle_two_applied_publications()
             }),
         )
     };
-    // A log record for `a1`, so the verbose projection has a record to
-    // answer from. The record comes back through the tree, which carries
-    // the header, exactly as a node's record does on the way out.
     let mut block = fixture_genesis();
     block.header = a1;
     ctx.chain.add_block(BlockRecord::from_block(1, &block));
@@ -885,10 +834,6 @@ fn verbose_block_facts_never_straddle_two_applied_publications()
     let ctx = Arc::new(ctx);
     let mut seen_a = false;
     let mut seen_b = false;
-    // Sampling runs until both publications have answered, not for a fixed
-    // count: the swapper's first store publishes the b2 tip, but thread
-    // startup is the scheduler's call, so a fixed budget can expire before
-    // the b2 branch is ever published.
     for iteration in 0..100_000 {
         let value = block_verbose_typed(&ctx, &record, false, 1)?;
         let confirmations = value
@@ -923,10 +868,6 @@ fn verbose_block_facts_never_straddle_two_applied_publications()
     Ok(())
 }
 
-/// Header-only tree nodes remain addressable even without a log record.
-///
-/// Rejecting unknown identities must not accidentally require active-chain
-/// membership or a body: this fork header is known but not applied.
 #[test]
 fn getblockheader_answers_a_header_only_tree_node() -> Result<(), Box<dyn std::error::Error>> {
     let Fork {
@@ -990,9 +931,6 @@ fn getblockstats_rejects_a_stale_block_hash() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// A structurally plausible stored block: one coinbase transaction, as
-/// every real block carries. Verbose rendering requires the coinbase, so
-/// an empty body trips production's typed absence error instead.
 fn coinbase_only_block(header: Header) -> Block {
     let coinbase = Tx {
         version: 1,
@@ -1014,8 +952,6 @@ fn coinbase_only_block(header: Header) -> Block {
     }
 }
 
-/// A log record for `header`, either carrying the block or standing in for
-/// one whose body the node no longer has.
 fn record_for(header: Header, with_body: bool) -> BlockRecord {
     if !with_body {
         let hash = header.compute_hash().0;
@@ -1024,11 +960,6 @@ fn record_for(header: Header, with_body: bool) -> BlockRecord {
     BlockRecord::from_block(1, &coinbase_only_block(header))
 }
 
-/// `getblock` and `getblockheader` both render `confirmations` when a body
-/// is available. A pruned body still leaves enough tree state for
-/// `getblockheader`, while Core-compatible `getblock` rejects that request
-/// as unavailable. The body-less fixture therefore checks the header RPC;
-/// the complete fixture checks both rendering paths.
 fn assert_reorged_block_reports_negative_confirmations(
     with_body: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1322,11 +1253,6 @@ fn getchaintxstats_emits_core_shape_with_zero_blocks() {
         .unwrap_or_else(|err| panic!("getchaintxstats failed: {err}"));
     assert!(result.get("time").is_some());
     assert!(result.get("window_final_block_height").is_some());
-    // `txcount` used to be present and zero here. Zero is not a missing
-    // measurement, it is a wrong one: genesis carries a coinbase, so the
-    // cumulative count at a genesis tip is one. Neither the durable counter
-    // nor an empty log knows it, so Core's answer -- and now this one -- is
-    // to omit the field.
     assert!(result.get("txcount").is_none(), "{result:?}");
 }
 
@@ -1360,7 +1286,6 @@ fn getchaintxstats_window_tx_count_includes_in_range_blocks() {
     let Some(txcount) = result.get("txcount").and_then(JsonValueTrait::as_u64) else {
         panic!("txcount missing: {result:?}");
     };
-    // Genesis block has 1 tx (coinbase).
     assert_eq!(txcount, 1);
 }
 
@@ -1425,11 +1350,6 @@ fn getchaintxstats_time_reflects_tip_block_header_timestamp() {
     assert_eq!(time, u64::from(expected_time));
 }
 
-/// A log with a duplicate height and uneven record sizes.
-///
-/// Heights are non-decreasing, which is the invariant the prefix sums rest
-/// on, but they are not a clean `0..n`: height 3 is recorded twice, as a
-/// reorg leaves it. The running totals must count both records.
 fn shaped_log() -> BlockLog {
     const HEIGHTS: [u32; 10] = [0, 1, 2, 3, 3, 4, 5, 6, 7, 8];
     const TIMES: [u32; 10] = [
@@ -1483,10 +1403,8 @@ fn block_log_running_sums_track_push_pop_and_clear() {
     assert_eq!(log.total_tx_count(), 145);
     assert_eq!(log.tx_count_before(4), 1 + 4 + 7 + 10);
     assert_eq!(log.tx_count_before(0), 0);
-    // `count` is clamped to the log's length rather than panicking.
     assert_eq!(log.tx_count_before(usize::MAX), 145);
 
-    // The disconnect path: popping the tip takes its bytes and txs back out.
     let _popped = log.pop();
     assert_eq!(log.size_on_disk(), 1_315 - 163);
     assert_eq!(log.total_tx_count(), 145 - 28);
@@ -1512,7 +1430,6 @@ fn block_log_running_sums_saturate_instead_of_wrapping() {
     log.push(record(max, max));
     assert_eq!(log.size_on_disk(), u64::MAX);
     assert_eq!(log.total_tx_count(), u64::MAX);
-    // A second push must not wrap the sums back to small values.
     log.push(record(1, 1));
     assert_eq!(log.size_on_disk(), u64::MAX);
     assert_eq!(log.total_tx_count(), u64::MAX);

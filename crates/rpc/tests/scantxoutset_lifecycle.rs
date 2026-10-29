@@ -1,5 +1,3 @@
-//! Bounded real HTTP admission and cancellation for the shared scan owner.
-
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -8,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use bitcoin_rs_e2e::rpc::Connection;
 use bitcoin_rs_rpc::{Auth, Handler, RpcServer, context::Context};
-use serde_json::{Value, json};
+use sonic_rs::{Value, json};
 
 fn call(connection: &mut Connection, method: &str, params: Value) -> anyhow::Result<Value> {
     let mut request = json!({"jsonrpc":"2.0", "id":1,"method":method});
@@ -31,8 +29,6 @@ fn reserved(context: &Context) -> anyhow::Result<()> {
 
 #[test]
 fn scan_preserves_control_capacity_and_observes_server_shutdown() -> anyhow::Result<()> {
-    // A close response does not acknowledge worker-permit release.
-    // Give each cancellation path its own listener and connection budget.
     for stop in [false, true] {
         check_scan_cancellation(stop)?;
     }
@@ -80,8 +76,6 @@ fn check_scan_cancellation(stop: bool) -> anyhow::Result<()> {
                 json!(0)
             );
             if stop {
-                // A rejected blocking request closes the control connection.
-                // Check it after the ordinary calls, then stop the server.
                 assert_eq!(
                     call(&mut control, "scantxoutset", json!(["start", []]))?["error"]["code"],
                     json!(-8)
@@ -93,8 +87,7 @@ fn check_scan_cancellation(stop: bool) -> anyhow::Result<()> {
                     json!(true)
                 );
             }
-            // The RPC transport deadline proves cancellation finishes while
-            // the authoritative transition is still excluded here.
+
             let response = scan
                 .join()
                 .map_err(|_| anyhow::anyhow!("scan worker panicked"))??;

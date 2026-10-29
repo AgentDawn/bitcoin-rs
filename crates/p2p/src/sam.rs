@@ -1,46 +1,4 @@
 //! I2P SAM v3 client (pinned IVNP bridge) for typed I2P transports.
-//!
-//! One persistent `SESSION CREATE STYLE=STREAM` root is held per session;
-//! every dial opens a fresh SAM bridge connection with `STREAM CONNECT`,
-//! and inbound streams arrive through fresh `STREAM ACCEPT` bridges.
-//! Names resolve only through `NAMING LOOKUP` on the bridge — never
-//! through the system resolver — and no failure falls back to direct TCP.
-//! Private destination material is never logged.
-//!
-//! Each installed root carries a generation. A stream request is issued
-//! against the root that was live when the caller started, so a stale
-//! `INVALID_ID` retires only that root and never one recovered meanwhile.
-//! The generation rises only when a root is installed.
-//!
-//! # Root readiness
-//!
-//! The pinned bridge answers `SESSION CREATE` only once its destination is
-//! ready, which can take its whole readiness wait ([`READINESS_WAIT`]).
-//! A root under construction is therefore one resumable [`PendingRoot`]
-//! owned by the `recovery` state: its socket, one absolute readiness
-//! deadline fixed once per root, before its socket connects, so the budget
-//! covers the TCP connect, `HELLO`, the readiness wait, and `NAMING LOOKUP`
-//! together, an explicit [`RootPhase`], the count of command bytes the socket
-//! already accepted, and the bounded partial reply line. A connect or accept
-//! caller advances it only while it holds `recovery`, bounded by the earlier
-//! of its own deadline and the root's deadline. A caller deadline pauses the
-//! exchange and reports `TimedOut`; the next caller resumes the same
-//! exchange, so each command reaches the bridge exactly once. Only a hard
-//! protocol or I/O failure, the root deadline, or [`SamSession::close`]
-//! discards it. A TCP connect that cannot finish inside a caller's deadline
-//! is abandoned: nothing was sent, so nothing can be duplicated. The
-//! readiness budget is separate from the per-stream [`EXCHANGE_BUDGET`].
-//!
-//! [`SamSession::close`] wakes a connected root at once. Before the socket
-//! exists there is nothing to wake, so `close` waits for at most the one
-//! connect attempt in flight (at most [`EXCHANGE_BUDGET`]) and never for the
-//! root's budget.
-//!
-//! # Lock order
-//!
-//! `recovery` then `control`, never the reverse. `wake` is a leaf: no other
-//! lock is taken while it is held, and `close` releases it before taking
-//! `recovery`.
 
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::Cell;
@@ -62,49 +20,24 @@ use bitcoin::secp256k1::rand::{RngCore, thread_rng};
 use bitcoin_rs_primitives::endpoint::base32_encode;
 use sha2::{Digest, Sha256};
 
-/// How long the pinned IVNP bridge may take to answer `SESSION CREATE`: its
-/// default SAM readiness wait (`operating.go:471-473`). Readiness needs an
-/// inbound tunnel, an outbound tunnel, and a confirmed publication.
 const READINESS_WAIT: Duration = Duration::from_secs(120);
 
-/// Budget of one bounded exchange: a stream request, a key step, and each
-/// of the connect, `HELLO`, and `NAMING LOOKUP` steps that bracket the
-/// readiness wait. It is never widened to cover the readiness wait.
 pub(crate) const EXCHANGE_BUDGET: Duration = Duration::from_secs(5);
 
-/// Owner budget for one root: the readiness wait plus three bounded steps
-/// (connect, `HELLO`, `NAMING LOOKUP`).
 pub(crate) const ROOT_READINESS_BUDGET: Duration =
     READINESS_WAIT.saturating_add(Duration::from_secs(3 * EXCHANGE_BUDGET.as_secs()));
 
-/// How long startup keeps retrying a bridge that has never accepted a
-/// connection (a refused or black-holed `--i2psam` address): the overall
-/// startup limit this node had before the readiness budget existed. It
-/// bounds the TCP connect waits as well as the retries: no connect attempt
-/// waits past it while the bridge has never accepted. Only a bridge that
-/// connects is given [`ROOT_READINESS_BUDGET`], and once one has connected
-/// the window no longer applies.
 #[cfg(test)]
 const UNREACHABLE_WINDOW: Duration = Duration::from_secs(20);
 
-/// Longest wait before a blocked root read or write notices cancellation. It
-/// only slices waits; every slice is clipped to the remaining deadline. A TCP
-/// connect is not sliced this finely: a handshake needs one full round trip
-/// inside its timeout, so each attempt gets up to [`EXCHANGE_BUDGET`].
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 
-/// Retry pause growth per failed startup step, in milliseconds.
 #[cfg(test)]
 const PAUSE_STEP_MS: u64 = 250;
 
-/// Failed startup steps after which the retry pause stops growing.
 #[cfg(test)]
 const PAUSE_STEPS_MAX: u64 = 10;
 
-/// Remaining budget before `deadline`.
-///
-/// An exhausted deadline is reported as `TimedOut` rather than handed to
-/// the socket layer, which rejects a zero timeout as `InvalidInput`.
 fn remaining_timeout(deadline: Instant) -> io::Result<Duration> {
     match deadline.checked_duration_since(Instant::now()) {
         Some(rem) if !rem.is_zero() => Ok(rem),
@@ -115,12 +48,6 @@ fn remaining_timeout(deadline: Instant) -> io::Result<Duration> {
     }
 }
 
-/// Acquire `mutex` without waiting past `deadline`.
-///
-/// Every blocking step on the recovery path is charged to the caller's
-/// absolute deadline, so a wider budget held by another caller can never
-/// extend this exchange. An expired budget is reported here rather than
-/// handed to the lock, which would wait without one.
 fn lock_within<T>(mutex: &Mutex<T>, deadline: Instant) -> io::Result<MutexGuard<'_, T>> {
     let remaining = remaining_timeout(deadline)?;
     mutex.try_lock_for(remaining).ok_or_else(|| {
@@ -133,10 +60,6 @@ fn lock_within<T>(mutex: &Mutex<T>, deadline: Instant) -> io::Result<MutexGuard<
 
 const MAX_SAM_LINE: usize = 16_384;
 
-/// Derive the SAM session id for one node instance from its private
-/// destination, so two nodes sharing one SAM bridge never collide on
-/// `SESSION CREATE`. Stable for the life of one destination key; falls
-/// back to a process-random suffix when the destination cannot decode.
 #[must_use]
 fn session_id_for(private_destination: &str) -> String {
     let mut out = String::from("btcrs-");
@@ -155,16 +78,6 @@ fn session_id_for(private_destination: &str) -> String {
     out
 }
 
-/// Strict canonical I2P base64 decode (SAM alphabet: `-`/`~` replace
-/// `+`/`/`; the standard alphabet is also accepted).
-///
-/// Canonicality is load-bearing: destinations decoded here are hashed
-/// into peer endpoints and accepted as key material, so malformed
-/// encodings must not silently decode. Rejects: invalid alphabet bytes
-/// (including whitespace/control bytes), padding anywhere except one or
-/// two trailing `=` completing a quartet, any data after padding,
-/// non-zero padding bits, and truncated quartets (a lone trailing
-/// character or padding that does not complete a group of four).
 #[must_use]
 pub(crate) fn i2p_base64_decode(text: &str) -> Option<Vec<u8>> {
     if text.is_empty() {
@@ -177,13 +90,13 @@ pub(crate) fn i2p_base64_decode(text: &str) -> Option<Vec<u8>> {
     }
     let core = &bytes[..bytes.len() - padding];
     if core.contains(&b'=') {
-        return None; // padding embedded in the body, or data after padding
+        return None;
     }
     if padding > 0 && !(core.len() + padding).is_multiple_of(4) {
-        return None; // padding does not complete a quartet
+        return None;
     }
     if core.len() % 4 == 1 {
-        return None; // truncated quartet
+        return None;
     }
     let mut values = Vec::with_capacity(core.len());
     for byte in core {
@@ -197,8 +110,6 @@ pub(crate) fn i2p_base64_decode(text: &str) -> Option<Vec<u8>> {
         };
         values.push(value);
     }
-    // Non-zero padding bits make the encoding non-canonical: a final
-    // pair carries 4 spare bits, a final triple carries 2.
     match values.len() % 4 {
         2 if values.last().is_some_and(|v| v & 0x0f != 0) => return None,
         3 if values.last().is_some_and(|v| v & 0x03 != 0) => return None,
@@ -224,20 +135,10 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// The one failure a closed session reports from every entry point.
 fn session_closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "sam session is closed")
 }
 
-/// Test builds only: `(local, bridge)` address pair of every bridge socket a
-/// session in this process opened, recorded before the socket's first write.
-///
-/// Fixture bridges listen on loopback, where any host process can connect
-/// (a local HTTP service probes every listening socket). A fixture uses this
-/// record to tell its session's connections, which stay strict, from
-/// connections no session opened. Entries are never removed: a stale pair
-/// can only make a later connection with the same addresses strict, never
-/// excuse one.
 #[cfg(test)]
 static SESSION_SOCKETS: std::sync::Mutex<Vec<(SocketAddr, SocketAddr)>> =
     std::sync::Mutex::new(Vec::new());
@@ -256,10 +157,6 @@ impl SamConn {
         Self::from_stream(stream)
     }
 
-    /// Wrap a connected bridge socket as a reader and a writer half.
-    ///
-    /// Every session socket passes through here before its first write, so
-    /// test builds record its address pair in `SESSION_SOCKETS`.
     fn from_stream(stream: TcpStream) -> io::Result<Self> {
         #[cfg(test)]
         if let (Ok(local), Ok(bridge)) = (stream.local_addr(), stream.peer_addr()) {
@@ -276,17 +173,6 @@ impl SamConn {
         })
     }
 
-    /// Read one reply line byte at a time. This is deliberately
-    /// unbuffered: after `STREAM STATUS RESULT=OK` the same socket
-    /// carries bridged peer payload, and a buffered reader could
-    /// prefetch and drop those bytes when the stream is handed off.
-    ///
-    /// The deadline is absolute: the remaining budget is recomputed
-    /// before every byte, so a bridge that trickles one byte inside each
-    /// socket timeout cannot stretch the exchange past the deadline.
-    ///
-    /// EOF before `\n` is always a truncated exchange, never a reply, even
-    /// when the bytes read so far are syntactically complete.
     fn read_line(&mut self, deadline: Instant) -> io::Result<String> {
         let mut line = Vec::new();
         loop {
@@ -318,8 +204,6 @@ impl SamConn {
         String::from_utf8(line).map_err(|_| invalid("sam reply line is not utf-8"))
     }
 
-    /// Write every byte of `buf` inside `deadline`, recomputing the
-    /// socket timeout before each partial write.
     fn write_all_deadline(&mut self, mut buf: &[u8], deadline: Instant) -> io::Result<()> {
         while !buf.is_empty() {
             let rem = remaining_timeout(deadline)?;
@@ -345,20 +229,11 @@ impl SamConn {
         self.read_line(deadline)
     }
 
-    /// SAM handshake: requires the bridge to negotiate exactly 3.3.
     fn hello(&mut self, deadline: Instant) -> io::Result<()> {
         let reply = self.command("HELLO VERSION MIN=3.1 MAX=3.3", deadline)?;
         check_hello(&reply)
     }
 
-    /// Whether the bridge still holds this session's control connection.
-    ///
-    /// The probe must not spend the caller's exchange budget, so the
-    /// socket is switched to non-blocking for one `MSG_PEEK`: a healthy
-    /// idle root reports `WouldBlock`. Only an orderly close or a hard
-    /// connection error counts as dead; an unrecognized error leaves a
-    /// possibly-live root alone, because replacing a live root would
-    /// race the bridge into `DUPLICATED_ID`.
     fn is_alive(&mut self) -> bool {
         if self.reader.set_nonblocking(true).is_err() {
             return false;
@@ -377,15 +252,11 @@ impl SamConn {
                     )
             }
         };
-        // Restoring the blocking mode is best effort: the root is only
-        // ever peeked, never read for payload, so a failed restore cannot
-        // corrupt the session and must not declare a live root dead.
         let _ = self.reader.set_nonblocking(false);
         alive
     }
 
     fn into_stream(self) -> TcpStream {
-        // Reads were unbuffered, so no bridged bytes can be stranded.
         let _ = self.writer.set_read_timeout(None);
         let _ = self.writer.set_write_timeout(None);
         let _ = self.reader.set_read_timeout(None);
@@ -394,7 +265,6 @@ impl SamConn {
     }
 }
 
-/// Require a `HELLO REPLY` that negotiated exactly version 3.3.
 fn check_hello(reply: &str) -> io::Result<()> {
     let fields = parse_fields(reply, "HELLO REPLY")?;
     if field(&fields, "RESULT") != Some("OK") || field(&fields, "VERSION") != Some("3.3") {
@@ -406,8 +276,6 @@ fn check_hello(reply: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Parse `VERB SUBVERB KEY=VALUE ...` SAM replies with quote awareness,
-/// exact verb boundary, and duplicate key rejection.
 fn parse_fields(reply: &str, prefix: &str) -> io::Result<Vec<(String, String)>> {
     let rest = if reply == prefix {
         ""
@@ -444,10 +312,10 @@ fn parse_fields(reply: &str, prefix: &str) -> io::Result<Vec<(String, String)>> 
         if key.is_empty() {
             return Err(invalid("malformed sam field: empty key"));
         }
-        i += 1; // skip '='
+        i += 1;
 
         if i < chars.len() && chars[i] == '"' {
-            i += 1; // skip opening quote
+            i += 1;
             let val_start = i;
             while i < chars.len() && chars[i] != '"' {
                 i += 1;
@@ -456,7 +324,7 @@ fn parse_fields(reply: &str, prefix: &str) -> io::Result<Vec<(String, String)>> 
                 return Err(invalid("malformed sam field: unterminated quoted value"));
             }
             let value: String = chars[val_start..i].iter().collect();
-            i += 1; // skip closing quote
+            i += 1;
             if i < chars.len() && chars[i] != ' ' && chars[i] != '\t' {
                 return Err(invalid(
                     "malformed sam field: trailing characters after quote",
@@ -521,13 +389,6 @@ fn require_ok(reply: &str, prefix: &str) -> io::Result<Vec<(String, String)>> {
     Ok(fields)
 }
 
-/// Length of the I2P `KeysAndCert` identity when `bytes` opens with a
-/// structurally valid destination: 384 key bytes plus a certificate
-/// (3-byte header + payload) at offset 384. For `CertificateKey` (5)
-/// the payload must be exactly `4 + signing excess + crypto excess`
-/// for recognized key types, mirroring the pinned bridge's
-/// `ParseIdentity`. Other certificate types follow its payload rules.
-/// Returns the identity's total length, or `None` when malformed.
 #[must_use]
 fn destination_identity_len(bytes: &[u8]) -> Option<usize> {
     const BASE: usize = 384;
@@ -542,11 +403,10 @@ fn destination_identity_len(bytes: &[u8]) -> Option<usize> {
     }
     let payload = &bytes[BASE + 3..total];
     let valid = match cert_type {
-        0 | 2 => payload_len == 0,                   // Null, Hidden
-        1 | 4 => true,                               // HashCash, Multiple
-        3 => payload_len == 40 || payload_len == 72, // Signed
+        0 | 2 => payload_len == 0,
+        1 | 4 => true,
+        3 => payload_len == 40 || payload_len == 72,
         5 => {
-            // Key: signing type (2) || crypto type (2) || excess keys.
             if payload_len < 4 {
                 return None;
             }
@@ -578,51 +438,29 @@ fn destination_identity_len(bytes: &[u8]) -> Option<usize> {
     valid.then_some(total)
 }
 
-/// Whether `bytes` is exactly one structurally valid I2P destination
-/// (`KeysAndCert` wire form, no trailing data; 387 bytes for Null Certificate,
-/// ~391 bytes for `CertificateKey`).
 #[must_use]
 fn valid_destination(bytes: &[u8]) -> bool {
     destination_identity_len(bytes) == Some(bytes.len()) && bytes.len() >= 387
 }
 
-/// The hash identifying an I2P destination (SHA-256 of the destination).
 #[must_use]
 pub(crate) fn destination_hash(destination: &[u8]) -> [u8; 32] {
     Sha256::digest(destination).into()
 }
 
-/// The session root together with the generation that identifies it.
-///
-/// One root, one generation: the count rises on every install and is never
-/// reused, so evidence gathered against an older root can never be mistaken
-/// for evidence about a newer one. Both fields live under the same exclusion
-/// so comparing a generation and retiring the root are one atomic step.
 struct ControlState {
-    /// The installed root, if any. Only the recovery owner installs one.
     conn: Option<SamConn>,
-    /// Generation of the root in `conn`, or of the most recently installed
-    /// root once `conn` is empty.
     generation: u64,
 }
 
-/// Phase of the one root exchange. Each variant names the command that is
-/// next written or whose reply is awaited; a phase ends only when its reply
-/// line has been consumed, so a command is never written twice.
 enum RootPhase {
-    /// `HELLO VERSION`: the bridge must negotiate exactly 3.3.
     Hello,
-    /// `SESSION CREATE`: the reply may take the whole readiness wait.
     Create,
-    /// `NAMING LOOKUP NAME=ME`: the bridge reports our public destination.
     Lookup,
-    /// Every reply has arrived. Only installation remains; the structurally
-    /// valid public destination the bridge reported is kept for it.
     Ready(String),
 }
 
 impl RootPhase {
-    /// The command line (newline included) this phase writes.
     fn command(&self, id: &str, private_destination: &str) -> String {
         match self {
             Self::Hello => "HELLO VERSION MIN=3.1 MAX=3.3\n".to_owned(),
@@ -634,7 +472,6 @@ impl RootPhase {
         }
     }
 
-    /// The phase that follows once `reply` answered this one.
     fn on_reply(&self, reply: &str) -> io::Result<Self> {
         match self {
             Self::Hello => check_hello(reply).map(|()| Self::Create),
@@ -653,21 +490,14 @@ impl RootPhase {
     }
 }
 
-/// Why one resumable root step ended without finishing.
 enum Stop {
-    /// The caller's own deadline passed. The exchange is intact and resumable.
     Paused,
-    /// The root's readiness deadline passed. The exchange is spent.
     Expired,
-    /// The cancellation predicate fired: the session closed, or the startup
-    /// owner cancelled.
     Cancelled,
-    /// A hard I/O or protocol failure. The exchange is spent.
     Failed(io::Error),
 }
 
 impl Stop {
-    /// The error a caller reports; `cancelled` builds the owner's own error.
     fn into_io(self, cancelled: fn() -> io::Error) -> io::Error {
         match self {
             Self::Paused => io::Error::new(
@@ -683,7 +513,6 @@ impl Stop {
     }
 }
 
-/// The failure a cancelled startup reports.
 fn startup_cancelled() -> io::Error {
     io::Error::new(
         io::ErrorKind::Interrupted,
@@ -691,7 +520,6 @@ fn startup_cancelled() -> io::Error {
     )
 }
 
-/// Whether a socket call ended because its slice timeout elapsed.
 fn slice_ended(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -699,10 +527,6 @@ fn slice_ended(error: &io::Error) -> bool {
     )
 }
 
-/// The wait for the next blocking step: at most `cap`, clipped to the
-/// earlier of the caller's and the root's deadline, after the checks that
-/// decide whether the step may start at all. The root deadline wins a tie,
-/// so a spent root is never merely paused.
 fn poll_slice(
     call_deadline: Instant,
     root_deadline: Instant,
@@ -724,31 +548,15 @@ fn poll_slice(
         .ok_or(Stop::Paused)
 }
 
-/// One root exchange in progress: the socket, the phase, and exactly what
-/// the bridge has been sent and has answered. It is advanced only by a
-/// caller holding `recovery`, and it is the only owner of its socket until
-/// it is installed or discarded.
 struct PendingRoot {
     conn: SamConn,
-    /// Absolute readiness deadline, fixed once per root before its socket
-    /// connects, so the budget includes the TCP connect. No caller and no
-    /// phase moves it.
     deadline: Instant,
     phase: RootPhase,
-    /// Bytes of the current phase's command the socket already accepted.
     sent: usize,
-    /// Reply bytes received for the current phase, without the newline.
     line: Vec<u8>,
 }
 
 impl PendingRoot {
-    /// Connect the root socket. Each attempt waits at most
-    /// [`EXCHANGE_BUDGET`], so cancellation is observed between attempts and
-    /// a bridge further than one poll slice away can still connect; an
-    /// attempt already in flight is not interrupted. A connect that cannot
-    /// finish by `connect_deadline` is abandoned: nothing was sent, so no
-    /// state is kept and no command can be duplicated. `root_deadline` is
-    /// the root's own readiness deadline and wins a tie.
     fn connect(
         sam: SocketAddr,
         connect_deadline: Instant,
@@ -773,9 +581,6 @@ impl PendingRoot {
         }
     }
 
-    /// Write what remains of `command` for at most `slice`. The offset is
-    /// recorded as soon as the socket accepts bytes, so a pause that follows
-    /// resumes mid-command instead of repeating or skipping bytes.
     fn write_step(&mut self, command: &[u8], slice: Duration) -> io::Result<()> {
         self.conn.writer.set_write_timeout(Some(slice))?;
         match self.conn.writer.write(&command[self.sent..]) {
@@ -792,9 +597,6 @@ impl PendingRoot {
         }
     }
 
-    /// Read at most one reply byte within `slice`. A complete line is
-    /// returned and consumed; end of stream before the newline is a dead
-    /// bridge, never a reply.
     fn read_step(&mut self, slice: Duration) -> io::Result<Option<String>> {
         self.conn.reader.set_read_timeout(Some(slice))?;
         let mut byte = [0u8; 1];
@@ -823,12 +625,6 @@ impl PendingRoot {
         }
     }
 
-    /// Drive the exchange until it is [`RootPhase::Ready`], or until a
-    /// deadline, cancellation, or hard failure stops it. Every blocking step
-    /// is bounded by the earlier of `call_deadline` and the root deadline.
-    /// A reply is consumed and the next phase entered with no deadline check
-    /// in between, so a pause can only fall inside a phase, never between a
-    /// reply and its successor.
     fn advance(
         &mut self,
         id: &str,
@@ -856,47 +652,25 @@ impl PendingRoot {
     }
 }
 
-/// Recovery ownership: the one root exchange that may be in progress.
 struct Recovery {
     pending: Option<PendingRoot>,
 }
 
-/// One persistent SAM STREAM session root.
 pub struct SamSession {
     sam: SocketAddr,
     id: String,
-    /// Our public destination (base64), reported for diagnostics only.
     destination: String,
-    /// Private destination material, stored for session re-establishment.
-    /// Never exposed via Debug or public accessors.
     private_destination: String,
-    /// Installed root and its generation. Never read for payload; held so
-    /// the bridge keeps the session alive.
     control: Mutex<ControlState>,
-    /// Serializes root installation against retirement and close, and owns
-    /// the one root exchange in progress. The order is always `recovery`
-    /// then `control`.
     recovery: Mutex<Recovery>,
-    /// Leaf lock: a clone of the socket `recovery`'s holder is blocked on,
-    /// so `close` can wake it without waiting for `recovery`. It is empty
-    /// while the holder is still in its TCP connect, when `close` waits for
-    /// that one attempt (at most [`EXCHANGE_BUDGET`]) instead. The holder
-    /// checks `closed` and stores the clone under this lock, and `close`
-    /// stores `closed` before it takes this lock, so a close either finds
-    /// the socket here or the holder finds `closed`. No lock is taken while
-    /// it is held.
     wake: Mutex<Option<TcpStream>>,
     closed: AtomicBool,
-    /// Budget of one stream exchange (`connect`, `accept`'s recovery step).
     timeout: Duration,
-    /// Readiness budget of a root recovered after the first one.
     root_budget: Duration,
 }
 
 impl std::fmt::Debug for SamSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never print destination private material; the session was
-        // created from it and holds no copy worth repeating.
         f.debug_struct("SamSession")
             .field("sam", &self.sam)
             .field("id", &self.id)
@@ -906,11 +680,6 @@ impl std::fmt::Debug for SamSession {
 }
 
 impl SamSession {
-    /// Establish the persistent session with `DESTINATION=<private>` on a
-    /// fresh control connection. The session id is derived from the
-    /// destination (see [`session_id_for`]) and stays stable for this session's life.
-    /// `timeout` bounds this establishment and is the budget of each later
-    /// stream exchange; a root recovered later gets [`ROOT_READINESS_BUDGET`].
     pub fn establish(
         sam: SocketAddr,
         private_destination: &str,
@@ -928,28 +697,6 @@ impl SamSession {
         )
     }
 
-    /// Establish the session under two absolute deadlines and a cancellation
-    /// predicate.
-    ///
-    /// `root_deadline` bounds the whole exchange. The owner fixes it before
-    /// this call connects, so it covers the TCP connect, `HELLO`, the
-    /// readiness wait, and `NAMING LOOKUP` together. `connect_deadline`
-    /// bounds only the TCP connect: a connect that cannot finish by it fails
-    /// `TimedOut` with nothing sent, and `root_deadline` wins a tie. Once the
-    /// bridge has accepted the connection only `root_deadline` applies.
-    ///
-    /// `cancelled` is polled at least every [`CANCEL_POLL`] while reading or
-    /// writing, between connect attempts, and once more together with
-    /// `root_deadline` before the session is returned, so a cancelled
-    /// establishment, or one whose root deadline passed after the final
-    /// reply, never publishes a session: the first reports `Interrupted`, the
-    /// second `TimedOut`. A connect attempt already in flight is not
-    /// interrupted; it ends within [`EXCHANGE_BUDGET`].
-    /// `timeout` is the per-stream budget the session keeps. `reached` is set
-    /// once the bridge accepted the connection and this call never clears it,
-    /// so a caller can tell a bridge that is unreachable from one that is
-    /// merely slow to become ready, and a bridge that has connected before
-    /// from one that never has.
     pub(crate) fn establish_within(
         sam: SocketAddr,
         private_destination: &str,
@@ -970,15 +717,8 @@ impl SamSession {
                 stop => stop.into_io(startup_cancelled),
             })?;
         reached.set(true);
-        // The SESSION STATUS reply carries the *private* destination on
-        // this bridge; the exchange never stores it. The public destination
-        // comes from NAMING LOOKUP NAME=ME on the session root.
         let advanced = root.advance(&id, private_destination, root_deadline, cancelled);
         let PendingRoot { conn, phase, .. } = root;
-        // Publication is the last step the root deadline bounds. The same
-        // check that gates every step before it runs once more, after the
-        // final reply: cancellation is reported as such, and a deadline that
-        // passed meanwhile is the root's `TimedOut`, never a cancellation.
         let verdict = match (advanced, phase) {
             (Ok(()), RootPhase::Ready(destination)) => {
                 poll_slice(root_deadline, root_deadline, CANCEL_POLL, cancelled)
@@ -1013,22 +753,6 @@ impl SamSession {
         })
     }
 
-    /// Establish the session for node startup under one absolute owner
-    /// `deadline` and a `cancelled` predicate.
-    ///
-    /// The identity is loaded or generated once and reused by every session
-    /// attempt, so a retry never creates a second key or a second session id.
-    /// Each network step is clipped to the remaining owner deadline, a
-    /// session attempt gets at most [`ROOT_READINESS_BUDGET`] (connect
-    /// included), and the pause between attempts is cut by cancellation and
-    /// by the deadline. A corrupt key, a malformed bridge reply, and a bridge
-    /// that does not speak 3.3 fail at once (`InvalidData`, `Unsupported`);
-    /// every other failure retries until the deadline. Cancellation is
-    /// reported as `Interrupted` and leaves no session behind; it is seen
-    /// between connect attempts, so a connect attempt in flight delays it by
-    /// at most [`EXCHANGE_BUDGET`]. A bridge that has never accepted a
-    /// connection is given up on after [`UNREACHABLE_WINDOW`], which also
-    /// clips its connect waits, instead of the whole owner deadline.
     #[cfg(test)]
     pub(crate) fn establish_startup(
         sam: SocketAddr,
@@ -1037,7 +761,6 @@ impl SamSession {
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
         let unreachable_after = Instant::now() + UNREACHABLE_WINDOW;
-        // A key step answers at once; it never needs the readiness budget.
         let private = retry_until(
             deadline.min(unreachable_after),
             cancelled,
@@ -1060,19 +783,6 @@ impl SamSession {
         )
     }
 
-    /// Retry root establishment until a session is up, a failure is final,
-    /// `cancelled` fires, or the owner `deadline` passes.
-    ///
-    /// Each attempt fixes its root deadline once, before it connects:
-    /// [`ROOT_READINESS_BUDGET`] clipped to `deadline`. While `reached` is
-    /// false no bridge has ever accepted a connection, so an attempt's connect
-    /// waits no longer than `unreachable_after`, and the retry ends, reporting
-    /// its last failure, at the first failure or the end of the pause after a
-    /// failure that falls at or past it. A connect cut off by the window
-    /// reports `TimedOut`; a refusal that preceded the window is reported as
-    /// itself. The first accepted connection sets `reached` for good; nothing
-    /// here clears it, so later attempts connect, and fail, under their root
-    /// deadline alone.
     #[cfg(test)]
     fn retry_establish(
         sam: SocketAddr,
@@ -1106,29 +816,14 @@ impl SamSession {
         )
     }
 
-    /// Ensure one live root and report the generation that owns it.
-    ///
-    /// The generation identifies the root this caller's request is issued
-    /// against, so later evidence about that root can be retired without
-    /// touching a root recovered in the meantime. The recovery lock, the
-    /// control lock, and the bridge exchange are all charged to
-    /// `deadline`; another caller's budget never extends this call.
     fn ensure_control(&self, deadline: Instant) -> io::Result<u64> {
         if self.closed.load(Ordering::Acquire) {
             return Err(session_closed());
         }
-        // Healthy fast path: a live root costs no budget, no recovery
-        // lock, and no state change.
         if let Some(generation) = self.live_control_generation(deadline)? {
             return Ok(generation);
         }
 
-        // Recovery is serialized on `recovery`, then `control` — the same
-        // order `retire_root` and `close` take. The dead root is shut down
-        // while those locks are held so the bridge cannot still own the old
-        // session when the replacement `SESSION CREATE` for the same id
-        // arrives. The wait for `recovery` is charged to `deadline`, so
-        // queueing behind another caller never extends this one.
         let mut recovery = lock_within(&self.recovery, deadline)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(session_closed());
@@ -1145,18 +840,10 @@ impl SamSession {
         self.recover_root(&mut recovery, deadline)
     }
 
-    /// Advance the pending root, or start one, then install it when ready.
-    ///
-    /// `recovery` is held by the caller. The pending root is taken out of it
-    /// for the exchange and goes back only when the exchange paused at this
-    /// caller's deadline; every other exit either installs it or shuts its
-    /// socket down, so no discarded root keeps a bridge session alive.
     fn recover_root(&self, recovery: &mut Recovery, call_deadline: Instant) -> io::Result<u64> {
         let cancelled = || self.closed.load(Ordering::Acquire);
         let mut root = match recovery.pending.take() {
             Some(root) => root,
-            // The readiness deadline is fixed here, once per root; resuming
-            // never moves it.
             None => PendingRoot::connect(
                 self.sam,
                 call_deadline,
@@ -1165,9 +852,6 @@ impl SamSession {
             )
             .map_err(|stop| stop.into_io(session_closed))?,
         };
-        // Register a close-reachable clone of the socket. The `closed`
-        // check and the store share the `wake` lock that `close` takes after
-        // it stores `closed`, so this root is never left unwakeable.
         let armed = root.conn.reader.try_clone().and_then(|clone| {
             let mut slot = self.wake.lock();
             if self.closed.load(Ordering::Acquire) {
@@ -1194,7 +878,6 @@ impl SamSession {
             }
             Err(stop) => {
                 let _ = root.conn.writer.shutdown(std::net::Shutdown::Both);
-                // A wake-induced failure is the close, not a bridge fault.
                 Err(if self.closed.load(Ordering::Acquire) {
                     session_closed()
                 } else {
@@ -1204,16 +887,6 @@ impl SamSession {
         }
     }
 
-    /// Publish a root whose exchange completed.
-    ///
-    /// The generation rises only here, and only when nothing refuses the
-    /// root: `close`, the root's own deadline, a public destination that is
-    /// not ours, or an exhausted counter each discard it with the generation
-    /// untouched. `recovery` stays held, so `close` cannot drain between
-    /// these checks and the install; a close that already stored `closed`
-    /// waits for `recovery` and then removes the root installed here. If this
-    /// caller's deadline passes while waiting for `control`, the complete
-    /// root stays pending for the next caller instead of being repeated.
     fn install_root(
         &self,
         recovery: &mut Recovery,
@@ -1255,25 +928,12 @@ impl SamSession {
         }
     }
 
-    /// Generation of the installed root while the bridge still holds it.
-    ///
-    /// The probe costs one non-blocking peek under `control` only. Its
-    /// answer describes the root at this instant, so retirement re-checks
-    /// the generation under the same exclusion instead of trusting it.
     fn live_control_generation(&self, deadline: Instant) -> io::Result<Option<u64>> {
         let mut state = lock_within(&self.control, deadline)?;
         let alive = state.conn.as_mut().is_some_and(SamConn::is_alive);
         Ok(alive.then_some(state.generation))
     }
 
-    /// Retire the installed root when it is still generation `observed`.
-    ///
-    /// `observed` names the root a request was issued against. Evidence
-    /// from that request — `STREAM STATUS RESULT=INVALID_ID` — is evidence
-    /// about that root alone, so a root installed while the evidence was in
-    /// flight has a newer generation and survives. The comparison and the
-    /// removal happen under `control` while `recovery` is held, so no
-    /// install can slip between them, and the wait is charged to `deadline`.
     fn retire_root(&self, observed: u64, deadline: Instant) -> io::Result<()> {
         let _recovery = lock_within(&self.recovery, deadline)?;
         let mut state = lock_within(&self.control, deadline)?;
@@ -1286,19 +946,16 @@ impl SamSession {
         Ok(())
     }
 
-    /// Our public destination in SAM base64 form.
     #[must_use]
     pub fn destination(&self) -> &str {
         &self.destination
     }
 
-    /// The per-instance SAM session id.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// The `.b32.i2p` name of our own destination.
     #[must_use]
     pub fn b32_name(&self) -> Option<String> {
         let bytes = i2p_base64_decode(&self.destination)?;
@@ -1308,9 +965,6 @@ impl SamSession {
         ))
     }
 
-    /// Parse and validate our local public destination as a typed
-    /// [`PeerEndpoint::I2p`] at `port`. Fails closed if the destination
-    /// is structurally invalid or corrupt.
     pub fn local_endpoint(&self, port: u16) -> io::Result<crate::PeerEndpoint> {
         let bytes = i2p_base64_decode(&self.destination)
             .filter(|b| valid_destination(b))
@@ -1340,11 +994,6 @@ impl SamSession {
         Ok((value, hash))
     }
 
-    /// Dial the peer identified by `hash` at `port` over a fresh bridge.
-    ///
-    /// Local bridge failures (connect, hello, lookup, protocol) are
-    /// [`DialFailure::Transport`]; only a bridge-reported
-    /// `CANT_REACH_PEER` or `TIMEOUT` is [`DialFailure::PeerUnreachable`].
     pub fn connect(
         &self,
         hash: [u8; 32],
@@ -1393,9 +1042,6 @@ impl SamSession {
                 )))
             }
             Some("INVALID_ID") => {
-                // The reply describes the root this request was issued
-                // against. Retiring it is bounded by the same deadline, and
-                // a root recovered meanwhile keeps a newer generation.
                 self.retire_root(root, deadline)
                     .map_err(DialFailure::Transport)?;
                 if self.ensure_control(deadline).is_ok() {
@@ -1437,11 +1083,6 @@ impl SamSession {
         }
     }
 
-    /// Accept one inbound stream, waiting at most `wait`. Returns the
-    /// bridged stream and the remote endpoint (destination hash + the
-    /// `TO_PORT` the peer dialed). An absent `TO_PORT`, or I2CP port `0`
-    /// (any or unspecified service), yields the application `fallback_port`;
-    /// a nonzero port is returned as reported.
     pub fn accept(
         &self,
         wait: Duration,
@@ -1479,8 +1120,6 @@ impl SamSession {
         let destination = parts
             .next()
             .ok_or_else(|| invalid("sam accepted stream carries no destination"))?;
-        // `Some(0)` is retained through the loop so a zero followed by
-        // another `TO_PORT` is still a duplicate.
         let mut port: Option<u16> = None;
         for part in parts {
             if let Some(value) = part.strip_prefix("TO_PORT=") {
@@ -1500,21 +1139,6 @@ impl SamSession {
         Ok((conn.into_stream(), destination_hash(&bytes), port))
     }
 
-    /// Close the session root; later dials fail closed.
-    ///
-    /// Order: store `closed`; wake root I/O in progress through `wake`
-    /// (released before anything else is taken); then take `recovery` and
-    /// drain the pending root and, under `control`, the installed one. No
-    /// root can be installed after the drain: every install holds `recovery`
-    /// and re-checks `closed`.
-    ///
-    /// Waiting for `recovery` ends in one of two ways. Once the holder's root
-    /// socket exists, the wake interrupts its read or write at once and the
-    /// holder reports the close. Before the socket exists there is nothing to
-    /// wake: the holder is inside a TCP connect attempt, which cannot be
-    /// interrupted, so `close` waits for that one attempt, at most
-    /// [`EXCHANGE_BUDGET`], after which the holder sees `closed` before it
-    /// starts another. Either way `close` never waits out a readiness budget.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         {
@@ -1535,16 +1159,6 @@ impl SamSession {
     }
 }
 
-/// Run `attempt` until it succeeds, fails for good, is cancelled, or the
-/// owner `deadline` passes. `attempt` receives the time left and must clip
-/// its own network steps to it. `InvalidData` (a corrupt key or a malformed
-/// bridge reply) and `Unsupported` (a bridge that does not speak 3.3) are
-/// final, because retrying cannot change them; so is any failure after which
-/// `give_up` reports true. `give_up` is consulted again once the pause that
-/// follows a failure ends, so a limit that expired during the pause reports
-/// that failure instead of spending a doomed attempt. Any other failure
-/// pauses and retries. When the deadline ends the loop, the last failure is
-/// reported.
 #[cfg(test)]
 fn retry_until<T>(
     deadline: Instant,
@@ -1592,11 +1206,6 @@ fn retry_until<T>(
     }
 }
 
-/// The jittered, growing pause between startup attempts. It is clipped to
-/// `deadline`, so it can never extend the owner deadline, and it polls
-/// `cancelled` every [`CANCEL_POLL`], so shutdown never waits out a pause.
-/// Reaching the deadline is not an error here: the caller's next deadline
-/// check reports it with the last failure.
 #[cfg(test)]
 fn startup_pause(failures: u64, deadline: Instant, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
     let base = Duration::from_millis(failures.min(PAUSE_STEPS_MAX) * PAUSE_STEP_MS);
@@ -1616,18 +1225,6 @@ fn startup_pause(failures: u64, deadline: Instant, cancelled: &dyn Fn() -> bool)
     }
 }
 
-/// Generate a fresh Ed25519 destination through the bridge.
-/// Returns `(public, private)` SAM base64 strings.
-///
-/// The request is `DEST GENERATE SIGNATURE_TYPE=7`: SAM defaults an omitted
-/// type to DSA-SHA1 (the pinned IVNP bridge defaults to 7), so the client
-/// selects Ed25519 explicitly and relies on no bridge default. A successful
-/// `DEST REPLY` is `DEST REPLY PUB=<pub> PRIV=<priv>` and carries no `RESULT`,
-/// unlike every other reply here, which `require_ok` accepts only with
-/// `RESULT=OK`. An explicit `RESULT=OK` is not a failure and is tolerated;
-/// the key pair is authoritative and still passes full validation. Any other
-/// `RESULT` is a failure status, refused before a key field is read even
-/// beside keys; only the sanitized result name reaches the error.
 #[cfg(test)]
 pub(crate) fn generate_destination(
     sam: SocketAddr,
@@ -1665,21 +1262,6 @@ pub(crate) fn generate_destination(
     Ok((public, private))
 }
 
-/// Open a persisted key file; the returned handle owns every later step.
-///
-/// Unix: the path is resolved exactly once, with `O_RDONLY | O_CLOEXEC |
-/// O_NOFOLLOW | O_NONBLOCK`. `O_NOFOLLOW` refuses a final-component
-/// symbolic link (a dangling one included, so it never reads as absent),
-/// and `O_NONBLOCK` keeps opening a FIFO from waiting for a writer before
-/// the type check below can refuse it. Only that handle is used after
-/// the open: its type is checked first, a non-regular file is refused
-/// before any permission change, a mode other than `0600` is repaired
-/// through the handle (`fchmod`), and the caller reads the same handle, so
-/// the object checked, repaired, and read cannot differ. Failure to
-/// tighten fails closed rather than running with exposed key material.
-/// Symbolic links in parent directories are still followed.
-///
-/// Elsewhere: a plain read-only open with no permission or link policy.
 #[cfg(all(test, unix))]
 fn open_key_file(path: &Path) -> io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
@@ -1703,20 +1285,11 @@ fn open_key_file(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Open a persisted key file (non-unix): no link or mode policy applies.
 #[cfg(all(test, not(unix)))]
 fn open_key_file(path: &Path) -> io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
-/// Load the persisted I2P private destination, generating and persisting
-/// it (mode `0600`, create-only) when the file is absent.
-///
-/// Fails closed on unreadable or corrupt content; never replaces an
-/// existing file and never logs the material. A reused file's mode is
-/// repaired to `0600` before its content is read. A symbolic link at
-/// `key_path` (unix), dangling or not, or any non-regular file is an
-/// error and never selects generation: only an absent path does.
 #[cfg(test)]
 pub(crate) fn load_or_create_private_destination(
     sam: SocketAddr,
@@ -1840,7 +1413,6 @@ impl Drop for TempCleanup<'_> {
     }
 }
 
-/// Write `contents` as a new mode-`0600` file; refuse to replace.
 #[cfg(test)]
 pub(crate) fn write_key_file(path: &Path, contents: &str) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1868,26 +1440,17 @@ pub(crate) fn write_key_file(path: &Path, contents: &str) -> io::Result<()> {
         file.sync_all()?;
     }
 
-    // Atomic publication without replacing an existing file.
-    // std::fs::hard_link fails with AlreadyExists if path already exists.
     std::fs::hard_link(&temp_path, path)?;
 
-    // Temp file can be removed now; drop guard will harmlessly find it gone.
     let _ = std::fs::remove_file(&temp_path);
     drop(cleanup);
 
-    // Sync parent directory to ensure directory entry is durable.
     let dir = std::fs::File::open(parent)?;
     dir.sync_all()?;
 
     Ok(())
 }
 
-/// Read a persisted key file, failing closed on corrupt content. On unix
-/// the file is opened once without following a final symbolic link, must
-/// be a regular file, has its mode repaired to `0600` through that handle,
-/// and is read through the same handle (see `open_key_file`). Callers treat
-/// only `NotFound` as an absent key; every other error is refused.
 #[cfg(test)]
 pub(crate) fn read_key_file(path: &Path) -> io::Result<String> {
     let mut file = open_key_file(path)?;

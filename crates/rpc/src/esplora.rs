@@ -20,17 +20,12 @@ use crate::rest::Response;
 
 use self::projection::Projection;
 
-/// Which Esplora directory a request landed in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Surface {
-    /// Wallet and explorer electrs tree at `/api`. No mempool-backend helpers.
     Public,
-    /// Electrs plus mempool-backend `/internal` and `/block-template` at `/esplora`.
     Backend,
 }
 
-/// Routes a read-only Esplora request already classified onto a surface.
-///
 /// `path` is the rest after `/api` or `/esplora`. The listener demux owns
 /// prefix matching; this function only dispatches inside a directory.
 #[must_use]
@@ -60,10 +55,7 @@ fn dispatch_get(
     public::get(ctx, path)
 }
 
-/// Routes Esplora raw-transaction broadcast and mempool-backend POSTs.
-///
 /// `path` is the rest after `/api` or `/esplora`. Unknown paths 404.
-/// The listener demux never calls this outside those directories.
 #[must_use]
 pub(crate) fn route_post(handler: &Handler, surface: Surface, path: &str, body: &[u8]) -> Response {
     if surface == Surface::Backend {
@@ -80,10 +72,6 @@ pub(crate) fn route_post(handler: &Handler, surface: Surface, path: &str, body: 
     public::post(handler, path, body)
 }
 
-/// See `docs/contracts/wallet-facing.md` WF-02.
-///
-/// `/api` is the public electrs directory. `/esplora` is the mempool-backend
-/// electrs tree (public routes plus `/internal` and `/block-template`).
 /// `/api/v1` is not an alias: that prefix is Mempool's own API on the
 /// explorer port, so `/api/v1/block-height/{h}` is `/v1/block-height/{h}`
 /// here and 404s.

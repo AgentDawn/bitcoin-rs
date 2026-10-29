@@ -179,8 +179,8 @@ dependencies = [
  "quanta 0.13.0",
  "rayon",
  "serde",
- "serde_json",
  "sha2",
+ "sonic-rs",
  "thiserror",
  "tracing",
 ]
@@ -337,9 +337,9 @@ dependencies = [
  "parking_lot",
  "rustix",
  "serde",
- "serde_json",
  "sha2",
  "smallvec",
+ "sonic-rs",
  "thiserror",
  "tracing",
 ]
@@ -385,7 +385,6 @@ dependencies = [
  "mio",
  "parking_lot",
  "serde",
- "serde_json",
  "sha2",
  "sonic-rs",
  "thiserror",
@@ -420,8 +419,8 @@ dependencies = [
  "parking_lot",
  "rustix",
  "serde",
- "serde_json",
  "sha2",
+ "sonic-rs",
  "thiserror",
  "tracing",
 ]

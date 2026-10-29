@@ -5,15 +5,10 @@ use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut};
 
 use super::*;
 
-/// The txid of every change in a mutation result, in commit order.
 fn change_txids(result: &crate::mutation::MutationResult) -> Vec<Hash256> {
     result.changes.iter().map(|change| change.txid).collect()
 }
 
-// MPL-02 (docs/contracts/mempool-mutations.md): sequence assignment,
-// batch-base reconstruction, and per-change lookup are modulo 2^64, so a
-// batch assigned `[u64::MAX, 0]` carries sequence zero as a valid
-// in-range value rather than an empty mutation.
 #[test]
 fn mutation_batch_crossing_sequence_rollover_keeps_base_and_lookups() {
     let mut pool = Mempool::new(MempoolLimits::default());
@@ -79,8 +74,6 @@ fn min_fee_floors_at_min_relay_while_the_rolling_rate_is_zero() {
         min_relay_fee_sat_per_kvb: 1_000,
         ..MempoolLimits::default()
     });
-    // A fresh pool's rolling rate is zero, so the floor is the configured
-    // min-relay rate at any clock.
     assert_eq!(pool.min_fee_sat_per_kvb(0), 1_000);
     assert_eq!(pool.min_fee_sat_per_kvb(u64::MAX), 1_000);
 }
@@ -191,7 +184,6 @@ fn aggregate_fees_stays_saturated_after_decrements() -> Result<(), MempoolError>
 #[test]
 fn iter_by_fee_rate_desc_orders_highest_first() {
     let mut pool = Mempool::new(MempoolLimits::default());
-    // Two distinct txs with different fee rates.
     let low_tx = single_output_tx(&[], Sequence::MAX, 1_000, vec![0x51].into());
     let low_txid = low_tx.txid();
     let _ = pool.insert_entry(MempoolEntry::new(Arc::new(low_tx), 100, 1_000, 1, 7, 0));
@@ -283,9 +275,9 @@ fn fee_rate_aggregate_tracks_duplicate_rates_and_removals() -> Result<(), Mempoo
 fn iter_above_fee_rate_filters_to_high_fee_only() {
     let mut pool = Mempool::new(MempoolLimits::default());
     let low_tx = single_output_tx(&[], Sequence::MAX, 1_000, vec![0x51].into());
-    let _ = pool.insert_entry(MempoolEntry::new(Arc::new(low_tx), 100, 1_000, 1, 7, 0)); // fee_rate = 1000
+    let _ = pool.insert_entry(MempoolEntry::new(Arc::new(low_tx), 100, 1_000, 1, 7, 0));
     let high_tx = single_output_tx(&[], Sequence::MAX, 99_000, vec![0x52].into());
-    let _ = pool.insert_entry(MempoolEntry::new(Arc::new(high_tx), 100, 10_000, 1, 7, 0)); // fee_rate = 100_000
+    let _ = pool.insert_entry(MempoolEntry::new(Arc::new(high_tx), 100, 10_000, 1, 7, 0));
     let high_only = pool.iter_above_fee_rate(50_000);
     assert_eq!(high_only.len(), 1);
     let both = pool.iter_above_fee_rate(500);
@@ -297,7 +289,6 @@ fn iter_above_fee_rate_filters_to_high_fee_only() {
 #[test]
 fn iter_replaceable_txids_returns_only_rbf_signaled_txs() {
     let mut pool = Mempool::new(MempoolLimits::default());
-    // RBF-signalled tx (sequence < 0xFFFFFFFE).
     let rbf_tx = Tx {
         version: 2,
         lock_time: LockTime::ZERO,
@@ -314,7 +305,6 @@ fn iter_replaceable_txids_returns_only_rbf_signaled_txs() {
     };
     let rbf_txid = rbf_tx.txid();
     let _ = pool.insert_entry(MempoolEntry::new(Arc::new(rbf_tx), 100, 10_000, 1, 7, 0));
-    // Non-RBF tx (sequence = MAX = 0xFFFFFFFF).
     let non_rbf_tx = Tx {
         version: 2,
         lock_time: LockTime::ZERO,
@@ -551,9 +541,6 @@ fn outpoint_spender_keeps_the_first_entry_when_two_spenders_are_indexed() {
     let first = spender_tx(99_000);
     let first_txid = first.txid();
     let _ = pool.insert_entry(MempoolEntry::new(Arc::new(first), 100, 10_000, 1, 7, 0));
-    // A second spender of the same outpoint is a pool invariant violation
-    // that insertion does not police; the query must still answer with
-    // the first indexed entry, like the scan it replaces did.
     let _ = pool.insert_entry(MempoolEntry::new(
         Arc::new(spender_tx(98_000)),
         100,
@@ -1170,8 +1157,6 @@ fn insert_entry_triggers_size_limit_eviction_when_overflow() {
     );
 }
 
-/// A refused low-fee arrival leaves state intact, while a higher-fee
-/// arrival can atomically evict the old entry and enter the pool.
 #[test]
 fn capacity_rejection_is_atomic_and_a_better_arrival_can_enter() {
     fn tx_paying(nonce: u8) -> Arc<Tx> {
@@ -1211,7 +1196,6 @@ fn capacity_rejection_is_atomic_and_a_better_arrival_can_enter() {
     );
 }
 
-/// POL-05: capacity rejection cannot remove the original or alter history.
 #[test]
 fn a_replacement_that_would_be_shed_leaves_the_pool_unchanged() {
     let limits = MempoolLimits {
@@ -1248,13 +1232,6 @@ fn a_replacement_that_would_be_shed_leaves_the_pool_unchanged() {
     assert!(seated_by.is_ok(), "bystander must fit: {seated_by:?}");
     assert_eq!(pool.len(), 2);
 
-    // Replacement: conflicts with the original (same prevout), higher
-    // absolute fee (BIP125 rule 3: 15_000 > 10_000), higher fee rate
-    // than the original (BIP125 rule 6: 150 > 100 sat/vbyte), but
-    // 900 vbytes at a far lower fee rate than the bystander
-    // (166 vs 10_000). After evicting the original (100 vbytes freed),
-    // the pool has 850 + 900 = 1750 > 1000, so the trim evicts the
-    // lowest-fee-rate entry — the replacement itself.
     let replacement = single_output_tx(
         &[prev],
         Sequence::ENABLE_RBF_NO_LOCKTIME,
@@ -1281,13 +1258,10 @@ fn a_replacement_that_would_be_shed_leaves_the_pool_unchanged() {
     assert!(!pool.contains_txid(&replacement_txid));
     assert_eq!(pool.mining_snapshot().entries, before.0);
     assert_eq!(pool.estimator_history(), before.1);
-    // Entries and history are untouched, but the refused trim's floor
-    // raise revisions the stamp.
     assert_ne!(pool.policy_stamp(), before.2);
     assert!(pool.min_fee_sat_per_kvb(9) > 0);
 }
 
-/// Every entry's four package totals, in entry-id order.
 fn totals(pool: &Mempool) -> Vec<(usize, u64, u64, u64, u64)> {
     let mut all = pool
         .entries
@@ -1306,8 +1280,6 @@ fn totals(pool: &Mempool) -> Vec<(usize, u64, u64, u64, u64)> {
     all
 }
 
-/// Builds a pool whose spend graph has every shape the closure argument
-/// rests on: a chain, a fan-out, a fan-in, and an isolated entry.
 fn graph_pool() -> Result<(Mempool, Vec<OutPoint>), MempoolError> {
     let mut pool = Mempool::new(MempoolLimits::default());
     let mut outs = Vec::new();
@@ -1339,8 +1311,6 @@ fn graph_pool() -> Result<(Mempool, Vec<OutPoint>), MempoolError> {
     Ok((pool, outs))
 }
 
-/// The incremental update must land on exactly what a full recompute
-/// would.
 #[test]
 fn incremental_metadata_matches_the_full_recompute() -> Result<(), MempoolError> {
     let (mut pool, _outs) = graph_pool()?;
@@ -1355,7 +1325,6 @@ fn incremental_metadata_matches_the_full_recompute() -> Result<(), MempoolError>
     Ok(())
 }
 
-/// The same, after a removal that leaves surviving relatives behind.
 #[test]
 fn incremental_metadata_matches_the_full_recompute_after_removals() -> Result<(), MempoolError> {
     for victim in 0..6_u32 {
@@ -1383,7 +1352,6 @@ fn incremental_metadata_matches_the_full_recompute_after_removals() -> Result<()
     Ok(())
 }
 
-/// The eviction path is a `remove_entries` caller nothing else drives.
 #[test]
 fn eviction_during_insertion_leaves_metadata_a_rebuild_agrees_with() -> Result<(), MempoolError> {
     let limits = MempoolLimits {
@@ -1443,7 +1411,6 @@ fn eviction_during_insertion_leaves_metadata_a_rebuild_agrees_with() -> Result<(
     Ok(())
 }
 
-/// The running totals must survive every mutation, not just insertion.
 #[test]
 fn running_totals_track_inserts_removals_and_prioritise() -> Result<(), MempoolError> {
     fn folded(pool: &Mempool) -> (u64, u64) {
@@ -1499,8 +1466,6 @@ fn running_totals_track_inserts_removals_and_prioritise() -> Result<(), MempoolE
     Ok(())
 }
 
-/// Bumping a transaction's fee must reindex the transactions it drags with
-/// it.
 #[test]
 fn prioritise_reindexes_the_descendants_it_lifts() -> Result<(), MempoolError> {
     let (mut pool, outs) = graph_pool()?;
@@ -1527,8 +1492,6 @@ fn prioritise_reindexes_the_descendants_it_lifts() -> Result<(), MempoolError> {
     Ok(())
 }
 
-/// A transaction can arrive after something that already spends its
-/// outputs.
 #[test]
 fn inserting_a_parent_after_its_child_refreshes_the_child() -> Result<(), MempoolError> {
     let mut pool = Mempool::new(MempoolLimits::default());
@@ -1564,7 +1527,6 @@ fn full_refusal_raises_the_floor_to_the_candidate_chunk_rate() {
     let candidate = single_output_tx(&[], Sequence::MAX, 1_002, vec![0x51, 2].into());
     let refused = pool.insert_entry(MempoolEntry::new(Arc::new(candidate), 900, 10, 2, 7, 0));
     assert!(matches!(refused, Err(MempoolError::Full)));
-    // Candidate chunk rate floor(10 * 1_000 / 900) = 11, plus 1_000.
     assert_eq!(pool.len(), 1);
     assert_eq!(pool.min_fee_sat_per_kvb(2), 1_011);
 }
@@ -1597,7 +1559,6 @@ fn remove_for_block_stamps_the_floor_for_decay_even_when_empty() {
     crate::eviction::evict_lowest_fee_packages(&mut pool, 200).expect("eviction");
     assert_eq!(pool.min_fee_sat_per_kvb(1_000), 3_000);
     pool.remove_for_block(&[], &[], 8, 1_000);
-    // Usage 200 of 400 is exactly half: full 12 h halflife, 3_000 -> 1_500.
     assert_eq!(pool.min_fee_sat_per_kvb(1_000 + 12 * 60 * 60), 1_500);
 }
 
@@ -1630,7 +1591,6 @@ fn expire_removes_stale_root_with_descendants() {
         "every expiry change is tagged Expiry: {expired:?}"
     );
     assert!(pool.is_empty());
-    // Idempotent: a repeated call commits nothing and moves no sequence.
     let sequence = pool.sequence_number();
     assert!(pool.expire(now).is_empty());
     assert_eq!(pool.sequence_number(), sequence);
@@ -1673,8 +1633,6 @@ fn expire_keeps_a_recycled_slot_with_a_fresh_timestamp() {
         Some(recycled),
         "the vacated slot is reused"
     );
-    // The stale (0, id) key left with the old entry: only the fresh key
-    // remains, so nothing is expired and expiry reaps nothing live.
     assert!(!pool.has_expired_entries(now));
     assert!(pool.expire(now).is_empty());
     assert!(pool.contains_txid(&fresh_txid));

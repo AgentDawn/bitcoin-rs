@@ -57,7 +57,6 @@ fn spent_output_projection_orders_inputs_and_ignores_bip30_restorations() -> Tes
     let same_block = OutPoint::new(parent.txid(), 0);
     let child = spend(same_block, 700);
     let mut undo = UndoBatch::empty();
-    // BIP30 overwrite restoration precedes inputs in native rollback order.
     undo.restore(UtxoAdd::new(OutPoint::new(cb.txid(), 0), coin(60), true, 1));
     undo.restore(UtxoAdd::new(FUNDED, coin(900), true, 2));
     let block = Block {
@@ -91,9 +90,6 @@ fn spent_output_projection_orders_inputs_and_ignores_bip30_restorations() -> Tes
         block_spent_outputs(&block, HEIGHT, &missing),
         Err(BlockSpendsError::Corrupt(_))
     ));
-    // The bounded codec rejects counts that cannot belong to this body
-    // before allocating decoded restores. Ordinary persistence decoding is
-    // deliberately unchanged.
     cb.outputs.clear();
     let no_outputs = Block {
         header: block.header,
@@ -115,9 +111,6 @@ impl SpentOutputLookup for NoSpend {
     }
 }
 
-/// `FUNDED` at height 1, then the block at `HEIGHT` spending it and
-/// creating `CREATED`; returns the set, its listener, the observable state
-/// before that block, and the block's undo.
 fn connected() -> Result<(UtxoSet, CoinStatsListener, State, UndoBatch), UtxoError> {
     let mut utxo = UtxoSet::new();
     let coin_stats = CoinStatsListener::new(CoinStats::new());
@@ -228,8 +221,6 @@ fn rollback_restores_the_exact_prior_state() -> TestResult {
     Ok(())
 }
 
-/// A torn rollback's `InFlight` marker must not be armed over: the
-/// refusal leaves both the set and the marker untouched.
 #[test]
 fn in_flight_marker_refuses_before_arming() -> TestResult {
     let (utxo, coin_stats, _, undo) = connected()?;
@@ -253,9 +244,6 @@ fn in_flight_marker_refuses_before_arming() -> TestResult {
     Ok(())
 }
 
-/// Recovery rewinds under the marker it is reconciling: a surviving
-/// `InFlight` marker neither refuses the step nor changes identity —
-/// the recovery checkpoint retires it.
 #[test]
 fn recovery_rewind_preserves_the_surviving_marker() -> TestResult {
     let (utxo, coin_stats, before, undo) = connected()?;
@@ -274,8 +262,6 @@ fn recovery_rewind_preserves_the_surviving_marker() -> TestResult {
     Ok(())
 }
 
-/// A `RolledBack` marker only owes a checkpoint of the rolled-back set, so
-/// the next disconnect re-arms over it and supersedes its identity.
 #[test]
 fn rolled_back_marker_carries_into_the_next_disconnect() -> TestResult {
     let (utxo, coin_stats, before, undo) = connected()?;
@@ -296,7 +282,6 @@ fn rolled_back_marker_carries_into_the_next_disconnect() -> TestResult {
     Ok(())
 }
 
-/// Marker writes fail in the chosen phase.
 #[derive(Default)]
 struct MarkerFails {
     inner: InMemoryUndoStore,
@@ -368,8 +353,6 @@ fn completion_failure_is_fatal_and_leaves_the_marker_in_flight() -> TestResult {
     Ok(())
 }
 
-/// Mismatched coinstats refuse the rollback before the undo runs: no
-/// part of the connected set moves for a recovery that cannot commit.
 #[test]
 fn coinstats_refusal_precedes_the_undo() -> TestResult {
     let (utxo, coin_stats, _, undo) = connected()?;
@@ -434,8 +417,6 @@ fn build_undo_blocks() -> Result<Vec<(BlockChanges, UndoBatch)>, Box<dyn std::er
     Ok(blocks)
 }
 
-/// Undo coverage for deterministic block disconnects: undoing the last
-/// five of ten blocks lands exactly on the five-block-only state.
 #[test]
 fn undoing_last_five_blocks_matches_first_five_only_state() -> TestResult {
     let blocks = build_undo_blocks()?;
@@ -481,8 +462,6 @@ fn first_undo_test_block(
     changes
 }
 
-/// The listener must restore the exact `MuHash` and accounting of the
-/// history the undone blocks never touched.
 #[test]
 fn listener_undo_restores_muhash_and_accounting() -> TestResult {
     let (full, full_listener) = listener_set();
@@ -539,8 +518,6 @@ fn listener_undo_restores_muhash_and_accounting() -> TestResult {
     Ok(())
 }
 
-/// A block of two transactions paired with a one-element `txids` slice:
-/// the fixture for every mismatch-refusal test below.
 fn block_with_short_txids() -> (Block, Vec<Txid>) {
     let make_tx = |seed: u8| Tx {
         version: 1,
@@ -568,10 +545,6 @@ fn block_with_short_txids() -> (Block, Vec<Txid>) {
     (block, txids)
 }
 
-/// A `txids` slice shorter than the block would let `zip` silently drop
-/// trailing transactions from the changes, undo, and value totals while
-/// reporting success. The build refuses the mismatch before iterating, at
-/// genesis too — the genesis early return must not skip validation.
 #[test]
 fn a_short_txid_list_is_refused_at_every_height() {
     let (block, txids) = block_with_short_txids();

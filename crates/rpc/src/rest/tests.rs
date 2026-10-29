@@ -317,7 +317,6 @@ fn headers_json_returns_genesis_and_remaining_headers() {
     );
     let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
     assert_eq!(values.len(), 3);
-    // render::header_json always includes previousblockhash (all-zeros for genesis)
     assert_eq!(
         values[0].get("previousblockhash").and_then(Value::as_str),
         Some("0000000000000000000000000000000000000000000000000000000000000000")
@@ -517,8 +516,6 @@ fn headers_truncate_the_tail_after_a_middle_linkage_break() {
     assert_eq!(values[1].get("height").and_then(Value::as_u64), Some(1));
 }
 
-/// Minimal native stand-in for the regtest genesis block: one coinbase
-/// tx, with self-consistent identity via `block_hash()`.
 fn regtest_genesis() -> Block {
     let coinbase = Tx {
         version: 1,
@@ -547,12 +544,6 @@ fn regtest_genesis() -> Block {
     }
 }
 
-/// `/rest/headers/` must serve bytes identical to the block's own header.
-///
-/// The three formats all serialize `HeaderRecord.header`, which comes from
-/// the block tree. This pins the bytes rather than a field count, so a
-/// header sourced from the wrong place fails here even if every JSON key is
-/// still present.
 #[test]
 fn headers_serve_the_block_header_bytes_verbatim() {
     let ctx = Arc::new(Context::new());
@@ -575,12 +566,6 @@ fn headers_serve_the_block_header_bytes_verbatim() {
     assert_eq!(response.body, expected.to_lower_hex_string().into_bytes());
 }
 
-/// A log-only hash remains an empty success in every REST format.
-///
-/// The deleted fallback consulted `block_by_hash`, which used to recover
-/// this fixture through its full-log scan. Removing both paths must preserve
-/// REST's established unknown-hash 200 contract rather than turn it into a
-/// 404 or leak cached data.
 #[test]
 fn headers_for_a_record_the_tree_does_not_know_serve_nothing() {
     let ctx = Arc::new(Context::new());
@@ -598,10 +583,6 @@ fn headers_for_a_record_the_tree_does_not_know_serve_nothing() {
         assert_eq!(response.body, expected);
     }
 }
-
-// -----------------------------------------------------------------------
-// New route tests
-// -----------------------------------------------------------------------
 
 #[test]
 fn route_status_table() {
@@ -621,7 +602,6 @@ fn route_status_table() {
         ("/rest/block/not-a-hash.json".into(), "", 400),
         (format!("/rest/blockpart/{HASH}.bin"), "", 404),
         (format!("/rest/blockpart/{HASH}.hex"), "", 404),
-        // blockpart serves bin and hex only.
         (format!("/rest/blockpart/{HASH}.json"), "", 404),
         ("/rest/chaininfo.json".into(), "", 200),
         ("/rest/chaininfo.bin".into(), "", 404),
@@ -645,9 +625,7 @@ fn route_status_table() {
         ("/rest/deploymentinfo.json".into(), "", 200),
         ("/rest/deploymentinfo.bin".into(), "", 404),
         ("/rest/deploymentinfo/not-a-hash.json".into(), "", 400),
-        // A well-formed but unknown hash is a bad request, not a 404.
         (format!("/rest/deploymentinfo/{HASH}.json"), "", 400),
-        // An empty context still knows genesis at height 0.
         ("/rest/blockhashbyheight/0.json".into(), "", 200),
         ("/rest/blockhashbyheight/0.hex".into(), "", 200),
         ("/rest/blockhashbyheight/0.bin".into(), "", 200),
@@ -718,8 +696,6 @@ fn chaininfo_json_uses_core_field_names_and_omits_absent_options() {
     for field in ["chain", "blocks", "headers", "bestblockhash"] {
         assert!(value.get(field).is_some(), "{field}: {value:?}");
     }
-    // Core 31.1 rpc/blockchain.cpp only inserts pruning/signet facts
-    // when applicable; an unpruned mainnet context has none of them.
     for field in [
         "automatic_pruning",
         "prune_target_size",
@@ -749,8 +725,6 @@ fn getutxos_json_returns_empty_utxos_for_unknown_outpoint() {
 #[test]
 fn getutxos_post_canonical_wire_and_input_boundaries() {
     let ctx = Arc::new(Context::new());
-    // Independent BIP64 wire fixture: nonzero bool, one little-endian
-    // txid (display 00..01), vout 0. This outpoint does not exist.
     let mut wire = vec![2, 1, 1];
     wire.resize(38, 0);
     let get = route(&ctx, &GETUTXOS_JSON.replace(".json", ".bin"), "", true);
@@ -922,7 +896,6 @@ fn getutxos_plain_read_waits_for_the_chain_transition() {
     assert_eq!(&response.body[4..36], &committed.hash.to_le_bytes());
 }
 
-/// An applied-tip publication with a distinctive height, hash, and count.
 fn tip_snapshot(height: u32, byte: u8, count: u64) -> Arc<TipSnapshot> {
     Arc::new(TipSnapshot {
         tip_id: bitcoin_rs_chain::NodeId::new(height),
@@ -936,9 +909,6 @@ fn tip_snapshot(height: u32, byte: u8, count: u64) -> Arc<TipSnapshot> {
 const GETUTXOS_JSON: &str = "/rest/getutxos/\
         0000000000000000000000000000000000000000000000000000000000000001-0.json";
 
-/// Height and hash used to come from two separate applied loads, so a
-/// publication between them could be reported as one block's height paired
-/// with another block's hash.
 #[test]
 fn getutxos_reports_one_coherent_tip_pair_under_concurrent_swap() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -966,10 +936,6 @@ fn getutxos_reports_one_coherent_tip_pair_under_concurrent_swap() {
 
     let mut seen_a = false;
     let mut seen_b = false;
-    // Sampling runs until both publications have answered, not for a fixed
-    // count: the swapper's first store publishes the new tip, but thread
-    // startup is the scheduler's call, so a fixed budget can expire before
-    // the new publication is ever observed.
     for iteration in 0..100_000 {
         let response = route(&ctx, GETUTXOS_JSON, "", true);
         assert_eq!(response.status, 200);
@@ -1006,8 +972,6 @@ fn getutxos_reports_one_coherent_tip_pair_under_concurrent_swap() {
     );
 }
 
-/// The response keeps the publication it captured rather than following one
-/// that lands while the response is still being assembled.
 #[test]
 fn getutxos_keeps_captured_tip_after_publication() {
     let ctx = Arc::new(Context::new());
@@ -1041,8 +1005,6 @@ fn getutxos_keeps_captured_tip_after_publication() {
     );
 }
 
-/// Deploymentinfo captures once, so a publication landing while the response
-/// is assembled cannot change the pair it reports.
 #[test]
 fn deploymentinfo_keeps_captured_tip_after_publication() {
     let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
@@ -1093,9 +1055,6 @@ fn deploymentinfo_keeps_captured_tip_after_publication() {
 const CHECKMEMPOOL_JSON: &str = "/rest/getutxos/checkmempool/\
         0000000000000000000000000000000000000000000000000000000000000001-0.json";
 
-/// The checkmempool branch mixes UTXO and mempool facts, so it refuses
-/// while a chain change is active. The refusal is the documented retry
-/// response: 503, `text/plain`, no trailing newline.
 #[test]
 fn getutxos_checkmempool_returns_503_on_unstable_generation() {
     let ctx = Arc::new(Context::new());
@@ -1107,8 +1066,6 @@ fn getutxos_checkmempool_returns_503_on_unstable_generation() {
     assert_eq!(response.body, b"chain generation is odd; retry".to_vec());
 }
 
-/// A generation that moves between the entry check and the end check
-/// discards the assembled body and returns the same retry response.
 #[test]
 fn getutxos_checkmempool_rejects_moved_generation() {
     let ctx = Arc::new(Context::new());
@@ -1120,8 +1077,6 @@ fn getutxos_checkmempool_rejects_moved_generation() {
     assert_eq!(response.body, b"chain generation is odd; retry".to_vec());
 }
 
-/// The plain branch reads no mempool fact and deploymentinfo never reads
-/// the generation, so an odd generation must not refuse either one.
 #[test]
 fn plain_tip_routes_ignore_mempool_generation() {
     let ctx = Arc::new(Context::new());

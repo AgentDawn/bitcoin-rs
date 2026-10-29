@@ -25,8 +25,6 @@ use corepc_types::v31;
 
 pub(crate) mod submit_package;
 
-/// Decodes a lowercase or uppercase hexadecimal string into bytes.
-///
 /// A non-hex string is a correctly typed but unacceptable value, so it
 /// answers Bitcoin Core's `RPC_INVALID_PARAMETER` (-8) class.
 fn hex_decode(hex: &str) -> Result<Vec<u8>, RpcError> {
@@ -42,11 +40,6 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, RpcError> {
 
 /// Builds Bitcoin Core 31.1's `-8` message for a malformed block-hash
 /// parameter.
-///
-/// PRE: `value` is the parameter string as supplied.
-/// POST: the `InvalidParameter` error naming a wrong length or non-hex
-///   content exactly as Core 31.1 spells it for `label`.
-/// INVARIANT: built only from the call's inputs; no state is read.
 fn block_hash_param_error(value: &str, label: &str) -> RpcError {
     if value.len() != 64 {
         return RpcError::InvalidParameter(format!(
@@ -77,8 +70,6 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         .transpose()?;
 
     if let Some(hash) = blockhash {
-        // Detailed reads resolve only header identity before entering the
-        // certified, bounded body/undo owner under the shared render budget.
         let record = if verbose == 2 && ctx.chain.block_undo_source.is_some() {
             ctx.chain.header_record(hash)
         } else {
@@ -252,16 +243,12 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         }
     }
 
-    // Core: the UTXO lookup and the chainstate tip (`coins_view->GetBestBlock`)
-    // are read under `cs_main`; capture both inside the stability barrier so a
-    // tip advance cannot interleave between the coin and its `bestblock`.
     let Some((live, view)) = ctx.chain.with_stable_chainstate(|| {
         ctx.chain
             .utxo
             .get_entry(&outpoint)
             .map(|live| (live, ctx.chain.applied_view()))
     }) else {
-        // Spent or never existed: Core-spec returns JSON null.
         return Ok(Value::new_null());
     };
     let confirmations = view.height().saturating_sub(live.height).saturating_add(1);
@@ -322,39 +309,12 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         return proof_from_single_record(ctx, &record, &wanted);
     }
 
-    // Without a block hash the scan below reads, deserializes and hashes every
-    // block on the chain to answer one call. The txindex already knows which
-    // block confirms a txid, so ask it first and scan only when it cannot
-    // answer — the same route Bitcoin Core takes, which requires the block hash
-    // *unless* txindex is enabled.
     if let Some(proof) = proof_via_index(ctx, &wanted) {
         return Ok(proof);
     }
     proof_from_block_log(ctx, &wanted)
 }
 
-/// Answers `gettxoutproof` from the txindex, or `None` when it cannot.
-///
-/// Probes the wanted txids until one resolves to a confirming height, then tries
-/// to build the proof from that block alone. Probing *every* txid rather than an
-/// arbitrary one matters: `wanted` is a `HashSet`, so "the first" is whichever
-/// the hasher happens to yield, and one unresolvable txid would otherwise drop
-/// the call into the full chain scan non-deterministically — the very cost this
-/// path exists to avoid.
-///
-/// Every miss returns `None` so the caller falls back to that scan: no index,
-/// no row, a stale row, a pruned body, or a block that does not hold *all* the
-/// wanted txids. The last of those is not belt-and-braces — BIP30's duplicate
-/// coinbase txids mean a txid can confirm in more than one block, so a block
-/// chosen from a single txid is a candidate, never a verdict.
-///
-/// An index that returns an error is a miss too, logged rather than propagated.
-/// Before this path existed a broken txindex could not fail this call, and the
-/// scan can still answer it; an optimization must not turn a working call into
-/// an error. `TxQueryError::Retry` makes that concrete rather than defensive:
-/// the index reconciles asynchronously, so it reports `Retry` while it is
-/// catching up, and a call the scan can answer today must not be refused
-/// because the index is behind.
 fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Option<Value> {
     let derived_index = ctx.indexes.derived_index.as_ref()?;
     for probe in wanted {
@@ -380,12 +340,6 @@ fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Opt
     None
 }
 
-/// Builds the proof from one named block, or reports why it could not.
-///
-/// The explicit-`blockhash` path: the caller named the block, so there is
-/// nothing to scan and the two failures are distinguishable — a body that is not
-/// there, and a block that does not hold every wanted txid. Both messages are
-/// the ones this handler returned before the index path existed.
 fn proof_from_single_record(
     ctx: &Arc<Context>,
     record: &bitcoin_rs_index::block_log::BlockRecord,
@@ -398,29 +352,12 @@ fn proof_from_single_record(
         .ok_or(RpcError::NotFound("no block contains all requested txids"))
 }
 
-/// Scans the whole block-record log for a block holding every wanted txid.
-///
-/// Deliberately does **not** clone the log, and deliberately does not hold its
-/// lock either. Cloning it copies every record on the chain — about 160 MB at a
-/// mainnet tip — to answer one call, on the exact path taken when the index
-/// cannot. Holding the read guard instead would stall block application for the
-/// length of a scan that loads a block body from disk per record.
-///
-/// So the length is snapshotted once and each record is copied out under a
-/// momentary lock, released before its body is read. Records are only ever
-/// appended, and the tail `pop` on disconnect only removes what was never in the
-/// snapshot's range, so a stale length can miss a block appended mid-scan but
-/// can never read a record that moved.
 fn proof_from_block_log(
     ctx: &Arc<Context>,
     wanted: &hashbrown::HashSet<Txid>,
 ) -> Result<Value, RpcError> {
     let len = ctx.chain.blocks.read().len();
     let mut saw_pruned_block = false;
-    // Scan-cost instrumentation: any future bound on this fallback must be
-    // adopted from these counters on representative successful scans, not
-    // from a guess (ENG-74). The scan is forward from genesis, so a
-    // late-window txid costs nearly the whole log and its bodies.
     let mut records_scanned: u64 = 0;
     let mut body_bytes_scanned: u64 = 0;
     for index in 0..len {
@@ -459,8 +396,6 @@ fn proof_from_block_log(
     }
 }
 
-/// Builds the merkle proof for `wanted` from one block record, or `None` when
-/// that block is pruned, undecodable, or does not hold every wanted txid.
 fn proof_from_record(
     ctx: &Arc<Context>,
     record: &bitcoin_rs_index::block_log::BlockRecord,
@@ -470,8 +405,6 @@ fn proof_from_record(
     proof_from_body(&bytes, wanted)
 }
 
-/// Builds the merkle proof for `wanted` from one serialized block, or `None`
-/// when it does not decode or does not hold every wanted txid.
 fn proof_from_body(bytes: &[u8], wanted: &hashbrown::HashSet<Txid>) -> Option<Value> {
     let block = native_deserialize::<NativeBlock>(bytes).ok()?;
     let block_txids = block
@@ -483,10 +416,7 @@ fn proof_from_body(bytes: &[u8], wanted: &hashbrown::HashSet<Txid>) -> Option<Va
         return None;
     }
 
-    // MerkleBlock construction requires bitcoin::Block (sanctioned seam).
     let bitcoin_block = bitcoin::consensus::encode::deserialize::<bitcoin::Block>(bytes).ok()?;
-    // WHY `Hash`: `from_byte_array` comes from the rust-bitcoin `Hash` trait
-    // here; the wire txids ride the sanctioned MerkleBlock seam in native LE bytes.
     let bitcoin_wanted: hashbrown::HashSet<bitcoin::Txid> = wanted
         .iter()
         .map(|txid| bitcoin::Txid::from_byte_array(*txid.as_bytes()))
@@ -524,10 +454,7 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
 }
 
 /// Fee rate above which `sendrawtransaction` refuses by default, in sat/kvB.
-///
 /// Bitcoin Core's `DEFAULT_MAX_RAW_TX_FEE_RATE`, `COIN / 10` — 0.1 BTC per kvB.
-/// The guard exists because a change-output mistake shows up as an enormous
-/// fee, and a fee is not recoverable once the transaction confirms.
 use crate::context::DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB;
 
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -553,8 +480,6 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     )?;
     for output in &tx.outputs {
         let script = output.script_pubkey.as_bytes();
-        // Core's burn guard is per output, not a sum. HasValidOps is
-        // already owned by the script crate, including malformed pushes.
         if (script.len() > bitcoin_rs_script::MAX_SCRIPT_SIZE
             || bitcoin_rs_script::is_op_return(script)
             || !bitcoin_rs_script::has_valid_ops(script))
@@ -578,14 +503,9 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
             &ctx.chain.admission_chain(),
         )
         .map_err(submit_error_to_rpc_error)?;
-    // `hashtx` for newly admitted changes is published once by the gateway
-    // observer, in commit order ahead of `rawtx` and the `sequence` `A` event.
-    // Already-known (duplicate) admissions commit nothing, so they notify nothing.
     typed_to_sonic(&v31::SendRawTransaction(txid.to_string()))
 }
 
-// corepc-types 0.15's v31 alias only describes completed rows. Core 31.1
-// rpc/mempool.cpp also emits these identity-only or package-error rows.
 #[derive(serde::Serialize)]
 #[serde(untagged)]
 enum AcceptanceRow {
@@ -674,8 +594,6 @@ pub(crate) fn decoderawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
     Ok(value)
 }
 
-/// BIP337 `compressrawtransaction`: encodes one raw transaction into
-/// its compressed form, degrading unresolvable outpoints to raw form
 /// with one warning each. Disabled (`-32603`) unless the node started
 /// with `--compressed-transactions`.
 pub(crate) fn compressrawtransaction(
@@ -698,10 +616,6 @@ pub(crate) fn compressrawtransaction(
     }
     let compress_outpoints = optional_bool(params, 1, true)?;
     let tx = decode_tx(raw, "TX decode failed".to_owned())?;
-    // Snapshot isolation: the resolver captures its applied view and
-    // resolves UTXO, txindex, and body facts only while this stable
-    // chainstate read excludes transitions, so one call cannot pair a
-    // new-branch UTXO entry with the captured height and body.
     ctx.chain.with_stable_chainstate(|| {
         let mut resolver = crate::context::RpcPrevoutResolver::new(ctx, cancellation.clone())?;
         let (compressed, warnings) = crate::compressed_tx::compress_transaction(
@@ -723,9 +637,6 @@ pub(crate) fn compressrawtransaction(
     })
 }
 
-/// BIP337 `decompressrawtransaction`: restores one compressed
-/// transaction to its raw hex form, refusing when the context its
-/// compressed outpoints or signatures commit to is unavailable.
 /// Disabled (`-32603`) unless the node started with
 /// `--compressed-transactions`.
 pub(crate) fn decompressrawtransaction(
@@ -748,12 +659,6 @@ pub(crate) fn decompressrawtransaction(
     }
     let bytes =
         hex_decode(raw).map_err(|_| RpcError::Deserialization("TX decode failed".to_owned()))?;
-    // Snapshot isolation, as in `compressrawtransaction`: every
-    // resolution read runs under the same stable chainstate read that
-    // captured the applied view. Public-key recovery runs after the lock
-    // is released: it only reads the resolved plan, so a large request
-    // cannot block chain transitions while grinding recovery ids. A tip
-    // move during recovery is caught by the second view check below.
     let (plan, resolver) = ctx.chain.with_stable_chainstate(|| {
         let mut resolver = crate::context::RpcPrevoutResolver::new(ctx, cancellation.clone())?;
         let plan = crate::compressed_tx::decompress_prepare(&bytes, &mut resolver)
@@ -799,7 +704,6 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
     };
     let replaceable = optional_bool(params, 3, false)?;
 
-    // BIP125 opt-in sequence; 0xFFFFFFFF = final (no RBF, no locktime).
     let default_sequence: u32 = if replaceable {
         0xFFFF_FFFD
     } else {
@@ -845,7 +749,6 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
         });
     }
 
-    // Address parsing requires bitcoin::Network (sanctioned seam).
     let network = convert::bitcoin_network(ctx.chain.chain_network);
     let mut tx_outputs = Vec::with_capacity(outputs.len());
     for (key, value) in outputs {
@@ -917,7 +820,6 @@ fn sats_from_btc(value: &Value, message: &'static str) -> Result<u64, RpcError> 
         return Err(RpcError::InvalidParams(message));
     }
 
-    // Optional positive sign; reject any other sign including negative.
     let text = if let Some(stripped) = text.strip_prefix('+') {
         stripped
     } else if text.starts_with('-') {
@@ -930,7 +832,6 @@ fn sats_from_btc(value: &Value, message: &'static str) -> Result<u64, RpcError> 
         return Err(RpcError::InvalidParams(message));
     }
 
-    // Parse scientific notation: mantissa and optional exponent.
     let (mantissa, exp) = if let Some(pos) = text.find(['e', 'E']) {
         let (m, e) = text.split_at(pos);
         let e_str = &e[1..];
@@ -960,9 +861,6 @@ fn sats_from_btc(value: &Value, message: &'static str) -> Result<u64, RpcError> 
         (text, 0_i32)
     };
 
-    // Split mantissa on decimal point. Like Core's ParseFixedPoint, a
-    // decimal point requires at least one digit on each side ("1." and
-    // ".1" are malformed), and a second point is garbage.
     let (int_part, frac_part) = if let Some(pos) = mantissa.find('.') {
         let (i, f) = mantissa.split_at(pos);
         let f = &f[1..];
@@ -974,8 +872,6 @@ fn sats_from_btc(value: &Value, message: &'static str) -> Result<u64, RpcError> 
         (mantissa, "")
     };
 
-    // Both parts must contain only ASCII digits, and the integer part
-    // must carry at least one digit.
     if int_part.is_empty()
         || !int_part.chars().all(|c| c.is_ascii_digit())
         || !frac_part.chars().all(|c| c.is_ascii_digit())
@@ -991,9 +887,6 @@ fn sats_from_btc(value: &Value, message: &'static str) -> Result<u64, RpcError> 
         return Ok(0);
     }
 
-    // Normalize: trailing zeros carry no value, so the fractional-decimal
-    // count is taken after trimming them ("100e-10" and "1.000000000" are
-    // whole satoshis, not nine-decimal amounts).
     while digits.last() == Some(&b'0') {
         digits.pop();
     }
@@ -1044,17 +937,6 @@ fn sats_from_btc(value: &Value, message: &'static str) -> Result<u64, RpcError> 
 
 /// `sendrawtransaction`'s fee argument: Core's `maxfeerate` amount, or the
 /// one pre-0.19 `allowhighfees` value that btcd's RPC client still emits.
-///
-/// Core 31.1 takes only an amount here and refuses any boolean as a type
-/// error; `testmempoolaccept` and `submitpackage` keep that strictness. btcd's
-/// client (pinned by LND v0.21.4 through btcwallet) picks the argument shape by
-/// stripping `/Satoshi:` and the trailing `/` from `getnetworkinfo.subversion`
-/// and string-comparing the rest to `0.19.0`. This node's honest
-/// `/bitcoin-rs:…/` user agent sorts below that, so LND broadcasts every
-/// wallet transaction as `["<hex>", false]`, `allowHighFees = false`. Only
-/// that value is accepted, and it means the default ceiling, exactly as an
-/// omitted or null argument. `true` would switch the fee guard off through a
-/// type Core refuses; nothing observed sends it, so it stays a type error.
 fn send_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, RpcError> {
     let legacy_default = params_array(params)?
         .get(index)
@@ -1096,9 +978,6 @@ fn optional_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, Rpc
     if sats == 0 {
         return Ok(None);
     }
-    // Core's `ParseFeeRate` refuses rates at or above 1 BTC/kvB, so the
-    // ceiling is enforced on the integer domain to keep the parameter
-    // contract identical.
     if sats >= 100_000_000 {
         return Err(RpcError::InvalidParams(
             "Fee rates larger than or equal to 1BTC/kvB are not accepted",
@@ -1111,21 +990,15 @@ fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
     sats_from_btc(value, "Invalid amount")
 }
 
-// ---------------------------------------------------------------------------
-// Prevout / context resolution and frozen reason mapping.
-// ---------------------------------------------------------------------------
-
-/// Maps an [`AcceptanceRejectReason`] to the Core-compatible RPC error.
-/// `MaxFeeExceeded` is a parameter error (`-32602`), pinned by the
-/// policy-contract integration test. All other admission rejections are
-/// transaction rejections (`-26`), matching Bitcoin Core's
-/// `RPC_VERIFY_REJECTED` code. Both typed cluster-limit failures map to
-/// Core's public `too-large-cluster` reason.
+/// `MaxFeeExceeded` is a parameter error (`-32602`), pinned by the policy-contract
+/// integration test.
+///
+/// All other admission rejections are transaction rejections (`-26`), matching Bitcoin
+/// Core's `RPC_VERIFY_REJECTED` code. Both typed cluster-limit failures map to Core's
+/// public `too-large-cluster` reason.
 pub(crate) fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
     match reason {
         AcceptanceRejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
-        // Core reports spent/unknown inputs as RPC_VERIFY_ERROR (-25), not
-        // the policy-rejection -26 used for rule violations.
         AcceptanceRejectReason::MissingInputs => {
             RpcError::TxVerifyError("bad-txns-inputs-missingorspent".to_owned())
         }
@@ -1133,8 +1006,6 @@ pub(crate) fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcE
     }
 }
 
-/// Maps a gateway [`SubmitError`] to the Core-compatible RPC error for
-/// `sendrawtransaction` and `testmempoolaccept`.
 fn submit_error_to_rpc_error(error: SubmitError) -> RpcError {
     match error {
         SubmitError::Policy(reason) => reject_reason_to_rpc_error(reason),
@@ -1143,7 +1014,6 @@ fn submit_error_to_rpc_error(error: SubmitError) -> RpcError {
     }
 }
 
-/// Maps an [`AcceptanceRejectReason`] to the frozen RPC reject-reason string.
 /// Cluster count and weight failures share Core's `too-large-cluster` reason;
 /// other variants use the mempool owner's public policy reason.
 fn reject_reason_to_frozen_string(reason: AcceptanceRejectReason) -> String {
@@ -1165,8 +1035,6 @@ pub(crate) fn finalizepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value,
         return Err(RpcError::InvalidParams("invalid base64 PSBT"));
     };
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
-    // The finalizer mutates every input it can satisfy and reports the rest.
-    // Incomplete inputs are part of the RPC result, not an RPC-level failure.
     let _incomplete = psbt.finalize_mut(&secp);
     let finalized_tx = if psbt.inputs.is_empty() {
         None
@@ -1427,7 +1295,6 @@ mod finalizepsbt_tests {
     fn exact_amount_parsing_honors_precision_invariants() {
         use super::sats_from_btc;
 
-        // 1e-8 = 1 sat accepted, 1e-9 rejected as Invalid amount
         assert_eq!(
             sats_from_btc(&json!(1e-8), "Invalid amount")
                 .unwrap_or_else(|err| panic!("sats_from_btc 1e-8 must parse: {err}")),
@@ -1447,17 +1314,13 @@ mod finalizepsbt_tests {
         assert!(sats_from_btc(&json!("1e-9"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1E-9"), "Invalid amount").is_err());
 
-        // Exact 8-decimal satoshi boundary
         assert_eq!(
             sats_from_btc(&json!("0.00000001"), "Invalid amount")
                 .unwrap_or_else(|err| panic!("sats_from_btc boundary must parse: {err}")),
             1
         );
-        // More than 8 fractional decimals rejected when they carry value
         assert!(sats_from_btc(&json!("0.000000001"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1.000000001"), "Invalid amount").is_err());
-        // Trailing zeros normalize away: these are whole satoshis, not
-        // nine-decimal amounts.
         assert_eq!(
             sats_from_btc(&json!("1.000000000"), "Invalid amount")
                 .unwrap_or_else(|err| panic!("sats_from_btc trailing zeros must parse: {err}")),
@@ -1478,7 +1341,6 @@ mod finalizepsbt_tests {
                 .unwrap_or_else(|err| panic!("sats_from_btc zeros must parse: {err}")),
             0
         );
-        // A decimal point needs a digit on each side (Core ParseFixedPoint).
         assert!(sats_from_btc(&json!("1."), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!(".1"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("."), "Invalid amount").is_err());
@@ -1489,7 +1351,6 @@ mod finalizepsbt_tests {
     fn exact_amount_parsing_handles_zero_sign_and_malformed_inputs() {
         use super::sats_from_btc;
 
-        // Zero handling
         assert_eq!(
             sats_from_btc(&json!(0), "Invalid amount")
                 .unwrap_or_else(|err| panic!("sats_from_btc zero must parse: {err}")),
@@ -1511,7 +1372,6 @@ mod finalizepsbt_tests {
             0
         );
 
-        // Optional positive sign accepted, negative sign rejected
         assert_eq!(
             sats_from_btc(&json!("+1.5"), "Invalid amount")
                 .unwrap_or_else(|err| panic!("sats_from_btc +1.5 must parse: {err}")),
@@ -1521,7 +1381,6 @@ mod finalizepsbt_tests {
         assert!(sats_from_btc(&json!("-0"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("-0.0"), "Invalid amount").is_err());
 
-        // Non-digits and malformed text rejected (including whitespace)
         assert!(sats_from_btc(&json!("abc"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1.2.3"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!(""), "Invalid amount").is_err());
@@ -1534,7 +1393,6 @@ mod finalizepsbt_tests {
     fn exact_amount_parsing_enforces_overflow_exponent_and_feerate_ceilings() {
         use super::{optional_max_feerate, parse_btc_amount, sats_from_btc};
 
-        // Overflow safety
         assert_eq!(
             sats_from_btc(&json!("184467440737.09551615"), "Invalid amount")
                 .unwrap_or_else(|err| panic!("sats_from_btc max must parse: {err}")),
@@ -1543,15 +1401,11 @@ mod finalizepsbt_tests {
         assert!(sats_from_btc(&json!("184467440737.09551616"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("18446744073709551616"), "Invalid amount").is_err());
         assert!(sats_from_btc(&json!("1e25"), "Invalid amount").is_err());
-        // Regression: `digits_len - point` overflows i32 for this input
-        // (point = -2147483646); it must return `InvalidParams`, not panic
-        // in an overflow-checking build.
         assert!(matches!(
             sats_from_btc(&json!("1.1e-2147483647"), "Invalid amount"),
             Err(RpcError::InvalidParams("Invalid amount"))
         ));
 
-        // parse_btc_amount routes through sats_from_btc
         assert_eq!(
             parse_btc_amount(&json!("1e-8"))
                 .unwrap_or_else(|err| panic!("parse_btc_amount 1e-8 must parse: {err}")),
@@ -1559,7 +1413,6 @@ mod finalizepsbt_tests {
         );
         assert!(parse_btc_amount(&json!("1e-9")).is_err());
 
-        // optional_max_feerate: 0 is no-cap, 1e-8 accepted, >= 1 BTC/kvB ceiling, negative rejected
         assert_eq!(
             optional_max_feerate(&json!([0]), 0)
                 .unwrap_or_else(|err| panic!("optional_max_feerate zero must parse: {err}")),

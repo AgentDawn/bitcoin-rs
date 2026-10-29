@@ -123,9 +123,6 @@ impl ChainQuery for FakeChain {
     }
 }
 
-/// Streaming fake mirroring `ActiveChainQuery`: block-typed items that
-/// resolve to a stored body are served behind `headroom`; everything
-/// else lands in `not_found` without a load.
 fn inv_hash(item: &Inventory) -> Option<[u8; 32]> {
     match item {
         Inventory::Block(hash) | Inventory::WitnessBlock(hash) => Some(hash.to_byte_array()),
@@ -178,7 +175,6 @@ impl ChainQuery for GreedyHeaders {
     }
 }
 
-/// Collecting-sink wrapper mirroring the listener's streaming send.
 fn dispatch_collect<S>(
     peer: &mut Peer<S>,
     message: &Message,
@@ -401,8 +397,6 @@ fn getblocktxn_is_answered_with_blocktxn_from_the_chain() -> Result<(), PeerErro
     Ok(())
 }
 
-/// Refuses one `getblocktxn` index list both with a chain attached and
-/// with none, so the boundary decision cannot depend on chain state.
 fn assert_getblocktxn_refused(indexes: Vec<u64>) {
     let chain = FakeChain::with_headers(2);
     let message = Message::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
@@ -523,14 +517,10 @@ fn getblocktxn_is_unanswered_while_the_production_gate_is_saturated()
     Ok(())
 }
 
-/// Streaming chain fake mirroring `ActiveChainQuery`: block-typed items
-/// that resolve to a stored body are served behind `headroom`; all other
-/// items land in `not_found` without a load.
 struct StreamingChain {
     blocks: Vec<Block>,
     loads: AtomicUsize,
     headroom_calls: AtomicUsize,
-    /// Panics when a load would reach this count (mutation-gate tripwire).
     load_tripwire: Option<usize>,
 }
 impl ChainQuery for StreamingChain {
@@ -740,9 +730,6 @@ fn hostile_50000_item_getdata_parks_the_tail() {
     assert!(!lease.is_cancelled(), "parking never cancels the lease");
 }
 
-/// A gate that closes mid-request parks the unexamined remainder in
-/// request order, keeps the misses found so far unsent, and the tail
-/// resumed later answers in the order the peer asked.
 #[test]
 fn halted_mixed_getdata_parks_ordered_tail_and_unsent_misses() -> Result<(), PeerError> {
     let headers = FakeChain::with_headers(2).headers;
@@ -770,7 +757,6 @@ fn halted_mixed_getdata_parks_ordered_tail_and_unsent_misses() -> Result<(), Pee
     };
     let mut peer = ready_peer();
     let emitted = RefCell::new(Vec::new());
-    // Consultations: tx_miss (1), block_a (2) pass; tx_hit (3) halts.
     let consulted = std::cell::Cell::new(0_usize);
 
     dispatch_inbound_full(
@@ -830,9 +816,6 @@ fn halted_mixed_getdata_parks_ordered_tail_and_unsent_misses() -> Result<(), Pee
     Ok(())
 }
 
-/// The probe's tail shape: the gate closes between the last served item
-/// and the trailing report. The misses must come back parked instead of
-/// being sent into a full queue, which would cancel the lease.
 #[test]
 fn gate_closed_at_the_trailing_report_parks_the_misses() -> Result<(), PeerError> {
     let headers = FakeChain::with_headers(1).headers;
@@ -852,8 +835,6 @@ fn gate_closed_at_the_trailing_report_parks_the_misses() -> Result<(), PeerError
     };
     let inventory = FakeTxInventory::empty();
     let emitted = RefCell::new(Vec::new());
-    // Consultations: the miss (1) and the block (2) pass; the trailing
-    // report (3) finds the gate closed.
     let consulted = std::cell::Cell::new(0_usize);
     let mut not_found = Vec::new();
 
@@ -988,14 +969,10 @@ fn oversized_getdata_inventory_is_protocol_error() {
     assert_eq!(peer_snapshot(&peer), before);
 }
 
-/// A fake `TxInventory` that knows a fixed set of txids/wtxids and can
-/// serve their bodies.
 struct FakeTxInventory {
     txs_by_txid: hashbrown::HashMap<bitcoin::Txid, Tx>,
     txs_by_wtxid: hashbrown::HashMap<bitcoin::Wtxid, Tx>,
     have_hashes: hashbrown::HashSet<[u8; 32]>,
-    /// The resident pool: a subset of the bodies above. A body known
-    /// only through `with_tx` models an orphan.
     resident: Vec<Arc<Tx>>,
     ancestor_packages: hashbrown::HashMap<Wtxid, Vec<Wtxid>>,
 }
@@ -1011,7 +988,6 @@ impl FakeTxInventory {
         }
     }
 
-    /// A transaction resident in the pool, so also known and servable.
     fn with_resident_tx(mut self, tx: Tx) -> Self {
         self.resident.push(Arc::new(tx.clone()));
         self.with_tx(tx)
@@ -1619,7 +1595,6 @@ fn inv_filter_bip339_wtxid() {
     );
 }
 
-/// The hash dispatch routes to header sync for one announced block vector.
 fn announced_hash(block_hash: bitcoin::BlockHash) -> Hash256 {
     use bitcoin::hashes::Hash as _;
     Hash256::from_le_bytes(block_hash.as_byte_array())
@@ -1634,7 +1609,6 @@ fn dispatch_collect_full<S>(
     dispatch_collect_gated(peer, message, chain, tx_inventory, true)
 }
 
-/// Same helper with the transaction-relay gate under test control.
 fn dispatch_collect_gated<S>(
     peer: &mut Peer<S>,
     message: &Message,
@@ -1645,8 +1619,6 @@ fn dispatch_collect_gated<S>(
     dispatch_collect_announcements(peer, message, chain, tx_inventory, relay_open).0
 }
 
-/// Same helper, additionally returning the block-inventory hashes that
-/// dispatch routed to header sync instead of requesting their bodies.
 #[expect(clippy::expect_used)]
 fn dispatch_collect_announcements<S>(
     peer: &mut Peer<S>,
@@ -1733,8 +1705,6 @@ fn deferred_filter_request_keeps_ping_responsive_and_bounds_pending_work() -> Re
     Ok(())
 }
 
-/// Serves the first filter of a request and hands back the rest, as a
-/// serving pass stopped by the outbound budget does.
 struct NarrowingChain;
 
 impl ChainQuery for NarrowingChain {
@@ -1789,8 +1759,6 @@ impl ChainQuery for NarrowingChain {
     }
 }
 
-/// The remainder a serving pass returns is the parked request's only
-/// cursor: the sent prefix is not replayed and the fixed end is kept.
 #[test]
 fn filter_remainder_is_the_parked_requests_only_cursor() -> Result<(), PeerError> {
     let mut peer = ready_peer();
@@ -1847,8 +1815,6 @@ fn version_at(version: u32) -> Message {
     })
 }
 
-/// The reply to a peer's `version` is the feature messages, then the
-/// features negotiated for its protocol version, then `verack`; a peer
 /// below BIP434's version never receives a `feature` frame.
 #[test]
 fn version_reply_orders_features_between_feature_messages_and_verack() -> Result<(), PeerError> {
@@ -1874,9 +1840,6 @@ fn version_reply_orders_features_between_feature_messages_and_verack() -> Result
     Ok(())
 }
 
-/// A `feature` from the peer is absorbed silently between its `version`
-/// and `verack`, and is a protocol violation that changes nothing once the
-/// peer is ready.
 #[test]
 fn remote_feature_is_accepted_before_verack_and_rejected_after() -> Result<(), PeerError> {
     let feature = Message::Feature(FeatureAnnouncement::new(
@@ -1901,8 +1864,6 @@ fn remote_feature_is_accepted_before_verack_and_rejected_after() -> Result<(), P
     Ok(())
 }
 
-/// An offered `sendpackages` follows the feature messages and precedes
-/// `verack`, once; a repeated `version` does not repeat it.
 #[test]
 fn version_reply_sends_the_offered_sendpackages_once_before_verack() -> Result<(), PeerError> {
     let both = PKG_RELAY_PKGTXNS | PKG_RELAY_ANC;
@@ -1935,7 +1896,6 @@ fn version_reply_sends_the_offered_sendpackages_once_before_verack() -> Result<(
 
 const BOTH_PACKAGE_BITS: u64 = PKG_RELAY_PKGTXNS | PKG_RELAY_ANC;
 
-/// A ready peer that negotiated package relay for `bits` on both sides.
 fn package_peer(bits: u64) -> Result<Peer<Cursor<Vec<u8>>>, PeerError> {
     let mut peer = Peer::new(Cursor::new(Vec::new()), Magic::BITCOIN);
     peer.offer_package_relay(bits);
@@ -1957,7 +1917,6 @@ fn package_item(inv_type: u32, wtxid: Wtxid) -> Inventory {
     }
 }
 
-/// Dispatches one message against `inventory` with every gate open.
 fn dispatch_over<S>(
     peer: &mut Peer<S>,
     message: &Message,
@@ -2041,7 +2000,6 @@ fn a_negotiated_bit_admits_only_its_own_messages() -> Result<(), PeerError> {
             Err(PeerError::Misbehavior(_))
         ));
     }
-    // `pkgtxns` bytes are admitted by the node's ingress, not dispatch.
     let mut peer = package_peer(PKG_RELAY_PKGTXNS)?;
     assert_eq!(
         dispatch_inbound(&mut peer, &Message::PkgTxnsPayload(bytes::Bytes::new()))?,
@@ -2078,13 +2036,15 @@ fn getdata_ancpkginfo_serves_the_resident_package_and_reports_the_rest() -> Resu
     let unknown = dummy_tx(4).wtxid();
     let misdirected = dummy_tx(5);
     let inventory = FakeTxInventory::empty()
-            .with_resident_tx(parent.clone())
-            .with_resident_tx(child.clone())
-            .with_resident_tx(misdirected.clone())
-            .with_tx(orphan.clone())
-            .with_ancestor_package(child.wtxid(), vec![parent.wtxid(), child.wtxid()])
-            // A package that does not end at its subject is never served.
-            .with_ancestor_package(misdirected.wtxid(), vec![misdirected.wtxid(), parent.wtxid()]);
+        .with_resident_tx(parent.clone())
+        .with_resident_tx(child.clone())
+        .with_resident_tx(misdirected.clone())
+        .with_tx(orphan.clone())
+        .with_ancestor_package(child.wtxid(), vec![parent.wtxid(), child.wtxid()])
+        .with_ancestor_package(
+            misdirected.wtxid(),
+            vec![misdirected.wtxid(), parent.wtxid()],
+        );
     let mut peer = package_peer(BOTH_PACKAGE_BITS)?;
 
     let responses = dispatch_over(
@@ -2160,8 +2120,6 @@ fn getpkgtxns_is_all_resident_in_request_order_or_one_notfound() -> Result<(), P
         })]
     );
 
-    // One member that is only an orphan, or absent altogether, makes the
-    // whole request unavailable: one notfound, nothing else.
     for unavailable in [orphan.wtxid(), unknown] {
         let wtxids = vec![parent.wtxid(), unavailable, child.wtxid()];
         let responses = dispatch_over(
@@ -2266,7 +2224,6 @@ fn getpkgtxns_is_left_unanswered_while_the_production_gate_is_closed() -> Result
     Ok(())
 }
 
-/// Counts resident package loads, forwarding to `inner`.
 struct CountingResident<'a> {
     inner: &'a FakeTxInventory,
     loaded: &'a AtomicUsize,
@@ -2304,8 +2261,6 @@ fn ancpkginfo_hands_the_missing_members_to_the_request_owner_once() -> Result<()
     });
     let mut peer = package_peer(BOTH_PACKAGE_BITS)?;
 
-    // The child is a held orphan and the parent a recent reject: both are
-    // known to the node, neither is resident, so both are requested.
     let refused = FakeTxInventory::empty()
         .with_tx(child.clone())
         .with_have(*parent.wtxid().as_bytes())
@@ -2320,7 +2275,6 @@ fn ancpkginfo_hands_the_missing_members_to_the_request_owner_once() -> Result<()
     );
     assert_eq!(peer.take_package_request(), None, "one handoff per message");
 
-    // A resident parent is not asked for again.
     let resident_parent = FakeTxInventory::empty().with_resident_tx(parent);
     dispatch_over(&mut peer, &message, &resident_parent)?;
     assert_eq!(

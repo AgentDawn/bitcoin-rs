@@ -1,12 +1,3 @@
-//! Fixtures are the three real transactions of Bitcoin Core's
-//! `package_hash_tests` (`src/test/txpackage_tests.cpp`, merged with
-//! `GetPackageHash` in `092c978a42e8f4a02291b994713505ba8aac8b28`) and the
-//! txids and wtxids that test names for them. Expected wire bytes are built
-//! from the BIP331 definition (a minimal `CompactSize` count followed by the
-//! items) with string concatenation, and expected package hashes from Core's
-//! definition restated over displayed hex strings with a direct SHA-256;
-//! neither reuses this module's comparator, framing, or hash code.
-
 use super::*;
 use bitcoin_rs_primitives::{Script, TxOut, deserialize};
 
@@ -18,26 +9,20 @@ const TX_3: &str = "0200000000010177862801f77c2c068a70372b4c435ef8dd621291c36a64
 
 const TXS: [&str; 3] = [TX_1, TX_2, TX_3];
 
-/// Displayed (big-endian) wtxids, ascending in displayed order as Core's test asserts.
 const WTXIDS: [&str; 3] = [
     "85cd1a31eb38f74ed5742ec9cb546712ab5aaf747de28a9168b53e846cbda17f",
     "b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b",
     "e065bac15f62bb4e761d761db928ddee65a47296b2b776785abb912cdec474e3",
 ];
 
-/// Displayed txids; Core asserts these order differently from the wtxids.
 const TXIDS: [&str; 3] = [
     "bd0f71c1d5e50589063e134fad22053cdae5ab2320db5bf5e540198b0b5a4e69",
     "b4749f017444b051c44dfd2720e88f314ff94f3dd6d56d40ef65854fcd7fff6b",
     "ee707be5201160e32c4fc715bec227d1aeea5940fb4295605e7373edce3b1a93",
 ];
 
-/// SHA-256 of the three wtxids' internal bytes in displayed order, computed
-/// outside this crate (Python `hashlib`) from Core's definition.
 const COMBINED_ALL: &str = "0f076ece34c184294c64badd99a4444bb0140d0812f3c76baf466180db2e4fb0";
-/// The same definition over wtxids 1 and 2 only.
 const COMBINED_FIRST_TWO: &str = "10c5067764b8619bba5d55181233d54ba1742b0bcdd4a4416975888a50414e25";
-/// The same definition over wtxid 1 alone.
 const COMBINED_FIRST: &str = "28e9c3a89feb2c9ecbd6d0c0abd7076bb0714ae3b627591effca0a3b1e24b959";
 
 fn unhex(hex: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
@@ -47,7 +32,6 @@ fn unhex(hex: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
         .collect()
 }
 
-/// Internal (little-endian) byte hex of a displayed hash.
 fn internal_hex(displayed: &str) -> String {
     (0..displayed.len())
         .step_by(2)
@@ -99,8 +83,6 @@ fn synthetic_wtxids(count: usize) -> Vec<Wtxid> {
         .collect()
 }
 
-/// Core's `GetPackageHash` over displayed hex: sort the strings, concatenate
-/// each hash's internal bytes, hash once.
 fn oracle(displayed: &[&str]) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let mut sorted = displayed.to_vec();
     sorted.sort_unstable();
@@ -119,7 +101,6 @@ fn sha256_of(parts: &[Vec<u8>]) -> [u8; 32] {
     engine.finalize().into()
 }
 
-/// Expected list wire bytes: one-byte count, then each hash's internal bytes.
 fn list_wire(displayed: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut hex = format!("{:02x}", displayed.len());
     for hash in displayed {
@@ -150,7 +131,6 @@ fn sendpackages_is_one_little_endian_u64() -> TestResult {
     assert_eq!(high.encode().as_slice(), unhex("0100000000000080")?);
     assert_eq!(SendPackages::decode(&high.encode())?, high);
 
-    // Zero and unknown bits are data here; negotiation, not the codec, ignores them.
     assert_eq!(SendPackages::decode(&[0; 8])?, SendPackages { versions: 0 });
     Ok(())
 }
@@ -198,8 +178,6 @@ fn combined_hash_is_not_integer_order_txid_prefixed_or_double_hashed() -> TestRe
     let wtxids = wtxids_of(&WTXIDS)?;
     let [first, second, third] = [wtxids[0], wtxids[1], wtxids[2]];
 
-    // Displayed order and `Wtxid`'s integer order disagree on (1, 2) and agree on (2, 3),
-    // the two pairs Core's test pins.
     assert!(WTXIDS[0] < WTXIDS[1] && WTXIDS[1] < WTXIDS[2]);
     assert!(second < first);
     assert!(second < third);
@@ -212,7 +190,6 @@ fn combined_hash_is_not_integer_order_txid_prefixed_or_double_hashed() -> TestRe
     let integer_order = sha256_of(&internal(&[second, first, third]));
     assert_ne!(combined, integer_order);
 
-    // Core's `hash_if_use_txid`: the txids in their own displayed order.
     assert_ne!(combined, oracle(&TXIDS)?);
 
     let mut prefixed = vec![vec![3_u8]];
@@ -244,7 +221,6 @@ fn combined_hash_has_member_count_vectors() -> TestResult {
         combined_package_hash(&pair)
     );
 
-    // Repeated members are hashed as repeated members, as Core's test requires.
     assert_ne!(
         combined_package_hash(&[wtxids[0], wtxids[0]]),
         combined_package_hash(&wtxids[..1])
@@ -261,7 +237,6 @@ fn combined_hash_sorts_a_full_package_by_displayed_order() -> TestResult {
         .collect();
     let displayed: Vec<&str> = displayed.iter().map(String::as_str).collect();
 
-    // The synthetic set must exercise the difference between the two orders.
     let mut by_integer = ascending.clone();
     by_integer.sort_unstable();
     let mut by_display = ascending.clone();
@@ -279,7 +254,6 @@ fn combined_hash_sorts_a_full_package_by_displayed_order() -> TestResult {
 
 #[test]
 fn ancpkginfo_wire_is_count_then_wtxids_with_subject_last() -> TestResult {
-    // Request order, deliberately neither displayed nor integer sorted.
     let order = [WTXIDS[2], WTXIDS[0], WTXIDS[1]];
     let wire = list_wire(&order)?;
     assert_eq!(wire[0], 3);
@@ -299,7 +273,6 @@ fn getpkgtxns_wire_preserves_request_order() -> TestResult {
     let request = GetPkgTxns::decode(&wire)?;
     assert_eq!(request.wtxids, wtxids_of(&order)?);
     assert_eq!(request.encode()?, wire);
-    // The answer to an unservable request names the same set however it was ordered.
     assert_eq!(
         combined_package_hash(&request.wtxids).as_slice(),
         unhex(COMBINED_ALL)?
@@ -329,7 +302,6 @@ fn getpkgtxns_keeps_a_repeated_wtxid_that_ancpkginfo_rejects() -> TestResult {
 
 #[test]
 fn pkgtxns_wire_is_count_then_witness_serialized_transactions_in_request_order() -> TestResult {
-    // tx_3, tx_1, tx_2: sorted by neither wtxid nor txid, mixing segwit and legacy.
     let order = [2, 0, 1];
     let wire = pkgtxns_wire(&order)?;
 
@@ -339,7 +311,6 @@ fn pkgtxns_wire_is_count_then_witness_serialized_transactions_in_request_order()
     assert_eq!(package.txs, expected);
     let wtxids: Vec<Wtxid> = package.txs.iter().map(Tx::wtxid).collect();
     assert_eq!(wtxids, wtxids_of(&[WTXIDS[2], WTXIDS[0], WTXIDS[1]])?);
-    // Witness data survives: the segwit members re-encode to Core's bytes.
     assert_eq!(package.encode()?, wire);
     Ok(())
 }
@@ -383,8 +354,6 @@ fn list_bounds_hold_at_the_limit_and_fail_one_past_it() -> TestResult {
 
 #[test]
 fn a_declared_count_over_the_bound_fails_before_the_body_is_read() {
-    // Prefix-only payloads: the bound is decided by the count alone, so a
-    // missing body reports the count, not truncation.
     for count in [101_u64, 253, 65_536, 0x1_0000_0000, u64::MAX] {
         let prefix = varint::encode(count);
         assert_eq!(AncPkgInfo::decode(&prefix), Err(too_many(count)));
@@ -412,7 +381,6 @@ fn empty_lists_are_rejected_on_both_sides() {
 #[test]
 fn compact_size_must_be_minimal() -> TestResult {
     let body = list_wire(&WTXIDS)?[1..].to_vec();
-    // The count 3 widened to three bytes is non-canonical for every list message.
     let mut widened = vec![0xfd, 0x03, 0x00];
     widened.extend_from_slice(&body);
     assert_eq!(
@@ -429,7 +397,6 @@ fn compact_size_must_be_minimal() -> TestResult {
     widest.extend_from_slice(&body);
     assert_eq!(GetPkgTxns::decode(&widest), Err(PackageError::NonCanonical));
 
-    // A cut prefix is truncation, not a count.
     assert_eq!(GetPkgTxns::decode(&[]), Err(PackageError::Truncated));
     assert_eq!(GetPkgTxns::decode(&[0xfd]), Err(PackageError::Truncated));
     assert_eq!(
@@ -466,7 +433,6 @@ fn pkgtxns_consumes_its_payload_exactly_and_surfaces_transaction_errors() -> Tes
     long.push(0);
     assert_eq!(PkgTxns::decode(&long), Err(PackageError::Trailing(1)));
 
-    // A count above the transactions present, and a transaction cut short.
     let mut missing = wire.clone();
     missing[0] = 4;
     assert!(matches!(

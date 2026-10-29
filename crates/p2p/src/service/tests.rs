@@ -1,12 +1,13 @@
 use super::*;
 use crate::PeerSource;
 use bitcoin_rs_primitives::PeerEndpoint;
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 
 #[test]
 fn feeler_poisson_delay_matches_actual_core_uniform_vectors() {
-    let data: serde_json::Value =
-        serde_json::from_str(include_str!("../../tests/data/core-poisson-v31.1.json"))
+    let data: sonic_rs::Value =
+        sonic_rs::from_str(include_str!("../../tests/data/core-poisson-v31.1.json"))
             .expect("actual Core sampling fixture");
     for row in data["rows"].as_array().expect("rows") {
         assert_eq!(
@@ -103,8 +104,6 @@ fn start_fails_when_listener_cannot_bind() {
     drop(occupied);
 }
 
-/// Each service owns a distinct aggregate budget: exhausting one leaves
-/// the other unaffected (no process-global singleton).
 #[test]
 fn independent_services_own_independent_aggregate_budgets() {
     let first = P2pService::new(
@@ -1382,7 +1381,6 @@ fn anchor_queue_preserves_diversity_and_releases_a_saturated_attempt() {
     );
     assert_eq!(receiver.try_recv().expect("diverse second").addr, other);
     assert_eq!(anchors, VecDeque::<PeerEndpoint>::new());
-    // A queued but never accepted anchor is returned, not discarded.
     book.defer_anchor(other);
     book.return_restart_anchors(10_004);
     assert_eq!(book.take_restart_anchors(10_004), vec![other]);
@@ -1494,8 +1492,6 @@ fn mapped_manual_pins_exclude_all_automatic_dial_classes_without_rewriting_confi
     assert_eq!(anchors, VecDeque::<PeerEndpoint>::new());
     let (headers, _) = crossbeam_channel::bounded(1);
     let (blocks, _) = crossbeam_channel::bounded(1);
-    // An inactive transport makes a regression fail locally before any TCP
-    // dial: this test never opens connections to its public-looking fixtures.
     let mut shared = crate::listener::ConnectionShared::new(
         Arc::clone(&maintenance.peer_table),
         maintenance.banned.clone(),
@@ -1601,7 +1597,6 @@ fn register_ready_block_peer(table: &crate::PeerTable, addr: PeerEndpoint) -> cr
 #[test]
 fn failed_first_anchor_retains_the_second_for_a_single_block_slot() {
     for target in [1, 2] {
-        // block-only total1; then one full plus one block slot
         let (mut maintenance, queue) = maintenance_fixture(target);
         maintenance.block_slots = 1;
         let book = crate::addrman::AddressBook::open(None, [1; 4], false, None);
@@ -1660,7 +1655,7 @@ fn failed_first_anchor_retains_the_second_for_a_single_block_slot() {
             "a racing feeler cannot claim a reserved anchor"
         );
         assert_eq!(anchors, VecDeque::from(vec![second]));
-        book.unqueue(first); // first attempt failed and its thread was reaped
+        book.unqueue(first);
         let reserved = queue_restart_anchors(
             &maintenance,
             &mut anchors,
@@ -1745,9 +1740,6 @@ fn shutdown_captures_anchors_before_cancelling_workers() {
     service.address_book.learn_dns("fixture", &[addr], now);
     service.address_book.succeeded(addr, 9, now);
     let lease = register_ready_block_peer(&service.peer_table, addr);
-    // Install an epoch so `shutdown` runs its worker-cancellation path
-    // (`cancel_all`); without it the anchor capture is never racing a
-    // cancel and the test would pass even with the old ordering.
     *service.workers.lock() = Some(Workers::default());
     assert!(service.workers.lock().is_some());
     service.shutdown();
@@ -1782,9 +1774,9 @@ fn shutdown_captures_anchors_before_cancelling_worker_leases() {
         crate::addrman::AddressBook::open(Some(path), Magic::REGTEST.to_bytes(), true, None);
     assert_eq!(restored.take_restart_anchors(now), vec![addr]);
 }
-fn saved_book(path: &std::path::Path) -> serde_json::Value {
+fn saved_book(path: &std::path::Path) -> sonic_rs::Value {
     let bytes = std::fs::read(path).expect("saved book");
-    serde_json::from_slice(&bytes[..bytes.len() - 32]).expect("book JSON")
+    sonic_rs::from_slice(&bytes[..bytes.len() - 32]).expect("book JSON")
 }
 
 #[test]
@@ -1899,8 +1891,6 @@ fn rejected_anchor_returns_original_metadata_and_releases_its_asmap_group() {
     let same_as: PeerEndpoint = "9.9.0.1:8333".parse::<PeerEndpoint>().expect("same ASN");
     book.learn_dns("seed", &[anchor], 10_000);
     book.succeeded(anchor, 9, 10_000);
-    // Promotion frees New before learning the same-AS peer: two fresh
-    // entries may otherwise collide in the keyed slot and drop that peer.
     book.learn_dns("seed", &[same_as], 10_000);
     assert_eq!(
         book.select(&[], &[], 10_000, u64::MAX, |addr| addr == same_as),
@@ -2232,9 +2222,6 @@ fn disable_during_outbound_tip_query_refuses_registration_before_handshake() {
         .expect("read timeout");
     let mut byte = [0];
     let received = std::io::Read::read(&mut remote, &mut byte);
-    // Close before joining: the old unconditional registration would send a
-    // VERSION and wait for a response. Its failure must be the leaked byte,
-    // not a second fixture pause or the production handshake deadline.
     let _ = remote.shutdown(std::net::Shutdown::Both);
     drop(remote);
     let result = worker.join().expect("outbound worker");
@@ -2302,8 +2289,6 @@ fn bootstrap_fixed_peer_endpoints_valid_typed_endpoints_bypass_resolver() {
     );
     let valid_i2p = format!("{}.b32.i2p:8333", "a".repeat(52));
 
-    // For valid overlay targets (TorV3 and I2P), resolver MUST remain untouched (0 calls)
-    // and pinned dials must be generated.
     let mut resolve_calls = 0;
     let valid_overlay_targets = vec![valid_onion, valid_i2p];
     bootstrap_fixed_peer_endpoints(
@@ -2329,7 +2314,6 @@ fn bootstrap_fixed_peer_endpoints_valid_typed_endpoints_bypass_resolver() {
         crate::PeerEndpoint::I2p { .. }
     ));
 
-    // For direct IP, resolver MUST remain untouched (0 calls) and dial is generated.
     bootstrap_fixed_peer_endpoints(
         &network_active,
         &peer_table,
@@ -2367,29 +2351,21 @@ fn malformed_reserved_overlay_targets_testdata() -> Vec<String> {
     let good_b32 = bitcoin_rs_primitives::endpoint::base32_encode(&good_tor_payload);
 
     vec![
-        // Rejected overlay targets:
-        // - invalid checksum
         invalid_checksum_onion,
-        // - wrong base32 length
         "abc.onion:8333".to_owned(),
         format!("{}.b32.i2p:8333", "a".repeat(51)),
         format!("{}.b32.i2p:8333", "a".repeat(53)),
-        // - malformed port
         format!("{good_b32}.onion:notaport"),
         format!("{good_b32}.onion:0"),
         format!("{good_b32}.onion:99999"),
-        // - missing port
         format!("{good_b32}.onion"),
         format!("{}.b32.i2p", "a".repeat(52)),
-        // - mixed case
         valid_onion.to_uppercase(),
         valid_i2p.to_uppercase(),
-        // - trailing dot
         format!("{good_b32}.onion.:8333"),
         format!("{good_b32}.onion."),
         format!("{}.b32.i2p.:8333", "a".repeat(52)),
         format!("{}.b32.i2p.", "a".repeat(52)),
-        // Unsupported .i2p names (human-readable, short, or invalid canonical b32)
         "foo.i2p:8333".to_owned(),
         "foo.i2p".to_owned(),
         "FOO.I2P:8333".to_owned(),
@@ -2401,7 +2377,6 @@ fn malformed_reserved_overlay_targets_testdata() -> Vec<String> {
         "B32.I2P:8333".to_owned(),
         "b32.i2p.:8333".to_owned(),
         "b32.i2p.".to_owned(),
-        // Absolute root overlay targets
         "onion.:8333".to_owned(),
         "onion.".to_owned(),
         "ONION.:8333".to_owned(),
@@ -2419,7 +2394,6 @@ fn bootstrap_fixed_peer_endpoints_malformed_reserved_overlay_names_bypass_resolv
 
     let rejected_overlay_targets = malformed_reserved_overlay_targets_testdata();
 
-    // For all rejected overlay targets, resolver MUST remain untouched (0 calls).
     let mut resolve_calls = 0;
     bootstrap_fixed_peer_endpoints(
         &network_active,
@@ -2447,8 +2421,6 @@ fn bootstrap_fixed_peer_endpoints_ordinary_dns_and_lan_use_resolver() {
     let peer_table = crate::PeerTable::new();
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
 
-    // For ordinary hostnames (including legitimate fakeb32.i2p.org and single-label LAN names),
-    // injected resolver MUST be called.
     let ordinary_hostnames = vec![
         "seed.bitcoin.sipa.be:8333".to_owned(),
         "fakeb32.i2p.org:8333".to_owned(),
@@ -2483,7 +2455,6 @@ fn bootstrap_fixed_peer_endpoints_ordinary_dns_and_lan_use_resolver() {
 fn bootstrap_fixed_peer_endpoints_queue_and_cancellation() {
     let peer_table = crate::PeerTable::new();
 
-    // Cancellation: when network_active is false, resolution and dial are skipped.
     let network_inactive = AtomicBool::new(false);
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
     let mut resolve_calls = 0;
@@ -2503,7 +2474,6 @@ fn bootstrap_fixed_peer_endpoints_queue_and_cancellation() {
     assert_eq!(resolve_calls, 0);
     assert!(outbound_rx.try_recv().is_err());
 
-    // Queue saturation: when outbound_tx is bounded and full, bootstrap breaks early.
     let network_active = AtomicBool::new(true);
     let (bounded_tx, bounded_rx) = crossbeam_channel::bounded(1);
     bootstrap_fixed_peer_endpoints(

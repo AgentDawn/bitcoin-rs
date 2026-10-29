@@ -1,11 +1,6 @@
 use super::*;
 use proptest::prelude::*;
 
-/// Frozen byte-for-byte copy of the ORIGINAL serial `Num3072::multiply`
-/// (single triple-carry accumulator, no chain splitting). Reuses the
-/// unchanged column helpers (`mul_limb`, `muladd3`, `mulnadd3`, `extract3`,
-/// `muln2`, `addnextract2`, `is_overflow`, `full_reduce`) so it is a genuine
-/// reference for the optimized implementation, not a transform of it.
 fn reference_multiply_into(target: &mut Num3072, other: &Num3072) {
     let left = target.limbs;
     let right = &other.limbs;
@@ -51,8 +46,6 @@ fn reference_multiply_into(target: &mut Num3072, other: &Num3072) {
     }
 }
 
-/// Deterministic 64-bit splitmix PRNG: zero-dependency, reproducible seed
-/// expansion for the `>=100_000` random differential vectors.
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -173,8 +166,6 @@ fn multiply_byte_identical_on_random_chains() {
 
 #[test]
 fn finalize_byte_identical_after_optimized_multiply_chain() {
-    // Confirms the optimized path also matches the ruint reference through
-    // finalize() across a seeded operation chain.
     let mut rng = SplitMix64::new(0xf1_0a11_2e57_3072);
     for _ in 0..2_000 {
         let mut candidate = MuHash3072::new();

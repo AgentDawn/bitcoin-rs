@@ -181,8 +181,6 @@ fn clock_peer(
     let mut info = table
         .info_of(endpoint)
         .ok_or_else(|| std::io::Error::other("clock fixture info"))?;
-    // A pre-BIP133 peer isolates inventory clock draws from fee-filter
-    // refreshes without substituting the scheduler under test.
     info.version = 70_012;
     table.publish_info(endpoint, &lease, info);
     Ok(connected)
@@ -212,8 +210,6 @@ fn nontransaction_inventory_does_not_create_relay_state_or_clocks()
 
 #[test]
 fn inbound_clock_key_uses_network_class_and_canonical_bind_endpoint() {
-    // Core v31.1 net.cpp's inbound key uses GetNetClass, GetAddrBytes and
-    // GetPort. IPv4 mapped bind bytes are identical; scope/flow are absent.
     let key = |remote: &str, bind: &str| {
         InboundClockKey::new(
             remote.parse::<crate::PeerAddress>().map_or_else(
@@ -257,7 +253,6 @@ fn inbound_peers_share_cycles_without_suppressing_due_siblings()
     assert_eq!(due, clock(&table, b));
     table.poll_transaction_relay(&gateway, now, false, &mut rng);
     assert!(inventory(&a_rx).is_empty() && inventory(&b_rx).is_empty());
-    // Joining an already-due key must not postpone existing siblings.
     let (c, c_rx) = clock_peer(&table, "1.1.1.1:3000", "10.0.0.1:8333", true)?;
     let draws = rng.draws;
     table.queue_transaction_relay(request, due, &mut rng);
@@ -462,7 +457,6 @@ fn relay_is_delayed_excludes_source_and_preserves_negotiated_identity() {
     );
 }
 
-/// A ready full-relay peer whose queue also charges `aggregate`.
 fn connect_on(
     table: &PeerTable,
     port: u16,
@@ -503,9 +497,6 @@ fn fee_filters(receiver: &MessageReceiver) -> Vec<i64> {
         .collect()
 }
 
-/// A fee filter the node aggregate refused was never sent: the schedule
-/// and the sent-while-syncing state return to what they were, so the next
-/// poll offers it again instead of waiting out a fresh interval.
 #[test]
 fn feefilter_saturated_restores() {
     let table = PeerTable::new();
@@ -520,15 +511,12 @@ fn feefilter_saturated_restores() {
         (peer.last_filter, peer.sent_ibd_filter, peer.next_filter)
     };
 
-    // A syncing node's filter goes out while the aggregate has room.
     table.poll_transaction_relay(&gateway, now, true, &mut rng);
     let syncing = fee_filters(&rx);
     assert_eq!(syncing.len(), 1);
     let (sent_rate, sent_while_syncing, _) = state(&table);
     assert!(sent_while_syncing && sent_rate.is_some());
 
-    // Other connections fill the aggregate; the synced node's filter is
-    // refused and every part of the state it advanced is given back.
     let hold = crate::test_support::hog(&aggregate, 256);
     let refused_at = now + Duration::from_secs(1);
     table.poll_transaction_relay(&gateway, refused_at, false, &mut rng);
@@ -546,9 +534,6 @@ fn feefilter_saturated_restores() {
     assert!(!state(&table).1);
 }
 
-/// An `inv` the node aggregate refused announced nothing: the peer knows
-/// nothing of it, the requests go back to the pending queue, and the next
-/// cycle offers them.
 #[test]
 fn relay_inv_saturated_requeues() {
     let table = PeerTable::new();
@@ -870,8 +855,6 @@ fn fee_filter_uses_core_integer_fee_threshold_at_fractional_boundaries()
 fn inbound_without_ip_key_keeps_inbound_cadence() {
     let now = Instant::now();
     let mut clocks = HashMap::new();
-    // Same deterministic draw for both: inbound mean (5s) must exceed
-    // outbound mean (2s) for the same uniform sample.
     let mut rng_in = StdRng::seed_from_u64(42);
     let mut rng_out = StdRng::seed_from_u64(42);
     let inbound = RelayPeer::new(now, true, None, &mut clocks, &mut rng_in);

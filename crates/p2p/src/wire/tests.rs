@@ -9,7 +9,6 @@ use super::{
     write_message,
 };
 
-/// Serves exactly one v1 wire header and fails on any read beyond it.
 struct HeaderOnlyReader {
     header: Cursor<Vec<u8>>,
 }
@@ -24,7 +23,6 @@ impl Read for HeaderOnlyReader {
     }
 }
 
-/// Build a regtest `ping` wire header declaring `payload_len` bytes of payload.
 fn header_declaring(payload_len: usize) -> Result<Vec<u8>, PeerError> {
     let len = u32::try_from(payload_len)
         .map_err(|_| PeerError::Protocol("payload length does not fit in u32"))?;
@@ -32,7 +30,7 @@ fn header_declaring(payload_len: usize) -> Result<Vec<u8>, PeerError> {
     header.extend_from_slice(&Magic::REGTEST.to_bytes());
     header.extend_from_slice(b"ping\0\0\0\0\0\0\0\0");
     header.extend_from_slice(&len.to_le_bytes());
-    header.extend_from_slice(&[0u8; 4]); // checksum (never reached / wrong on purpose)
+    header.extend_from_slice(&[0u8; 4]);
     Ok(header)
 }
 
@@ -75,7 +73,6 @@ fn receiver_resumes_a_frame_split_by_poll_timeouts() -> Result<(), PeerError> {
     write_message(&mut ping, Magic::REGTEST, &super::Message::Ping(42))?;
     let mut pong = Vec::new();
     write_message(&mut pong, Magic::REGTEST, &super::Message::Pong(7))?;
-    // The ping stops arriving once inside its header and once inside its payload.
     let mut stream = StallingStream::new([
         Inbound::Bytes(ping[..10].to_vec()),
         Inbound::Stall(ErrorKind::TimedOut),
@@ -104,9 +101,6 @@ fn receiver_retains_only_received_bytes_for_a_stalled_frame() -> Result<(), Peer
     use crate::test_support::{Inbound, OrFail, StallingStream};
     use std::io::ErrorKind;
 
-    // A peer declares a maximum-size payload, delivers a fragment, then
-    // stalls: the retained buffer holds received bytes, not the declared
-    // length.
     let dribble = [7u8; 100];
     let mut stream = StallingStream::new([
         Inbound::Bytes(header_declaring(MAX_MESSAGE_PAYLOAD)?),
@@ -319,7 +313,6 @@ fn feature_message_v1_roundtrip() -> Result<(), PeerError> {
 
 #[test]
 fn feature_message_rejects_malformed_wire_payload() {
-    // Feature command with empty payload (truncated).
     let mut frame = Vec::with_capacity(HEADER_LEN);
     frame.extend_from_slice(&Magic::REGTEST.to_bytes());
     frame.extend_from_slice(b"feature\0\0\0\0\0");
@@ -338,7 +331,6 @@ fn package_wtxid(tag: u8) -> bitcoin_rs_primitives::Wtxid {
     bitcoin_rs_primitives::Wtxid(bitcoin_rs_primitives::Hash256::from_le_bytes(&[tag; 32]))
 }
 
-/// A one-input, one-output transaction whose prevout hash is `tag`.
 fn package_tx(tag: u8) -> Result<bitcoin_rs_primitives::Tx, PeerError> {
     let mut raw = vec![1, 0, 0, 0, 1];
     raw.extend_from_slice(&[tag; 32]);
@@ -389,8 +381,6 @@ fn package_messages_roundtrip_over_v1_with_exact_wire_len() -> Result<(), PeerEr
         let (decoded, raw) = read_message(&mut Cursor::new(wire.clone()), Magic::REGTEST)?;
         assert_eq!(raw.as_ref(), encode_payload(message)?.as_slice());
         if let super::Message::PkgTxns(package) = message {
-            // The receive path parses no transaction: the caller charges
-            // the frame, then decodes it explicitly.
             assert_eq!(decoded, super::Message::PkgTxnsPayload(raw.clone()));
             assert_eq!(&crate::packages::PkgTxns::decode(&raw)?, package);
             let mut rewritten = Vec::new();
@@ -523,7 +513,6 @@ fn staletip_roundtrips_and_over_limit_is_ignored_not_punished() -> Result<(), Pe
     assert_eq!(decoded, message);
     assert_eq!(raw.as_ref(), encode_payload(&message)?.as_slice());
 
-    // 21 headers: over the BIP332 limit, decided from the count alone.
     let mut over = vec![0u8; 32];
     over.push(21);
     let (ignored, _) = read_message(
@@ -536,7 +525,6 @@ fn staletip_roundtrips_and_over_limit_is_ignored_not_punished() -> Result<(), Pe
         "{ignored:?}"
     );
 
-    // Any other defect is a malformed payload.
     let result = read_message(
         &mut Cursor::new(frame_of(b"staletip", &[0u8; 31])?),
         Magic::REGTEST,
@@ -550,8 +538,6 @@ fn staletip_roundtrips_and_over_limit_is_ignored_not_punished() -> Result<(), Pe
 
 #[test]
 fn pkgtxns_receive_defers_every_transaction_parse() -> Result<(), PeerError> {
-    // A payload no `PkgTxns` decoder accepts still arrives as the raw
-    // variant: the listener charges the frame before any decode.
     let frame = frame_of(b"pkgtxns", &[0])?;
     let (message, raw) = read_message(&mut Cursor::new(frame), Magic::REGTEST)?;
     assert_eq!(raw.as_ref(), [0]);
@@ -573,7 +559,7 @@ fn pkgtxns_receive_defers_every_transaction_parse() -> Result<(), PeerError> {
 fn empty_command_in_v1_header_is_rejected() {
     let mut frame = Vec::with_capacity(HEADER_LEN);
     frame.extend_from_slice(&Magic::REGTEST.to_bytes());
-    frame.extend_from_slice(&[0u8; 12]); // all zeroes command
+    frame.extend_from_slice(&[0u8; 12]);
     frame.extend_from_slice(&0u32.to_le_bytes());
     frame.extend_from_slice(&super::checksum(&[]));
 

@@ -9,7 +9,6 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::Chainstate;
 
-/// Coordination only: the published `ArcSwap` remains the sole tip value.
 #[derive(Default)]
 pub(crate) struct TipNotification {
     pub(crate) gate: Mutex<()>,
@@ -40,8 +39,6 @@ impl ActiveTipWait for Chainstate {
                 return Some(guard);
             }
         };
-        // An omitted current_tip captures the settled starting tip, just as
-        // Core's initial GetTip does. Do not start from a transient prefix.
         let starting_transition = if matches!(condition, TipWaitCondition::Changed(None)) {
             let Some(guard) = settled_transition() else {
                 return self.applied_tip.load_full();
@@ -61,10 +58,6 @@ impl ActiveTipWait for Chainstate {
                 return Some(tip);
             }
             if condition.matches(&tip) {
-                // Publication occurs inside a transition. Release the wait
-                // gate BEFORE acquiring transition exclusion; a publisher
-                // uses the opposite order. Only lock acquisition is timed:
-                // unsatisfied tip predicates park on the Condvar, not a poll.
                 drop(gate);
                 let Some(transition) = settled_transition() else {
                     return self.applied_tip.load_full();
@@ -74,9 +67,6 @@ impl ActiveTipWait for Chainstate {
                 if condition.matches(&settled) || stopped() {
                     return Some(settled);
                 }
-                // A transient reorg prefix does not satisfy a settled wait.
-                // Keep the gate until parking so the next publish cannot be
-                // lost after dropping the transition exclusion.
                 drop(transition);
             }
             if let Some(end) = deadline {

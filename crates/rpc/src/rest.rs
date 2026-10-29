@@ -1,11 +1,3 @@
-//! Bitcoin Core-compatible REST surface used by remote clients.
-//!
-//! The twelve supported route prefixes mirror Core's `StartREST` registration table.
-//! JSON projections come from `crate::render` and `crate::tx_render`; hex
-//! and binary payloads use consensus serialization. Applied-chain membership is
-//! always resolved through [`crate::context::Context`] ancestry facts — never
-//! from the header tip alone.
-
 use alloc::sync::Arc;
 use std::str::FromStr;
 
@@ -29,17 +21,12 @@ use bitcoin_rs_index::block_log::BlockRecord;
 
 const DEFAULT_HEADER_COUNT: u32 = 5;
 const MAX_HEADER_COUNT: u32 = 2_000;
-/// Core's `MAX_GETUTXOS_OUTPOINTS`.
 const MAX_GETUTXOS_OUTPOINTS: u8 = 15;
-/// Includes bounded whitespace in hex input; checked before HTTP body allocation.
 pub(crate) const MAX_GETUTXOS_BODY_BYTES: usize = 2_048;
-/// Core's `MEMPOOL_HEIGHT` sentinel in REST CCoin/JSON responses.
 const MEMPOOL_HEIGHT: u32 = 0x7fff_ffff;
 
-/// BIP141's maximum block weight also bounds any valid serialized block body.
 const MAX_REST_BLOCK_BODY_BYTES: usize = 4_000_000;
 
-/// The Bitcoin Core REST prefixes registered by `StartREST`.
 pub const REGISTRATIONS: [&str; 12] = [
     "/rest/tx/",
     "/rest/block/notxdetails/",
@@ -55,16 +42,11 @@ pub const REGISTRATIONS: [&str; 12] = [
     "/rest/spenttxouts/",
 ];
 
-/// HTTP response produced by a REST route.
 #[derive(Debug)]
 pub struct Response {
-    /// HTTP status code.
     pub status: u16,
-    /// HTTP reason phrase.
     pub reason: &'static str,
-    /// MIME type.
     pub content_type: &'static str,
-    /// Response body.
     pub body: Vec<u8>,
 }
 
@@ -74,21 +56,11 @@ struct HeaderRecord {
     header: Header,
 }
 
-/// Routes one REST request.
-///
-/// REST is deliberately distinct from unknown routes: a disabled gateway and
-/// a genuinely unknown path return 404, while malformed header parameters
-/// return 400. The enforcer uses 404 on `/rest/*` to diagnose a disabled
-/// gateway, so an unknown but well-formed block hash returns an empty 200
-/// response instead of a misleading 404. Header query parameters other than
-/// `count` are ignored, matching Core's cache-buster-friendly behavior.
 #[must_use]
 pub fn route(ctx: &Arc<Context>, path: &str, query: &str, enabled: bool) -> Response {
     if !enabled {
         return not_found();
     }
-    // Order matters: `/rest/block/notxdetails/` must be checked before
-    // `/rest/block/` so the longer prefix wins.
     if let Some(suffix) = path.strip_prefix("/rest/tx/") {
         return route_tx(ctx, suffix);
     }
@@ -125,15 +97,11 @@ pub fn route(ctx: &Arc<Context>, path: &str, query: &str, enabled: bool) -> Resp
     not_found()
 }
 
-/// The exact REST resource boundary admitted for POST (including bad formats,
-/// which the resource itself diagnoses). Other REST methods stay unavailable.
 pub(crate) fn getutxos_suffix(path: &str) -> Option<&str> {
     path.strip_prefix("/rest/getutxos")
         .filter(|suffix| suffix.is_empty() || suffix.starts_with(['/', '.']))
 }
 
-/// Routes a bounded POST to the getutxos resource. URI input remains accepted
-/// with an empty body; nonempty input is exclusively binary or hex.
 #[must_use]
 pub fn route_post(ctx: &Arc<Context>, path: &str, body: &[u8], enabled: bool) -> Response {
     if !enabled {
@@ -154,11 +122,6 @@ pub(crate) fn getutxos_body_too_large() -> Response {
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Route handlers
-// ---------------------------------------------------------------------------
-
-/// Core: `/rest/tx/<txid>.<ext>`.
 fn route_tx(ctx: &Arc<Context>, suffix: &str) -> Response {
     let (hash_text, format) = split_format(suffix);
     let Ok(txid) = Txid::from_str(hash_text) else {
@@ -191,8 +154,6 @@ fn route_tx(ctx: &Arc<Context>, suffix: &str) -> Response {
     }
 }
 
-/// Core: `/rest/block/<hash>.<ext>` (full tx details) and
-/// `/rest/block/notxdetails/<hash>.<ext>` (txid-only).
 fn route_block(ctx: &Arc<Context>, suffix: &str, with_details: bool) -> Response {
     let (hash_text, format) = split_format(suffix);
     let Ok(hash) = Hash256::from_str(hash_text) else {
@@ -237,8 +198,6 @@ fn route_block(ctx: &Arc<Context>, suffix: &str, with_details: bool) -> Response
     }
 }
 
-/// Core `/rest/blockpart/<hash>.<ext>` serves raw block payload bytes (hex or
-/// binary only), matching Core's original part endpoint which rejected JSON.
 fn route_block_part(ctx: &Arc<Context>, suffix: &str) -> Response {
     let (hash_text, format) = split_format(suffix);
     let Ok(hash) = Hash256::from_str(hash_text) else {
@@ -287,7 +246,6 @@ fn bounded_block_body(ctx: &Context, record: &BlockRecord) -> Result<Vec<u8>, Re
     Ok(body)
 }
 
-/// Core `/rest/chaininfo.json` (JSON only).
 fn route_chaininfo(ctx: &Arc<Context>, path: &str) -> Response {
     let (_, format) = split_format(path);
     if format != Some("json") {
@@ -296,7 +254,6 @@ fn route_chaininfo(ctx: &Arc<Context>, path: &str) -> Response {
     json_response(getblockchaininfo(ctx, &json!([])))
 }
 
-/// Core `/rest/mempool/<info|contents>.json`.
 fn route_mempool(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     let (kind, format) = split_format(suffix);
     if kind != "info" && kind != "contents" {
@@ -339,7 +296,6 @@ fn route_mempool(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     }
 }
 
-/// Core `/rest/headers/<hash>.<ext>?count=<count>`.
 fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     let (hash_text, format) = split_format(suffix);
     let count = match parse_count(query) {
@@ -352,8 +308,6 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     let Some(format) = format else {
         return not_found_with("output format not found");
     };
-    // One capture serves the run selection and every returned header, so the
-    // response cannot describe two different applied publications.
     let view = ctx.chain.applied_view();
     release_applied_capture();
     let records = header_records(ctx, &view, hash, count);
@@ -388,16 +342,12 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     }
 }
 
-// Records that a route has captured its applied view, so a test can publish a
-// competing tip at that exact instant. This seam never adds state or an API to
-// production builds.
 #[cfg(test)]
 std::thread_local! {
     static AFTER_APPLIED_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Fires and clears the request-local hook, when a test armed one.
 fn release_applied_capture() {
     #[cfg(test)]
     AFTER_APPLIED_CAPTURE.with(|slot| {
@@ -407,24 +357,11 @@ fn release_applied_capture() {
     });
 }
 
-/// Arms a one-shot closure that runs immediately after the next route capture.
 #[cfg(test)]
 fn arm_capture_hook(hook: impl FnOnce() + 'static) {
     AFTER_APPLIED_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-/// Core `/rest/getutxos[/checkmempool]/<txid>-<n>....{bin,hex,json}`.
-///
-/// URI and canonical bool/vector body input share the same lookup. Core 31.1
-/// incorrectly prepends a serialized-string length when decoding POST; this
-/// route intentionally decodes the supplied bytes directly (registry deviation).
-///
-/// PRE: parsing and format resolution have succeeded.
-/// POST: the `checkmempool` branch answers only while the gateway's chain
-/// generation is stable across the whole read; an unstable or moved
-/// generation returns the retry response instead of a body.
-/// INVARIANT: plain UTXO reads exclude chain transitions without depending on
-/// mempool generation. Mixed reads retain the existing generation fence.
 fn route_getutxos(ctx: &Arc<Context>, suffix: &str, body: &[u8]) -> Response {
     let (path, format) = split_format(suffix);
     let request = if body.is_empty() {
@@ -443,9 +380,6 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str, body: &[u8]) -> Response {
     let Some(format) = format else {
         return format_not_found(available_formats());
     };
-    // The checkmempool branch pairs UTXO facts with pool facts, so a chain
-    // transition between the reads could confirm a spend the transition
-    // already reversed. The entry check refuses while a change is active.
     let entry_generation = if check_mempool {
         match ctx.mempool.gateway.stable_generation() {
             Some(generation) => Some(generation),
@@ -454,14 +388,8 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str, body: &[u8]) -> Response {
     } else {
         None
     };
-    // A pool read cannot exclude a chain change that already began: the
-    // gateway releases its writer after setting the odd generation. Plain
-    // reads therefore use the existing transition read role, while mixed
-    // reads use the checked generation and retain one pool snapshot.
     let transition = (!check_mempool).then(|| ctx.chain.chain_transition.lock());
     let pool = check_mempool.then(|| ctx.mempool.gateway.read());
-    // Height and hash describe one publication, so a response cannot pair one
-    // block's height with another block's hash.
     let view = ctx.chain.applied_view();
     release_applied_capture();
 
@@ -492,9 +420,6 @@ fn route_getutxos(ctx: &Arc<Context>, suffix: &str, body: &[u8]) -> Response {
     }
     drop(pool);
     drop(transition);
-    // The end check compares for exact equality only; a generation that
-    // moved while the reads ran discards the assembled results and asks the
-    // client to retry.
     if entry_generation.is_some_and(|entry| ctx.mempool.gateway.stable_generation() != Some(entry))
     {
         return service_unavailable("chain generation is odd; retry");
@@ -512,7 +437,6 @@ fn getutxos_response(
     let active_height = view.height();
     let active_hash = view.hash(network);
     let mut bitmap = vec![0_u8; hits.len().div_ceil(8)];
-    // Bitmap packs the least-significant hit bit first per byte, matching Core.
     for (index, hit) in hits.iter().enumerate() {
         if *hit {
             bitmap[index / 8] |= 1 << (index % 8);
@@ -563,7 +487,6 @@ fn getutxos_response(
     }
 }
 
-/// Core deployment transport over the same native projection as JSON-RPC.
 fn route_deploymentinfo(ctx: &Arc<Context>, suffix: &str) -> Response {
     let (hash_text, format) = split_format(suffix);
     if format != Some("json") {
@@ -587,7 +510,6 @@ fn route_deploymentinfo(ctx: &Arc<Context>, suffix: &str) -> Response {
     }
 }
 
-/// Core `/rest/blockhashbyheight/<height>.<ext>`.
 fn route_blockhash_by_height(ctx: &Arc<Context>, suffix: &str) -> Response {
     let (height_text, format) = split_format(suffix);
     let Ok(height) = height_text.parse::<u32>() else {
@@ -613,7 +535,6 @@ fn route_blockhash_by_height(ctx: &Arc<Context>, suffix: &str) -> Response {
     }
 }
 
-/// Core spent outputs use ordinary `TxOut` encoding, never native undo bytes.
 fn route_spent_txouts(ctx: &Context, suffix: &str) -> Response {
     use bitcoin_rs_utxo::contract::{BlockSpendsError as E, BoundedReadError, HistoryUnavailable};
     let (hash_text, format) = split_format(suffix);
@@ -700,16 +621,6 @@ fn route_spent_txouts(ctx: &Context, suffix: &str) -> Response {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Header chain walk
-// ---------------------------------------------------------------------------
-
-/// Walks the applied chain from `hash`, bounded by the response's captured
-/// publication.
-///
-/// PRE: `view` is the response's one captured applied publication.
-/// POST: the returned run is selected against that tip alone.
-/// INVARIANT: this helper never loads `applied_tip`.
 fn header_records(
     ctx: &Context,
     view: &AppliedView,
@@ -812,12 +723,6 @@ fn invalid_count(value: &str) -> Response {
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Getutxos helpers
-// ---------------------------------------------------------------------------
-
-/// Parses at most fifteen outpoints without allocating from a wire count.
-/// Full consumption is required, including for a zero-length vector.
 fn parse_getutxos_body(
     format: Option<&str>,
     body: &[u8],
@@ -899,8 +804,6 @@ fn parse_getutxos_outpoints(path: &str) -> Result<(bool, Vec<(Txid, u32)>), Resp
     Ok((check_mempool, outpoints))
 }
 
-/// Serializes the getutxos response body: active height, active hash, packed
-/// bitmap, then one `CCoin` (version, height, txout) per unspent output.
 fn serialize_getutxos_bin(
     active_height: u32,
     active_hash: Hash256,
@@ -914,7 +817,7 @@ fn serialize_getutxos_bin(
     body.extend_from_slice(bitmap);
     append_compact_size(&mut body, outs.len());
     for (height, txout) in outs {
-        body.extend_from_slice(&0_u32.to_le_bytes()); // CCoin version dummy
+        body.extend_from_slice(&0_u32.to_le_bytes());
         body.extend_from_slice(&height.to_le_bytes());
         body.extend_from_slice(&consensus_bytes(txout));
     }
@@ -928,18 +831,6 @@ fn append_compact_size(body: &mut Vec<u8>, len: usize) {
     body.extend_from_slice(bitcoin_rs_primitives::varint::encode(value).as_slice());
 }
 
-// ---------------------------------------------------------------------------
-// Chain context helpers
-// ---------------------------------------------------------------------------
-
-/// Builds the applied-chain facts [`crate::render`] needs to project a block or
-/// header.
-///
-/// PRE: `view` is the response's one captured applied publication.
-/// POST: confirmation, active-membership, and next-block-hash facts come from
-///   that view.
-/// INVARIANT: this helper never loads `applied_tip`, so a response cannot mix
-///   two publications.
 fn build_chain_context(
     ctx: &Context,
     view: &AppliedView,
@@ -974,12 +865,6 @@ fn build_chain_context(
     }
 }
 
-/// Applied-chain facts for a header record, resolving the real record (and its
-/// transaction count) through the tree/log when available.
-///
-/// PRE: `view` is the response's one captured applied publication.
-/// POST: every applied fact comes from that view.
-/// INVARIANT: this helper never loads `applied_tip`.
 fn header_chain_context(
     ctx: &Context,
     view: &AppliedView,
@@ -999,13 +884,6 @@ fn header_chain_context(
     build_chain_context(ctx, view, &real, &record.header)
 }
 
-// ---------------------------------------------------------------------------
-// Format and query helpers
-// ---------------------------------------------------------------------------
-
-/// Splits an endpoint suffix into its text portion and trailing data format.
-/// Recognized formats are stripped; an unknown suffix stays in the path so
-/// endpoint validation returns Core's malformed-parameter error.
 fn split_format(suffix: &str) -> (&str, Option<&'static str>) {
     match suffix.rsplit_once('.') {
         Some((base, "json")) => (base, Some("json")),
@@ -1040,27 +918,6 @@ fn sonic_bytes(value: &Value) -> Vec<u8> {
         .into_bytes()
 }
 
-// ---------------------------------------------------------------------------
-// Response constructors
-// ---------------------------------------------------------------------------
-//
-// One owner for every HTTP response the RPC crate emits. REST and Esplora
-// routes both build responses here, so status, reason phrase, content type,
-// and body encoding cannot drift between the two surfaces.
-//
-// PRE: `message`/`body` bytes are already in their final wire encoding.
-// POST: a [`Response`] carrying exactly the named status and reason, with
-//   the named content type and the message or body as its payload.
-// INVARIANT: no constructor inspects handler state or mutates shared state;
-//   the same arguments always produce the same bytes.
-
-/// Answers a serialized value as a 200 JSON response.
-///
-/// PRE: `value` serializes losslessly for the response's JSON visitor set.
-/// POST: a 200 `application/json` response carrying the sonic-rs encoding,
-///   or the internal-error response when serialization fails.
-/// INVARIANT: the encoding is sonic-rs output for the same value on every
-///   call; no handler state is read.
 pub(crate) fn json_ok<T: serde::Serialize>(value: T) -> Response {
     match sonic_rs::to_string(&value) {
         Ok(body) => text_response("application/json", body.into_bytes()),

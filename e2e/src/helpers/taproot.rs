@@ -1,6 +1,3 @@
-//! Independently signed BIP341 spends shared by native and process regressions.
-//! Fixed fixture keys never enter production code or a wallet.
-
 #![expect(clippy::expect_used, reason = "fixed-key fixture construction")]
 
 use bitcoin::hashes::Hash as _;
@@ -52,8 +49,6 @@ fn template(outpoint: OutPoint, prevout: &TxOut) -> Transaction {
     }
 }
 
-/// Every signature message, tweak, signature and control block is produced by
-/// rust-bitcoin/secp256k1, independently of bitcoin-rs's native sighash code.
 pub fn cases(outpoint: OutPoint, prevout: &TxOut) -> Vec<Case> {
     let secp = Secp256k1::new();
     let (key, tree, leaf) = tree();

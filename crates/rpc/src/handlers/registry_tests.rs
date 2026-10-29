@@ -36,9 +36,6 @@ fn core_method_registry_has_the_expected_surface() {
     );
     let handler = Handler::new(Arc::new(Context::new()));
     for entry in shipped_rpc_rows() {
-        // A subsystem a bare context runs without answers `-32601`
-        // carrying its own name (Core's wallet-disabled behavior); only
-        // a foreign name is drift.
         assert!(
             !matches!(
                 handler.dispatch(entry.name, &json!([])),
@@ -106,10 +103,6 @@ fn pool_extensions_follow_compile_and_runtime_gates() {
     }
 }
 
-// Bitcoin Core 31.1 parameter-error classification, probed against the
-// pinned release: a wrong JSON type is -3 in Core's own words, a
-// correctly typed but unacceptable value is -8, and only shape and
-// arity remain on -32602.
 #[test]
 #[expect(clippy::expect_used)]
 fn wrong_json_type_answers_core_type_error_text() {
@@ -163,8 +156,6 @@ fn txid_parameter_errors_use_core_text() {
     );
 }
 
-/// Core 31.1 transformNamedArguments: named holes, `args`, and collision
-/// ordering are observable through the transaction RPC, not a new route.
 #[test]
 #[expect(clippy::expect_used)]
 fn named_transaction_arguments_follow_core() {
@@ -262,8 +253,6 @@ fn named_binding_preserves_method_boundaries() {
         .expect_err("name validation precedes missing outputs");
     assert_eq!(error.code(), -8);
     assert_eq!(error.to_string(), "Unknown named parameter extra");
-    // The prerequisite must not newly recognize parameters whose semantics
-    // are implemented in the later raw-transaction/PSBT conversion slice.
     for (method, params, name) in [
         (
             "createrawtransaction",
@@ -310,8 +299,6 @@ fn test_context() -> (Arc<Context>, Arc<bitcoin_rs_chainstate::Chainstate>) {
 fn await_waiter(handler: &Handler) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        // Observe the owner without competing for the waiter's permit.
-        // Release the mutex before checking the deadline or sleeping.
         let active = handler.blocking_requests.lock().0;
         if active != 0 {
             return;

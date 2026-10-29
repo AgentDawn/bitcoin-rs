@@ -1,8 +1,3 @@
-//! Low-work, partial-prefix, and duplicate-fetch regressions for
-//! stale-tip batches: identified-peer, non-wire batches take the same
-//! minimum-work/fault hold as ordinary headers, preserve a displaced
-//! tip on rejection, and never double-fetch an owned body.
-
 use super::super::BlockSync;
 use super::super::chain::HeaderAdmission;
 use super::super::chain::SyncChain;
@@ -191,9 +186,6 @@ fn regtest_tree_with_main() -> BlockTree {
     tree
 }
 
-/// A valid low-work multi-header stale-tip page defers below the floor
-/// instead of admitting past the minimum-work hold; a broken page needs
-/// direct admission so the fault is reported.
 #[test]
 fn low_work_stale_tip_page_defers_while_broken_page_admits() {
     let tree = regtest_tree_with_main();
@@ -205,8 +197,6 @@ fn low_work_stale_tip_page_defers_while_broken_page_admits() {
     let second = bitcoin_rs_chain::regtest_fixture::mined_regtest_header(first.compute_hash(), 102)
         .unwrap_or_else(|error| panic!("fixture mines: {error}"));
     let valid_page = [first, second];
-    // Below the floor with a known parent: the valid page is complete
-    // and well-linked, so it defers rather than bypassing the hold.
     assert!(
         sync.presync_anchor(&valid_page).is_some(),
         "the fixture page must sit below the raised floor"
@@ -215,11 +205,8 @@ fn low_work_stale_tip_page_defers_while_broken_page_admits() {
         !sync.body_carried_header_needs_admission(&valid_page),
         "a valid low-work stale-tip page must defer, not admit past the hold"
     );
-    // A broken page (unmet proof of work) needs admission to fault.
     let mut broken = valid_page;
     broken[1].nonce = broken[1].nonce.wrapping_add(1).wrapping_mul(7919);
-    // The grind above almost surely breaks the target; if it somehow
-    // still meets it, flip bits to force the failure deterministically.
     if bitcoin_rs_chain::validate_pow(
         &broken[1],
         Hash256::from(broken[1].compute_hash()),
@@ -235,14 +222,6 @@ fn low_work_stale_tip_page_defers_while_broken_page_admits() {
     );
 }
 
-/// A rejected batch whose valid prefix displaced the tip preserves the
-/// old tip through the drain's tip-movement wiring instead of losing it.
-///
-/// Drives a stale-tip-style batch (identified peer, non-wire) through
-/// `drain_inbound_headers`: the above-floor prefix moves the tip, the
-/// garbage tail rejects, and the retainer must hold the pre-batch tip.
-/// Deleting the drain's `Rejected -> record_demoted_tip` wiring leaves
-/// the retainer empty and fails this test.
 #[test]
 fn partial_prefix_rejection_preserves_demoted_tip() {
     let tree = regtest_tree_with_main();
@@ -295,21 +274,11 @@ fn partial_prefix_rejection_preserves_demoted_tip() {
     );
 }
 
-/// A body the compact path already owns is never direct-fetched twice:
-/// both drain branches gate on `owns_body_fetch`.
-///
-/// Drives a linear-extension announcement through
-/// `drain_inbound_headers` with the tip body pre-owned by the announcer:
-/// the drain must resolve the owned mark and send no `getdata` for it.
-/// A control announcement without ownership must fetch, proving the
-/// test exercises the real direct-fetch path. Deleting either drain
-/// guard turns the owned case into a fetch and fails.
 #[test]
 fn duplicate_fetch_skips_owned_body() {
     let tree = regtest_tree_with_main();
     let floor = ChainWork::from_be_bytes(Network::Regtest.minimum_chain_work());
     let (sync, peers, headers_tx) = routing_sync(tree, floor);
-    // Owned case: linear extension at height 3, pre-owned by announcer.
     let (source, rx) = connected_peer(&peers, 18446, 3);
     let tip = sync
         .chain
@@ -345,8 +314,6 @@ fn duplicate_fetch_skips_owned_body() {
         !saw_getdata,
         "the owned body must not be direct-fetched twice"
     );
-    // Control: a fresh announcement without ownership must fetch,
-    // proving this test drives the real direct-fetch path.
     let (control_source, control_rx) = connected_peer(&peers, 18447, 4);
     let tip = sync
         .chain

@@ -7,7 +7,6 @@ fn test_txid(n: u8) -> Txid {
     Txid(Hash256::from_le_bytes(&bytes))
 }
 
-/// A txid spread over more than 256 values, for the capacity test.
 fn wide_txid(n: u32) -> Txid {
     let mut bytes = [0_u8; 32];
     bytes[..4].copy_from_slice(&n.to_le_bytes());
@@ -95,7 +94,6 @@ fn skipped_height_jump_matches_sequential_empty_notifications() {
     );
 }
 
-/// Fresh arrivals must not be counted as failures.
 #[test]
 fn a_burst_of_fresh_arrivals_does_not_erase_a_good_estimate() {
     let mut est = FeeEstimator::new();
@@ -120,7 +118,6 @@ fn a_burst_of_fresh_arrivals_does_not_erase_a_good_estimate() {
     );
 }
 
-/// Re-announcing a transaction must not restart its clock.
 #[test]
 fn a_repeated_admission_keeps_the_original_entry_height() {
     let mut est = FeeEstimator::new();
@@ -137,7 +134,6 @@ fn a_repeated_admission_keeps_the_original_entry_height() {
     );
 }
 
-/// Departures must free capacity, or the estimator wedges.
 #[test]
 fn a_departure_frees_capacity_for_new_transactions() {
     let mut est = FeeEstimator::new();
@@ -165,7 +161,6 @@ fn a_departure_frees_capacity_for_new_transactions() {
     );
 }
 
-/// A confirmation after skipped heights must still record its misses.
 #[test]
 fn a_confirmation_after_skipped_heights_records_the_targets_it_missed() {
     let mut est = FeeEstimator::new();
@@ -192,7 +187,6 @@ fn a_confirmation_after_skipped_heights_records_the_targets_it_missed() {
     );
 }
 
-/// Decay models elapsed blocks, so one height decays once.
 #[test]
 fn a_repeated_height_notification_decays_the_history_once() {
     let mut once = FeeEstimator::new();
@@ -220,7 +214,6 @@ fn a_repeated_height_notification_decays_the_history_once() {
     );
 }
 
-/// A target resolves once, even if the same height is processed twice.
 #[test]
 fn a_target_resolves_once_when_a_height_is_processed_twice() {
     let bucket_index = {
@@ -308,7 +301,6 @@ fn decay_reduces_influence_of_old_data() {
     );
 }
 
-/// Sums every recorded success across all buckets and targets.
 fn total_confirmations(est: &FeeEstimator) -> f64 {
     est.buckets
         .iter()
@@ -367,8 +359,6 @@ fn confirmation_at_a_new_height_after_a_disconnect_records_exactly_once() {
     );
 }
 
-/// A confirmation at or below the high-water height records the
-/// observation without advancing or re-decaying the estimator.
 #[test]
 fn non_advancing_height_confirmation_records_without_decay() {
     for (case, tag, height) in [
@@ -429,8 +419,6 @@ fn history_encoding_is_deterministic() {
     assert_eq!(est.to_history_bytes(), est.to_history_bytes());
 }
 
-/// Every payload shape the version-1 decoder must refuse. Offsets follow
-/// the layout magic(8) version(4) height-flag(1) bucket-count(4) buckets.
 #[test]
 fn history_rejects_every_corrupt_payload_shape() {
     let base = FeeEstimator::new().to_history_bytes();

@@ -168,8 +168,6 @@ fn headers_spurious_wakes_and_other_chainstates_do_not_change_active_tip() {
         TipWaitCondition::Changed(Some(genesis.hash)),
         Arc::new(AtomicBool::new(false)),
     );
-    // This is the private registration proof that the black-box header
-    // response comparison cannot observe through the public RPC surface.
     let deadline = Instant::now() + Duration::from_secs(2);
     while owner.tip_notification.changed.notify_all() == 0 {
         assert!(Instant::now() < deadline, "waiter must park before headers");
@@ -344,7 +342,6 @@ fn omitted_current_tip_captures_after_an_in_flight_transition() {
     let second_payload = BlockPayload::from_local(second);
     transition.connect(&second_payload).expect("second");
     drop(transition);
-    // Notify is only a test observation of parking, not publication.
     let deadline = Instant::now() + Duration::from_secs(1);
     while owner.tip_notification.changed.notify_all() == 0 {
         assert!(Instant::now() < deadline, "waiter must capture then park");

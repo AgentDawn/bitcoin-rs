@@ -17,10 +17,6 @@ use crate::error::RpcError;
 use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_index::block_log::BlockRecord;
 
-/// Minimal one-coinbase-tx fixture block standing in for the chain genesis.
-///
-/// Identity is self-consistent via `block_hash()`; with a single transaction
-/// the merkle root is its txid, matching consensus layering.
 fn fixture_genesis() -> Block {
     use bitcoin_rs_primitives::{Amount, CompactTarget, LockTime, Script, Sequence, Witness};
     let coinbase = Tx {
@@ -208,8 +204,6 @@ fn getrawtransaction_explicit_coinbase_preserves_undo_failures_and_render_budget
         2,
         block.block_hash().to_string()
     ]);
-    // No body reader is installed: detailed reads must go directly to the
-    // bounded owner, and must not fall back after its typed refusal.
     let retry: fn() -> BlockSpendsError = || BlockSpendsError::Retry;
     for (failure, code) in [
         (retry, -1),
@@ -233,9 +227,6 @@ fn getrawtransaction_explicit_coinbase_preserves_undo_failures_and_render_budget
                 .code(),
             code
         );
-        // The requested coinbase needs no prevouts, but explicit v2
-        // authenticates the entire block/undo. Even with its body
-        // readable, an undo failure for the block must remain visible.
         attach_body_for_block(Arc::get_mut(&mut ctx).expect("unique context"), &block, 0);
         for verbosity in [json!(1), json!(true)] {
             let value = getrawtransaction(
@@ -298,8 +289,8 @@ fn getrawtransaction_detailed_read_omits_unavailable_undo_and_rejects_partial_ro
             let spent = match self.mode {
                 0 => Err(HistoryUnavailable::Missing),
                 1 => Err(HistoryUnavailable::Pruned { below: 1 }),
-                2 => Ok(vec![vec![]]), // Missing the spend's row is not omission.
-                _ => Ok(vec![vec![], vec![]]), // Nor is a partial input row.
+                2 => Ok(vec![vec![]]),
+                _ => Ok(vec![vec![], vec![]]),
             };
             Ok(BlockSpends {
                 block: self.block.clone(),
@@ -343,10 +334,6 @@ fn getrawtransaction_detailed_read_omits_unavailable_undo_and_rejects_partial_ro
 
 #[test]
 fn getrawtransaction_uses_applied_ancestry_for_explicit_block_metadata() {
-    // API-02 / Core 31.1 rawtransaction.cpp (pinned source
-    // 9be056a8a72b624dae9623b2f7bded92c2a21c91, TxToJSON): a retained
-    // inactive block has zero confirmations and no time fields. Header
-    // validity, height, or body availability alone cannot confirm it.
     let genesis = distinct_block(1);
     let mut sibling = distinct_block(2);
     sibling.header.prev_blockhash = genesis.block_hash();
@@ -724,9 +711,6 @@ fn gettxoutproof_with_blockhash_reports_pruned_body_for_a_header_only_block() {
     ));
 }
 
-/// Builds a block distinguishable from the blocks of other markers: the
-/// coinbase script makes the txid differ, and the merkle root is recomputed
-/// so `verifytxoutproof` can still extract matches from a proof over it.
 fn distinct_block(marker: u8) -> Block {
     use bitcoin_rs_primitives::Script;
     let mut block = fixture_genesis();
@@ -738,13 +722,9 @@ fn distinct_block(marker: u8) -> Block {
     block
 }
 
-/// Adds a second transaction so one block can hold two wanted txids.
 fn block_with_two_txs(marker: u8) -> Block {
     use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
     let mut block = distinct_block(marker);
-    // The extra tx must carry at least one input: the gettxoutproof path
-    // round-trips block bytes through the sanctioned rust-bitcoin
-    // MerkleBlock seam, whose decoder rejects input-less transactions.
     let extra = Tx {
         version: 2,
         lock_time: LockTime::ZERO,
@@ -765,12 +745,6 @@ fn block_with_two_txs(marker: u8) -> Block {
     block
 }
 
-/// Stands in for the txindex, answering only the query these tests are about.
-///
-/// `gettxoutproof` calls nothing else on `DerivedIndexQuery`, so the other three
-/// methods answer emptily and every probe behaviour these tests need — a
-/// fixed height, a selective one, an error, a panic, a counter — is the
-/// closure rather than another stub type.
 struct HeightQuery<F>(F);
 
 impl<F> DerivedIndexQuery for HeightQuery<F>
@@ -797,7 +771,6 @@ where
     }
 }
 
-/// Resolves only the txids it was told about, so a probe can be made to miss.
 fn resolving(resolvable: Vec<(Txid, u32)>) -> impl Fn(&Txid) -> Result<Option<u32>, TxQueryError> {
     move |txid| {
         Ok(resolvable
@@ -882,8 +855,6 @@ fn proof_for(ctx: &Arc<Context>, txids: &[Txid]) -> Result<sonic_rs::Value, RpcE
 #[test]
 
 fn gettxoutproof_index_path_does_not_read_unrelated_block_bodies() {
-    // Records without a body force a `BlockBodySource` read, so a scan over
-    // them panics; only skipping them entirely keeps this test green.
     let block = distinct_block(3);
     let Some(wanted) = block.txs.first().map(Tx::txid) else {
         panic!("block has no transactions");
@@ -936,9 +907,6 @@ fn gettxoutproof_falls_back_to_the_scan_when_the_index_cannot_answer() {
 
 #[test]
 fn gettxoutproof_falls_back_when_the_indexed_block_lacks_some_wanted_txids() {
-    // The candidate block holds one wanted txid; only the second block holds
-    // both. A block chosen from a single txid is a candidate, not a verdict,
-    // so pointing the index at the wrong one must still produce the proof.
     let both = block_with_two_txs(9);
     let blocks = [distinct_block(1), both.clone()];
     let wanted = both.txs.iter().map(Tx::txid).collect::<Vec<_>>();
@@ -1016,10 +984,6 @@ fn gettxoutproof_index_path_answers_for_several_txids_in_one_block() {
 
 #[test]
 fn gettxoutproof_probes_every_txid_before_giving_up_on_the_index() {
-    // `wanted` is a HashSet, so which txid is probed first is whatever the
-    // hasher yields. Making only the *second*-added txid resolvable pins that
-    // an unresolvable probe does not by itself drop the call into the scan —
-    // the scan here would panic.
     let block = block_with_two_txs(12);
     let wanted = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
     let Some(only_one) = wanted.last().copied() else {
@@ -1051,14 +1015,6 @@ fn gettxoutproof_probes_every_txid_before_giving_up_on_the_index() {
 
 #[test]
 fn gettxoutproof_falls_back_to_the_scan_when_the_index_errors() {
-    // Before this path existed, a broken txindex could not fail this call and
-    // the scan answered it. An optimization must not turn a working call into
-    // an error.
-    //
-    // Every variant, not just the interesting-looking ones. `Retry` is the
-    // one that matters most: the index reconciles asynchronously, so it is
-    // the *routine* answer while the index catches up, and it must not
-    // refuse a call the scan can answer today.
     for error in [
         TxQueryError::Retry,
         TxQueryError::Unavailable(TxUnavailableCause::Other("worker stopped".into())),
@@ -1082,9 +1038,6 @@ fn gettxoutproof_falls_back_to_the_scan_when_the_index_errors() {
 
         let result = proof_for(&ctx, &[wanted]);
 
-        // Comparing against the scan's answer, not merely asserting that
-        // *some* string came back: a failing index must not get to decide
-        // what the answer is, only that it is not the one supplying it.
         assert_eq!(
             result.as_ref().ok().and_then(|value| value.as_str()),
             scanned.as_str(),
@@ -1096,8 +1049,6 @@ fn gettxoutproof_falls_back_to_the_scan_when_the_index_errors() {
 
 #[test]
 fn gettxoutproof_with_blockhash_never_consults_the_index() {
-    // The explicit-blockhash path is unchanged by this work, and an index
-    // that panics on use proves it stays that way.
     let block = distinct_block(4);
     let Some(wanted) = block.txs.first().map(Tx::txid) else {
         panic!("block has no transactions");
@@ -1127,12 +1078,6 @@ fn gettxoutproof_with_blockhash_never_consults_the_index() {
     );
 }
 
-/// Counts probes so the loop can be pinned deterministically.
-///
-/// `probes_every_txid_before_giving_up_on_the_index` pins the *outcome*, but
-/// only probabilistically: `wanted` is a `HashSet`, so a one-probe
-/// implementation happens to pick the resolvable txid about half the time.
-/// Resolving nothing and counting instead is deterministic.
 #[test]
 fn gettxoutproof_asks_the_index_about_every_wanted_txid() {
     let block = block_with_two_txs(13);
@@ -1148,7 +1093,6 @@ fn gettxoutproof_asks_the_index_about_every_wanted_txid() {
     install_blocks(&mut ctx, std::slice::from_ref(&block));
     let ctx = Arc::new(ctx);
 
-    // Resolves nothing, so this falls through to the scan and still answers.
     let result = proof_for(&ctx, &wanted);
     assert!(
         result.as_ref().is_ok_and(|value| value.as_str().is_some()),
@@ -1162,14 +1106,6 @@ fn gettxoutproof_asks_the_index_about_every_wanted_txid() {
     );
 }
 
-/// Pins that a candidate block failing verification does not end the walk.
-///
-/// `falls_back_when_the_indexed_block_lacks_some_wanted_txids` pins the
-/// outcome, but its index answers the same height for every probe, so
-/// "keeps probing after a failed candidate" and "gives up on the first
-/// candidate" reach the same place: the fallback scan, which answers either
-/// way. Counting probes separates them — a walk that returns whatever the
-/// first candidate produced asks exactly once.
 #[test]
 fn gettxoutproof_keeps_probing_after_a_candidate_block_fails_verification() {
     let block = block_with_two_txs(14);
@@ -1177,8 +1113,6 @@ fn gettxoutproof_keeps_probing_after_a_candidate_block_fails_verification() {
     let probes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
 
     let counter = Arc::clone(&probes);
-    // Every probe names height 0, whose block holds none of the wanted
-    // txids, so every candidate fails verification.
     let mut ctx = Context::new();
     ctx.indexes.derived_index = Some(Arc::new(HeightQuery(move |_: &Txid| {
         counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1200,14 +1134,6 @@ fn gettxoutproof_keeps_probing_after_a_candidate_block_fails_verification() {
     );
 }
 
-/// Pins that the block-record lock is released before each body load.
-///
-/// The scan reads a block body from disk per record. Holding the log's
-/// `RwLock` across that would stall block application for the whole scan,
-/// and cloning the log to avoid it copies every record on the chain — about
-/// 160 MB at a mainnet tip. The walk does neither, and this proves it: the
-/// body source tries to take the write lock, which can only succeed if the
-/// scan is not holding a read guard.
 #[test]
 fn scan_does_not_hold_the_block_log_lock_across_a_body_load() {
     struct LockProbeSource {
@@ -1254,7 +1180,6 @@ fn scan_does_not_hold_the_block_log_lock_across_a_body_load() {
     }));
     let ctx = Arc::new(ctx);
 
-    // Body-less records, so every body must come from the source above.
     for (height, block) in blocks.iter().enumerate() {
         let height = u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}"));
         let hash = block.block_hash();
@@ -1269,10 +1194,6 @@ fn scan_does_not_hold_the_block_log_lock_across_a_body_load() {
     );
 }
 
-/// `P2WSH(OP_TRUE)`: a version-0 push-32 program whose witness script is a
-/// bare `OP_TRUE`. It is a standard output template, and spendable by a
-/// one-item `[OP_TRUE]` witness, so the retry fixtures chain parent and
-/// child generations without signature material.
 fn retry_spendable_script() -> Vec<u8> {
     let mut script = vec![0x00, 0x20];
     script.extend_from_slice(&[
@@ -1283,7 +1204,6 @@ fn retry_spendable_script() -> Vec<u8> {
     script
 }
 
-/// Funds a UTXO in the context's UTXO set and returns the outpoint.
 fn retry_fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
     use bitcoin_rs_primitives::{Amount, Script};
     let mut changes = BlockChanges::default();
@@ -1305,7 +1225,6 @@ fn retry_fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
     OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0)
 }
 
-/// One-input one-output tx spending `prevout` with `output_value` sats.
 fn retry_tx(prevout: OutPoint, output_value: u64) -> Tx {
     use bitcoin_rs_primitives::{Amount, LockTime, Script, Sequence, Witness};
     Tx {
@@ -1324,27 +1243,15 @@ fn retry_tx(prevout: OutPoint, output_value: u64) -> Tx {
     }
 }
 
-/// Consensus hex for RPC submission.
 fn retry_raw_hex(tx: &Tx) -> String {
     consensus_bytes(tx).to_lower_hex_string()
 }
 
-/// Proves `sendrawtransaction` rebuilds admission context on retry: the
-/// first attempt captures context from a mempool state where the child's
-/// parent is absent (missing inputs), parks at the gateway seam, the test
-/// changes the chain generation (forcing `GenerationChanged`) and admits
-/// the parent, then releases the park. The retried attempt must observe
-/// the FRESH mempool state — the parent now provides the child's prevout —
-/// and succeed. If the context were reused from the first attempt (the
-/// r4c3 mutation), the stale `missing_inputs` flag would reject the child.
 #[test]
 fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection() {
     let ctx = Arc::new(Context::new());
     reset_admission_park();
 
-    // Parent spends a confirmed UTXO; child spends the parent's output.
-    // The parent output is NOT in the UTXO set, so the child's prevout is
-    // only available while the parent is in the mempool.
     let parent_prevout = retry_fund_utxo(&ctx, 0x70, 100_000);
     let parent = retry_tx(parent_prevout, 90_000);
     let parent_txid = parent.txid();
@@ -1353,10 +1260,6 @@ fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection() {
     let child_txid = child.txid();
     let child_hex = retry_raw_hex(&child);
 
-    // Provisional refusals reach this seam too, so retry must rebuild missing inputs.
-    // Arm the admission park gate: the first `admit_transaction` on this
-    // gateway will block before the write lock, signal `parked`, and wait
-    // for `release`.
     let (parked_tx, parked_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let target = Arc::as_ptr(&ctx.mempool.gateway).expose_provenance();
@@ -1367,15 +1270,10 @@ fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection() {
     let admission =
         thread::spawn(move || handler.dispatch("sendrawtransaction", &json!([child_hex])));
 
-    // Wait for the first attempt to park at the gateway seam.
     parked_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("first admission parked at the gateway seam");
 
-    // While the first attempt is parked (before the write lock, holding
-    // no guard), change the chain generation so the first attempt's
-    // captured generation token is stale, and admit the parent so the
-    // mempool sequence bumps and the parent's output is available.
     let guard = ctx_clone
         .mempool
         .gateway
@@ -1402,18 +1300,12 @@ fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection() {
         )
         .expect("parent admitted to the mempool");
 
-    // Release the park: the first attempt proceeds, sees the stale
-    // generation token, and returns `GenerationChanged` — retrying with
-    // fresh facts.
     release_tx.send(()).expect("release the parked admission");
 
     let result = admission.join().expect("admission thread did not panic");
 
     reset_admission_park();
 
-    // The retried admission must succeed: the parent is now in the
-    // mempool, the child's prevout is available, and the context was
-    // rebuilt from the fresh mempool state.
     let txid_str = result
         .as_ref()
         .map_err(|err| format!("sendrawtransaction failed: {err}"))
@@ -1429,12 +1321,10 @@ fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection() {
         "the retried admission must observe the fresh mempool state"
     );
 
-    // The child must be in the mempool.
     assert!(
         ctx.mempool.gateway.read().contains_txid(&child_txid),
         "the child must be pooled after successful retry"
     );
-    // The parent must still be in the mempool.
     assert!(
         ctx.mempool.gateway.read().contains_txid(&parent_txid),
         "the parent must remain pooled"

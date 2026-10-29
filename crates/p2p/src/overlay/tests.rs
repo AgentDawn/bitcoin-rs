@@ -50,7 +50,6 @@ fn socks_routes_onion_as_a_domain_and_preserves_stream_bytes() {
         let mut port = [0; 2];
         stream.read_exact(&mut port).expect("port");
         assert_eq!(u16::from_be_bytes(port), 8333);
-        // Fragmenting the reply must not lose framing; bound IP is transport metadata only.
         for byte in [5, 0, 0, 1, 127, 0, 0, 1, 0, 0] {
             stream.write_all(&[byte]).expect("reply");
         }
@@ -410,8 +409,6 @@ fn sam_session_recovery(invalid_id: bool) {
     let lease = crate::PeerLease::new(tx).with_transport_alive(connected.alive.clone());
     shared.peer_table.register(endpoint, lease.clone());
     assert!(!lease.is_cancelled());
-    // A shared network label is not epoch ownership. This lease carries a
-    // different marker and must survive both old-session recovery and shutdown.
     let (other_tx, _other_rx) = crossbeam_channel::unbounded();
     let independent =
         crate::PeerLease::new(other_tx).with_transport_alive(Some(Arc::new(AtomicBool::new(true))));

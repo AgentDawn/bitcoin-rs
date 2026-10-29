@@ -19,9 +19,6 @@ use crate::peer::{Peer, PeerState};
 
 const FAILSAFE: Duration = Duration::from_secs(5);
 
-// CONTRACT: docs/policies/p2p-compatibility.md#5-message-surface (a
-// handshake failure on a live lease surfaces its protocol error; only an
-// externally revoked lease is muted as a shutdown).
 #[test]
 fn inbound_handshake_failure_on_live_lease_returns_err() {
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
@@ -32,9 +29,6 @@ fn inbound_handshake_failure_on_live_lease_returns_err() {
     );
     let (mut client, server, peer_addr) = loopback_pair();
 
-    // A validly framed message with a foreign magic fails the handshake
-    // while the lease is fully live: nothing external revoked it. The
-    // revocation mask (remove_current cancels) must not swallow this.
     let mut frame = Vec::new();
     frame.extend_from_slice(&[0x00, 0x11, 0x22, 0x33]);
     frame.extend_from_slice(b"version\0\0\0\0\0");
@@ -144,9 +138,6 @@ fn sinks_stamp_exact_connection_source() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn send_block_forwards_the_blocks_header() -> Result<(), Box<dyn std::error::Error>> {
-    // Every inbound body carries its own header; `send_block` must also
-    // emit it through the headers sink so body-only announcements
-    // (`inv`-served, compact reconstruction, pushes) reach admission.
     let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
     let shared = test_shared(Arc::new(crate::PeerTable::new()), headers_tx, blocks_tx);
@@ -273,8 +264,6 @@ fn message_loop_exits_after_replacement_during_read() {
     assert!(table.is_current(replacement.source(Some(addr))));
 }
 
-/// Drives one scripted `sendcmpct` through the message loop on a fresh
-/// table and reports the published relay preference afterwards.
 fn sendcmpct_scenario(send_compact: bool, version: u64, port: u16) -> bool {
     let mut wire = Vec::new();
     crate::wire::write_message(
@@ -333,17 +322,12 @@ fn sendcmpct_scenario(send_compact: bool, version: u64, port: u16) -> bool {
 
 #[test]
 fn sendcmpct_raises_published_compact_relay_preference() {
-    // A post-verack sendcmpct announces BIP152 relay, with or without the
-    // high-bandwidth push preference: an inbound peer is never selected
-    // for push, and fetch eligibility must not depend on it.
     assert!(sendcmpct_scenario(true, 2, 18_448));
     assert!(sendcmpct_scenario(false, 2, 18_449));
     assert!(!sendcmpct_scenario(false, 1, 18_450));
     assert!(!sendcmpct_scenario(false, 7, 18_451));
 }
 
-/// Serves the scripted bytes, then ends the connection with a clean
-/// EOF so the message loop exits without the idle timeout.
 struct ScriptedEof(io::Cursor<Vec<u8>>);
 
 impl io::Read for ScriptedEof {
@@ -465,10 +449,6 @@ fn stale_release_preserves_replacement_and_current_release_removes_it() {
     assert!(table.is_empty());
 }
 
-/// Test-only writer that admits exactly `remaining` bytes, then blocks
-/// on a channel signal instead of an OS socket buffer; the unblock
-/// failure simulates what `stream.shutdown(Both)` does to a real
-/// `write_all` mid-write.
 struct BlockingTestWriter {
     remaining: Cell<usize>,
     unblock: crossbeam_channel::Receiver<()>,
@@ -496,8 +476,6 @@ impl io::Write for BlockingTestWriter {
     }
 }
 
-/// Test-only writer that accepts everything and emits one event after
-/// each `write` returns, so tests synchronize on writes without polling.
 struct EventWriter {
     events: crossbeam_channel::Sender<()>,
 }
@@ -513,7 +491,6 @@ impl io::Write for EventWriter {
     }
 }
 
-/// Serves one encoded message, then keeps the reader in the poll path.
 struct ScriptedStream {
     script: io::Cursor<Vec<u8>>,
 }
@@ -564,8 +541,6 @@ fn cancel_wakes_writer_blocked_on_empty_queue_with_live_senders() {
         let _ = done_tx.send(());
     });
 
-    // The queue is idle and a foreign lease clone keeps every sender
-    // alive; only the close signal can wake the writer.
     lease.cancel();
     done_rx
         .recv_timeout(FAILSAFE)
@@ -617,9 +592,6 @@ fn writer_mid_write_exits_on_unblock_deterministically() {
         let _ = done_tx.send(());
     });
 
-    // Five pings are queued as one control burst. Two full frames (64 B)
-    // succeed; the third header exceeds the remaining budget and the
-    // write blocks with the whole burst still owned by the writer.
     blocked_rx
         .recv_timeout(FAILSAFE)
         .expect("writer must exhaust its byte budget");
@@ -777,8 +749,6 @@ fn run_connected_session_publishes_peer_relay_preference_and_joins_writer() {
                 ),
                 Magic::BITCOIN,
             );
-            // Receiving wtxidrelay chooses outbound inventory; our own
-            // advertisement alone must not switch the remote preference.
             if peer_requested_wtxid {
                 peer.wtxid_relay.mark_peer_supported();
             }
@@ -787,9 +757,6 @@ fn run_connected_session_publishes_peer_relay_preference_and_joins_writer() {
             let _ = done_tx.send(result);
         });
 
-        // The external clone keeps the queue's senders alive for the whole
-        // call; only the teardown close signal lets the writer exit, so the
-        // session must still return under the failsafe.
         let result = done_rx
             .recv_timeout(FAILSAFE)
             .expect("session must return while an external lease clone is alive");
@@ -894,8 +861,6 @@ impl crate::TxInventory for RelayDuringInventoryLookup {
         use bitcoin::secp256k1::rand::SeedableRng as _;
         self.calls.fetch_add(1, Ordering::Relaxed);
         let mut rng = bitcoin::secp256k1::rand::rngs::StdRng::seed_from_u64(1484);
-        // Force the worker interleaving at the real dispatch callback,
-        // before dispatch returns, without a timing race or test hook.
         self.table
             .poll_transaction_relay(&self.gateway, self.due, false, &mut rng);
         self.lease.cancel();
@@ -1045,16 +1010,11 @@ fn message_loop_disconnects_saturated_peer() {
     );
     let addr = PeerEndpoint::from((Ipv4Addr::LOCALHOST, 18_447));
 
-    // The first Pong response takes the one-frame budget, so the second
-    // cannot be admitted and the saturation policy cancels the lease and
-    // ends the loop.
     let result = run_message_loop(&mut peer, addr, &lease, &shared, None);
     assert!(result.is_err(), "saturation must end the message loop");
     assert!(lease.is_cancelled());
 }
 
-/// Queues `messages` through a real lease, in order, and returns the lease
-/// (which owns the charges' budget) with the writer's receiver.
 fn queued(
     messages: &[crate::Message],
 ) -> (
@@ -1129,10 +1089,6 @@ fn collect_write_burst_emits_a_bulk_payload_alone() {
     ));
 }
 
-/// Frames still queued when the writer ends return their own charge and
-/// nothing else: a live reservation of the same connection and another
-/// connection's bytes stay charged, the dead writer refuses new work,
-/// and the reservation returns exactly when its owner drops it.
 #[test]
 fn queued_frames_release_on_writer_exit() {
     use crate::connection::{OutboundBudget, SharedOutboundBudget};

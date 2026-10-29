@@ -335,10 +335,6 @@ fn v2_transport_defaults_on_and_disables_from_every_surface() {
     }
 }
 
-/// Startup failure for `validation.engine = "kernel"` on a
-/// build without bitcoinkernel support. The engine selection is resolved
-/// and checked during configuration — before the data directory, chain
-/// state, or any worker is created — and must name the missing capability.
 #[test]
 #[cfg(not(feature = "kernel"))]
 fn validation_engine_kernel_is_rejected_without_kernel_support() {
@@ -472,7 +468,6 @@ fn cli_network_profile_precedes_cli_explicit_p2p_overrides() {
     assert!(!config.p2p.dns_seeds_enabled);
 }
 
-/// IDX-01: `--scriptindex` without a value means `full`.
 #[test]
 fn cli_scriptindex_flag_enables_full_index() {
     let config = resolved(&["bitcoin-rs", "--txindex=false", "--scriptindex"], &[]);
@@ -481,7 +476,6 @@ fn cli_scriptindex_flag_enables_full_index() {
     assert_eq!(config.indexes.script_index, ScriptIndexMode::Full);
 }
 
-/// IDX-01: `--scriptindex=utxo` enables `ScriptLive` only.
 #[test]
 fn cli_scriptindex_utxo_enables_live_only_index() {
     let config = resolved(

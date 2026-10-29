@@ -29,11 +29,6 @@ fn codec_keeps_canonical_metadata_and_zero_copy_script() -> Result<(), UtxoError
             u32::MAX,
         )],
     )?;
-    // Deliberately maxes both directory widths: `u32::MAX` in the vout and
-    // height costs 5 varint bytes each, where a real output pays 1 and
-    // 3. Even here the output representation is 15 metadata+script bytes.
-    //   varint(u32::MAX) = 5, varint(compress(42)) = 2,
-    //   varint(u32::MAX << 1 | 1) = 5, varint(2) = 1, script = 2
     assert_eq!(
         record.payload_bytes(),
         RECORD_HEADER_LEN + 15,
@@ -56,14 +51,12 @@ fn encoded_len_matches_the_bytes_written() -> Result<(), UtxoError> {
         OwnedUtxoOut::new(1, 1, vec![0x51], false, 1),
         OwnedUtxoOut::new(127, 100_000_000, vec![0x00; 22], true, 840_000),
         OwnedUtxoOut::new(128, 2_099_999_999_999_999, script.clone(), false, 1_048_576),
-        // Above the money supply: takes the raw amount escape.
         OwnedUtxoOut::new(u32::MAX, u64::MAX, script, true, u32::MAX),
     ];
     for case in cases {
         let payload = OutputParts::from_owned(&case).payload_len()?;
         let vout_width = width_for(u64::from(case.vout));
         let len_width = width_for(u64::try_from(payload).unwrap_or(u64::MAX));
-        // header || widths || one vout entry || one length entry || payload
         let expected = RECORD_HEADER_LEN + 1 + vout_width + len_width + payload;
         let record = UtxoRecord::from_owned_outputs(Hash256::default(), &[case])?;
         assert_eq!(
@@ -145,7 +138,6 @@ fn a_corrupt_encoded_record_is_refused() -> Result<(), UtxoError> {
         );
     }
 
-    // A length-directory entry claiming a payload past the buffer end.
     let mut lying_length = encoded;
     lying_length[len_dir] = 0xf0;
     assert!(matches!(
@@ -157,8 +149,6 @@ fn a_corrupt_encoded_record_is_refused() -> Result<(), UtxoError> {
 
 #[test]
 fn an_absurd_compressed_amount_is_rejected_rather_than_overflowing() {
-    // `varint(u64::MAX - 1)`: ten bytes, and not the escape sentinel, so it
-    // reaches the amount transform.
     let mut payload = vec![0xFE_u8];
     payload.extend_from_slice(&[0xFF; 8]);
     payload.push(0x01);
@@ -178,14 +168,8 @@ fn an_absurd_compressed_amount_is_rejected_rather_than_overflowing() {
     ));
 }
 
-/// v5 has no invalid bool byte — `coinbase` is one bit of a varint, so
-/// every value is meaningful. What it has instead is several ways to spell
-/// one output, and all of them must be refused: `UtxoRecord` compares by
-/// bytes, so a second spelling makes equal records unequal.
 #[test]
 fn non_canonical_v5_spellings_are_rejected() {
-    // Assembles a one-output record: `header || widths || vout_dir ||
-    // len_dir || payload`.
     fn record(vout_width: usize, len_width: usize, vout: u64, payload: &[u8]) -> Vec<u8> {
         let mut bytes = Hash256::default().to_le_bytes().to_vec();
         bytes.extend_from_slice(&1_u32.to_le_bytes());
@@ -206,14 +190,12 @@ fn non_canonical_v5_spellings_are_rejected() {
         "the canonical spelling must decode"
     );
 
-    // The amount as a two-byte spelling of one.
     let non_minimal = record(1, 1, 0, &[0x81, 0x00, 0x02, 0x51, 0xAC]);
     assert!(matches!(
         UtxoRecord::from_encoded(non_minimal.into_boxed_slice()),
         Err(UtxoError::CorruptRecord)
     ));
 
-    // The escape used for a value the compact form already covers.
     let mut escaped = [0xFF_u8; 9].to_vec();
     escaped.push(0x01);
     escaped.extend_from_slice(&1_u64.to_le_bytes());
@@ -223,9 +205,6 @@ fn non_canonical_v5_spellings_are_rejected() {
         Err(UtxoError::CorruptRecord)
     ));
 
-    // Directories wider than this record needs. This spelling is what the
-    // fixed-width layout introduced, and the reason the widths are
-    // validated on decode rather than merely read.
     for (vout_width, len_width) in [(2, 1), (1, 2), (4, 4)] {
         let wide = record(vout_width, len_width, 0, &[0x01, 0x02, 0x51, 0xAC]);
         assert!(
@@ -237,7 +216,6 @@ fn non_canonical_v5_spellings_are_rejected() {
         );
     }
 
-    // A script longer than the `u16` payload ceiling.
     let mut oversize = vec![0x01, 0x02];
     oversize.extend_from_slice(&vec![0x51; 65_536]);
     assert!(matches!(
@@ -276,18 +254,13 @@ fn deep_clone_is_independent_and_byte_equal() -> Result<(), UtxoError> {
     )?;
     let clone = record.clone();
     assert_eq!(clone, record);
-    // Clones own a distinct payload; no slack survives the copy.
     assert_eq!(clone.payload_bytes(), record.payload_bytes());
-    // Dropping the source must leave the clone fully valid; Miri verifies the
-    // allocations are independent.
     drop(record);
     assert_eq!(clone.output_count(), 2);
     assert!(clone.find_output(1).is_some());
     Ok(())
 }
 
-/// A record with no outputs is a real encoding (a fully-spent
-/// transaction); every accessor on it must stay empty-shaped.
 #[test]
 fn an_outputless_record_decodes_and_reports_empty() -> Result<(), UtxoError> {
     let record = UtxoRecord::from_owned_outputs(Hash256::default(), &[])?;
@@ -298,7 +271,6 @@ fn an_outputless_record_decodes_and_reports_empty() -> Result<(), UtxoError> {
     assert_eq!(record.outputs().len(), 0);
     let decoded = UtxoRecord::from_encoded(record.buf.clone())?;
     assert_eq!(decoded, record);
-    // Removing nothing from nothing is an exact cover of an empty set.
     let mut removed = Vec::new();
     assert!(matches!(
         record.remove_run_replacement(&[], Some(&mut removed))?,
@@ -308,10 +280,6 @@ fn an_outputless_record_decodes_and_reports_empty() -> Result<(), UtxoError> {
     Ok(())
 }
 
-/// Every removal outcome for one live record: which requests leave it
-/// unchanged, which replace it, which empty it, and what each materializes
-/// into the sink — in request order, with a `None` hole for every vout the
-/// record does not hold and no phantom removal ever fabricated.
 #[test]
 fn removal_outcome_and_materialization_follow_the_request() -> Result<(), UtxoError> {
     type Case = (&'static [u32], Outcome, &'static [Option<u32>]);
@@ -356,8 +324,6 @@ fn removal_outcome_and_materialization_follow_the_request() -> Result<(), UtxoEr
         let outcome = match record.remove_run_replacement(request, Some(&mut removed))? {
             RemovedRecord::Unchanged => Outcome::Unchanged,
             RemovedRecord::Replaced(replacement) => {
-                // Survivors as a set: the replacement's iteration order is
-                // the partition's, not the vout order.
                 let mut survivors: Vec<u32> = replacement.outputs().map(|out| out.vout).collect();
                 survivors.sort_unstable();
                 Outcome::Replaced(survivors)
@@ -380,7 +346,6 @@ fn removal_outcome_and_materialization_follow_the_request() -> Result<(), UtxoEr
                 "materialized payload for {request:?}"
             );
         }
-        // The sink is optional and must not change the outcome.
         let without_sink = record.remove_run_replacement(request, None)?;
         assert_eq!(
             matches!(without_sink, RemovedRecord::Emptied),
@@ -391,11 +356,6 @@ fn removal_outcome_and_materialization_follow_the_request() -> Result<(), UtxoEr
     Ok(())
 }
 
-/// `edit_replacement` fuses one removal run with one add run. The
-/// uniqueness score is taken against the *pre-removal* max, so an addition
-/// below it, a full removal, and a re-add of a removed vout each have to
-/// rebuild rather than append — and the survivors must be exactly the
-/// union, with the addition carrying its new payload.
 #[test]
 fn edit_replacement_fuses_removals_and_additions() -> Result<(), UtxoError> {
     type Addition = (u32, u64, &'static [u8], bool);
@@ -462,7 +422,6 @@ fn edit_replacement_fuses_removals_and_additions() -> Result<(), UtxoError> {
         assert_eq!(added.coinbase, coinbase, "{name}: coinbase");
     }
 
-    // An add-only edit must stay byte-equal to the staged add path.
     let record = UtxoRecord::from_owned_outputs(
         Hash256::default(),
         &[output(0, &[0x50], 5), output(1, &[0x51], 6)],
@@ -478,9 +437,6 @@ fn edit_replacement_fuses_removals_and_additions() -> Result<(), UtxoError> {
     Ok(())
 }
 
-/// Removing an inline output leaves `inline_len` below both the count and
-/// the partition capacity, where appends would have to rewrite the
-/// partition; the run must fall back to a rebuild and stay correct.
 #[test]
 fn add_with_an_unsaturated_inline_partition_falls_back_to_rebuild() -> Result<(), UtxoError> {
     let nine: Vec<OwnedUtxoOut> = (0..9)
@@ -508,8 +464,6 @@ fn add_with_an_unsaturated_inline_partition_falls_back_to_rebuild() -> Result<()
     Ok(())
 }
 
-/// The fast-path guard itself: equal or decreasing vouts fail, strictly
-/// increasing runs after any seed pass.
 #[test]
 fn the_unique_add_guard_rejects_equal_and_decreasing_vouts() {
     assert!(vouts_are_strictly_increasing(None, [0]));
@@ -520,10 +474,6 @@ fn the_unique_add_guard_rejects_equal_and_decreasing_vouts() {
     assert!(!vouts_are_strictly_increasing(None, [3, 1]));
 }
 
-// --- violation tests: state ---
-
-/// The record's boxed byte slice makes it `Send`/`Sync`: the sole owner
-/// may cross a thread boundary and stay decodable.
 #[test]
 fn a_record_moved_across_threads_stays_decodable() -> Result<(), UtxoError> {
     let record = UtxoRecord::from_owned_outputs(
@@ -576,10 +526,6 @@ fn records_at_the_inline_partition_boundary_iterate_exactly() -> Result<(), Utxo
     Ok(())
 }
 
-/// A failed non-unique add must leave the caller's overwrite sink
-/// untouched: the events are staged locally and reach the sink only after
-/// the replacement encodes. The oversized script fails the encode after
-/// the duplicate vout has already been merged.
 #[test]
 fn failed_non_unique_add_leaves_the_overwrite_sink_untouched() -> Result<(), UtxoError> {
     let existing = output(0, &[0x51], 10);

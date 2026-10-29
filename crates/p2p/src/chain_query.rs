@@ -1,8 +1,4 @@
 //! Active-chain header walks and hash-addressed block serving.
-//!
-//! Locator interpretation, header-walk policy, and inventory serving live
-//! here. [`BlockTree`] answers active-chain identity; [`BlockBodySource`]
-//! supplies bodies.
 
 use crate::inv::native_block_hash;
 
@@ -32,53 +28,37 @@ use crate::staletip::{
 };
 use crate::wire::{Message, PeerError};
 
-/// Depth from the active tip for which a `getdata` of a block is still worth
-/// answering with a `cmpctblock`.
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 
-/// Depth from the active tip for which a `getblocktxn` is still answered with a
-/// `blocktxn`.
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
 
-/// Core 31.1 `BlockRequestAllowed`: stale-block fingerprinting bound, in seconds.
 const STALE_RELAY_AGE_LIMIT: u32 = 30 * 24 * 60 * 60;
 
 #[derive(Clone, Copy)]
 enum ServingPolicy {
-    /// Unsolicited announcements must still name the applied, selected chain.
     Announcement,
-    /// Full/compact inventory replies, including deep getblocktxn fallback.
     Inventory,
-    /// Shallow getblocktxn uses stored data without the stale-age gate in Core.
     BlockTransactions,
 }
 
 type HeldBlock = (Hash256, Arc<Block>);
 
-/// Holds the block body from the most recent early-announcement attempt.
-///
-/// The query serves `getblocktxn` and compact `getdata` from this body
-/// before the store has it. Each attempt replaces the body. A failed
-/// connect does not clear it, as with Core's `m_most_recent_block`.
 #[derive(Clone, Default)]
 pub struct RecentBlockSlot {
     inner: Arc<Mutex<Option<HeldBlock>>>,
 }
 
 impl RecentBlockSlot {
-    /// Holds `block` under `hash`, replacing the previous body.
     pub fn store(&self, hash: Hash256, block: Arc<Block>) {
         *self.inner.lock() = Some((hash, block));
     }
 
-    /// The held body when the most recent early send was `hash`.
     #[must_use]
     pub fn load(&self) -> Option<(Hash256, Arc<Block>)> {
         self.inner.lock().clone()
     }
 }
 
-/// Read-only active-chain view for P2P `getheaders` / `getdata`.
 #[derive(Clone)]
 pub struct ActiveChainQuery {
     block_tree: BlockTreeReader,
@@ -90,15 +70,6 @@ pub struct ActiveChainQuery {
 }
 
 impl ActiveChainQuery {
-    /// Builds a P2P chain query view over shared active-chain state of one
-    /// network.
-    ///
-    /// PRE: `block_tree` holds only headers of `network`, and `applied_tip`
-    ///   publishes the chain owner's fully-applied tip.
-    /// POST: returns the view; serving queries refuse below the network's
-    ///   minimum chain work, and tip-age reads (`best_block_time`) report
-    ///   the applied tip, never a fresher-but-unapplied header.
-    /// INVARIANT: the view's network never changes after construction.
     #[must_use]
     pub fn new(block_tree: BlockTreeReader, applied_tip: TipReader, network: Network) -> Self {
         Self {
@@ -111,14 +82,12 @@ impl ActiveChainQuery {
         }
     }
 
-    /// Returns `self` with a durable body source for metadata-only headers.
     #[must_use]
     pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
         self.block_body_source = Some(source);
         self
     }
 
-    /// Attaches the existing optional derived-index query owner.
     #[must_use]
     pub fn with_compact_filters(
         mut self,
@@ -128,20 +97,12 @@ impl ActiveChainQuery {
         self
     }
 
-    /// Attaches the early-announce body rendezvous so `getblocktxn` and
-    /// compact `getdata` for the most recently announced hash answer from
-    /// the held body before the store carries it.
     #[must_use]
     pub fn with_recent_block(mut self, recent: RecentBlockSlot) -> Self {
         self.recent = recent;
         self
     }
 
-    /// Resolve a hash against one tree view and the applied frontier. Header
-    /// selection alone is not evidence of body validation. Off-chain inventory
-    /// replies require a count recorded by application (or authenticated restore)
-    /// and Core's timestamp/proof-equivalent age checks. Shallow getblocktxn
-    /// follows Core's `HAVE_DATA` path; the body source proves data availability.
     fn serving_position(&self, hash: BlockHash, policy: ServingPolicy) -> Option<(u32, u32)> {
         let tree = self.block_tree.read();
         let tip = self.applied_tip.load_full()?;
@@ -174,10 +135,6 @@ impl ActiveChainQuery {
         allowed.then_some((tip.height, node.height))
     }
 
-    /// Load the exact (height, hash) body outside the tree lock, validate its
-    /// encoding and hash, then recheck eligibility and applied depth. A reorg
-    /// may retain a servable stale block; removal, invalidation or aging out
-    /// during I/O must still refuse it. Announcements remain active-only.
     fn load_block(
         &self,
         height: u32,
@@ -221,7 +178,6 @@ impl ActiveChainQuery {
         (current_height == height).then(|| (bytes::Bytes::from(bytes), tip_height))
     }
 
-    /// The stored body as a `block` payload, witnesses retained.
     fn full_block_response(
         &self,
         height: u32,
@@ -232,8 +188,6 @@ impl ActiveChainQuery {
             .map(|(body, _)| Message::BlockPayload(body))
     }
 
-    /// The held early-announced body for `hash`, when the most recent early
-    /// send was this block.
     fn recent_body(&self, hash: BlockHash) -> Option<Arc<Block>> {
         let (slot_hash, body) = self.recent.load()?;
         (BlockHash::from(slot_hash) == hash).then_some(body)
@@ -268,9 +222,7 @@ impl ActiveChainQuery {
         false
     }
 
-    /// One `blocktxn` reply from consensus-encoded body bytes under the
     /// peer's servable BIP152 profile. Shared by the stored path and the
-    /// held early-announced body.
     fn blocktxn_message(
         payload: &[u8],
         request: &BlockTransactionsRequest,
@@ -329,17 +281,11 @@ impl ChainQuery for ActiveChainQuery {
             return Ok(FilterServing::Done);
         }
         let stop_hash = Hash256::from_le_bytes(stop.as_byte_array());
-        // Filters follow validated, applied blocks even while a competing
-        // headers-only branch leads. The index query rechecks its snapshot.
         let end = self.applied_tip.load_full().and_then(|tip| {
             self.block_tree
                 .read()
                 .active_height_of(tip.tip_id, stop_hash)
         });
-        // A resumed remainder continues the range whose prefix was already
-        // sent. If the stop hash no longer ends at the same height (a reorg,
-        // or a stop hash that left the active chain) the rest cannot be
-        // spliced onto that prefix: the range is interrupted for good.
         if let Some(expected_end) = pending.expected_end
             && end != Some(expected_end)
         {
@@ -389,13 +335,6 @@ impl ChainQuery for ActiveChainQuery {
         if let Some(error) = send_error {
             return Err(error);
         }
-        // Never replay a sent prefix or silently abandon its tail. A halt at
-        // the outbound gate after a prefix was sent is not an interruption:
-        // the remainder starts after the prefix, keeps the end the prefix was
-        // computed against, and resumes without repeating anything sent. Only
-        // a range that stopped short without a halt is interrupted for good.
-        // A completed range remains complete even if the final snapshot check
-        // reports Retry.
         if emitted > 0 && halted {
             return Ok(FilterServing::Pending(FilterRequest {
                 request: Message::GetCFilters(GetCFilters {
@@ -415,12 +354,6 @@ impl ChainQuery for ActiveChainQuery {
         {
             return Ok(FilterServing::Pending(pending.clone()));
         }
-        // A resumed remainder has already sent a prefix of the range, so a
-        // pass that stops before its first filter for any reason other than
-        // backpressure or a snapshot retry (the index no longer answers, a
-        // storage error, or the tip moved under the snapshot) abandons the
-        // tail: the range is interrupted for good. A first attempt keeps
-        // BIP157's no-answer behavior below.
         if emitted == 0 && pending.expected_end.is_some() {
             return Err(PeerError::Io(std::io::Error::other(
                 "compact filter range interrupted",
@@ -451,12 +384,6 @@ impl ChainQuery for ActiveChainQuery {
         stop_hash: BlockHash,
         limit: usize,
     ) -> Vec<Header> {
-        // Locator-based replies follow the applied chain, not the header-best
-        // chain: Core only serves validated headers, and during a reorg the
-        // applied tip may sit off best while bodies catch up. The snapshot is
-        // validated under the tree lock; on mismatch return empty, never fall
-        // back to header-best traversal. The empty-locator single-header
-        // direct lookup stays on the header-best chain, unchanged.
         if limit == 0 {
             return Vec::new();
         }
@@ -515,11 +442,6 @@ impl ChainQuery for ActiveChainQuery {
         headers
     }
 
-    /// The applied tip's header time. Limited-peer admission derives the
-    /// local depth from it, so it must read the fully-applied tip the
-    /// download policy serves, not the header tip: fresh-but-unapplied
-    /// headers would make a lagging node look current and admit
-    /// `NODE_NETWORK_LIMITED` peers it cannot download bodies from.
     fn best_block_time(&self) -> Option<u32> {
         let tip = self.applied_tip.load_full()?;
         let tree = self.block_tree.read();
@@ -571,11 +493,6 @@ impl ChainQuery for ActiveChainQuery {
             let Some((tip_height, height)) =
                 self.serving_position(request.hash(), ServingPolicy::Inventory)
             else {
-                // A pre-commit announcement has no serving position yet: the
-                // tree names no applied height and no chain count exists. Its
-                // held body still answers compact requests, under the same
-                // headroom gate as every other serve. Full requests stay
-                // not-found: only the compact race may use the held body.
                 if let BlockRequest::Compact(hash) = request
                     && let Some(version) = compact_version
                     && let Some(body) = self.recent_body(hash)
@@ -607,24 +524,7 @@ impl ChainQuery for ActiveChainQuery {
         Ok(outcome)
     }
 
-    /// PRE: `request` carries decoded absolute, strictly increasing
-    /// transaction indexes for one block. `compact_version` is the peer's
     /// servable BIP152 profile.
-    /// POST: the held most-recent early-announced body answers its indexed
-    /// transactions first, before any depth or eligibility check (Core 31.1
-    /// `net_processing.cpp:4342-4351` serves its most-recent block the same
-    /// way). Disk-backed and deep requests use the fallback instead: the
-    /// `blocktxn` reply for a block within `MAX_BLOCKTXN_DEPTH` of the
-    /// active tip, encoded for `compact_version` (v1 strips witnesses, any
-    /// other profile keeps them), the whole witness-bearing `block` for a
-    /// deeper one, and `None` for a block this node cannot serve or while
-    /// the `headroom` gate is saturated; `Err` reports an index past the end
-    /// of the body.
-    /// INVARIANT: deep requests use full-block inventory policy, including
-    /// stale-block age/validation restrictions; shallow stored stale blocks
-    /// remain reconstructible (Core 31.1 `net_processing.cpp:4333-4391`).
-    /// `headroom` is evaluated immediately before loading, so a saturated
-    /// gate materializes no body.
     fn block_transactions(
         &self,
         request: &BlockTransactionsRequest,
@@ -747,7 +647,6 @@ impl ChainQuery for ActiveChainQuery {
     }
 }
 
-/// Clear every witness in a `blocktxn` response for the v1 serving profile.
 fn strip_witnesses(transactions: &mut BlockTransactions) {
     for tx in &mut transactions.transactions {
         for input in &mut tx.input {
@@ -757,7 +656,6 @@ fn strip_witnesses(transactions: &mut BlockTransactions) {
 }
 
 impl ActiveChainQuery {
-    /// Builds one compact response under the caller's announcement or
     /// inventory policy at the negotiated BIP152 version.
     fn compact_block_for(
         &self,
@@ -766,8 +664,6 @@ impl ActiveChainQuery {
         compact_version: Option<u64>,
         policy: ServingPolicy,
     ) -> Option<Message> {
-        // The held early-announced body answers before the store, for both
-        // the announcement race and compact `getdata`.
         if let Some(body) = self.recent_body(hash) {
             return cmpct_message_from_native(&body, compact_version?);
         }
@@ -788,8 +684,6 @@ impl ActiveChainQuery {
         }))
     }
 
-    /// The reply for one resolved block request, or `None` when its body is
-    /// unavailable and the item belongs in `not_found`.
     fn response_for(
         &self,
         request: BlockRequest,
@@ -814,10 +708,6 @@ impl ActiveChainQuery {
     }
 }
 
-/// Bitcoin Core v31.1 `BlockRequestAllowed` and `GetBlockProofEquivalentTime`
-/// at commit 9be056a8a72b624dae9623b2f7bded92c2a21c91. The proof-time difference
-/// is signed: a block with at least best-header work is not too old. Overflow
-/// in the positive work-time product fails closed, like Core's int64 saturation.
 fn stale_block_is_recent(
     tree: &BlockTree,
     node: &bitcoin_rs_chain::BlockTreeNode,
@@ -842,12 +732,10 @@ fn stale_block_is_recent(
             .is_some_and(|scaled| scaled / work < ChainWork::from(STALE_RELAY_AGE_LIMIT))
 }
 
-/// Whether one block sits deeper below the active tip than `limit`.
 const fn beyond_depth(tip_height: u32, height: u32, limit: u32) -> bool {
     tip_height.saturating_sub(height) > limit
 }
 
-/// Which hash-addressed body one block-typed inventory item asks for.
 #[derive(Clone, Copy, Debug)]
 enum BlockRequest {
     Full {
@@ -889,9 +777,6 @@ fn fresh_nonce() -> u64 {
         .finish()
 }
 
-/// Builds one `cmpctblock` message from a native block already in hand,
-/// without a store lookup: the early-announce path relays a block whose body
-/// is not yet durable. The single build is shared by every eligible peer;
 /// `None` for a non-BIP152 version or an unencodable block.
 pub(crate) fn cmpct_message_from_native(block: &Block, version: u64) -> Option<Message> {
     let version = u32::try_from(version).ok()?;

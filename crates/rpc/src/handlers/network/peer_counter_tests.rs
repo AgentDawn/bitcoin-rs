@@ -13,10 +13,6 @@ fn peer(addr: &str, bind: &str, time_offset: i64, counters: Arc<PeerCounters>) -
     directed_peer(addr, bind, time_offset, counters, true)
 }
 
-/// A peer whose direction the test chooses.
-///
-/// The clock offset is sampled from outbound peers only, so a fixture that
-/// cannot make one cannot exercise the median at all.
 fn directed_peer(
     addr: &str,
     bind: &str,
@@ -50,7 +46,6 @@ fn directed_peer(
     }
 }
 
-/// `count` outbound peers, each declaring the offset `offsets` gives it.
 fn outbound_peers(offsets: &[i64]) -> Vec<PeerInfo> {
     offsets
         .iter()
@@ -92,10 +87,6 @@ fn first_peer(ctx: &Arc<Context>) -> sonic_rs::Value {
     entry.clone()
 }
 
-/// The byte counts are the connection's own, not a placeholder.
-///
-/// The traffic is put through a `CountingStream`, the way a real connection
-/// does it, so this covers the wiring and not just the rendering.
 #[test]
 fn getpeerinfo_reports_what_the_connection_actually_moved() {
     let counters = Arc::new(PeerCounters::default());
@@ -139,10 +130,6 @@ fn getpeerinfo_reports_what_the_connection_actually_moved() {
     );
 }
 
-/// `addrbind` is this node's end of the connection.
-///
-/// It used to repeat `addr`, which told an operator listening on several
-/// interfaces nothing at all about which one carried the peer.
 #[test]
 fn getpeerinfo_reports_the_bind_address_not_the_peer_address() {
     let ctx = context_with(vec![peer(
@@ -163,7 +150,6 @@ fn getpeerinfo_reports_the_bind_address_not_the_peer_address() {
     );
 }
 
-/// A peer's clock offset is reported with its sign.
 #[test]
 fn getpeerinfo_reports_the_peers_clock_offset() {
     for offset in [-90_i64, 0, 120] {
@@ -182,8 +168,6 @@ fn getpeerinfo_reports_the_peers_clock_offset() {
     }
 }
 
-/// The negotiated transport is reported as Core does: `v2` with the
-/// BIP324 session id in byte order, or `v1` with an empty id.
 #[test]
 fn getpeerinfo_reports_the_negotiated_transport() {
     let mut session_id = [0_u8; 32];
@@ -218,11 +202,6 @@ fn getpeerinfo_reports_the_negotiated_transport() {
     }
 }
 
-/// The node's own offset is the median, so one peer cannot move it.
-///
-/// The figure exists to tell an operator their clock is wrong. A single
-/// peer claiming an absurd time must not be able to raise that alarm, which
-/// is exactly what a mean would let it do.
 #[test]
 fn getnetworkinfo_timeoffset_is_the_median_of_its_peers() {
     let ctx = context_with(outbound_peers(&[10, 20, 30, 40, 100_000]));
@@ -237,18 +216,6 @@ fn getnetworkinfo_timeoffset_is_the_median_of_its_peers() {
     );
 }
 
-/// An inbound peer cannot move the node's reported clock offset.
-///
-/// Core takes samples from outbound peers only, and says why at the call
-/// site: "Don't use timedata samples from inbound peers to make it harder
-/// for others to create false warnings about our clock being out of sync."
-/// Anyone can open an inbound connection and declare any time they like, so
-/// medianing over every peer hands whoever does that the operator's belief
-/// about whether this machine's clock is wrong.
-///
-/// Five outbound peers agreeing on ten seconds, and a crowd of inbound ones
-/// declaring an hour. The inbound peers outnumber the outbound ones, so a
-/// median over all of them lands on the inbound value and this fails.
 #[test]
 fn getnetworkinfo_timeoffset_ignores_inbound_peers() {
     let mut peers = outbound_peers(&[10, 10, 10, 10, 10]);
@@ -273,12 +240,6 @@ fn getnetworkinfo_timeoffset_ignores_inbound_peers() {
     );
 }
 
-/// Too few samples is not a measurement, and is reported as none.
-///
-/// `TimeOffsets::Median` returns zero below five offsets: "Only calculate
-/// the median if we have 5 or more offsets". Four peers all an hour ahead
-/// used to be reported as an hour, which reads as a confident finding about
-/// the local clock drawn from four strangers.
 #[test]
 fn getnetworkinfo_timeoffset_needs_five_samples() {
     let four = context_with(outbound_peers(&[3_600, 3_600, 3_600, 3_600]));
@@ -291,8 +252,6 @@ fn getnetworkinfo_timeoffset_needs_five_samples() {
         "four samples is below Core's floor, so there is no offset to report"
     );
 
-    // The paired case, so the zero above is the floor and not an inability
-    // to report anything at all.
     let five = context_with(outbound_peers(&[3_600, 3_600, 3_600, 3_600, 3_600]));
     assert_eq!(
         getnetworkinfo(&five, &json!(null))
@@ -304,25 +263,9 @@ fn getnetworkinfo_timeoffset_needs_five_samples() {
     );
 }
 
-/// Offsets at the extremes of `i64` are reported, not halved.
-///
-/// The even-count branch used to average the two middle samples as
-/// `lower.saturating_add(upper) / 2`. With both near `i64::MAX` the sum
-/// saturates *before* the division, so the answer comes back at roughly
-/// half the magnitude -- and these are values a peer can simply put in its
-/// version message, so an attacker controlling two outbound peers could
-/// pick what the node reported about its own clock.
-///
-/// There is no averaging any more: Core indexes `sorted[size / 2]` and so
-/// does this, which removes the arithmetic rather than making it
-/// overflow-safe. This test is what says the class is gone rather than
-/// relocated -- an extreme value must arrive at the output unchanged, at
-/// both ends of the range.
 #[test]
 fn extreme_offsets_are_reported_at_their_own_magnitude() {
     for extreme in [i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1] {
-        // Six samples, so the even-count path is the one taken, with both
-        // middle values at the extreme.
         let ctx = context_with(outbound_peers(&[
             i64::MIN,
             i64::MIN,
@@ -336,10 +279,6 @@ fn extreme_offsets_are_reported_at_their_own_magnitude() {
             .get("timeoffset")
             .and_then(JsonValueTrait::as_i64);
 
-        // Sorted, `[MIN, MIN, extreme, extreme, MAX, MAX]` puts an extreme
-        // at index 3 whichever way `extreme` sorts, except when it *is* an
-        // endpoint -- in which case the value at index 3 is that endpoint
-        // too. Either way the answer is a sample, never a computed number.
         let Some(reported) = reported else {
             panic!("time_offset missing for {extreme}");
         };
@@ -355,13 +294,6 @@ fn extreme_offsets_are_reported_at_their_own_magnitude() {
     }
 }
 
-/// An even sample count takes the upper middle, as Core does.
-///
-/// Core indexes `sorted[size / 2]` whatever the parity, and says why it
-/// does not interpolate: "approximate median is good enough, keep it
-/// simple". Averaging the two middle values answers a number no peer
-/// reported and differs from Core on every even count -- here 40 against
-/// the 35 an average of the two middle samples would give.
 #[test]
 fn getnetworkinfo_timeoffset_does_not_interpolate() {
     let ctx = context_with(outbound_peers(&[10, 20, 30, 40, 50, 60]));
@@ -376,11 +308,6 @@ fn getnetworkinfo_timeoffset_does_not_interpolate() {
     );
 }
 
-/// A round trip that was never measured is not reported as zero.
-///
-/// Core omits `pingtime` and `minping` until it has a measurement. These
-/// used to be `0.0`, which is not merely wrong but flattering: zero is the
-/// best latency a peer could possibly have.
 #[test]
 fn getpeerinfo_omits_ping_times_it_has_never_measured() {
     let ctx = context_with(vec![peer(
@@ -396,11 +323,6 @@ fn getpeerinfo_omits_ping_times_it_has_never_measured() {
     assert!(entry.get("pingwait").is_none(), "{entry:?}");
 }
 
-/// The reported client version follows the release, not a constant.
-///
-/// The expected number is derived here from the package version rather than
-/// read back from the function under test, which could not disagree with
-/// itself.
 #[test]
 fn getnetworkinfo_version_tracks_the_release() {
     let mut expected = 0_i64;
@@ -425,7 +347,6 @@ fn getnetworkinfo_version_tracks_the_release() {
     );
 }
 
-/// With no peers there is nothing to compare against.
 #[test]
 fn getnetworkinfo_timeoffset_is_zero_without_peers() {
     let result = getnetworkinfo(&Arc::new(Context::new()), &json!(null))

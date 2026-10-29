@@ -699,8 +699,6 @@ fn insert_evicts_same_height_fork_before_expected_hash() {
     assert!(stager.contains(&expected_hash));
 }
 
-/// Two bodies with identical consensus bytes and different decoded heap
-/// ownership: `fat` keeps spare `txs` capacity, `lean` is exactly sized.
 fn lean_and_fat_blocks() -> (Block, Block, bytes::Bytes) {
     let genesis = Network::Regtest.genesis_block();
     let serialized = bytes::Bytes::from(consensus_bytes(&genesis));
@@ -742,9 +740,6 @@ fn decoded_attribution_follows_insert_drain_and_restore_apart_from_serialized_by
     assert_eq!(stager.retained_attributed_bytes(), 0);
     assert_eq!(stager.retained_attributed_bytes_high_water(), peak);
 
-    // The committer restores clones, whose vectors are exactly sized: the
-    // stager must attribute the allocation it now owns, not the drained
-    // original's.
     let fat_tail = drained.split_off(1);
     let clone = fat_tail[0].clone();
     let clone_bytes = clone.payload().block().retained_heap_bytes();
@@ -804,7 +799,6 @@ fn restore_refilling_past_the_earlier_peak_advances_only_the_retained_high_water
     let combined = lean_bytes + fat_bytes + 2 * wire;
     assert_eq!(stager.retained_attributed_bytes(), combined);
     assert_eq!(stager.retained_attributed_bytes_high_water(), combined);
-    // The serialized marks are insert-only: restore never moved them.
     assert_eq!(stager.received_bytes(), 2 * wire);
     assert_eq!(stager.received_bytes_high_water(), wire);
     assert_eq!(stager.received_high_water(), 1);
@@ -901,7 +895,6 @@ fn eviction_discard_and_retire_release_attribution() {
         panic!("incoming block should stage after evicting the older one");
     };
     assert_eq!(dropped, [evicted]);
-    // Both bodies were resident until the count-budget eviction ran.
     assert_eq!(
         stager.retained_attributed_bytes_high_water(),
         fat_bytes + lean_bytes + 2 * wire

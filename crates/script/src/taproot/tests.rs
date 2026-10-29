@@ -14,8 +14,6 @@ fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {
     engine.finalize().into()
 }
 
-/// Builds a valid single-leaf taproot commitment and returns all the
-/// pieces needed for script-path tests.
 struct TaprootFixture {
     control: Vec<u8>,
     output: [u8; 32],
@@ -39,7 +37,6 @@ impl TaprootFixture {
         let tapleaf_bytes = tagged_hash(b"TapLeaf", &tapleaf_msg);
         let tapleaf = Hash256::from_le_bytes(&tapleaf_bytes);
 
-        // Single leaf: merkle root = tapleaf
         let mut tweak_msg = internal.serialize().to_vec();
         tweak_msg.extend_from_slice(&tapleaf_bytes);
         let tweak_bytes = tagged_hash(b"TapTweak", &tweak_msg);
@@ -73,9 +70,6 @@ fn compact_size(n: usize) -> Vec<u8> {
     if n < 0xfd { vec![n as u8] } else { vec![] }
 }
 
-/// BIP341 commitment rules: the valid single-leaf tree verifies, its
-/// merkle root is the tapleaf hash, and every perturbation of the control
-/// block or output key fails the tweak check.
 #[test]
 fn taproot_commitment_accepts_the_valid_tree_and_rejects_perturbations() {
     for script in [[0x51].as_slice(), &[0x51, 0x52, 0x53]] {
@@ -140,9 +134,6 @@ struct CommitmentVector {
     output: &'static str,
 }
 
-// BIP341 wallet-test-vectors.json, scriptPubKey cases 1, 3 and 5.
-// Source Git blob: 11261b00ba24afb90b62109505d9ca5ddd773b3b.
-// Expected roots/output keys are published bytes, not candidate outputs.
 const BIP341_VECTORS: [CommitmentVector; 6] = [
     CommitmentVector {
         control: concat!(
@@ -241,8 +232,6 @@ fn bip341_published_commitment_vectors() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-// BIP340 Tagged Hashes and BIP341 Script validation rules: compare with
-// the direct formula at every legal Merkle depth, including equal nodes.
 #[test]
 fn cached_branch_prefix_matches_direct_hash_at_every_control_depth() {
     let leaf = Hash256::from_le_bytes(&[0x5a; 32]);
@@ -275,8 +264,6 @@ fn cached_branch_prefix_matches_direct_hash_at_every_control_depth() {
     }
 }
 
-// BIP340 domain separation: concurrent callers must not contaminate the
-// two fixed prefixes or carry one message into the next message's state.
 #[test]
 fn cached_tag_prefixes_are_independent_across_threads() {
     std::thread::scope(|scope| {

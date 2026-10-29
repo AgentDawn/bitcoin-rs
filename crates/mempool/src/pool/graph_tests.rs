@@ -3,7 +3,6 @@ use super::*;
 const TIME: u64 = 1_700_000_000;
 const HEIGHT: u32 = 900;
 
-/// Small deterministic PRNG so mutation sequences are reproducible.
 struct XorShift(u64);
 
 impl XorShift {
@@ -26,8 +25,6 @@ impl XorShift {
     }
 }
 
-/// Transaction whose txid is unique per `nonce`: the nonce rides in the
-/// lock time, so two fixtures never collide.
 fn graph_tx(nonce: u32, inputs: &[OutPoint], rbf: bool) -> Tx {
     Tx {
         version: 2,
@@ -76,10 +73,6 @@ fn insert_ok(pool: &mut Mempool, nonce: u32, inputs: &[OutPoint], vsize: u32) ->
     txid
 }
 
-/// Two thousand independent entries removed in one batch: every component
-/// settles, every change commits in removal order, and no linearization
-/// survives. Independent entries make each removal dirty its own
-/// component, the shape that turned the membership scans quadratic.
 #[test]
 fn batched_removal_of_two_thousand_independent_entries_settles() {
     const COUNT: u32 = 2000;
@@ -124,9 +117,6 @@ fn batched_removal_of_two_thousand_independent_entries_settles() {
     );
 }
 
-/// Independent component calculation: BFS over the txid index and one
-/// whole-txid range of the spend index — the primitives this slice
-/// wrapped, none of the cached graph state it maintains.
 fn reference_components(pool: &Mempool) -> Vec<Vec<EntryId>> {
     let mut seen: HashSet<EntryId> = HashSet::new();
     let mut components = Vec::new();
@@ -177,8 +167,6 @@ fn reference_components(pool: &Mempool) -> Vec<Vec<EntryId>> {
     components
 }
 
-/// Every structural invariant the mutation paths must maintain,
-/// checked against the reference calculation and the raw totals.
 fn assert_graph_exact(pool: &Mempool) {
     let mut cached: Vec<Vec<EntryId>> = Vec::new();
     let mut by_component: HashMap<u32, Vec<EntryId>> = HashMap::new();
@@ -390,16 +378,6 @@ fn plain_admission_enforces_cluster_limits_through_the_cache() {
     assert_graph_exact(&pool);
 }
 
-/// The cached cluster check and the walk must return the same verdict
-/// while nothing is excluded. In a debug build `check_cluster_limits`
-/// compares the two on every admission; a release build runs only the
-/// cache, so this test is the release-safe guard. Each shape exercises a
-/// different way the paths could diverge: a candidate that merges two
-/// components, a sibling reached only by an up-then-down edge, a partition
-/// a removal just re-derived (with a limit tight enough that a stale
-/// merged summary would flip the verdict), a size-limit verdict answered
-/// from the merged summary weight, and a neighbour that is an in-pool
-/// child of the candidate itself.
 #[test]
 fn check_cluster_limits_cached_matches_walk_across_graph_shapes() {
     fn agrees(pool: &Mempool, tx: &Tx, weight: u64, expected: Result<(), PolicyError>) {
@@ -560,8 +538,6 @@ fn graph_work_stays_local_on_worst_case_shapes() {
     assert_graph_exact(&pool);
 }
 
-/// Fuzzer insert: tolerated to fail (a full cluster, an evicted parent),
-/// records the slot identity and the tx body when it commits.
 fn try_insert_tracked(
     pool: &mut Mempool,
     txs: &mut Vec<Tx>,
@@ -676,7 +652,6 @@ fn random_mutations_leave_graph_semantics_exact() {
                     }
                 }
                 9 if pool.len() > 8 => {
-                    // Trim pressure.
                     let target = u64::try_from(rng.below(200) * 100).unwrap_or(0);
                     crate::evict_lowest_fee_packages(&mut pool, target)
                         .expect("valid graph eviction");

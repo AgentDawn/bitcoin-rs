@@ -54,7 +54,6 @@ fn graph_pool() -> (Mempool, Txid) {
     (pool, root_txid)
 }
 
-/// A cluster is a connected component, not an ancestor package.
 #[test]
 fn a_cluster_holds_siblings_that_no_ancestor_walk_reaches() {
     let (pool, root_txid) = graph_pool();
@@ -79,8 +78,6 @@ fn a_cluster_holds_siblings_that_no_ancestor_walk_reaches() {
     );
 }
 
-/// Resolves `child_a` by structure rather than by a hard-coded txid: it is
-/// the root's child that itself has a child.
 fn child_a_txid_of(pool: &Mempool, root_txid: Txid) -> Txid {
     let Some(root_id) = pool.entry_id_by_txid(&root_txid) else {
         panic!("fixture root is missing");
@@ -95,8 +92,6 @@ fn child_a_txid_of(pool: &Mempool, root_txid: Txid) -> Txid {
     panic!("fixture has no grandchild-bearing child");
 }
 
-/// Admission refuses a transaction that would take the cluster over the
-/// count limit, and admits the same one when the limit allows it.
 #[test]
 fn admission_refuses_a_transaction_over_the_cluster_count_limit() {
     let confirmed = OutPoint::new(txid_of([9_u8; 32]), 0);
@@ -143,7 +138,6 @@ fn admission_refuses_a_transaction_over_the_cluster_count_limit() {
     );
 }
 
-/// Admission counts the candidate's cousins, not just its own chain.
 #[test]
 fn admission_counts_a_cousin_that_no_chain_through_the_parent_reaches() {
     let confirmed = OutPoint::new(txid_of([17_u8; 32]), 0);
@@ -176,7 +170,6 @@ fn admission_counts_a_cousin_that_no_chain_through_the_parent_reaches() {
     );
 }
 
-/// The size limit is enforced independently of the count limit.
 #[test]
 fn admission_refuses_a_transaction_over_the_cluster_size_limit() {
     let confirmed = OutPoint::new(txid_of([11_u8; 32]), 0);
@@ -204,8 +197,6 @@ fn admission_refuses_a_transaction_over_the_cluster_size_limit() {
     );
 }
 
-/// A transaction already spending the candidate's outputs joins its
-/// cluster, so the candidate cannot be admitted by looking only upstream.
 #[test]
 fn a_cluster_includes_transactions_that_already_spend_the_candidate() {
     let confirmed = OutPoint::new(txid_of([13_u8; 32]), 0);
@@ -236,8 +227,6 @@ fn a_cluster_includes_transactions_that_already_spend_the_candidate() {
 #[test]
 fn cluster_limits_default_to_cores_values_and_follow_configuration() {
     let pool = Mempool::new(MempoolLimits::default());
-    // Core `policy.h`: DEFAULT_CLUSTER_LIMIT{64} and
-    // DEFAULT_CLUSTER_SIZE_LIMIT_KVB{101}, the latter in kvB.
     assert_eq!(pool.cluster_limits(), (64, 101_000));
 
     let limits = MempoolLimits {
@@ -253,9 +242,6 @@ fn cluster_limits_default_to_cores_values_and_follow_configuration() {
     );
 }
 
-/// A replacement that evicts a member of a cluster at the count limit must
-/// be judged against the post-eviction cluster. Counting the soon-removed
-/// original would reject a replacement that does not grow the cluster.
 #[test]
 fn a_replacement_that_evicts_from_a_full_cluster_is_admitted() {
     let confirmed = OutPoint::new(txid_of([21_u8; 32]), 0);
@@ -295,10 +281,6 @@ fn a_replacement_that_evicts_from_a_full_cluster_is_admitted() {
     );
 }
 
-/// POL-05/06 (`docs/contracts/mempool-policy.md`): preview and commit
-/// enforce the same projected cluster bound. Core 31.1
-/// `src/validation.cpp::ReplacementChecks` validates the change set's
-/// cluster limits before accepting a replacement.
 #[test]
 fn replacement_preview_rejects_a_cluster_only_violation() {
     let confirmed = OutPoint::new(txid_of([23_u8; 32]), 0);
@@ -351,10 +333,6 @@ fn replacement_preview_rejects_a_cluster_only_violation() {
     );
 }
 
-/// POL-05 (`docs/contracts/mempool-policy.md`): planned victims are
-/// absent from the projected graph. Core 31.1
-/// `src/validation.cpp::ReplacementChecks` stages removals before
-/// `CheckMemPoolPolicyLimits`, so replacing a member does not grow a full cluster.
 #[test]
 fn replacement_preview_excludes_planned_evictions() {
     let confirmed = OutPoint::new(txid_of([27_u8; 32]), 0);
@@ -511,8 +489,6 @@ fn block_inclusion_removes_root_but_leaves_descendants() {
     let before = pool.len();
     let removed = pool.remove_for_block(&[&root_tx], &[root_txid], 8, 1);
     assert_ne!(removed.len(), 0);
-    // The root left, while its descendants remain as transactions that
-    // now spend confirmed outputs.
     assert!(pool.entry_id_by_txid(&root_txid).is_none());
     assert_eq!(pool.len(), before - 1);
     assert_ne!(pool.len(), 0);

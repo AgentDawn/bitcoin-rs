@@ -103,9 +103,7 @@ fn stripped_size_drops_witness_and_matches_header_plus_base_transactions() {
         stripped < total,
         "the witness discount must be visible: {stripped} vs {total}"
     );
-    let manual: usize = 80
-            + 1 // compact size for one transaction
-            + block.txs.iter().map(Tx::base_size).sum::<usize>();
+    let manual: usize = 80 + 1 + block.txs.iter().map(Tx::base_size).sum::<usize>();
     assert_eq!(stripped, manual);
 }
 
@@ -155,7 +153,6 @@ fn retained_heap_bytes_genesis_fixture_matches_independent_calculation() -> Resu
     let bytes = read_test_fixture("0.bin")?;
     let block = deserialize::<Block>(&bytes)?;
 
-    // Independently derive expected value directly from vector capacities.
     let independent = block.txs.capacity() * core::mem::size_of::<Tx>()
         + block
             .txs
@@ -183,7 +180,6 @@ fn retained_heap_bytes_genesis_fixture_matches_independent_calculation() -> Resu
 
     assert_eq!(block.retained_heap_bytes(), independent);
 
-    // Genesis fixture has 1 tx, 1 input (77-byte script_sig), 1 output (67-byte script_pubkey).
     let expected_literal = core::mem::size_of::<Tx>()
         + core::mem::size_of::<TxIn>()
         + core::mem::size_of::<TxOut>()
@@ -225,9 +221,6 @@ fn retained_heap_bytes_fixture_363731_matches_independent_calculation() -> Resul
 
     assert_eq!(block.retained_heap_bytes(), independent);
 
-    // 363731 has 1883 txs, 3748 inputs (431,845 scriptSig bytes), 4265 outputs (106,226 scriptPubKey bytes).
-    // On 64-bit systems with size_of::<usize>() == 8:
-    // 1883 * 56 + 3748 * 88 + 4265 * 32 + 431,845 + 106,226 = 1,109,823 bytes.
     if core::mem::size_of::<usize>() == 8 {
         assert_eq!(block.retained_heap_bytes(), 1_109_823);
     }
@@ -312,7 +305,6 @@ fn retained_heap_bytes_synthetic_witness_heavy_capacity_variations() {
     assert_eq!(block.txs[0].retained_heap_bytes(), expected_tx);
     assert_eq!(block.retained_heap_bytes(), expected_block);
 
-    // Verifying spare capacity accounting when reserving extra capacity in txs:
     block.txs.reserve_exact(7);
     let extra_txs_cap = block.txs.capacity() - 3;
     let expected_after_reserve = expected_block + extra_txs_cap * core::mem::size_of::<Tx>();
@@ -326,7 +318,6 @@ fn payload_from_raw_retains_exact_fixture_bytes() -> Result<()> {
     let bytes = read_test_fixture("363731.bin")?;
     let payload = BlockPayload::from_raw(bytes::Bytes::from(bytes.clone()))?;
 
-    // Full decoded-block equality and byte-exact retention, never hash-only.
     assert_eq!(payload.bytes().as_ref(), bytes.as_slice());
     assert_eq!(payload.block(), &deserialize::<Block>(&bytes)?);
     assert_eq!(crate::encode::consensus_bytes(payload.block()), bytes);
@@ -381,14 +372,11 @@ fn payload_from_prefix_returns_consumed_and_discards_remainder() -> Result<()> {
 
     let (payload, consumed) = BlockPayload::from_prefix(bytes::Bytes::from(bytes.clone()))?;
 
-    // Consumed length is exactly the block; retained bytes exclude the remainder.
     assert_eq!(consumed, bytes.len() - 3);
     assert_eq!(payload.bytes().as_ref(), &bytes[..consumed]);
     assert_eq!(payload.block(), &deserialize::<Block>(&bytes[..consumed])?);
     assert_eq!(payload.bytes().len(), consumed);
 
-    // A large ignored submitblock suffix is released: only the consumed
-    // prefix is retained, byte for byte.
     let mut padded = read_test_fixture("0.bin")?;
     padded.extend_from_slice(&vec![0xA5; 1 << 20]);
     let (payload, consumed) = BlockPayload::from_prefix(bytes::Bytes::from(padded.clone()))?;
@@ -396,7 +384,6 @@ fn payload_from_prefix_returns_consumed_and_discards_remainder() -> Result<()> {
     assert_eq!(payload.bytes().len(), consumed);
     assert_eq!(payload.bytes().as_ref(), &padded[..consumed]);
 
-    // Exact input with no remainder consumes everything.
     let exact = read_test_fixture("363731.bin")?;
     let exact_len = exact.len();
     let (payload, consumed) = BlockPayload::from_prefix(bytes::Bytes::from(exact.clone()))?;
@@ -417,12 +404,10 @@ fn payload_from_local_encodes_witness_block_exactly() -> Result<()> {
     let expected = crate::encode::consensus_bytes(&block);
     assert_eq!(payload.bytes().as_ref(), expected.as_slice());
     assert_eq!(payload.block(), &block);
-    // Witness material is byte-identical in the retained encoding.
     assert!(
         payload.bytes().windows(64).any(|w| w == [0x21_u8; 64]),
         "retained bytes must carry the full witness item"
     );
-    // Strict re-decode of the retained bytes reproduces the full block value.
     let roundtrip = BlockPayload::from_raw(payload.bytes().clone())?;
     assert_eq!(roundtrip.block(), &block);
     assert_eq!(roundtrip.bytes(), payload.bytes());
@@ -433,8 +418,6 @@ fn payload_from_local_encodes_witness_block_exactly() -> Result<()> {
 fn payload_witness_identity_is_byte_exact_not_txid_only() {
     use super::BlockPayload;
 
-    // Same base transaction with different witness items: identical txids but
-    // different consensus bytes. Identity must come from bytes, not txid.
     let left = block_with_tx(witness_tx(vec![vec![0x11_u8; 32]].into()));
     let right = block_with_tx(witness_tx(vec![vec![0x22_u8; 32]].into()));
     assert_eq!(left.txs[0].txid(), right.txs[0].txid());

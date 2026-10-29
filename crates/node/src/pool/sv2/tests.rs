@@ -44,7 +44,6 @@ use super::{BlockPipeline, DeferredBlock, LedgerHost, announce_current_job, hand
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-/// Failure of the miner-side fixture itself, never of the host under test.
 #[derive(Debug, thiserror::Error)]
 enum FixtureError {
     #[error("SV2 {stage} failed: {detail}")]
@@ -72,8 +71,6 @@ type Store = bitcoin_rs_storage::RedbStore;
 const LOGIN: &str = "42.rig";
 const PAYOUT: &[u8] = &[0x51];
 const EPOCH: u32 = 17;
-
-// ---- host fixtures: the node's real composition, minus sockets ----------
 
 fn ledger_host(path: &Path) -> Result<Arc<LedgerHost>, Box<dyn Error>> {
     let store: Arc<dyn KvStore> = Arc::new(Store::open(path)?);
@@ -132,7 +129,6 @@ fn pool_core(
     Ok(PoolCore::new(config, control, ledger)?)
 }
 
-/// The connection configuration `start` builds for every accepted socket.
 fn server_config(ledger: &Arc<LedgerHost>) -> Result<ServerConfig, Box<dyn Error>> {
     let mut config = ServerConfig::new(ShareTarget::from_le_bytes([0xff; 32])?);
     config.limits = Limits {
@@ -156,7 +152,6 @@ fn server_config(ledger: &Arc<LedgerHost>) -> Result<ServerConfig, Box<dyn Error
     Ok(config)
 }
 
-/// A fixed, disposable authority key pair; never a real key.
 fn authority() -> Result<AuthorityKeypair, Box<dyn Error>> {
     let secp = Secp256k1::new();
     let pair = Keypair::from_seckey_slice(&secp, &[0x11; 32])?;
@@ -165,8 +160,6 @@ fn authority() -> Result<AuthorityKeypair, Box<dyn Error>> {
         Zeroizing::new(pair.secret_bytes()),
     ))
 }
-
-// ---- the miner side: a real Noise initiator over the same SRI crates ----
 
 struct Frame {
     msg_type: u8,
@@ -287,7 +280,6 @@ impl Miner {
     }
 }
 
-/// Runs the miner's half of `Noise_NX` against the pinned authority.
 fn handshake(
     connection: &mut Connection,
     core: &PoolCore,
@@ -336,8 +328,6 @@ fn handshake(
     })
 }
 
-// ---- deterministic work -------------------------------------------------
-
 fn header_hash(job: &Job, prefix: &[u8], nonce: u32) -> Result<BlockHash, FixtureError> {
     let (session, rolled) = prefix.split_at(job.extranonce_layout().session_len());
     job.header(
@@ -350,20 +340,16 @@ fn header_hash(job: &Job, prefix: &[u8], nonce: u32) -> Result<BlockHash, Fixtur
     .map_err(sv2("header"))
 }
 
-/// The first `count` nonces whose header meets the network target.
 fn block_nonces(job: &Job, prefix: &[u8], count: usize) -> Result<Vec<u32>, FixtureError> {
     nonces(job, prefix, true, count)
 }
 
-/// The first nonce whose header misses the network target: a plain share.
 fn share_nonce(job: &Job, prefix: &[u8]) -> Result<u32, FixtureError> {
     nonces(job, prefix, false, 1)?
         .pop()
         .ok_or(FixtureError::NonceSpace(1))
 }
 
-/// Scans upward from zero over the whole `u32` space. The job fixes every
-/// other header field, so the answer is fixed: no clock, no randomness.
 fn nonces(
     job: &Job,
     prefix: &[u8],
@@ -395,15 +381,12 @@ fn has(frames: &[Frame], msg_type: u8) -> bool {
     frames.iter().any(|frame| frame.msg_type == msg_type)
 }
 
-/// `(sequence_number, error_code)` of the one `SubmitShares.Error` in `frames`.
 fn share_error(frames: &mut Vec<Frame>) -> Result<(u32, String), FixtureError> {
     let mut frame = take(frames, MESSAGE_TYPE_SUBMIT_SHARES_ERROR)?;
     let error: SubmitSharesError =
         binary_sv2::from_bytes(&mut frame.payload).map_err(sv2("share error decode"))?;
     Ok((error.sequence_number, error.error_code.as_utf8_or_hex()))
 }
-
-// ---- the host under test ------------------------------------------------
 
 struct Host {
     core: PoolCore,
@@ -443,8 +426,6 @@ impl Host {
         })
     }
 
-    /// One `serve_connection` iteration: announce, reserve the block
-    /// record permit, feed, then the node's own `handle_events`.
     fn deliver(&mut self, wire: &[u8]) -> Result<Vec<Frame>, Box<dyn Error>> {
         announce_current_job(&mut self.connection, &self.core)?;
         let permit = self
@@ -509,7 +490,6 @@ impl Host {
     }
 }
 
-/// After the retirement the same connection carries work on a new parent.
 fn new_parent_work_is_accepted(host: &mut Host, channel: &Channel) -> TestResult {
     let next = host.core.install(candidate(101, 0xcd)?, Vec::new())?.job;
     let nonce = share_nonce(&next, &channel.prefix)?;
@@ -530,8 +510,6 @@ fn applied_sv2_block_retires_the_common_job_before_a_sibling_reaches_the_node() 
         return Err("two winning nonces exist".into());
     };
 
-    // The node applies the first winner; the host acknowledges it only
-    // after the durable found-block record.
     let applied = host.submit(&channel, 1, &job, first)?;
     assert!(has(&applied, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS));
     assert_eq!(host.node_submissions(), 1);
@@ -539,8 +517,6 @@ fn applied_sv2_block_retires_the_common_job_before_a_sibling_reaches_the_node() 
     assert!(host.ledger.found_block_recorded(first_hash)?);
     assert_eq!(host.credited_shares()?, 1);
 
-    // A distinct winner on the same job is stale: the host's `Applied`
-    // handling is the only thing that retired the job.
     let sibling = host.submit(&channel, 2, &job, second);
     assert_eq!(
         host.node_submissions(),
@@ -553,7 +529,6 @@ fn applied_sv2_block_retires_the_common_job_before_a_sibling_reaches_the_node() 
     assert!(!host.ledger.found_block_recorded(second_hash)?);
     assert_eq!(host.credited_shares()?, 1);
 
-    // The exact accepted replay keeps its duplicate identity.
     let mut frames = host.submit(&channel, 3, &job, first)?;
     assert_eq!(share_error(&mut frames)?, (3, "duplicate-share".to_owned()));
     assert_eq!(host.node_submissions(), 1);
@@ -571,8 +546,6 @@ fn undetermined_sv2_block_withholds_success_and_retries_authoritative_state() ->
         .pop()
         .ok_or("a winning nonce exists")?;
 
-    // Journal backpressure leaves the chain outcome unknown: the host must
-    // retain the submission instead of confirming an unapplied block.
     *host.control.submit.lock() = bitcoin_rs_mining::BlockValidationResult::Inconclusive;
     let pending = host.submit(&channel, 1, &job, winner)?;
     assert!(
@@ -584,8 +557,6 @@ fn undetermined_sv2_block_withholds_success_and_retries_authoritative_state() ->
     assert_eq!(host.deferred.len(), 1, "Undetermined work is retained");
     assert_eq!(host.node_submissions(), 1);
 
-    // Authoritative recovery applies the block: the retained waiter retries
-    // once and then confirms instead of producing a false success.
     *host.control.submit.lock() = bitcoin_rs_mining::BlockValidationResult::Accepted;
     let entry = host.deferred.pop().ok_or("retained waiter missing")?;
     let waiter = super::settle_one_deferred(
@@ -615,9 +586,6 @@ fn reaped_worker_panic_propagates_through_stop_join() -> TestResult {
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
-    // A listener-loop reap must not discard the panic: the service flag
-    // retains it so shutdown still fails after joining the rest, matching
-    // SV1's `sessions_panicked`.
     let connections: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let worker_panicked = Arc::new(AtomicBool::new(false));

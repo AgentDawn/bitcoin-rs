@@ -17,7 +17,6 @@ fn fixture_outpoint(tag: u8) -> OutPoint {
     OutPoint::new(Txid(Hash256::from_le_bytes(&[tag; 32])), 0)
 }
 
-/// Seeds one confirmed, anyone-can-spend output worth `value`.
 fn seed_utxo(ctx: &Context, tag: u8, value: u64) {
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
@@ -51,12 +50,12 @@ fn spending_tx(tag: u8, output_value: u64) -> Tx {
             value: Amount::from_sat(output_value),
             script_pubkey: {
                 let mut out = Vec::with_capacity(25);
-                out.push(0x76); // OP_DUP
-                out.push(0xa9); // OP_HASH160
+                out.push(0x76);
+                out.push(0xa9);
                 out.push(0x14);
                 out.extend_from_slice(&[9_u8; 20]);
-                out.push(0x88); // OP_EQUALVERIFY
-                out.push(0xac); // OP_CHECKSIG
+                out.push(0x88);
+                out.push(0xac);
                 Script::from_bytes(out)
             },
         }],
@@ -86,8 +85,6 @@ fn sendrawtransaction_admits_the_transaction_to_the_mempool() {
 fn sendrawtransaction_refuses_an_absurd_fee_by_default() {
     let ctx = Arc::new(Context::new());
     seed_utxo(&ctx, 8, 100_000_000);
-    // 1 BTC in, 0.01 BTC out: a 0.99 BTC fee on a ~110 vbyte transaction,
-    // which is thousands of times the 0.1 BTC/kvB default ceiling.
     let tx = spending_tx(8, 1_000_000);
 
     let error = sendrawtransaction(&ctx, &json!([hex_of(&tx)]))
@@ -106,13 +103,6 @@ fn sendrawtransaction_refuses_an_absurd_fee_by_default() {
     );
 }
 
-/// The guard is the caller's to lift, and the ceiling is a *rate*.
-///
-/// Zero disables it outright. Any other value is BTC per kvB, turned into
-/// an absolute fee for this transaction's vsize -- so 0.99 BTC/kvB on a
-/// ~110-vbyte transaction is a ceiling near 0.109 BTC, and a 0.99 BTC fee
-/// is still far above it. Reading the argument as an absolute cap would
-/// send that transaction.
 #[test]
 fn the_fee_ceiling_is_a_rate_and_zero_disables_it() {
     let disabled = {
@@ -139,12 +129,10 @@ fn the_fee_ceiling_is_a_rate_and_zero_disables_it() {
     assert_eq!(ctx.mempool.gateway.read().len(), 0);
 }
 
-/// A ceiling the transaction stays under changes nothing.
 #[test]
 fn sendrawtransaction_admits_a_fee_below_the_ceiling() {
     let ctx = Arc::new(Context::new());
     seed_utxo(&ctx, 10, 100_000);
-    // A ~10_000 sat fee on ~110 vbytes, well under the default ceiling.
     let tx = spending_tx(10, 90_000);
 
     let sent = sendrawtransaction(&ctx, &json!([hex_of(&tx)]));
@@ -153,8 +141,6 @@ fn sendrawtransaction_admits_a_fee_below_the_ceiling() {
     assert_eq!(ctx.mempool.gateway.read().len(), 1);
 }
 
-/// Core's `ParseFeeRate` refuses ceilings at or above one whole coin per
-/// kvB, so the parameter itself is invalid no matter how small the fee.
 #[test]
 fn sendrawtransaction_rejects_a_fee_rate_of_a_whole_coin() {
     let ctx = Arc::new(Context::new());
@@ -173,8 +159,6 @@ fn sendrawtransaction_rejects_a_fee_rate_of_a_whole_coin() {
     );
 }
 
-/// Missing inputs are Core's `RPC_VERIFY_ERROR` (-25), not the policy
-/// rejection code reserved for rule violations.
 #[test]
 fn sendrawtransaction_rejects_a_transaction_whose_inputs_do_not_exist() {
     let ctx = Arc::new(Context::new());
@@ -193,8 +177,6 @@ fn sendrawtransaction_rejects_a_transaction_whose_inputs_do_not_exist() {
     assert!(ctx.mempool.gateway.read().is_empty());
 }
 
-/// A transaction with duplicate inputs must be rejected by consensus
-/// verification, not admitted to the mempool.
 #[test]
 fn sendrawtransaction_rejects_a_transaction_with_duplicate_inputs() {
     let ctx = Arc::new(Context::new());
@@ -235,7 +217,6 @@ fn sendrawtransaction_rejects_a_transaction_with_duplicate_inputs() {
     assert!(ctx.mempool.gateway.read().is_empty());
 }
 
-/// Core rebroadcasts rather than failing, and callers retry on a dropped
 #[test]
 fn sendrawtransaction_is_idempotent_for_a_transaction_already_in_the_pool() {
     let ctx = Arc::new(Context::new());
@@ -277,7 +258,6 @@ fn sendrawtransaction_does_not_treat_an_evicted_tx_as_already_known() {
         "the original must enter the pool"
     );
 
-    // Same confirmed input, larger fee. BIP125 rules 3/4/6 all clear.
     let replacement = spending_tx(1, 80_000);
     let Ok(_) = sendrawtransaction(&ctx, &json!([hex_of(&replacement)])) else {
         panic!("the higher-fee replacement must be accepted");
@@ -311,11 +291,6 @@ fn sendrawtransaction_does_not_treat_an_evicted_tx_as_already_known() {
     );
 }
 
-/// The verdict must come from the acceptance checks.
-///
-/// This RPC used to answer `allowed: true` for anything that merely
-/// decoded, so a transaction spending outputs that do not exist was
-/// reported as acceptable.
 #[test]
 fn testmempoolaccept_rejects_a_transaction_that_only_decodes() {
     let ctx = Arc::new(Context::new());
@@ -365,8 +340,6 @@ fn testmempoolaccept_allows_a_transaction_without_admitting_it() {
     );
 }
 
-/// `wtxid` was a copy of `txid`. They differ for any witness transaction,
-/// and package relay identifies transactions by the witness id.
 #[test]
 fn testmempoolaccept_reports_the_witness_txid() {
     let ctx = Arc::new(Context::new());
@@ -405,17 +378,12 @@ fn standardness_is_enforced_on_mainnet() {
     );
     seed_utxo(&mainnet, 1, 100_000);
     let mut tx = spending_tx(1, 90_000);
-    // Consensus-valid, non-standard.
     tx.version = 4;
     assert!(
         sendrawtransaction(&mainnet, &json!([hex_of(&tx)])).is_err(),
         "mainnet must enforce standardness"
     );
 }
-/// Builds a 12-header chain in `ctx.chain.block_tree`, with the applied tip 6
-/// blocks behind the header tip, and publishes both tips in `ctx`. Block
-/// times start above the lock-time threshold so the MTP values actually
-/// govern finality for the timestamp-locked transaction under test.
 fn build_divergent_tips(ctx: &Context) -> (u32, u32) {
     const BASE: u32 = 500_000_000;
     const STEP: u32 = 600;
@@ -480,10 +448,6 @@ fn build_divergent_tips(ctx: &Context) -> (u32, u32) {
     )
 }
 
-/// `sendrawtransaction` must take the BIP113 median-time-past from the
-/// applied tip, not a header tip that has run ahead. A timestamp-locked
-/// transaction that is final only under the header-tip MTP must be
-/// rejected.
 #[test]
 fn sendrawtransaction_rejects_tx_final_only_under_header_tip_mtp() {
     const BASE: u32 = 500_000_000;
@@ -504,7 +468,7 @@ fn sendrawtransaction_rejects_tx_final_only_under_header_tip_mtp() {
     seed_utxo(&ctx, 1, 100_000);
     let mut tx = spending_tx(1, 90_000);
     tx.lock_time = LockTime::from_consensus(lock_time);
-    tx.inputs[0].sequence = Sequence::from_consensus(0xFFFF_FFFE); // non-final
+    tx.inputs[0].sequence = Sequence::from_consensus(0xFFFF_FFFE);
 
     let result = sendrawtransaction(&ctx, &json!([hex_of(&tx)]));
     assert!(

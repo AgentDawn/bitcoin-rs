@@ -169,8 +169,6 @@ fn every_network_carries_chain_tx_data() {
         } = network.chain_tx_data();
         assert!(tx_rate > 0.0, "{network:?} needs a non-zero rate");
         if matches!(network, Network::Regtest) {
-            // Core pins regtest at a zero baseline with a non-zero rate on
-            // purpose, so progress there is a function of time alone.
             assert_eq!((time, tx_count), (0, 0));
         } else {
             assert!(time > 0 && tx_count > 0, "{network:?}");
@@ -180,9 +178,6 @@ fn every_network_carries_chain_tx_data() {
 
 #[test]
 fn mainnet_assume_utxo_data_matches_pinned_core() -> Result<(), crate::HashError> {
-    // Independent literals from Bitcoin Core src/kernel/chainparams.cpp:
-    // v31.1 (840k..935k): 9be056a8a72b624dae9623b2f7bded92c2a21c91
-    // v32.0rc1 (965k): d0231bb01d83178224bf7b198ba04f78cc2c89ef
     let expected_mainnet = [
         (
             840_000,

@@ -49,8 +49,6 @@ fn rejects_outdated_versions_after_activation() -> Result<(), Box<dyn std::error
 
     let mut filled = 0_u32;
     for (activation, stale, required) in [(500_u32, 1_i32, 2_i32), (1251, 2, 3), (1351, 3, 4)] {
-        // Fill up to the activation height with headers that already meet
-        // the floor, so only the candidate's version is under test.
         for height in filled + 1..activation {
             extend_regtest(&mut tree, &mut prev, height, required, base_time);
         }
@@ -118,8 +116,6 @@ fn rejects_testnet4_bip94_timewarp_candidate() -> Result<(), Box<dyn std::error:
         tip_time = header.time;
     }
     let parent_id = tree.lookup(prev.0).ok_or("fixture tip present")?;
-    // Height 2016 is a difficulty-adjustment boundary on Testnet4, so the
-    // candidate must carry the retargeted bits.
     let bits = next_work_required(&tree, parent_id, tip_time, network)?;
     let now = tip_time + MAX_FUTURE_TIME_SECONDS;
     let candidate = |time: u32| BlockHeader {
@@ -131,7 +127,6 @@ fn rejects_testnet4_bip94_timewarp_candidate() -> Result<(), Box<dyn std::error:
         nonce: 0,
     };
 
-    // More than `MAX_TIMEWARP` below the parent: rejected.
     assert_eq!(
         validate_contextual_header(
             &tree,
@@ -147,7 +142,6 @@ fn rejects_testnet4_bip94_timewarp_candidate() -> Result<(), Box<dyn std::error:
             minimum: tip_time - 600,
         })
     );
-    // Exactly `MAX_TIMEWARP` below the parent: still valid.
     validate_contextual_header(
         &tree,
         parent_id,
@@ -219,9 +213,6 @@ fn wall_clock_conversion_handles_epoch_and_u32_boundaries() {
     }
 }
 
-/// Eleven headers with times 0..=10, so the tip's median time past is
-/// exactly 5. Insertion bypasses `accept_headers` so the fixture itself is
-/// not subject to the rules under test.
 fn chain_with_median_five() -> (BlockTree, BlockHeader) {
     let mut tree = BlockTree::new();
     let mut prev = BlockHash::default();
@@ -237,7 +228,6 @@ fn chain_with_median_five() -> (BlockTree, BlockHeader) {
     (tree, tip)
 }
 
-// MTP binds in both modes; replay must ignore the caller's future ceiling.
 #[test]
 fn timestamp_bounds_hold_per_validation_mode() -> Result<(), Box<dyn std::error::Error>> {
     let (tree, tip) = chain_with_median_five();
@@ -319,12 +309,6 @@ fn timestamp_bounds_hold_per_validation_mode() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// A rejected batch whose valid higher-work prefix displaced the tip
-/// still reports the old tip through [`demoted_tip_after_rejection`].
-///
-/// The `Err` itself carries no displacement; the tree retains the prefix
-/// and the helper recovers the stale leaf for relay instead of losing it.
-/// A linear extension that fails the same way reports no demotion.
 #[test]
 fn partial_prefix_failure_preserves_demoted_tip_via_helper()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -345,8 +329,6 @@ fn partial_prefix_failure_preserves_demoted_tip_via_helper()
     }
     let pre_tip = tree.tip().map(|tip| tip.hash);
 
-    // Side branch from genesis with more headers than the main chain, so
-    // its prefix carries strictly higher work and displaces the tip.
     let mut side_prev = genesis.block_hash();
     let mut batch = Vec::new();
     for height in [101_u32, 102, 103] {
@@ -354,9 +336,6 @@ fn partial_prefix_failure_preserves_demoted_tip_via_helper()
         side_prev = header.compute_hash();
         batch.push(header);
     }
-    // Invalid tail on the displaced tip: mined for its garbage parent so
-    // proof of work passes, then rejected with `MissingParent` after the
-    // prefix has already moved the tip.
     let garbage = BlockHash::from(Hash256::from_le_bytes(&[0xFF_u8; 32]));
     let tail = mine_regtest(garbage, 104, base_time + 104 * 600, 4);
     batch.push(tail);
@@ -379,7 +358,6 @@ fn partial_prefix_failure_preserves_demoted_tip_via_helper()
         "the tip active before the batch is the preserved demotion"
     );
 
-    // A linear extension that fails the same way displaces nothing.
     let tip_now = tree.tip().map(|tip| tip.hash);
     let bad_child = mine_regtest(garbage, 999, now, 4);
     let linear = accept_headers(

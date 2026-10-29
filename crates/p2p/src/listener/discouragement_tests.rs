@@ -131,7 +131,7 @@ fn accepted_version_updates_once_without_replaying_on_later_steps()
         }
         book.save();
         let bytes = std::fs::read(directory.path().join("peers-f9beb4d9.dat"))?;
-        let stored: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 32])?;
+        let stored: sonic_rs::Value = sonic_rs::from_slice(&bytes[..bytes.len() - 32])?;
         assert_eq!(
             stored["records"][0]["services"],
             if repeated_version { 9 } else { 1033 },
@@ -162,7 +162,6 @@ fn only_current_remote_protocol_faults_change_automatic_avoidance()
         PeerError::Protocol("outbound peer lacks desirable services"),
         PeerError::PayloadTooLarge(usize::MAX),
         PeerError::Io(io::Error::from(io::ErrorKind::TimedOut)),
-        // A v2 key read with v2 off; Core only disconnects.
         PeerError::inbound(PeerError::WrongNetwork {
             expected: Magic::BITCOIN,
             actual: Magic::from_bytes([0x2f, 0x1a, 0x7c, 0x05]),
@@ -202,8 +201,6 @@ fn invalid_wire_session_closes_and_refuses_the_next_automatic_admission()
 -> Result<(), Box<dyn std::error::Error>> {
     for inbound in [false, true] {
         let shared = shared();
-        // Exercise real socket framing and teardown with a nonlocal
-        // connection identity. The test never dials this public address.
         let address: PeerEndpoint = "8.8.8.8:8333".parse()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let mut sender = TcpStream::connect(listener.local_addr()?)?;
@@ -235,7 +232,7 @@ fn invalid_wire_session_closes_and_refuses_the_next_automatic_admission()
         info.inbound = inbound;
         let mut malformed = Vec::new();
         crate::wire::write_message(&mut malformed, Magic::BITCOIN, &Message::Ping(7))?;
-        malformed[20] ^= 1; // A fully delivered frame with a bad checksum.
+        malformed[20] ^= 1;
         io::Write::write_all(&mut sender, &malformed)?;
         io::Write::write_all(&mut sender, &malformed)?;
         let Err(error) = run_connected_session(&mut peer, address, &shared, lease, rx, info) else {
@@ -301,8 +298,6 @@ fn protected_handshake_discards_bad_order_without_extending_deadline()
         )?;
         crate::wire::write_message(&mut bytes, Magic::REGTEST, &Message::Verack)?;
         let mut peer = Peer::new(std::io::Cursor::new(bytes), Magic::REGTEST);
-        // A cursor-backed outbound reader avoids interleaving test writes
-        // with unread input; the steps are the production handshake owner.
         let (accepted, _) = crate::handshake::next_handshake_step(
             &mut peer,
             &lease,

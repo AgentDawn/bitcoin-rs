@@ -20,21 +20,12 @@ fn getmempoolinfo_emits_one_sat_per_vbyte_default_for_relay_fees() {
         panic!("minrelaytxfee missing: {result:?}");
     };
 
-    // 1000 sat/kvB / 100_000_000 = 0.00001
     assert!(
         (min_relay - 0.00001).abs() < 1e-9,
         "expected ~0.00001, got {min_relay}"
     );
 }
 
-/// `limitclustercount` / `limitclustersize` are read from the pool, not
-/// restated in the handler.
-///
-/// Asserted by changing the configured limits and requiring the response
-/// to follow. Checking only the defaults would pass just as well against
-/// two constants written into this file, which is the failure this guards:
-/// the fields must describe policy the pool enforces, and a handler that
-/// reports numbers of its own describes nothing.
 #[test]
 fn getmempoolinfo_cluster_limits_follow_the_pool_rather_than_a_constant() {
     let ctx = Arc::new(Context::new());
@@ -68,8 +59,6 @@ fn getmempoolinfo_cluster_limits_follow_the_pool_rather_than_a_constant() {
     );
 }
 
-/// The defaults a fresh pool reports are Bitcoin Core's, so a client
-/// reading them against Core sees the same numbers.
 #[test]
 fn getmempoolinfo_defaults_to_cores_cluster_limits() {
     let ctx = Arc::new(Context::new());
@@ -78,8 +67,6 @@ fn getmempoolinfo_defaults_to_cores_cluster_limits() {
         .dispatch("getmempoolinfo", &json!([]))
         .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
 
-    // Core `policy.h`: DEFAULT_CLUSTER_LIMIT{64},
-    // DEFAULT_CLUSTER_SIZE_LIMIT_KVB{101} expressed in vbytes.
     assert_eq!(
         result
             .get("limitclustercount")
@@ -154,10 +141,6 @@ fn getmempoolinfo_omits_mempool_sequence_like_core() {
     let result = handler
         .dispatch("getmempoolinfo", &json!([]))
         .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
-    // Core's getmempoolinfo carries no mempool_sequence; the sequence
-    // counter belongs to `getrawmempool` with sequence=true. The pinned
-    // v31::GetMempoolInfo shape matches, and this defends against a
-    // hand-built field reappearing.
     assert!(
         result.get("mempool_sequence").is_none(),
         "mempool_sequence must stay absent from getmempoolinfo: {result:?}"
@@ -171,9 +154,6 @@ fn getmempoolinfo_policy_fields_project_the_enforced_record() {
     let result = handler
         .dispatch("getmempoolinfo", &json!([]))
         .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
-    // The enforced defaults: bare multisig permitted, the 83-byte
-    // nulldata budget, the cluster limits admission enforces, and the
-    // eviction-floor increment.
     assert_eq!(
         result
             .get("permitbaremultisig")
@@ -209,7 +189,6 @@ fn getmempoolinfo_policy_fields_project_the_enforced_record() {
         panic!("incrementalrelayfee missing: {result:?}");
     };
     assert!((incremental - 0.00001).abs() < 1e-12);
-    // The projection follows the pool's signal-independent replacement policy.
     assert_eq!(
         result.get("fullrbf").and_then(JsonValueTrait::as_bool),
         Some(true)
@@ -219,10 +198,6 @@ fn getmempoolinfo_policy_fields_project_the_enforced_record() {
 #[test]
 fn getmempoolinfo_policy_follows_the_configured_pool_limits() {
     let ctx = Arc::new(Context::new());
-    // Reconfigure the live pool's limits after composition, the way
-    // `policy_contract.rs` reconfigures floors mid-test: the per-guard
-    // derivation must quote them on the next call, never a stale
-    // composition-time copy.
     ctx.mempool.gateway.pool().write().limits.cluster_count = 7;
     ctx.mempool
         .gateway
@@ -234,8 +209,6 @@ fn getmempoolinfo_policy_follows_the_configured_pool_limits() {
     let result = handler
         .dispatch("getmempoolinfo", &json!([]))
         .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
-    // The cluster fields follow the configured cluster limits; unrelated
-    // defaults stay untouched.
     assert_eq!(
         result
             .get("limitclustercount")
@@ -286,8 +259,6 @@ fn getrawmempool_without_sequence_flag_returns_bare_array() {
 
 #[test]
 fn getrawmempool_verbose_with_sequence_is_rejected() {
-    // Core's MempoolToJSON rejects verbose=true with mempool_sequence=true
-    // with RPC_INVALID_PARAMETER. The REST twin enforces the same rule.
     let ctx = Arc::new(Context::new());
     let handler = crate::Handler::new(Arc::clone(&ctx));
     let error = handler

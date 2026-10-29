@@ -86,10 +86,6 @@ fn stable_chainstate_reader_does_not_block_transaction_admission() -> anyhow::Re
         &Hash256::default(),
     )?;
 
-    // Stable whole-chain readers hold this mutex without changing the
-    // generation. Admission must succeed through its real RPC path while
-    // such a reader is active, rather than spending its retry budget on
-    // contention that says nothing about stale chain facts.
     let accepted = ctx
         .chain
         .with_stable_chainstate(|| crate::handlers::tx::sendrawtransaction(&ctx, &json!([raw])))?;
@@ -184,8 +180,6 @@ fn admission_chain_uses_current_handles_and_one_applied_tip() -> anyhow::Result<
         []
     );
 
-    // A borrowed capability observes current handles even in isolated
-    // contexts that replace test state after construction.
     ctx.chain.utxo = bitcoin_rs_utxo::UtxoReader::new(Arc::new(bitcoin_rs_utxo::UtxoSet::new()));
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
@@ -244,8 +238,6 @@ fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {
         0,
     ));
 
-    // Accepted: the handler commits the funded transaction through the
-    // gateway.
     let rpc_ctx = Arc::new(Context::new());
     bitcoin_rs_utxo::contract::commit_block_changes(
         &rpc_ctx.chain.utxo.fixture_set(),
@@ -256,7 +248,6 @@ fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {
     assert_eq!(accepted.as_str(), Some(spend.txid().to_string()).as_deref());
     assert!(rpc_ctx.mempool.gateway.read().contains_txid(&spend.txid()));
 
-    // Refused: an unknown prevout is refused and not inserted.
     let orphan = spending(OutPoint::new(
         Txid::from(Hash256::from_le_bytes(&[22; 32])),
         0,
@@ -267,8 +258,6 @@ fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {
     assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);
     assert!(!rpc_ctx.mempool.gateway.read().contains_txid(&orphan.txid()));
 
-    // Preview: testmempoolaccept answers for the funded transaction
-    // without inserting it.
     let preview_ctx = Arc::new(Context::new());
     bitcoin_rs_utxo::contract::commit_block_changes(
         &preview_ctx.chain.utxo.fixture_set(),
@@ -294,8 +283,6 @@ fn admission_envelopes_share_gateway_outcomes() -> anyhow::Result<()> {
 }
 
 fn burn_raw() -> String {
-    // Consensus-valid but unspendable: a 1_000-sat OP_RETURN output.
-    // Inputs never resolve; the burn guard runs before admission.
     let burn = Tx {
         version: 2,
         inputs: vec![TxIn {
@@ -323,27 +310,21 @@ fn sendrawtransaction_honors_maxburnamount_before_admission() {
 
     let rpc_ctx = Arc::new(Context::new());
     let raw = &burn_raw();
-    // Default cap 0: the burn guard fires before admission is attempted,
-    // so even an unfunded burn is refused at the guard, not the pool.
     let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw]))
         .expect_err("burn above the default cap must be refused");
     assert!(
         refused.to_string().contains("maxburnamount"),
         "unexpected refusal: {refused}"
     );
-    // A cap covering the burn output passes the guard; admission then
-    // refuses the unknown prevout instead.
     let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw, null, "0.00001"]))
         .expect_err("unknown prevout must still be refused");
     assert_eq!(refused.code(), RpcError::CORE_VERIFY_ERROR);
-    // An explicit cap below the burn still refuses at the guard.
     let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw, null, "0.00000999"]))
         .expect_err("burn above the explicit cap must be refused");
     assert!(
         refused.to_string().contains("maxburnamount"),
         "unexpected refusal: {refused}"
     );
-    // The named form carries the same cap.
     let refused = tx::sendrawtransaction(
         &rpc_ctx,
         &json!({"hexstring": raw, "maxburnamount": "0.00001"}),
@@ -412,7 +393,6 @@ fn sendrawtransaction_publishes_hashtx_once_per_admission() -> anyhow::Result<()
         &Hash256::default(),
     )?;
 
-    // Accepted: one `hashtx` for the admitted txid.
     tx::sendrawtransaction(&rpc_ctx, &json!([raw]))?;
     assert_eq!(
         published(),
@@ -420,7 +400,6 @@ fn sendrawtransaction_publishes_hashtx_once_per_admission() -> anyhow::Result<()
         "admission must publish exactly one hashtx"
     );
 
-    // Duplicate: already known, so the second call publishes nothing.
     tx::sendrawtransaction(&rpc_ctx, &json!([raw]))?;
     assert_eq!(
         published().len(),
@@ -428,7 +407,6 @@ fn sendrawtransaction_publishes_hashtx_once_per_admission() -> anyhow::Result<()
         "a duplicate admission must not republish"
     );
 
-    // Rejected: an unknown prevout publishes nothing.
     let orphan = spending(OutPoint::new(
         Txid::from(Hash256::from_le_bytes(&[32; 32])),
         0,
@@ -501,7 +479,6 @@ fn submitpackage_publishes_hashtx_only_for_newly_admitted() -> anyhow::Result<()
         &Hash256::default(),
     )?;
 
-    // Both members are newly admitted: one `hashtx` each, in order.
     submitpackage(&rpc_ctx, &json!([[raws[0].clone(), raws[1].clone()]]))?;
     assert_eq!(
         published(),
@@ -509,8 +486,6 @@ fn submitpackage_publishes_hashtx_only_for_newly_admitted() -> anyhow::Result<()
         "each newly admitted member must publish hashtx"
     );
 
-    // Re-submission finds residents: rows carry no aggregate rate, so
-    // nothing publishes again.
     submitpackage(&rpc_ctx, &json!([[raws[0].clone(), raws[1].clone()]]))?;
     assert_eq!(published().len(), 2, "resident members must not republish");
     Ok(())
@@ -525,14 +500,12 @@ fn sendrawtransaction_rejects_unknown_extra_params() {
 
     let rpc_ctx = Arc::new(Context::new());
     let raw = &burn_raw();
-    // A fourth positional parameter is rejected before decoding.
     let refused = tx::sendrawtransaction(&rpc_ctx, &json!([raw, null, null, "extra"]))
         .expect_err("a fourth parameter must be refused");
     assert!(
         refused.to_string().contains("too many parameters"),
         "unexpected refusal: {refused}"
     );
-    // An unknown named parameter is rejected before decoding.
     let refused = tx::sendrawtransaction(&rpc_ctx, &json!({"hexstring": raw, "bogus": 1}))
         .expect_err("an unknown named parameter must be refused");
     assert!(

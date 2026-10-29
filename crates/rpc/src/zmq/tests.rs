@@ -257,8 +257,6 @@ fn socket_publisher_enumerates_live_notifiers_in_publication_order() -> anyhow::
         endpoint(dedicated.clone(), vec![ZmqTopic::Sequence], 9),
     ])?;
 
-    // Read through the trait object — the path RPC consumers take — so the
-    // enumeration is proven to live on the `dyn ZmqPublisher` surface.
     let publisher: Arc<dyn ZmqPublisher> = Arc::new(publisher);
     assert_eq!(
         publisher.active_notifiers(),

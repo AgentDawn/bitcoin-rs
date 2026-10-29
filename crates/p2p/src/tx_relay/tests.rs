@@ -5,21 +5,16 @@ use crossbeam_channel::bounded;
 use parking_lot::Mutex;
 use std::sync::atomic::AtomicBool;
 
-/// A peer in the fake sink: a node id and a remaining send budget.
 #[derive(Clone)]
 struct FakePeer {
     node_id: u64,
     capacity: usize,
 }
 
-/// One recorded announcement: txid, excluded source, outcome.
 type SinkEntry = (Txid, Option<u64>, RelayOutcome);
 
-/// Test sink that records announcements without a live connection.
 struct FakeSink {
     peers: Mutex<Vec<FakePeer>>,
-    /// Shared so a test can read it after the sink moves into the
-    /// spawned relay worker.
     log: Arc<Mutex<Vec<SinkEntry>>>,
 }
 
@@ -73,14 +68,11 @@ fn dummy_wtxid(byte: u8) -> Wtxid {
     Wtxid::from(Hash256::from_le_bytes(&[byte; 32]))
 }
 
-/// Allocates a fresh process-unique node id via a throwaway lease.
 fn fresh_node_id() -> u64 {
     let (tx, _rx) = bounded::<crate::QueuedFrame>(1);
     PeerLease::new(tx).node_id()
 }
 
-/// Builds `count` fake peers with generous capacity and returns the
-/// peers plus their node ids, so tests can exclude a specific peer.
 fn fake_peers(count: usize) -> (Vec<FakePeer>, Vec<u64>) {
     let mut peers = Vec::with_capacity(count);
     let mut ids = Vec::with_capacity(count);
@@ -175,8 +167,6 @@ fn pending_broadcast_batches_resume_by_key_after_completion_and_removal() {
     for (_, wtxid, _) in remaining {
         gateway.mark_broadcast(wtxid);
     }
-    // Reusing the removed transaction as a peer admission must not inherit
-    // its previous local pending flag or index membership.
     gateway
         .insert_entry(
             relay_identity_peer(),
@@ -601,9 +591,6 @@ fn relay_identity_tx() -> Arc<bitcoin_rs_primitives::Tx> {
     })
 }
 
-/// Admits a transaction with a distinct coinbase-style input to
-/// `gateway`, so a queued announcement for its txid is live at send
-/// time, and returns the transaction with its admission epoch.
 fn admit_live_tx(marker: u8, gateway: &MempoolGateway) -> (Arc<bitcoin_rs_primitives::Tx>, u64) {
     use bitcoin_rs_primitives::OutPoint;
 
@@ -614,8 +601,6 @@ fn admit_live_tx(marker: u8, gateway: &MempoolGateway) -> (Arc<bitcoin_rs_primit
     (tx, sequence)
 }
 
-/// Inserts `tx` and returns the admission epoch its relay request must
-/// carry for the send-time residency check to match.
 fn admit_entry(tx: &Arc<bitcoin_rs_primitives::Tx>, gateway: &MempoolGateway) -> u64 {
     use bitcoin_rs_mempool::MempoolEntry;
 
@@ -629,8 +614,6 @@ fn admit_entry(tx: &Arc<bitcoin_rs_primitives::Tx>, gateway: &MempoolGateway) ->
         .expect("a single insert carries one admission sequence")
 }
 
-/// Reads the resident entry's wtxid for a fixture transaction, so a
-/// queued request carries the same identity the gateway serves.
 fn live_wtxid(txid: &Txid, gateway: &MempoolGateway) -> Wtxid {
     gateway
         .read()

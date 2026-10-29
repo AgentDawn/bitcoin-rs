@@ -2,7 +2,6 @@ use super::*;
 
 #[test]
 fn maximum_fee_uses_core_amount_rounding_including_one_satoshi_boundaries() {
-    // Core feerate.cpp GetFee: truncation, minimum one sat, zero disables.
     for (fee, vsize, rate, rejects) in [
         (2_000, 2_000, 1_000, false),
         (2_001, 2_000, 1_000, true),
@@ -74,7 +73,6 @@ fn only_versions_one_through_three_are_standard() {
     }
 }
 
-/// Push opcodes are pushes, and standard nulldata accepts them (including `OP_RESERVED` 0x50).
 #[test]
 fn accepts_op_return_followed_by_a_numeric_push() {
     for op in [opcode::OP_PUSHNUM_1, opcode::OP_RESERVED] {
@@ -89,7 +87,6 @@ fn accepts_op_return_followed_by_a_numeric_push() {
     }
 }
 
-/// `OP_RETURN` followed by a non-push opcode is not standard nulldata.
 #[test]
 fn rejects_op_return_followed_by_an_opcode() {
     let mut tx = standard_tx(1);
@@ -101,7 +98,6 @@ fn rejects_op_return_followed_by_an_opcode() {
     );
 }
 
-/// A push that is not a pubkey length still passes `is_multisig`.
 #[test]
 fn rejects_bare_multisig_whose_key_is_not_a_pubkey() {
     let mut script = vec![opcode::OP_PUSHNUM_1];
@@ -120,7 +116,6 @@ fn rejects_bare_multisig_whose_key_is_not_a_pubkey() {
     );
 }
 
-/// The same shape, honestly declared, stays standard.
 #[test]
 fn accepts_a_well_formed_bare_multisig() {
     let key = [0x02_u8; 33];
@@ -170,7 +165,6 @@ fn rejects_one_of_four_bare_multisig() {
     );
 }
 
-/// The pay-to-anchor template, `OP_1` plus a two-byte push of 0x4e73.
 #[test]
 fn accepts_a_pay_to_anchor_output() {
     let mut tx = standard_tx(1);
@@ -181,9 +175,6 @@ fn accepts_a_pay_to_anchor_output() {
     assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
 }
 
-/// A `SegWit` spend can be consensus-valid and still below the relay
-/// minimum once its witness is stripped, which a weight check alone
-/// cannot see.
 #[test]
 fn rejects_a_transaction_below_the_non_witness_minimum() {
     let mut tx = standard_tx(1);
@@ -268,7 +259,6 @@ fn accepts_two_nulldata_outputs_within_the_aggregate_limit() {
     );
 }
 
-// CONTRACT: API-24
 #[test]
 fn dust_relay_fee_changes_the_boundary() {
     let mut tx = standard_tx(1);
@@ -299,7 +289,6 @@ fn accepts_single_op_return_within_limit() {
 #[test]
 fn only_one_ephemeral_dust_output_is_standard() {
     let mut tx = standard_tx(1);
-    // Core IsStandardTx permits one dust output; admission checks its fees.
     tx.outputs[0].value = Amount::from_sat(1);
     assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     tx.outputs.push(tx.outputs[0].clone());
@@ -312,7 +301,7 @@ fn only_one_ephemeral_dust_output_is_standard() {
 #[test]
 fn rejects_non_standard_output_script() {
     let mut tx = standard_tx(1);
-    tx.outputs[0].script_pubkey = vec![0x74].into(); // OP_DEPTH
+    tx.outputs[0].script_pubkey = vec![0x74].into();
     assert_eq!(
         is_standard_tx(&tx, &policy()),
         Err(StandardnessError::NonStandardOutput)
@@ -326,7 +315,6 @@ fn signed_delta_clamp_prevents_maxfeerate_rejection_and_retains_effective_rate()
     let tx = standard_tx(2);
     let txid = tx.txid();
 
-    // Base fee: 1_000 sats, negative delta of -3_000 sats -> modified fee: -2_000 sats.
     pool.prioritise(txid, -3_000)?;
     assert_eq!(pool.modified_fee_for(txid, 1_000)?, -2_000);
 
@@ -342,20 +330,16 @@ fn signed_delta_clamp_prevents_maxfeerate_rejection_and_retains_effective_rate()
         &policy(),
         &tx,
         context,
-        Some(10_000), // max_feerate_sat_per_kvb
+        Some(10_000),
         None,
         &Bip68Admission::default(),
     );
 
-    // Clamping negative modified fee to max(0) ensures:
-    // 1. Never maps a negative delta to u64::MAX, so max feerate is not exceeded.
     assert_ne!(
         fact.reject_reason,
         Some(AcceptanceRejectReason::MaxFeeExceeded)
     );
-    // 2. Modified fee is tracked as signed -2000.
     assert_eq!(fact.modified_fee, Some(-2_000));
-    // 3. Clamped effective fee rate produces Some(0), not None.
     assert_eq!(fact.effective_fee_rate, Some(0));
     Ok(())
 }
@@ -367,7 +351,6 @@ fn three_vsize_meanings_on_sigop_heavy_tx() -> Result<(), Box<dyn std::error::Er
     use alloc::sync::Arc;
 
     let mut tx = standard_tx(2);
-    // Add 50 OP_CHECKSIG opcodes in an output script (each counts as 4 sigop cost in consensus).
     let sigop_script = Script::from_bytes(vec![opcode::OP_CHECKSIG; 50]);
     tx.outputs.push(TxOut {
         value: Amount::from_sat(50_000),
@@ -383,7 +366,6 @@ fn three_vsize_meanings_on_sigop_heavy_tx() -> Result<(), Box<dyn std::error::Er
     );
 
     let context = prepared_context(&tx, &[prevout], false);
-    // 50 OP_CHECKSIG opcodes in added output + 1 in P2PKH output = 51 sigops = 204 sigop cost.
     assert_eq!(context.sigop_cost, 204);
 
     let unadjusted_weight = tx.weight();
@@ -393,8 +375,6 @@ fn three_vsize_meanings_on_sigop_heavy_tx() -> Result<(), Box<dyn std::error::Er
         u32::try_from(Tx::vsize_from_weight(unadjusted_weight))?
     );
 
-    // Policy-adjusted virtual size reflects the heavy sigop cost:
-    // 204 sigop cost * 20 = 4,080 WU; 4,080 / 4 = 1,020 vB.
     let vsize_adjusted = context.vsize;
     assert_eq!(vsize_adjusted, 1_020);
     assert!(vsize_adjusted > vsize_bip141);
@@ -408,13 +388,10 @@ fn three_vsize_meanings_on_sigop_heavy_tx() -> Result<(), Box<dyn std::error::Er
         context.sigop_cost,
     );
 
-    // 1. entry.vsize = vsize_adjusted = context.vsize (sigop-adjusted entry vsize)
     assert_eq!(entry.vsize, vsize_adjusted);
     assert_eq!(entry.vsize, 1_020);
-    // 2. entry.bip141_vsize = vsize_bip141 = tx.vsize() unadjusted
     assert_eq!(entry.bip141_vsize, vsize_bip141);
     assert_eq!(entry.bip141_vsize, u32::try_from(tx.vsize())?);
-    // 3. Consensus weight unadjusted
     assert_eq!(entry.weight, unadjusted_weight);
     Ok(())
 }

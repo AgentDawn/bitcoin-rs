@@ -56,9 +56,6 @@ impl UtxoView for hashbrown::HashMap<OutPoint, TxOut> {
     }
 }
 
-// Activation contract: BIP141, "Sigops" (https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#sigops),
-// as implemented by Bitcoin Core v31.1 in src/validation.cpp:
-// https://github.com/bitcoin/bitcoin/blob/v31.1/src/validation.cpp
 #[test]
 fn assume_valid_and_prepared_sigop_checks_follow_witness_activation()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -85,7 +82,6 @@ fn assume_valid_and_prepared_sigop_checks_follow_witness_activation()
             script_pubkey: Script::from_bytes([vec![0x00, 0x20], vec![1; 32]].concat()),
         },
     )]);
-    // Skipping execution still accounts sigops with the active flags.
     assert_eq!(
         super::verify_transaction_non_script(&tx, &prevouts, 0, 0, VerifyFlags::P2SH),
         Ok(()),
@@ -97,7 +93,6 @@ fn assume_valid_and_prepared_sigop_checks_follow_witness_activation()
             max: crate::MAX_BLOCK_SIGOPS_COST
         }),
     );
-    // Preparation binds the execution flags for its cached post-error.
     let txs = vec![tx];
     let block = test_block_parse(&txs);
     let resolved = vec![vec![prevouts.get(&outpoint).cloned()]];
@@ -212,7 +207,6 @@ fn verify_transaction_accepts_valid_multi_input_taproot_keypath() {
     for (index, seed) in seeds.into_iter().enumerate() {
         let secret = SecretKey::from_slice(&[seed; 32]).unwrap_or_else(|_| panic!("secret key"));
         let keypair = Keypair::from_secret_key(&secp, &secret);
-        // BIP341 key-only tweak: t = TaggedHash("TapTweak", x_only_pubkey || [0u8; 32])
         let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
         let tag = {
             let mut h = Sha256::new();
@@ -223,7 +217,7 @@ fn verify_transaction_accepts_valid_multi_input_taproot_keypath() {
         tweak_hash.update(tag);
         tweak_hash.update(tag);
         tweak_hash.update(xonly.serialize());
-        tweak_hash.update([0u8; 32]); // empty merkle root
+        tweak_hash.update([0u8; 32]);
         let tweak_arr: [u8; 32] = tweak_hash.finalize().into();
         let tweak = Scalar::from_be_bytes(tweak_arr).unwrap_or_else(|_| panic!("tweak scalar"));
         let tweaked_keypair = keypair
@@ -236,8 +230,8 @@ fn verify_transaction_accepts_valid_multi_input_taproot_keypath() {
         };
         outpoints.push(outpoint);
         let mut script_pubkey = Vec::with_capacity(34);
-        script_pubkey.push(0x51); // OP_1
-        script_pubkey.push(0x20); // push 32 bytes
+        script_pubkey.push(0x51);
+        script_pubkey.push(0x20);
         script_pubkey.extend_from_slice(&output_key.serialize());
         prevouts.push(TxOut {
             value: Amount::from_sat(50_000),
@@ -328,7 +322,6 @@ fn kernel_scripts_preserve_verdicts_and_non_script_bypass() {
 #[test]
 fn locktime_finality_uses_the_height_and_the_caller_supplied_cutoff() {
     const TIMESTAMP: u32 = 500_000_100;
-    // (locktime, height, cutoff, final)
     let cases: [(u32, u32, u32, bool); 8] = [
         (0, 0, 0, true),
         (200, 100, 0, false),
@@ -337,7 +330,6 @@ fn locktime_finality_uses_the_height_and_the_caller_supplied_cutoff() {
         (TIMESTAMP, 1, TIMESTAMP - 1, false),
         (TIMESTAMP, 1, TIMESTAMP, false),
         (TIMESTAMP, 1, TIMESTAMP + 1, true),
-        // A height cutoff cannot retire a timestamp locktime.
         (TIMESTAMP, u32::MAX, 0, false),
     ];
     let utxos = hashbrown::HashMap::new();
@@ -370,7 +362,6 @@ fn locktime_finality_uses_the_height_and_the_caller_supplied_cutoff() {
             );
         }
 
-        // A final sequence on every input overrides the locktime.
         tx.inputs[0].sequence = Sequence::MAX;
         assert!(is_final_tx(&tx, height, cutoff), "{label} final sequence");
     }
@@ -577,10 +568,6 @@ fn op_equal_txout(value: u64) -> TxOut {
     }
 }
 
-/// A block whose spend carries an invalid signature connects when the
-/// cache holds its exact `(wtxid, flags)` entry (scripts skipped, pre-
-/// and post-checks still run), fails again once the hit consumed the
-/// entry, and fails when the entry sits under different flags.
 #[test]
 fn script_cache_hit_skips_scripts_for_exact_flags_only() -> Result<(), Box<dyn std::error::Error>> {
     use crate::script_cache::{ScriptExecutionCache, WindowCacheTakes};
@@ -602,8 +589,6 @@ fn script_cache_hit_skips_scripts_for_exact_flags_only() -> Result<(), Box<dyn s
     cache.insert(wtxid, flags);
     let parsed = test_block_parse(&txs);
     let mut view = block_view_for(&txs, resolved.clone());
-    // Populate precomputed witness ids so the hit exercises the
-    // facts-wtxids key source (identical keys for witness-free bodies).
     let _ = view.witness_ids();
     let mut takes = WindowCacheTakes::new(&cache);
     let hit =
@@ -633,11 +618,8 @@ fn script_cache_hit_skips_scripts_for_exact_flags_only() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// A transaction's stored post-verdict fires even though its prevouts
-/// moved into the prepared state; the balanced control still passes.
 #[test]
 fn prepared_error_selection_keeps_pre_script_post_order() {
-    // OP_1 prevout: the script passes and the stored post-verdict decides.
     let resolved = vec![vec![], vec![Some(op1_txout(50))]];
     let balanced_txs = vec![
         coinbase_transaction_with_script_sig_len(2),
@@ -654,8 +636,6 @@ fn prepared_error_selection_keeps_pre_script_post_order() {
         super::prepare_block_script_checks(&mut view, 0, 0, VerifyFlags::NONE, &parsed, None)
             .unwrap_or_else(|error| panic!("fixture prevouts resolve: {error}"));
     assert!(overdraft.prepared[1].script_state.is_some());
-    // One unit spans the block; the stored post-verdict of the second
-    // transaction is reported once its scripts pass.
     let verdict = super::verify_prepared_units(core::slice::from_ref(&overdraft));
     assert!(
         matches!(
@@ -687,8 +667,6 @@ fn mismatch_input(outpoint: OutPoint) -> TxIn {
     }
 }
 
-/// A witness-bearing variant: the script still mismatches, but the
-/// wtxid no longer equals the txid, so a txid fallback misses the cache.
 fn witnessed_mismatch_input(outpoint: OutPoint) -> TxIn {
     TxIn {
         witness: Witness::from_stack(vec![vec![0x51]]),
@@ -696,9 +674,6 @@ fn witnessed_mismatch_input(outpoint: OutPoint) -> TxIn {
     }
 }
 
-/// A witness-bearing body keyed from `from_txids` facts hits the cache
-/// under its real wtxid: the prepare derives witness ids instead of
-/// falling back to the txid.
 #[test]
 fn script_cache_hit_uses_derived_witness_ids_for_witness_bearing_bodies()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -748,7 +723,6 @@ type OrderingCase = (&'static str, Vec<Tx>, Vec<Vec<Option<TxOut>>>, Expect);
 
 enum Expect {
     Accepted,
-    // Backend reason text differs; both must report input zero.
     ScriptAtFirstInput,
     Exact(ConsensusError),
 }
@@ -927,7 +901,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 
 fn load_taproot_scriptpath_fixture() -> TaprootScriptPathFixture {
     let json = include_str!("../../tests/vectors/scripts/taproot_scriptpath_spend.json");
-    let file: TaprootScriptPathFile = serde_json::from_str(json)
+    let file: TaprootScriptPathFile = sonic_rs::from_str(json)
         .unwrap_or_else(|error| panic!("taproot scriptpath fixture parses: {error}"));
     let tx: Tx = deserialize(&decode_hex(&file.tx_hex))
         .unwrap_or_else(|error| panic!("taproot scriptpath tx hex decodes: {error}"));

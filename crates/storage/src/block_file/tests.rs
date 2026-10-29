@@ -72,17 +72,6 @@ fn write_record_handles_short_interrupted_and_zero_writes() -> io::Result<()> {
     Ok(())
 }
 
-/// `disk_usage` reports bytes that are there, and stops reporting them when
-/// they are deleted.
-///
-/// This is what `getblockchaininfo` calls `size_on_disk`. The figure it
-/// replaces was the sum of every block's serialized length, which pruning
-/// could not move: records are kept when their bodies are dropped, so a
-/// pruned node went on reporting bytes it no longer had — under a field name
-/// that is read precisely to check whether pruning is working.
-///
-/// Compared against a fresh walk of the directory at every step, so it pins
-/// the number against the files rather than against itself.
 #[test]
 fn disk_usage_follows_the_files_through_appends_and_deletion() -> Result<(), crate::StorageError> {
     let data_dir = tempdir()?;
@@ -95,7 +84,6 @@ fn disk_usage_follows_the_files_through_appends_and_deletion() -> Result<(), cra
     assert_eq!(after_first, super::measure_blocks_dir(&blocks_dir)?);
     assert!(after_first > 0, "an appended body occupies bytes");
 
-    // Past the 120-byte cap, so this rolls into a second file.
     let third = store.persist(None, 2, hash(2), b"a longer second body")?;
     let third = store.persist(None, 3, hash(3), b"third").map(|_| third)?;
     assert_eq!(third.file_no, 0, "the fixture must roll over");
@@ -103,7 +91,6 @@ fn disk_usage_follows_the_files_through_appends_and_deletion() -> Result<(), cra
     assert_eq!(after_rollover, super::measure_blocks_dir(&blocks_dir)?);
     assert!(after_rollover > after_first, "appends add bytes");
 
-    // File 0 is complete, so it is prunable; file 1 is the current one.
     assert!(
         store.delete_file_if_not_current(0)?,
         "the fixture must have a prunable file"
@@ -122,7 +109,6 @@ fn disk_usage_follows_the_files_through_appends_and_deletion() -> Result<(), cra
     Ok(())
 }
 
-/// A failed rollback must not leave a later append behind a torn frame.
 #[test]
 fn retry_recovers_an_append_whose_rollback_failed() -> Result<(), crate::StorageError> {
     let data_dir = tempdir()?;
@@ -173,14 +159,6 @@ fn retry_recovers_an_append_whose_rollback_failed() -> Result<(), crate::Storage
     Ok(())
 }
 
-/// Only block files count, and a stray file must not be mistaken for one.
-///
-/// The seeding walk and the running figure have to agree about what a block
-/// file is: `append` counts framed records and nothing else, so a walk that
-/// counted every directory entry would seed a number the maintained one can
-/// never match — and `disk_usage`'s guard would fire on a node that had
-/// nothing wrong with it. Backup copies, editor scratch files and the
-/// operating system's own directory droppings all land here.
 #[test]
 fn disk_usage_counts_only_block_files() -> Result<(), crate::StorageError> {
     let data_dir = tempdir()?;
@@ -260,8 +238,6 @@ fn load_range_agrees_with_slicing_the_whole_body() -> Result<(), crate::StorageE
     let body: Vec<u8> = (0..=255_u8).cycle().take(1_000).collect();
     let position = store.persist(None, 9, hash(9), &body)?;
 
-    // Exhaustive over a coarse grid rather than a handful of cases: an
-    // off-by-one in the header skip shows up only at specific offsets.
     for offset in (0_u32..1_000).step_by(37) {
         for len in [0_u32, 1, 2, 33, 256, 999] {
             let Some(end) = offset.checked_add(len) else {
@@ -293,9 +269,6 @@ fn load_range_refuses_a_frame_that_is_not_the_requested_block() -> Result<(), cr
     let store = FlatFileBlockStore::open(data_dir.path())?;
     let position = store.persist(None, 11, hash(11), b"the original body")?;
 
-    // Same frame, wrong identity: a range must be as strongly bound to
-    // (height, hash) as a whole-body load is, or a reorged-away block could
-    // serve bytes for a height it no longer owns.
     assert_eq!(store.load_range(position, 12, hash(11), 0, 4)?, None);
     assert_eq!(store.load_range(position, 11, hash(12), 0, 4)?, None);
     assert_eq!(
@@ -315,7 +288,6 @@ fn load_range_rejects_out_of_bounds_and_overflowing_ranges() -> Result<(), crate
     assert_eq!(store.load_range(position, 5, hash(5), 11, 0)?, None);
     assert_eq!(store.load_range(position, 5, hash(5), 0, 11)?, None);
     assert_eq!(store.load_range(position, 5, hash(5), u32::MAX, 1)?, None);
-    // The exact end of the body is in bounds.
     assert_eq!(
         store.load_range(position, 5, hash(5), 10, 0)?,
         Some(Vec::new())

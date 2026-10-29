@@ -58,14 +58,8 @@ fn test_sync_with_mined_chain(
     })
 }
 
-/// One connection cannot fill the shared inbound block channel with bodies
-/// it was never asked for, and a body the download window owns is never
-/// dropped for that bound.
 #[test]
 fn unsolicited_block_flood_is_bounded_per_source() -> Result<(), Box<dyn std::error::Error>> {
-    // Real sync wiring: peer A announces block 2 and the window asks A for
-    // its body, so A's requested delivery must outlive A's exhausted
-    // unsolicited credits.
     let peers = Arc::new(crate::PeerTable::new());
     let MinedSyncFixture {
         sync,
@@ -156,7 +150,6 @@ fn unsolicited_block_flood_is_bounded_per_source() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// An empty mempool that counts its identity scans.
 struct ScanCounter(std::sync::atomic::AtomicUsize);
 
 impl crate::compact_blocks::CompactBlockHints for ScanCounter {
@@ -266,13 +259,8 @@ fn deliver_compact_block(
     Ok(())
 }
 
-/// A compact block reconstructs only when its header earns the mempool
-/// scan: valid proof of work, a known parent, and more work than the
-/// applied chain or a body fetch this connection owns. Anything else is a
-/// header announcement only, and repeating an admitted hash never rescans.
 #[test]
 fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std::error::Error>> {
-    // Genesis plus two blocks, all applied: the applied tip is block 2.
     let peers = Arc::new(crate::PeerTable::new());
     let fixture = test_sync_with_applied_chain(&peers)?;
     let sync = fixture.sync;
@@ -291,7 +279,7 @@ fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std
         deliver_compact_block(block, &mut reconstruction, &hints, &lease, addr, &shared)
     };
     let scans = || hints.0.load(Ordering::Relaxed);
-    // An earning header both reaches the mempool and forwards its body.
+
     let assert_reconstructed = |expected_scans: usize, expected_blocks: usize, message: &str| {
         assert_eq!(scans(), expected_scans, "{message}");
         assert_eq!(blocks_rx.len(), expected_blocks, "{message}");
@@ -305,19 +293,17 @@ fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std
         )
     };
 
-    // No proof of work: the right parent, but a target the hash misses.
     let mut no_work = next(3)?;
     no_work.header.bits = bitcoin_rs_primitives::CompactTarget::from_consensus(0x1d00_ffff);
     deliver(&no_work)?;
-    // Unknown parent.
+
     let orphan = regtest_fixture::mined_block_with_prev_hash(
         no_work.header.compute_hash(),
         4,
         vec![regtest_fixture::coinbase(4)],
     )?;
     deliver(&orphan)?;
-    // A replayed applied block: known parent, but no more work than the
-    // applied tip.
+
     let replayed = blocks.first().ok_or("chain has block 1")?;
     deliver(replayed)?;
     assert_reconstructed(0, 0, "no rejected header reaches the mempool");
@@ -326,7 +312,6 @@ fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std
         assert_eq!(announced.headers.len(), 1, "each header is still announced");
     }
 
-    // Another connection owning its body fetch does not count for this one.
     assert!(sync.enqueue_owned_body_fetch(
         other_source,
         Hash256::from(replayed.block_hash()),
@@ -336,17 +321,14 @@ fn compact_reconstruction_requires_an_earning_header() -> Result<(), Box<dyn std
     assert_reconstructed(0, 0, "ownership is by exact connection");
     assert_eq!(headers_rx.try_recv()?.headers.len(), 1);
 
-    // The replayed block once this connection owns its body fetch.
     assert!(sync.enqueue_owned_body_fetch(source, Hash256::from(replayed.block_hash()), || true,));
     deliver(replayed)?;
     assert_reconstructed(1, 1, "this connection owns the replayed body fetch");
 
-    // A new block extending the applied tip needs no request.
     let extending = next(3)?;
     deliver(&extending)?;
     assert_reconstructed(2, 2, "an extending block reconstructs without a request");
 
-    // Repeating it never rescans the mempool.
     deliver(&extending)?;
     assert_reconstructed(2, 2, "a repeat never rescans the mempool");
     Ok(())

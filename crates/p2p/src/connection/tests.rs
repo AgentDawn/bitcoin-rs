@@ -7,7 +7,6 @@ use crossbeam_channel::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A standalone per-connection budget (no aggregate).
 fn standalone(max_messages: usize, max_bytes: usize, reserve: usize) -> Arc<OutboundBudget> {
     Arc::new(OutboundBudget::with_block_reserve(
         max_messages,
@@ -16,22 +15,18 @@ fn standalone(max_messages: usize, max_bytes: usize, reserve: usize) -> Arc<Outb
     ))
 }
 
-/// Charges `bytes` or fails the test with the refusal kind.
 fn charge(budget: &Arc<OutboundBudget>, bytes: usize) -> OutboundCredit {
     budget
         .try_charge(bytes)
         .unwrap_or_else(|refusal| panic!("charge of {bytes} refused: {refusal:?}"))
 }
 
-/// Reserves a production credit or fails the test with the refusal kind.
 fn reserve(budget: &Arc<OutboundBudget>) -> OutboundCredit {
     budget
         .try_reserve_production()
         .unwrap_or_else(|refusal| panic!("production reservation refused: {refusal:?}"))
 }
 
-/// A lease on `shared` with roomy local bounds and the given reserve; the
-/// receiver is returned so the channel stays connected.
 fn shared_lease_with_reserve(
     shared: &Arc<SharedOutboundBudget>,
     reserve_bytes: usize,
@@ -46,7 +41,6 @@ fn shared_lease_with_reserve(
     (lease, rx)
 }
 
-/// A default lease on `shared`.
 fn shared_lease(shared: &Arc<SharedOutboundBudget>) -> (PeerLease, Receiver<QueuedFrame>) {
     let (tx, rx) = crossbeam_channel::unbounded();
     (PeerLease::new(tx).with_shared_budget(shared), rx)
@@ -247,7 +241,6 @@ fn block_production_reserve_admits_worst_case_block() {
 
 #[test]
 fn headroom_needs_a_free_item_slot_as_well_as_the_byte_reserve() {
-    // Bytes are abundant: only the item cap can close the gate.
     let budget = standalone(2, 1_000_000, 100);
     assert!(budget.may_reserve_production(), "empty queue");
     let first = charge(&budget, 10);
@@ -271,7 +264,6 @@ fn may_charge_is_the_admit_condition_without_the_reserve() {
     let reserve_bytes = 100;
     let budget = standalone(3, 3 * reserve_bytes, reserve_bytes);
     assert!(budget.may_charge(10));
-    // 250 queued bytes plus the 100-byte reserve exceed the 300-byte cap.
     let first = charge(&budget, 2 * reserve_bytes + 50);
     assert!(
         !budget.may_reserve_production(),
@@ -391,8 +383,6 @@ fn bip434_features_never_enter_the_post_handshake_queue() {
         let (lease, rx) = shared_lease_with_reserve(&shared, 1_000);
         let message = crate::Message::Feature(crate::feature::FeatureAnnouncement::bip332(true));
         let credit = reserved.then(|| reserve(&lease.budget_handle()));
-        // Even under aggregate pressure this is a local caller error,
-        // never retryable Shared backpressure.
         let (other, _rx) = shared_lease_with_reserve(&shared, 1_000);
         let held = charge(&other.budget_handle(), 10_000 - shared.pending());
         let result = match credit {
@@ -420,9 +410,6 @@ fn cancelled_lease_refuses_send() {
     );
 }
 
-/// The aggregate is a strict cap: with it full, a peer whose own queue is
-/// empty is refused too (no empty-queue bypass), its lease stays live,
-/// nothing is charged, and a retry after the drain succeeds.
 #[test]
 fn strict_cap_no_empty_queue_bypass() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(100, 0));
@@ -444,9 +431,6 @@ fn strict_cap_no_empty_queue_bypass() {
     assert!(other.send(crate::Message::Ping(2)).is_ok());
 }
 
-/// The reservation is the admission: `max = 2R - 1 + margin` admits one
-/// production credit, `max = 2R + margin` admits two, and the next is a
-/// shared refusal that charges nothing.
 #[test]
 fn reservation_is_the_admission() {
     let reserve_bytes = 100;
@@ -470,9 +454,6 @@ fn reservation_is_the_admission() {
     }
 }
 
-/// 32 threads race for production credits while a sampler watches the
-/// counter: the cap is never exceeded at any instant and exactly
-/// `floor(bulk_limit / R)` reservations win.
 #[test]
 fn concurrent_reservations_never_exceed_cap() {
     use std::sync::Barrier;
@@ -534,8 +515,6 @@ fn concurrent_reservations_never_exceed_cap() {
     assert_eq!(shared.pending(), 0);
 }
 
-/// Dropping a credit and shrinking a credit each wake a session parked on
-/// the aggregate.
 #[test]
 fn shrink_and_drop_wake_waiters() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(100, 0));
@@ -551,7 +530,6 @@ fn shrink_and_drop_wake_waiters() {
         move || budget.may_charge(50)
     };
     let (thread, done) = spawn_waiter(&waiter_budget, Duration::from_secs(60), ready);
-    // The waiter may not have parked yet; the protocol must hold either way.
     std::thread::sleep(Duration::from_millis(50));
     hog_budget.shrink(&mut hog_credit, 40);
     let woke = done.recv_timeout(WAKE_DEADLINE);
@@ -561,8 +539,6 @@ fn shrink_and_drop_wake_waiters() {
     assert_eq!(shared.pending(), 40);
     assert_eq!(hog_budget.pending(), (1, 40));
 
-    // A fresh pair for the drop half, since the first waiter's writer is
-    // marked dead.
     let (second_waiter, _second_rx) = shared_lease(&shared);
     let second_budget = second_waiter.budget_handle();
     let held = charge(&second_budget, 50);
@@ -582,9 +558,6 @@ fn shrink_and_drop_wake_waiters() {
     assert_eq!(shared.pending(), 0);
 }
 
-/// Every credit returns its charge exactly once on both halves: a drop
-/// releases it, a shrink releases only the excess, and a bystander's
-/// charge is never touched.
 #[test]
 fn credit_drop_exactly_once() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(1_000, 0));
@@ -619,9 +592,6 @@ fn credit_drop_exactly_once() {
     assert_eq!(shared.pending(), 0);
 }
 
-/// The bulk margin keeps one maximum frame of the aggregate for control
-/// traffic: production credits stop at the bulk limit while an ordinary
-/// charge still takes the margin, and only then does the aggregate refuse.
 #[test]
 fn bulk_margin_keeps_control_flowing() {
     let reserve_bytes = 100;
@@ -634,7 +604,6 @@ fn bulk_margin_keeps_control_flowing() {
     assert_eq!(budget.try_reserve_production().err(), Some(Refusal::Shared));
     assert!(!budget.may_reserve_production());
 
-    // Control traffic still flows into the margin.
     let ping = crate::Message::Ping(9);
     assert!(lease.send(ping).is_ok());
     let control = charge(
@@ -646,8 +615,6 @@ fn bulk_margin_keeps_control_flowing() {
     drop((bulk, control));
 }
 
-/// A credit reserved before the message existed shrinks to the exact wire
-/// length when spent, and its charge then rides with the queued frame.
 #[test]
 fn send_with_shrinks_the_reservation_to_the_wire_length() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(10_000, 1_000));
@@ -675,8 +642,6 @@ fn send_with_shrinks_the_reservation_to_the_wire_length() {
     assert_eq!(lease.budget_handle().pending(), (0, 0));
 }
 
-/// `send_with` fails closed and returns the charge when the lease is
-/// cancelled or the message outgrew its reservation.
 #[test]
 fn send_with_fails_closed_and_releases_the_credit() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(10_000, 0));
@@ -706,9 +671,6 @@ fn send_with_fails_closed_and_releases_the_credit() {
     assert_eq!(cancelled.budget_handle().pending(), (0, 0));
 }
 
-/// A dead writer reclaims nothing: charges taken before death stay with
-/// their queued frames and release when those drop; later charges are
-/// refused locally and close the lease.
 #[test]
 fn dead_writer_refuses_charges_and_reclaims_nothing() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(1_000, 0));
@@ -735,10 +697,6 @@ fn dead_writer_refuses_charges_and_reclaims_nothing() {
     assert_eq!(budget.pending(), (0, 0));
 }
 
-/// Two leases sharing one aggregate: the first fills it, a peer with an
-/// empty queue is refused without being cancelled, and the first
-/// connection's own local bounds never moved. Draining the hog reopens
-/// the aggregate.
 #[test]
 fn shared_aggregate_caps_two_connections_without_touching_local_bounds() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(100, 0));
@@ -749,8 +707,6 @@ fn shared_aggregate_caps_two_connections_without_touching_local_bounds() {
     let first = charge(&hog_budget, 60);
     let second = charge(&hog_budget, 39);
     assert_eq!(shared.pending(), 99);
-    // Local bounds are untouched: the hog still has its whole local
-    // budget, only the aggregate is nearly full.
     assert!(hog_budget.may_charge(1));
     assert_eq!(hog_budget.pending(), (2, 99));
 
@@ -765,12 +721,10 @@ fn shared_aggregate_caps_two_connections_without_touching_local_bounds() {
     assert_eq!(shared.pending(), 99);
     assert_eq!(other.budget_handle().pending(), (0, 0));
 
-    // Draining the hog reopens the aggregate for the same lease.
     drop(first);
     assert!(other.send(crate::Message::Ping(2)).is_ok());
     assert_eq!(shared.pending(), 39 + ping_len);
 
-    // A further send that no longer fits is backpressure, not a close.
     let overflow = crate::Message::Ping(3);
     assert_eq!(
         other.send(overflow.clone()),
@@ -780,9 +734,6 @@ fn shared_aggregate_caps_two_connections_without_touching_local_bounds() {
     drop(second);
 }
 
-/// A healthy peer progresses while another peer saturates only its own
-/// local budget: local bounds isolate connections, the aggregate only
-/// binds the sum.
 #[test]
 fn healthy_peer_progresses_beside_a_locally_saturated_peer() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(1_000_000, 0));
@@ -805,8 +756,6 @@ fn healthy_peer_progresses_beside_a_locally_saturated_peer() {
     assert!(!healthy.is_cancelled());
 }
 
-/// A waiter parked on the aggregate wakes when a DIFFERENT connection
-/// drains: cross-connection resumption, not just local release.
 #[test]
 fn aggregate_waiter_resumes_on_another_connections_drain() {
     let shared = Arc::new(SharedOutboundBudget::with_limits(200, 0));
@@ -814,7 +763,6 @@ fn aggregate_waiter_resumes_on_another_connections_drain() {
     let (waiter, _waiter_rx) = shared_lease_with_reserve(&shared, 100);
     let waiter_budget = waiter.budget_handle();
     let hog_credit = charge(&hog.budget_handle(), 150);
-    // The hog's bytes plus the worst-case reserve exceed the aggregate.
     assert!(!waiter_budget.may_reserve_production());
 
     let ready = {
@@ -822,7 +770,6 @@ fn aggregate_waiter_resumes_on_another_connections_drain() {
         move || budget.may_reserve_production()
     };
     let (thread, done) = spawn_waiter(&waiter_budget, Duration::from_secs(60), ready);
-    // The waiter may not have parked yet; the protocol must hold either way.
     std::thread::sleep(Duration::from_millis(50));
     drop(hog_credit);
     let woke = done.recv_timeout(WAKE_DEADLINE);
@@ -836,8 +783,6 @@ fn aggregate_waiter_resumes_on_another_connections_drain() {
     assert_eq!(shared.pending(), 0);
 }
 
-/// Independent aggregates stay independent: exhausting one node's budget
-/// leaves another node's connections unaffected (no global singleton).
 #[test]
 fn independent_aggregates_stay_independent() {
     let first = Arc::new(SharedOutboundBudget::with_limits(100, 0));
@@ -929,7 +874,6 @@ fn saturated_getdata_fourth_send_refuses_and_closes_lease() {
     assert!(independent.send(crate::Message::Ping(1)).is_ok());
 }
 
-/// Runs `wait_for` on a thread and reports when it returned.
 fn spawn_waiter(
     budget: &Arc<OutboundBudget>,
     timeout: Duration,
@@ -944,8 +888,6 @@ fn spawn_waiter(
     (handle, done_rx)
 }
 
-/// A saturated budget with one worst-case message pending: no headroom
-/// until the credit drops.
 fn saturated_budget() -> (Arc<OutboundBudget>, OutboundCredit) {
     let reserve_bytes = 100;
     let budget = standalone(10, 2 * reserve_bytes, reserve_bytes);
@@ -966,12 +908,10 @@ fn release_wakes_a_waiter_long_before_its_timeout() {
     let (budget, credit) = saturated_budget();
     let (waiter, done) = spawn_waiter(&budget, Duration::from_secs(60), production_ready(&budget));
 
-    // The waiter may not have parked yet; the protocol must hold either way.
     std::thread::sleep(Duration::from_millis(50));
     drop(credit);
 
     let woke = done.recv_timeout(WAKE_DEADLINE);
-    // Unblock the waiter on failure so the join below cannot hang.
     budget.mark_writer_dead();
     waiter.join().unwrap_or_else(|_| panic!("waiter panicked"));
     assert!(woke.is_ok(), "a release must wake the waiter");
@@ -1035,12 +975,9 @@ fn a_release_that_leaves_the_queue_saturated_does_not_end_the_wait() {
     assert!(!budget.may_reserve_production());
     let (waiter, done) = spawn_waiter(&budget, Duration::from_secs(60), production_ready(&budget));
 
-    // 180 pending plus the 100 reserve still exceeds the 200 cap: the
-    // wake finds no headroom and the waiter must keep waiting.
     std::thread::sleep(Duration::from_millis(50));
     drop(credits.pop());
     let early = done.recv_timeout(Duration::from_millis(300));
-    // 90 + 100 <= 200: this release opens the gate.
     drop(credits.pop());
     let woke = done.recv_timeout(WAKE_DEADLINE);
     budget.mark_writer_dead();

@@ -7,15 +7,10 @@ const TXID_LEN: usize = 32;
 const OUTPUT_COUNT_OFFSET: usize = TXID_LEN;
 const INLINE_LEN_OFFSET: usize = OUTPUT_COUNT_OFFSET + core::mem::size_of::<u32>();
 const RECORD_HEADER_LEN: usize = INLINE_LEN_OFFSET + core::mem::size_of::<u8>();
-/// Largest v5 payload prologue, for the encoder's stack buffer: 10 bytes for
-/// the amount varint (or the escape sentinel), 8 for a raw escaped amount, and
-/// 5 for the packed height. The script needs none — it is the rest.
 const PAYLOAD_PROLOGUE_MAX_LEN: usize = crate::compress::VARINT_MAX_LEN + 8 + 5;
 
 const WIDTHS_OFFSET: usize = RECORD_HEADER_LEN;
 const V5_BODY_OFFSET: usize = WIDTHS_OFFSET + 1;
-/// Widest directory entry. `vout` is a `u32`; a payload is at most a 10-byte
-/// amount, 8 escape bytes, a 5-byte height and a `u16`-ceilinged script.
 const MAX_DIR_WIDTH: usize = 4;
 
 const fn width_for(value: u64) -> usize {
@@ -124,13 +119,6 @@ pub(crate) struct OneUtxoOut<'a> {
     pub height: u32,
 }
 
-/// A transaction-level UTXO record encoded in one owned byte slice.
-///
-/// PRE: constructors receive a valid canonical encoding or validated output
-/// parts.
-/// POST: the slice contains the complete canonical record payload.
-/// INVARIANT: the payload is immutable after construction and owns no spare
-/// capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UtxoRecord {
     buf: Box<[u8]>,
@@ -160,11 +148,6 @@ impl<'a> Iterator for UtxoOutputIter<'a> {
         let (output, next) =
             match decode_output_at(self.bytes, &self.layout, self.index, self.payload) {
                 Ok(decoded) => decoded,
-                // `UtxoRecord` is validated at construction (`from_encoded` runs
-                // `validate_encoded`, which fully decodes every output) and its
-                // `bytes` field is private and immutable afterward; a decode
-                // failure here means the validated record was mutated in place,
-                // which is an unrecoverable internal corrupt state.
                 Err(error) => {
                     panic!("validated UTXO record output must remain decodable: {error:?}")
                 }
@@ -258,16 +241,6 @@ impl UtxoRecord {
             .max()
     }
 
-    /// Builds one replacement for additions to an existing record or a new
-    /// txid.
-    ///
-    /// PRE: `existing`, when present, has `txid`; additions and `add_unique`
-    /// satisfy the checks of the current staging paths.
-    /// POST: returns the canonical replacement. If `overwritten` is Some, it
-    /// has one entry per addition in addition order; an append has a None
-    /// entry.
-    /// INVARIANT: an error leaves the source record, shard table, and any
-    /// `overwritten` sink unchanged.
     pub(crate) fn add_run_replacement<'p>(
         existing: Option<&Self>,
         txid: Hash256,
@@ -278,9 +251,6 @@ impl UtxoRecord {
         if add_unique {
             let appended = match existing {
                 Some(record) => record.append_unique_run(additions)?,
-                // Unique adds on a fresh record encode in slice order with the
-                // inline partition filled to capacity; no dedup pass is
-                // needed.
                 None => Some(Self::from_output_parts(
                     txid,
                     additions.len().min(INLINE_CAPACITY),
@@ -288,23 +258,16 @@ impl UtxoRecord {
                 )?),
             };
             if let Some(record) = appended {
-                // The unique fast path can never overwrite a live vout, so
-                // every append slot is None.
                 if let Some(sink) = overwritten {
                     sink.resize(sink.len().saturating_add(additions.len()), None);
                 }
                 return Ok(record);
             }
-            // Appending would reorder the inline partition or widen a
-            // directory: fall through to the rebuild, where the unique scan
-            // overwrites nothing and every sink slot is None.
         }
         let (mut parts, mut inline_len) = match existing {
             Some(record) => (record.output_parts(), record.header().inline_len),
             None => (Vec::with_capacity(additions.len()), 0),
         };
-        // Overwrite events are staged locally: `from_output_parts` can still
-        // fail, and a failed add must leave the caller's sink untouched.
         let mut staged = overwritten
             .is_some()
             .then(|| Vec::with_capacity(additions.len()));
@@ -322,9 +285,6 @@ impl UtxoRecord {
         Ok(record)
     }
 
-    /// Increasing-unique append-copy fast path. Returns `None` when appending
-    /// would reorder the inline partition bytes, or when the directories would
-    /// have to widen, so the caller must rebuild.
     fn append_unique_run(&self, additions: &[OutputParts<'_>]) -> Result<Option<Self>, UtxoError> {
         let header = self.header();
         let appends_at_end =
@@ -347,9 +307,6 @@ impl UtxoRecord {
         let inline_len = (header.inline_len + additions.len()).min(INLINE_CAPACITY);
         let inline_len_u8 = u8::try_from(inline_len).map_err(|_| UtxoError::CorruptRecord)?;
 
-        // Widths must stay exactly as they are: narrower would be non-minimal
-        // for the outputs already encoded, wider would mean rewriting every
-        // existing directory entry.
         let mut additions_len = 0_usize;
         for addition in additions {
             let payload_len = addition.payload_len()?;
@@ -401,26 +358,11 @@ impl UtxoRecord {
         if buf.len() != payload_len {
             return Err(UtxoError::CorruptRecord);
         }
-        // Invariant: the copied prefix came from this validated record and every
-        // appended addition was size-checked above, so the payload is canonical
-        // and needs no re-decode. The length check above is fail-fast in every
-        // profile: a release build never constructs a validated record whose
-        // written length disagrees with the sizing pass.
         Ok(Some(Self {
             buf: buf.into_boxed_slice(),
         }))
     }
 
-    /// Builds a replacement for one ordered run of removals.
-    ///
-    /// PRE: `vouts` may contain absent or repeated indexes and is in request
-    /// order.
-    /// POST: returns Unchanged, Emptied, or Replaced as today. If `removed` is
-    /// Some, it receives one slot per requested vout in request order; absent
-    /// or repeated indexes have None. Exact-cover removal builds no
-    /// replacement.
-    /// INVARIANT: each live vout is removed at most once; an error leaves
-    /// source bytes and the shard table unchanged.
     pub(crate) fn remove_run_replacement(
         &self,
         vouts: &[u32],
@@ -460,26 +402,12 @@ impl UtxoRecord {
         )?))
     }
 
-    /// Builds the replacement for a coalesced remove run followed by a
-    /// coalesced add run on this record, in one borrowed descriptor pass with a
-    /// single encode. Removes model inline-partition removal in `vouts` request
-    /// order; the adds then overwrite or append in `additions` payload order.
-    /// Used by the no-listener commit path when one record identity is both
-    /// spent and rebuilt in the same batch; no removed or overwritten output is
-    /// materialized, and each surviving output stays borrowed. A failed encode
-    /// returns `Err` before any buffer is produced, so the caller's record is
-    /// left byte-identical.
     pub(crate) fn edit_replacement<'a>(
         &'a self,
         vouts: &[u32],
         additions: &'a [OutputParts<'a>],
     ) -> Result<RemovedRecord, UtxoError> {
         if self.is_full_removal(vouts) {
-            // Every live output is spent, so the additions alone form the final
-            // record; survivors are never collected. No survivor remains to
-            // dedup against, so the strictly-increasing test starts from `None`
-            // and is byte-identical to the pre-removal-max form (a full removal
-            // makes the dedup scan a no-op either way).
             if additions.is_empty() {
                 return Ok(RemovedRecord::Emptied);
             }
@@ -490,10 +418,6 @@ impl UtxoRecord {
         }
         let mut parts = self.output_parts();
         let mut inline_len = self.header().inline_len;
-        // `add_unique` is the strictly-increasing fast path. `parts` are the
-        // pre-removal live outputs, so their max is exactly the record's
-        // pre-removal `max_vout`; computing it here from the already-built
-        // descriptors avoids a second full decode of every output.
         let add_unique = vouts_are_strictly_increasing(
             parts.iter().map(|part| part.vout).max(),
             additions.iter().map(|part| part.vout),
@@ -511,8 +435,6 @@ impl UtxoRecord {
         Ok(RemovedRecord::Replaced(replacement))
     }
 
-    /// True when `vouts` removes every live output exactly once (no duplicate
-    /// and no absent request). Borrowed header/output scan; allocates nothing.
     fn is_full_removal(&self, vouts: &[u32]) -> bool {
         if self.output_count() != vouts.len() {
             return false;
@@ -525,8 +447,6 @@ impl UtxoRecord {
         true
     }
 
-    /// The exact-cover check plus the located outputs in request order, so the
-    /// caller's materialization does not repeat the per-vout lookup.
     fn full_removal_outputs(&self, vouts: &[u32]) -> Option<Vec<OneUtxoOut<'_>>> {
         if self.output_count() != vouts.len() {
             return None;
@@ -552,10 +472,6 @@ impl UtxoRecord {
     fn header(&self) -> RecordHeader {
         match decode_header(self.bytes()) {
             Ok(header) => header,
-            // `UtxoRecord` is only built through `from_encoded` or
-            // `from_output_parts`, both of which produce a canonical payload; a
-            // header decode failure means the validated record was mutated in
-            // place.
             Err(error) => panic!("UtxoRecord is validated at construction: {error:?}"),
         }
     }
@@ -566,9 +482,6 @@ impl UtxoRecord {
         parts
     }
 
-    /// Internal constructor from borrowed descriptors. Every descriptor is
-    /// either a validated existing output or a prevalidated addition, so the
-    /// encoded payload is canonical by construction and needs no re-decode.
     fn from_output_parts(
         txid: Hash256,
         inline_len: usize,
@@ -650,8 +563,6 @@ impl<'a> OutputParts<'a> {
     }
 }
 
-/// Outcome of a coalesced remove run. The optional sink materializes one slot
-/// per requested vout in request order; absent or repeated slots stay None.
 pub(crate) enum RemovedRecord {
     Unchanged,
     Emptied,
@@ -662,13 +573,6 @@ fn owned_parts(outputs: &[OwnedUtxoOut]) -> Vec<OutputParts<'_>> {
     outputs.iter().map(OutputParts::from_owned).collect()
 }
 
-/// Applies a coalesced add run to `parts` with overwrite semantics, preserving
-/// the inline/overflow partition order. When `overwritten` is supplied,
-/// each displaced output is cloned owned into it in addition order. The
-/// caller commits the sink only after the replacement record encodes: the
-/// displaced outputs are staged locally and appended to the sink after the
-/// whole run is applied, so an encoding failure in the caller never leaves
-/// the sink partially filled.
 fn apply_additions<'a>(
     parts: &mut Vec<OutputParts<'a>>,
     inline_len: &mut usize,
@@ -719,9 +623,6 @@ fn remove_part_at<'a>(
     }
 }
 
-/// Strictly-increasing-vout test for the `add_unique` fast path, seeded with
-/// the maximum vout live before the additions; `None` means no seed was
-/// supplied. A non-strictly-greater vout fails on `<=`.
 pub(crate) fn vouts_are_strictly_increasing(
     previous: Option<u32>,
     vouts: impl IntoIterator<Item = u32>,
@@ -742,9 +643,6 @@ fn push_dir_entry(buf: &mut Vec<u8>, value: u64, width: usize) -> Result<(), Utx
     Ok(())
 }
 
-/// Encodes a canonical record payload into one exact-size boxed slice. Every
-/// script must be `<= u16::MAX`; existing outputs satisfy this by construction
-/// and additions are prevalidated here.
 fn encode_record(
     txid: Hash256,
     inline_len: usize,
@@ -756,8 +654,6 @@ fn encode_record(
         return Err(UtxoError::CorruptRecord);
     }
 
-    // One pass for the sizes: the directory widths are a property of the whole
-    // record, so nothing can be written until every payload length is known.
     let mut payload_lens: SmallVec<[u32; 16]> = SmallVec::with_capacity(outputs.len());
     let mut payload_total = 0_usize;
     let mut max_vout = 0_u64;
@@ -789,8 +685,6 @@ fn encode_record(
     buf.extend_from_slice(&output_count.to_le_bytes());
     buf.push(inline_len_u8);
     buf.push(pack_widths(vout_width, len_width)?);
-    // One `extend` per directory entry is cheaper than staging both directories
-    // in a scratch buffer: the entries are only one or two bytes each.
     for output in outputs {
         push_dir_entry(&mut buf, u64::from(output.vout), vout_width)?;
     }
@@ -800,8 +694,6 @@ fn encode_record(
     for output in outputs {
         write_payload(&mut buf, output)?;
     }
-    // Sizing and writing must agree exactly: the length directory records the
-    // computed sizes, so any disagreement would corrupt the encoding.
     if buf.len() != payload_len {
         return Err(UtxoError::CorruptRecord);
     }
@@ -824,8 +716,6 @@ fn write_payload(buf: &mut Vec<u8>, output: &OutputParts<'_>) -> Result<(), Utxo
     u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
     let (amount, escaped) = amount_parts(output.value);
 
-    // Lay the variable-length prologue into one stack buffer and copy it once.
-    // Appending a checked byte per field adds overhead to every output.
     let mut prologue = [0_u8; PAYLOAD_PROLOGUE_MAX_LEN];
     let mut at = write_varint_at(amount, &mut prologue, 0).ok_or(UtxoError::CorruptRecord)?;
     if escaped {
@@ -854,10 +744,6 @@ fn validate_encoded(bytes: &[u8]) -> Result<RecordHeader, UtxoError> {
     let header = decode_header(bytes)?;
     let layout = V5Layout::read(bytes, header.output_count)?;
 
-    // Both directory widths must be the narrowest that fits, or the record
-    // would have a second, wider spelling of itself. `UtxoRecord` compares by
-    // bytes, so two spellings of one record is a correctness bug, not a
-    // cosmetic one.
     let mut max_vout = 0_u64;
     let mut max_len = 0_u64;
     let mut cursor = layout.payloads;
@@ -931,8 +817,6 @@ fn decode_output_at<'a>(
             .try_into()
             .map_err(|_| UtxoError::CorruptRecord)?;
         let value = u64::from_le_bytes(raw);
-        // An escaped value that would have compressed is a second spelling of
-        // an amount the compact form already covers.
         if value <= crate::compress::MAX_COMPRESSIBLE_AMOUNT {
             return Err(UtxoError::CorruptRecord);
         }
@@ -948,8 +832,6 @@ fn decode_output_at<'a>(
     let height = u32::try_from(packed >> 1).map_err(|_| UtxoError::CorruptRecord)?;
     let coinbase = packed & 1 == 1;
 
-    // Whatever is left of the payload is the script, so no length is stored.
-    // Keep the script length within the representable record bound.
     let script_pubkey = body.get(cursor..).ok_or(UtxoError::CorruptRecord)?;
     u16::try_from(script_pubkey.len()).map_err(|_| UtxoError::CorruptRecord)?;
 

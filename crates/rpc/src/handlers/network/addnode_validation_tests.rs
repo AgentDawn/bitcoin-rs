@@ -177,7 +177,6 @@ fn disconnectnode_cancels_lease_and_removes_peer() {
     assert_eq!(ctx.network.peer_table.infos(), []);
 }
 
-/// Handshake metadata for an outbound test peer at `addr`.
 fn peer_info_at(addr: SocketAddr) -> bitcoin_rs_p2p::PeerInfo {
     let endpoint = bitcoin_rs_p2p::PeerEndpoint::Ip(addr);
     bitcoin_rs_p2p::PeerInfo {
@@ -202,8 +201,6 @@ fn peer_info_at(addr: SocketAddr) -> bitcoin_rs_p2p::PeerInfo {
     }
 }
 
-/// A session registered at `addr` that has not completed its handshake:
-/// no metadata is published, so `getpeerinfo` does not list it.
 fn register_pending_peer(ctx: &Context, addr: SocketAddr) -> bitcoin_rs_p2p::PeerLease {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let lease = bitcoin_rs_p2p::PeerLease::new(tx);
@@ -213,8 +210,6 @@ fn register_pending_peer(ctx: &Context, addr: SocketAddr) -> bitcoin_rs_p2p::Pee
     lease
 }
 
-/// A fixture outbound session registered at `addr` with published
-/// metadata, the shape `getpeerinfo` lists.
 fn register_peer(ctx: &Context, addr: SocketAddr) -> bitcoin_rs_p2p::PeerLease {
     let lease = register_pending_peer(ctx, addr);
     let endpoint = bitcoin_rs_p2p::PeerEndpoint::Ip(addr);
@@ -226,12 +221,6 @@ fn register_peer(ctx: &Context, addr: SocketAddr) -> bitcoin_rs_p2p::PeerLease {
     lease
 }
 
-/// The wire row mirrors the pinned `v31::PeerInfo` by hand because the
-/// pinned `id` is a `u32`. The pinned crate denies unknown fields, so
-/// strict deserialization rejects an extra or renamed key, and the key sets
-/// must agree once the pinned type's unset optionals are dropped. The typed
-/// round trip reads a populated optional the mirror forgot as `None` too,
-/// so the optionals the row always carries are checked directly.
 #[test]
 fn getpeerinfo_rows_match_the_pinned_v31_row() -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
@@ -274,7 +263,6 @@ fn getpeerinfo_rows_match_the_pinned_v31_row() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// Every field of a rendered row except `id`, keyed for semantic comparison.
 fn fields_but_id(
     row: &Value,
 ) -> Result<std::collections::BTreeMap<&str, &Value>, Box<dyn std::error::Error>> {
@@ -282,11 +270,6 @@ fn fields_but_id(
     Ok(object.iter().filter(|(key, _)| *key != "id").collect())
 }
 
-/// A connection id above `u32::MAX` is serialized exactly, in the same
-/// whole-query response as its neighbours, and never aliases another id.
-/// The process-wide connection counter cannot be driven that far in a test,
-/// so each row is the real projection of one session with its id replaced
-/// at the width boundary.
 #[test]
 fn getpeerinfo_row_carries_ids_above_u32_max_exactly() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = Context::new();
@@ -298,7 +281,6 @@ fn getpeerinfo_row_carries_ids_above_u32_max_exactly() -> Result<(), Box<dyn std
         .as_ref()
         .ok_or("the fixture session completed its handshake")?;
 
-    // The allocator aborts rather than hand out `u64::MAX`.
     let ids = [
         u64::from(u32::MAX),
         u64::from(u32::MAX) + 1,
@@ -328,8 +310,6 @@ fn getpeerinfo_row_carries_ids_above_u32_max_exactly() -> Result<(), Box<dyn std
         .collect::<Vec<_>>();
     assert_eq!(rendered_ids, ids.map(Some));
 
-    // Width is the only thing the id changes: every other field is the
-    // same row.
     let Some((first, rest)) = rendered.split_first() else {
         return Err("the rendered rows are not empty".into());
     };
@@ -340,9 +320,6 @@ fn getpeerinfo_row_carries_ids_above_u32_max_exactly() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// A `nodeid` selector above `u32::MAX` is a different connection from
-/// the live one that shares its low 32 bits, so it finds nothing and
-/// disconnects nothing.
 #[test]
 fn disconnectnode_nodeid_above_u32_max_never_aliases_a_live_connection()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -360,8 +337,6 @@ fn disconnectnode_nodeid_above_u32_max_never_aliases_a_live_connection()
     Ok(())
 }
 
-/// `getpeerinfo.id` is the connection's identity, not its position, so a
-/// caller can name the connection it read about after the array shifts.
 #[test]
 fn getpeerinfo_ids_are_connection_identities_not_positions()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -392,7 +367,6 @@ fn getpeerinfo_ids_are_connection_identities_not_positions()
         "the reported id is the connection's own, in connection order"
     );
 
-    // Removing an earlier connection shifts positions but not identities.
     assert!(ctx.network.p2p.disconnect_ready_node_id(lease_a.node_id()));
     let after = getpeerinfo(&ctx, &json!(null))?;
     let Some(rows) = after.as_array() else {
@@ -412,11 +386,6 @@ fn getpeerinfo_ids_are_connection_identities_not_positions()
     Ok(())
 }
 
-/// The former handler checked `peers[index].endpoint` and then asked for
-/// an address-only disconnect. A replacement registered between those two
-/// steps was the one cancelled — a connection the call never named. The
-/// identity form resolves and removes under one table write, so the
-/// selected connection's id stops resolving and its successor survives.
 #[test]
 fn disconnectnode_nodeid_never_disconnects_a_replacement_at_the_same_address()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -425,8 +394,6 @@ fn disconnectnode_nodeid_never_disconnects_a_replacement_at_the_same_address()
     let selected = register_peer(&ctx, addr);
     let selected_id = selected.node_id();
 
-    // A fresh connection takes the address over before the operator acts;
-    // registering at an occupied address cancels the predecessor.
     let replacement = register_peer(&ctx, addr);
     assert!(selected.is_cancelled());
     let replacement_id = replacement.node_id();
@@ -452,8 +419,6 @@ fn disconnectnode_nodeid_never_disconnects_a_replacement_at_the_same_address()
     Ok(())
 }
 
-/// An anonymous inbound overlay session has no logical endpoint, but its
-/// typed handle is visible and `nodeid` remains the stable selector.
 #[test]
 fn disconnectnode_nodeid_addresses_an_anonymous_inbound_session()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -493,7 +458,6 @@ fn disconnectnode_nodeid_addresses_an_anonymous_inbound_session()
     let handle = bitcoin_rs_p2p::PeerRemote::AnonymousTor(anon.connection_id()).to_string();
     let ctx = Arc::new(ctx);
 
-    // `getpeerinfo` exposes the anonymous handle, never a proxy address.
     let peers = getpeerinfo(&ctx, &json!(null))?;
     let Some(rows) = peers.as_array() else {
         return Err("getpeerinfo must return an array".into());
@@ -508,7 +472,6 @@ fn disconnectnode_nodeid_addresses_an_anonymous_inbound_session()
         Some(node_id)
     );
 
-    // No address can name it, so the empty-address form is required.
     let result = disconnectnode(&ctx, &json!(["", node_id]))
         .unwrap_or_else(|err| panic!("disconnectnode failed: {err}"));
     assert!(result.is_null());
@@ -517,10 +480,6 @@ fn disconnectnode_nodeid_addresses_an_anonymous_inbound_session()
     Ok(())
 }
 
-/// Address and nodeid together name one connection: the one at that
-/// address, and only if it carries that id. The pair is checked under the
-/// table lock, so a replacement at the address fails the identity half
-/// rather than being disconnected in the stale connection's place.
 #[test]
 fn disconnectnode_address_and_nodeid_is_a_conjunction_under_replacement()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -558,8 +517,6 @@ fn disconnectnode_address_and_nodeid_is_a_conjunction_under_replacement()
     Ok(())
 }
 
-/// A named `nodeid` alone is Core's identity-only form and needs no
-/// address; a malformed address still fails before any lookup.
 #[test]
 fn disconnectnode_accepts_a_named_nodeid_alone_and_keeps_address_precedence()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -583,7 +540,6 @@ fn disconnectnode_accepts_a_named_nodeid_alone_and_keeps_address_precedence()
     Ok(())
 }
 
-/// Address-only behaviour is unchanged, including its error precedence.
 #[test]
 fn disconnectnode_address_only_still_selects_by_address() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -604,10 +560,6 @@ fn disconnectnode_address_only_still_selects_by_address() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// The address-only form targets a *connected* node, one `getpeerinfo`
-/// lists. A session that is registered but has not completed its
-/// handshake answers `NotFound` and survives, exactly as before the
-/// identity forms existed; the same call succeeds once it is ready.
 #[test]
 fn disconnectnode_address_only_ignores_a_session_still_handshaking()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -638,9 +590,6 @@ fn disconnectnode_address_only_ignores_a_session_still_handshaking()
     Ok(())
 }
 
-/// The identity forms obey the same rule: a handshaking session has no
-/// `getpeerinfo` id for an operator to have read, so naming its id, alone
-/// or with its address, reaches nothing.
 #[test]
 fn disconnectnode_identity_forms_ignore_a_session_still_handshaking()
 -> Result<(), Box<dyn std::error::Error>> {

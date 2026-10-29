@@ -139,7 +139,6 @@ fn register_dummy_peer(ctx: &Context) {
     );
 }
 
-// API-08: mainnet GBT requires a connected peer.
 #[test]
 fn getblocktemplate_rejects_mainnet_without_peers() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -152,7 +151,6 @@ fn getblocktemplate_rejects_mainnet_without_peers() {
     assert_eq!(error.to_string(), "bitcoin-rs is not connected!");
 }
 
-// API-08: mainnet GBT is rejected during initial block download.
 #[test]
 fn getblocktemplate_rejects_mainnet_during_ibd() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -169,7 +167,6 @@ fn getblocktemplate_rejects_mainnet_during_ibd() {
     );
 }
 
-// API-08: proposal mode bypasses the mainnet connection gates.
 #[test]
 fn getblocktemplate_proposal_skips_mainnet_connection_gates() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -266,11 +263,8 @@ fn getblocktemplate_forwards_longpollid() {
         request.long_poll_id.as_deref(),
         Some(sample_candidate().template_id.as_str())
     );
-    // `submitold`/`workid` are BIP23 extras outside the pinned v17
-    // GetBlockTemplate contract and are no longer emitted.
 }
 
-/// API-14: signet must be advertised alongside segwit on signet.
 #[test]
 fn getblocktemplate_requires_signet_rule_on_signet() {
     let mut template = sample_template();
@@ -295,7 +289,6 @@ fn getblocktemplate_requires_signet_rule_on_signet() {
     assert!(rules.iter().any(|rule| rule.as_str() == Some("!signet")));
 }
 
-/// API-14: a template-listed mandatory rule requires explicit client support.
 #[test]
 fn getblocktemplate_rejects_template_mandatory_rule_without_client_support() {
     let mut template = sample_template();
@@ -313,7 +306,6 @@ fn getblocktemplate_rejects_template_mandatory_rule_without_client_support() {
     assert_eq!(control.template_calls.load(Ordering::Relaxed), 1);
 }
 
-/// API-14: segwit is the base client rule for template mode.
 #[test]
 fn getblocktemplate_rejects_missing_segwit_rule() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -332,7 +324,6 @@ fn getblocktemplate_rejects_missing_segwit_rule() {
     assert_eq!(control.template_calls.load(Ordering::Relaxed), 0);
 }
 
-/// API-14: proposal mode skips client-rule negotiation.
 #[test]
 fn getblocktemplate_proposal_skips_client_rule_negotiation() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -476,7 +467,6 @@ fn mining_methods_without_a_control_answer_method_not_found() {
 }
 
 #[test]
-// CONTRACT: API-15
 fn submitblock_requires_mining_control_and_rejects_garbage_encoding() {
     let missing = Arc::new(Context::new());
     let error =
@@ -495,7 +485,6 @@ fn submitblock_requires_mining_control_and_rejects_garbage_encoding() {
 }
 
 #[test]
-// CONTRACT: API-15
 fn submitblock_ignores_bip22_dummy_and_trailing_bytes() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
     let ctx = ctx_with_control(control.clone());
@@ -515,7 +504,6 @@ fn submitblock_ignores_bip22_dummy_and_trailing_bytes() {
 }
 
 #[test]
-// CONTRACT: API-15
 fn submitblock_rejects_non_string_bip22_dummy() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
     let ctx = ctx_with_control(control.clone());
@@ -540,14 +528,9 @@ fn submitblock_rejects_non_string_bip22_dummy() {
 }
 
 #[test]
-// CONTRACT: API-15
 fn decode_tx_zero_input_zero_flag_accepted_like_core() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
     let ctx = ctx_with_control(control.clone());
-    // A single transaction encoded as version | zero-input dummy | zero flag |
-    // lock time: Core reads the zero flag as the legacy empty transaction
-    // (zero inputs, zero outputs) and admits it to validation instead of
-    // failing with -22.
     let empty = Tx {
         version: 1,
         inputs: Vec::new(),
@@ -599,7 +582,6 @@ fn getmininginfo_projects_control_state() {
 }
 
 #[test]
-// CONTRACT: docs/contracts/external-api.md#API-25
 fn getmininginfo_omits_unset_optional_fields() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
     {
@@ -615,7 +597,6 @@ fn getmininginfo_omits_unset_optional_fields() {
 }
 
 #[test]
-// Core emits the tip's nBits at top level and the next block's only under next.
 fn getmininginfo_top_level_target_is_the_tip_not_the_next_block() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
     {
@@ -692,7 +673,6 @@ fn prioritisetransaction_calls_mempool_prioritise_directly() {
     let entry = pool
         .entry_by_txid(&txid)
         .expect("entry remains after prioritise");
-    // fee_delta overlay is additive across calls: 500 then 600.
     assert_eq!(entry.fee_delta, 1_100);
     assert_eq!(entry.fee, 1_000);
 }
@@ -730,7 +710,6 @@ fn dust_priority_tx() -> Tx {
     }
 }
 
-// CONTRACT: API-24
 #[test]
 fn prioritisetransaction_rejects_dust_outputs_like_core() {
     use bitcoin_rs_mempool::MempoolEntry;
@@ -752,7 +731,6 @@ fn prioritisetransaction_rejects_dust_outputs_like_core() {
     assert_eq!(error.to_string(), PRIORITISE_DUST_ERROR);
 }
 
-// CONTRACT: API-24
 #[test]
 fn prioritisetransaction_allows_dust_overlay_on_regtest() {
     use bitcoin_rs_mempool::MempoolEntry;
@@ -773,7 +751,6 @@ fn prioritisetransaction_allows_dust_overlay_on_regtest() {
     assert_eq!(result.as_bool(), Some(true));
 }
 
-// CONTRACT: API-24
 #[test]
 fn prioritisetransaction_allows_absent_txid_overlay() {
     let ctx = Arc::new(Context::new());
@@ -912,8 +889,6 @@ fn getmininginfo_can_include_signet_challenge() {
 
 #[test]
 fn getmininginfo_reports_testnet4_separately_from_testnet3() {
-    // Core's getmininginfo reports ChainTypeToString(TESTNET4) == "testnet4",
-    // matching getblockchaininfo. The old code collapsed both to "test".
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
     {
         let mut info = control.info.lock();
@@ -985,7 +960,6 @@ fn getnetworkhashps_rejects_arity_and_core_invalid_windows() {
 }
 
 #[test]
-// CONTRACT: docs/contracts/external-api.md#API-06
 fn getnetworkhashps_projects_control_invalid_request_as_invalid_parameter() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
     *control.fail.lock() = Some(MiningControlError::InvalidRequest(CompactString::from(
@@ -1001,7 +975,6 @@ fn getnetworkhashps_projects_control_invalid_request_as_invalid_parameter() {
     ));
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-28
 #[test]
 fn getprioritisedtransactions_projects_the_overlay() {
     use bitcoin_rs_mempool::MempoolEntry;
@@ -1046,7 +1019,6 @@ fn getprioritisedtransactions_projects_the_overlay() {
             .and_then(JsonValueTrait::as_bool),
         Some(true)
     );
-    // CONTRACT: docs/contracts/external-api.md#API-28
     assert_eq!(
         pooled_row
             .get("modified_fee")
@@ -1092,7 +1064,6 @@ fn sample_raw_tx() -> Tx {
     }
 }
 
-/// API-05: generatetoaddress pays a network-valid address and returns n hashes.
 #[test]
 fn generatetoaddress_projects_solved_hashes() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1106,7 +1077,6 @@ fn generatetoaddress_projects_solved_hashes() {
     assert!(hashes.iter().all(|hash| hash.as_str().is_some()));
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-29
 #[test]
 fn generatetoaddress_rejects_script_hex_and_descriptors() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1124,7 +1094,6 @@ fn generatetoaddress_rejects_script_hex_and_descriptors() {
     }
 }
 
-/// API-05: generateblock output is an address or descriptor; empty txs is coinbase-only.
 #[test]
 fn generateblock_projects_hash_object() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1147,7 +1116,6 @@ fn generateblock_projects_hash_object() {
     assert!(request.submit);
 }
 
-/// API-05: generateblock accepts `addr()` without a checksum.
 #[test]
 fn generateblock_accepts_addr_descriptor() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1176,7 +1144,6 @@ fn generateblock_accepts_addr_descriptor() {
     );
 }
 
-/// API-05: generateblock submit=false returns solved hex without persisting.
 #[test]
 fn generateblock_without_submit_includes_hex() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1201,9 +1168,6 @@ fn generateblock_without_submit_includes_hex() {
     assert!(!request.submit);
 }
 
-/// API-05, API-29: generateblock requires the transactions array like
-/// Core; null is not an empty list, and bare-script output errors match
-/// Core.
 #[test]
 fn generateblock_requires_transactions_array() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1223,7 +1187,6 @@ fn generateblock_requires_transactions_array() {
     assert_eq!(hex.to_string(), GENERATEBLOCK_INVALID_OUTPUT);
 }
 
-/// API-05: 64-character hex is a mempool txid; longer hex is a raw transaction.
 #[test]
 fn generateblock_keeps_raw_transactions() {
     use bitcoin_rs_mempool::MempoolEntry;
@@ -1265,7 +1228,6 @@ fn generateblock_keeps_raw_transactions() {
     );
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-27
 #[test]
 fn generateblock_rejects_unknown_mempool_txid_like_core() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1281,7 +1243,6 @@ fn generateblock_rejects_unknown_mempool_txid_like_core() {
     );
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-27
 #[test]
 fn generateblock_rejects_undecodable_raw_tx_like_core() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1305,7 +1266,6 @@ fn generateblock_rejects_undecodable_raw_tx_like_core() {
     }
 }
 
-/// API-05: extra generateblock positionals are rejected, matching Core arity.
 #[test]
 fn generateblock_rejects_trailing_parameters() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1319,7 +1279,6 @@ fn generateblock_rejects_trailing_parameters() {
     ));
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-29
 #[test]
 fn generateblock_rejects_invalid_supplied_checksums() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1346,7 +1305,6 @@ fn generateblock_rejects_invalid_supplied_checksums() {
     }
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-30
 #[test]
 fn generateblock_maps_test_block_validity_to_verify_error() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1363,7 +1321,6 @@ fn generateblock_maps_test_block_validity_to_verify_error() {
     );
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-29
 #[test]
 fn generateblock_rejects_garbage_output_like_core() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1375,7 +1332,6 @@ fn generateblock_rejects_garbage_output_like_core() {
     assert_eq!(error.to_string(), GENERATEBLOCK_INVALID_OUTPUT);
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-31
 #[test]
 fn generateblock_rejects_multipath_before_ranged_like_core() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1406,7 +1362,6 @@ fn generateblock_rejects_multipath_before_ranged_like_core() {
     assert_eq!(ranged.to_string(), GENERATEBLOCK_RANGED);
 }
 
-// CONTRACT: docs/contracts/external-api.md#API-31
 #[test]
 fn generateblock_rejects_hardened_xpub_like_core() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());
@@ -1419,8 +1374,6 @@ fn generateblock_rejects_hardened_xpub_like_core() {
     assert_eq!(error.to_string(), GENERATEBLOCK_NEEDS_PRIVATE_KEYS);
 }
 
-// An armed control failure must reach `submitheader` like every other
-// result-returning operation, mapping Rejected onto the Core verify error.
 #[test]
 fn submitheader_maps_armed_control_failure() {
     let control = FakeMiningControl::with_template(sample_template(), sample_mining_info());

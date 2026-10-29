@@ -54,8 +54,6 @@ fn remote_version(version: u32) -> Message {
     })
 }
 
-/// A `feature` frame as a remote peer sends it: its identifier need not be
-/// printable.
 fn remote_feature(id: &[u8], data: &[u8]) -> Message {
     Message::Feature(FeatureAnnouncement::new(
         FeatureId::from_raw_unchecked(id.to_vec()),
@@ -63,16 +61,12 @@ fn remote_feature(id: &[u8], data: &[u8]) -> Message {
     ))
 }
 
-/// Drives one inbound handshake over `remote`, the frames the peer sends,
-/// and returns the peer with the handshake's outcome.
 fn inbound_handshake_over(
     remote: &[Message],
 ) -> Result<(Peer<ScriptedStream>, Result<(), PeerError>), PeerError> {
     inbound_handshake_offering(0, remote)
 }
 
-/// [`inbound_handshake_over`] on a node that offers package relay with
-/// `offer`.
 fn inbound_handshake_offering(
     offer: u64,
     remote: &[Message],
@@ -80,8 +74,6 @@ fn inbound_handshake_offering(
     inbound_handshake_with(|peer| peer.offer_package_relay(offer), remote)
 }
 
-/// [`inbound_handshake_over`] on a node `configure` set up before the
-/// handshake.
 fn inbound_handshake_with(
     configure: impl FnOnce(&mut Peer<ScriptedStream>),
     remote: &[Message],
@@ -455,7 +447,6 @@ fn inbound_handshake_resumes_frames_split_by_poll_timeouts() -> Result<(), PeerE
     )?;
     let mut verack = Vec::new();
     write_message(&mut verack, magic, &Message::Verack)?;
-    // Each frame stops arriving part-way for longer than one socket poll.
     let stream = StallingStream::new([
         Inbound::Bytes(version[..30].to_vec()),
         Inbound::Stall(io::ErrorKind::TimedOut),

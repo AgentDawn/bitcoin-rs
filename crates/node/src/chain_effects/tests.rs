@@ -11,7 +11,6 @@ use bitcoin_rs_primitives::{
 };
 use parking_lot::Mutex;
 
-/// Records every ZMQ call in the order the follower made it.
 #[derive(Debug, Default)]
 struct RecordingPublisher {
     events: Mutex<Vec<String>>,
@@ -99,7 +98,6 @@ fn settlement_breaking_followers(gateway: Arc<MempoolGateway>, generation: u64) 
     )
 }
 
-/// `ARCH-07`: a no-op follower set asks for no derived payloads.
 #[test]
 fn noop_asks_for_no_payloads() {
     let followers = ChainFollowers::noop();
@@ -125,7 +123,6 @@ fn connect_outcome(tip: &TipSnapshot, block: &Block) -> ConnectOutcome {
     }
 }
 
-/// `ARCH-07`: connect then disconnect rewinds the RPC log and emits ZMQ in order.
 #[test]
 fn connect_then_disconnect_rewinds_the_rpc_log_and_emits_in_order() -> anyhow::Result<()> {
     let genesis = Network::Regtest.genesis_block();
@@ -160,7 +157,6 @@ fn connect_then_disconnect_rewinds_the_rpc_log_and_emits_in_order() -> anyhow::R
     Ok(())
 }
 
-/// `ARCH-07`: disconnect does not pop a `BlockLog` tail that is not this block.
 #[test]
 fn disconnect_does_not_pop_a_different_tail() -> anyhow::Result<()> {
     let genesis = Network::Regtest.genesis_block();
@@ -175,7 +171,6 @@ fn disconnect_does_not_pop_a_different_tail() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Records the committed block receipts the mining wake received.
 #[derive(Default)]
 struct ReceiptWake {
     receipts: Mutex<Vec<(Hash256, usize)>>,
@@ -193,10 +188,6 @@ impl bitcoin_rs_mining::MempoolSequenceWake for ReceiptWake {
     }
 }
 
-/// `RCV-02`: a follower set without an admission gate removed nothing, so a
-/// committed connect still publishes a truthful, empty receipt for the
-/// connected tip. A foreground joined on a prepared candidate waits for
-/// exactly that receipt.
 #[test]
 fn gatewayless_connect_publishes_an_empty_receipt_for_the_tip() -> anyhow::Result<()> {
     let genesis = Network::Regtest.genesis_block();
@@ -312,9 +303,6 @@ fn snapshot_retries_each_resident_orphan_once_after_settlement() -> anyhow::Resu
         None,
     ));
     let followers = followers_with_gateway(&gateway);
-    // Fresh-submission clock: post-commit expiry runs against the wall
-    // clock, so orphan arrivals and retries must carry real time; an epoch
-    // timestamp would expire the retried commit immediately after admission.
     let now = bitcoin_rs_primitives::unix_time_secs();
     let parent = Network::Regtest.genesis_block().txs[0].txid();
     let available = orphan_child(OutPoint::new(parent, 0));
@@ -354,8 +342,6 @@ fn snapshot_retries_each_resident_orphan_once_after_settlement() -> anyhow::Resu
     assert_eq!(gateway.orphan_count(), 2);
     assert!(!gateway.has_observer());
     let fence = gateway.begin_chain_change()?;
-    // Existing parent work and the snapshot-wide wake must share one ready
-    // identity. The other parent becomes available only through the snapshot.
     gateway.chain_changed(&[missing.inputs[0].previous_output.txid]);
     *chain.prevouts.write() = vec![(
         available.inputs[0].previous_output,
@@ -366,8 +352,6 @@ fn snapshot_retries_each_resident_orphan_once_after_settlement() -> anyhow::Resu
     )];
     followers.on_snapshot();
     followers.on_snapshot();
-    // The queued claim must select a still-live announcer after the
-    // original connection leaves, without losing the resident body.
     gateway.maintain_orphans(now, [replacement, missing_source]);
     assert_eq!(gateway.retry_orphans(&chain, now), []);
     assert!(gateway.read().is_empty());
@@ -400,11 +384,6 @@ fn snapshot_retries_each_resident_orphan_once_after_settlement() -> anyhow::Resu
     Ok(())
 }
 
-/// Exercise committed-outcome dispatch with a real gateway, without any
-/// mempool mutation or observer that could independently wake the child.
-/// Full chain application and transition ownership have separate tests in
-/// `crates/chainstate`; this checks the follower's lifecycle notification
-/// boundary.
 fn assert_admission_followers_after_chain_change(connect: bool) -> anyhow::Result<()> {
     let gateway = Arc::new(MempoolGateway::new(
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
@@ -413,8 +392,6 @@ fn assert_admission_followers_after_chain_change(connect: bool) -> anyhow::Resul
         None,
     ));
     let followers = followers_with_gateway(&gateway);
-    // Fresh-submission clock: see the snapshot-retry test above; epoch
-    // timestamps would expire the retried commit under the wall clock.
     let now = bitcoin_rs_primitives::unix_time_secs();
     let block = Network::Regtest.genesis_block();
     let parent = block.txs[0].txid();

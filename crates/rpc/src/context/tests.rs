@@ -1,7 +1,5 @@
 use super::*;
 
-/// A txindex status source stand-in, so the identity test can prove the
-/// capability travels to `indexes` without a live index runtime.
 struct ReadySource;
 
 impl bitcoin_rs_index::DerivedIndexCapabilitySource for ReadySource {
@@ -10,9 +8,6 @@ impl bitcoin_rs_index::DerivedIndexCapabilitySource for ReadySource {
     }
 }
 
-/// One context answers `getblockcount` from eight threads at once, which
-/// is the behavior the old compile-time bound stood in for: shared
-/// dispatch, not a trait assertion about the struct.
 #[test]
 fn eight_threads_share_one_context_for_getblockcount() {
     use alloc::vec::Vec;
@@ -36,9 +31,6 @@ fn eight_threads_share_one_context_for_getblockcount() {
     }
 }
 
-/// The count travels inside the applied tip: one publication replaces
-/// tip and count together, so no reader can pair one with the other's
-/// successor.
 #[test]
 fn applied_tip_publication_carries_the_transaction_count() {
     let ctx = Context::new();
@@ -57,8 +49,6 @@ fn applied_tip_publication_carries_the_transaction_count() {
     assert_eq!(ctx.chain.applied_view().chain_tx_count(), Some(42));
 }
 
-/// Every fact projected from one view describes the publication that view
-/// captured, even after the publisher advances to a new tip.
 #[test]
 fn applied_view_uses_one_publication() {
     use bitcoin_rs_chain::{ChainTxCount, ChainWork, NodeId};
@@ -74,8 +64,6 @@ fn applied_view_uses_one_publication() {
         })
     };
 
-    // Before the first publication every projection answers with its
-    // documented empty default.
     let empty = ctx.chain.applied_view();
     assert_eq!(empty.tip(), None);
     assert_eq!(empty.height(), 0);
@@ -89,7 +77,6 @@ fn applied_view_uses_one_publication() {
     let b = tip(20, 0xbb, 9, ChainTxCount::established(200));
     ctx.chain.applied_tip.store(Some(Arc::clone(&a)));
     let view = ctx.chain.applied_view();
-    // The publisher advances while the response is still being built.
     ctx.chain.applied_tip.store(Some(b));
 
     assert_eq!(view.height(), 10, "height must stay at the capture");
@@ -105,11 +92,8 @@ fn applied_view_uses_one_publication() {
     );
     assert_eq!(view.chain_tx_count(), Some(100), "count must stay");
 
-    // A fresh capture sees the newer publication.
     assert_eq!(ctx.chain.applied_view().height(), 20);
 
-    // A present tip whose count is unknown stays unknown: it is never
-    // guessed as zero, which would differ from it by an entire chain.
     ctx.chain
         .applied_tip
         .store(Some(tip(30, 0xcc, 11, ChainTxCount::UNKNOWN)));
@@ -118,9 +102,6 @@ fn applied_view_uses_one_publication() {
     assert_eq!(unknown.chain_tx_count(), None);
 }
 
-/// Capturing a view never waits on the transition barrier. This pins the
-/// primitive only; the status readers keep their own barrier until their
-/// separate change.
 #[test]
 fn applied_view_does_not_wait_for_transition() -> anyhow::Result<()> {
     use std::sync::mpsc;
@@ -152,23 +133,6 @@ fn applied_view_does_not_wait_for_transition() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The embedded call and the RPC handler reach the gateway through the
-/// one shared admission operation. The same accepted transaction commits
-/// on both surfaces, the same policy refusal is reported by both, and
-/// neither surface inserts a refused transaction.
-///
-/// A log whose heights are non-decreasing but not a clean `0..n`.
-///
-/// Height 3 is recorded three times, as two reorgs leave it; the log starts
-/// at height 1, as a restored or pruned log may; and heights 6 and 7 are
-/// missing. All three break the "record for height `h` is at index `h`"
-/// assumption the direct-index fast path tries first.
-///
-/// The starting height is load-bearing. With the log starting at zero, index
-/// 3 holds the *first* record at height 3, so a fast path that skipped the
-/// "is the predecessor lower?" guard would answer correctly anyway. Starting
-/// at one puts a duplicate at index 3 and the run head at index 2, which is
-/// where the two disagree.
 fn shaped_records() -> Vec<BlockRecord> {
     const HEIGHTS: [u32; 8] = [1, 2, 3, 3, 3, 4, 8, 9];
     HEIGHTS
@@ -176,8 +140,6 @@ fn shaped_records() -> Vec<BlockRecord> {
         .enumerate()
         .map(|(index, height)| {
             let mut hash = [0_u8; 32];
-            // Distinct per record, not per height: the duplicates have to be
-            // distinguishable by hash or the walk has nothing to walk.
             hash[0] = u8::try_from(index).unwrap_or(0);
             let mut record =
                 BlockRecord::synthetic(height, BlockHash::from(Hash256::from_le_bytes(&hash)));
@@ -187,10 +149,6 @@ fn shaped_records() -> Vec<BlockRecord> {
         .collect()
 }
 
-/// Every record at a duplicated height must be reachable by its own hash.
-///
-/// A search that stopped at the run's first record would answer `None` for
-/// the others, turning `getblock` on a stale branch into "block not found".
 #[test]
 fn every_record_at_a_duplicated_height_is_reachable() {
     let records = shaped_records();
@@ -210,12 +168,6 @@ fn every_record_at_a_duplicated_height_is_reachable() {
     }
 }
 
-/// `block_by_height` with no applied tip reads the log directly.
-///
-/// That fallback used to scan for the first record at the height and now
-/// searches for it. It is the path a Context takes before the first tip is
-/// published, and nothing covered it: a mutation replacing it with "the last
-/// record in the log" stayed green.
 #[test]
 fn block_by_height_without_an_applied_tip_reads_the_log() {
     let ctx = Context::new();
@@ -236,11 +188,6 @@ fn block_by_height_without_an_applied_tip_reads_the_log() {
     }
 }
 
-/// A reorg leaves the losing block in the log beside the winner, so a height
-/// can address two records. The binary search lands anywhere in that run,
-/// which is why the lookup walks it and compares hashes; returning the first
-/// record at the height would hand back the wrong block on exactly the shape
-/// this exists for.
 #[test]
 fn record_at_height_hash_picks_the_matching_hash_within_a_duplicate_height() {
     let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
@@ -267,12 +214,6 @@ fn record_at_height_hash_picks_the_matching_hash_within_a_duplicate_height() {
     );
 }
 
-/// Heights `[1, 1, 2]` are chosen so the dense fast path indexes straight
-/// onto the *second* of the duplicates: `records[1]` has height 1, so the
-/// height check alone would accept it. Only the guard on the preceding
-/// record rejects it and sends the lookup to the search that finds the run
-/// start. A log starting at height 0 never exercises that, which is how an
-/// earlier version of this test passed while the guard was removed.
 #[test]
 fn record_at_height_returns_the_first_record_of_a_duplicate_height() {
     let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
@@ -290,9 +231,6 @@ fn record_at_height_returns_the_first_record_of_a_duplicate_height() {
     assert!(record_at_height(&records, 7).is_none());
 }
 
-/// The dense fast path indexes straight into the log. It must not fire when
-/// the log does not start at height zero, or it would answer with whatever
-/// record happens to sit at that index.
 #[test]
 fn record_at_height_does_not_trust_the_index_on_a_sparse_log() {
     let wanted = Hash256::from_le_bytes(&[0x44_u8; 32]);
@@ -366,18 +304,12 @@ fn from_handles_shares_chain_handles_with_caller() {
         },
         ..ContextHandles::default()
     });
-    // Identity is not observable: the two roles are distinct types with no
-    // comparison. Exclusion is, and exclusion is what the wiring has to
-    // guarantee — a guard taken from the context must block the caller's
-    // own role, which fails if the context was wired to another domain.
     let held = ctx.chain.chain_transition.lock();
     assert!(
         chain_transition.try_lock().is_none(),
         "the caller's role must exclude the same transitions the context does"
     );
     drop(held);
-    // The count travels inside the applied tip: one publication replaces
-    // tip and count together, through the cell the caller shares.
     let snapshot = |count| {
         Arc::new(TipSnapshot {
             tip_id: bitcoin_rs_chain::NodeId::new(0),
@@ -437,9 +369,6 @@ fn from_handles_shares_chain_handles_with_caller() {
     );
 }
 
-/// One retained publication answers a whole status response: after the
-/// publisher advances to a second tip, the view captured at the first still
-/// reports that first tip's height, hash, work, and count together.
 #[test]
 fn status_keeps_the_captured_applied_pair() {
     let ctx = Context::new();
@@ -455,7 +384,6 @@ fn status_keeps_the_captured_applied_pair() {
     ctx.chain.applied_tip.store(Some(tip(3, 0xaa, 7, 42)));
     let captured = ctx.chain.applied_view();
 
-    // The publisher advances while the response is still being built.
     ctx.chain.applied_tip.store(Some(tip(9, 0xbb, 9, 84)));
 
     let progress = ctx.chain.sync_progress_at(&captured);
@@ -476,7 +404,6 @@ fn status_keeps_the_captured_applied_pair() {
         "the captured count must stay paired with the captured tip"
     );
 
-    // A fresh capture follows the publisher; header height is sampled apart.
     assert_eq!(ctx.chain.sync_progress().blocks, 9);
 }
 
@@ -517,9 +444,6 @@ fn new_context_wires_utxo_commits_to_coin_stats() {
     assert_eq!(snapshot.total_amount, 125_000);
 }
 
-/// Two connected log records resolve their metadata through the height
-/// read seam with no header bytes, which is what the log stores: the
-/// tree supplies headers, never the log.
 #[test]
 fn connected_log_blocks_resolve_metadata_without_header_bytes() {
     let genesis = Network::Regtest.genesis_block();
@@ -578,12 +502,6 @@ fn context_reads_metadata_only_block_record_from_body_source() {
     );
 }
 
-/// The hex a caller sees must be byte-identical to what the stored `String`
-/// used to hold; only where it is produced changed.
-///
-/// Read through a resolved record now, because that is where a header comes
-/// from: the tree, via `block_by_hash`. A record built straight from a
-/// block has none.
 #[test]
 fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
     let block = Network::Regtest.genesis_block();
@@ -607,12 +525,6 @@ fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
     );
 }
 
-/// The tree's header must reach a caller even when the log has the block.
-///
-/// `block_by_hash` returns the cached record for its payload facts — size,
-/// transaction count — and that record has no header. Returning
-/// it unchanged would answer with none, which is what an earlier revision of
-/// this change did until this test caught it.
 #[test]
 fn block_by_hash_answers_with_the_tree_header_for_a_cached_record() {
     let block = Network::Regtest.genesis_block();
@@ -645,11 +557,6 @@ fn block_by_hash_answers_with_the_tree_header_for_a_cached_record() {
         "the cached transaction count must survive the header splice"
     );
 }
-/// A log-only hash must not make a block identity visible.
-///
-/// The old tree-miss fallback scanned every log record and accepted the
-/// matching hash, making unknown-hash RPC cost linear in chain length and
-/// allowing fixture-only state to masquerade as a real node identity.
 #[test]
 fn block_by_hash_ignores_log_records_the_tree_does_not_know() {
     let ctx = Context::new();
@@ -660,9 +567,6 @@ fn block_by_hash_ignores_log_records_the_tree_does_not_know() {
     assert!(ctx.chain.block_by_hash(hash).is_none());
 }
 
-/// A record with no header must render as the empty string, the way an empty
-/// `String` field did, so callers that inspected it for emptiness still see
-/// what they saw.
 #[test]
 fn synthetic_record_has_no_header_and_renders_empty_hex() {
     let record = BlockRecord::synthetic(7, BlockHash::from(Hash256::from_le_bytes(&[3_u8; 32])));
@@ -671,12 +575,6 @@ fn synthetic_record_has_no_header_and_renders_empty_hex() {
     assert_eq!(record.header_hex(), "");
 }
 
-/// Covers the record the block tree derives, which had no test at all.
-///
-/// `header_record` builds its header with `try_into().ok()`, so a length that
-/// does not fit yields `None` and the header vanishes silently — where the
-/// old `String` field would at least have carried something. A mutation that
-/// dropped the header from this path failed no test before this one existed.
 #[test]
 fn tree_derived_record_carries_the_header() {
     use bitcoin_rs_chain::NodeStatus;
@@ -699,8 +597,6 @@ fn tree_derived_record_carries_the_header() {
         tree.node(id).expect("inserted node").hash
     };
 
-    // Nothing was pushed into `blocks`, so the record can only come from the
-    // tree.
     let record = ctx
         .chain
         .block_by_hash(hash)
@@ -759,8 +655,6 @@ fn block_by_height_prefers_tree_identity_over_stale_cache() -> Result<(), Box<dy
         ctx.chain
             .applied_tip
             .store(Some(Arc::new((*applied_tip).clone())));
-        // Stale cache entry at the SAME height as the tree child but with a
-        // different hash. The active-tree identity must win over this cache.
         let stale_hash = Hash256::from_le_bytes(&[0xa5_u8; 32]);
         ctx.chain
             .add_block(BlockRecord::synthetic(1, BlockHash::from(stale_hash)));
@@ -958,9 +852,6 @@ fn ibd_latch_judges_the_contexts_own_tree() {
         ..ContextHandles::default()
     });
 
-    // With the regtest work floor at zero and the tip recent, only the
-    // tree lookup can make `is_active` answer false; a latch holding any
-    // other tree finds no node and keeps reporting true.
     let now = 1_800_000_000_u64;
     let tip = insert_recent_tip(&ctx, now);
     ctx.chain.applied_tip.store(Some(Arc::new(tip)));

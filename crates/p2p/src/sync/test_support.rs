@@ -1,4 +1,3 @@
-//! Applied-chain fixtures shared by sync, listener, and download-window tests.
 use super::chain::{
     HeaderAdmission, HistoricalAdvance, ReorgError, SyncChain, SyncChainError,
     WindowApplyDisposition, WindowCommitError,
@@ -12,17 +11,11 @@ use bitcoin_rs_primitives::{Block, BlockPayload, Hash256, Header, Network, Tx, T
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 
-/// One-shot scripted branch switch: `connected` hashes are reported as
-/// committed (applied tip advanced, `connected_body` fired) before `error`
-/// is returned, mirroring a connect walk that stopped partway.
 pub(super) struct ScriptedBranchSwitch {
     pub(super) connected: Vec<Hash256>,
     pub(super) error: ReorgError,
 }
 
-/// Applied-chain stub for executor tests: real [`BlockTree`] header admission
-/// and block-at-a-time applied-tip advance, with one-shot scripted commit and
-/// branch-switch failures.
 pub(crate) struct TestChain {
     pub(super) network: Network,
     pub(super) block_tree: Arc<RwLock<BlockTree>>,
@@ -31,8 +24,6 @@ pub(crate) struct TestChain {
     pub(super) minimum_chain_work: ChainWork,
     pub(super) scripted_commit_failure: Mutex<Option<(Hash256, WindowApplyDisposition)>>,
     pub(super) scripted_branch_switch: Mutex<Option<ScriptedBranchSwitch>>,
-    /// Publishes a new tip pair immediately after returning the old header
-    /// snapshot, making an observation-time tip race deterministic.
     pub(super) scripted_tip_update: Mutex<Option<(Arc<TipSnapshot>, Arc<TipSnapshot>)>>,
     pub(super) historical: Mutex<std::collections::VecDeque<(u32, Hash256)>>,
     pub(super) historical_connected: Mutex<Vec<Hash256>>,
@@ -62,9 +53,6 @@ impl TestChain {
 }
 
 impl TestChain {
-    /// Binding check over an already-held tree guard — the same
-    /// `softfork_state` parent derivation node applies before delegating to
-    /// the consensus binding check.
     fn body_binding(&self, tree: &BlockTree, block: &Block) -> Result<(), SyncChainError> {
         let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
         let segwit_active = tree
@@ -78,8 +66,6 @@ impl TestChain {
             .map_err(|error| -> SyncChainError { Box::new(error) })
     }
 
-    /// Overrides the assumed-work floor the presync gate reads, so a test
-    /// can make a fixture chain pass or fail it at will.
     #[must_use]
     pub(crate) const fn with_minimum_chain_work(mut self, minimum: ChainWork) -> Self {
         self.minimum_chain_work = minimum;
@@ -345,10 +331,6 @@ impl SyncChain for TestChain {
     }
 }
 
-/// A latch that has left initial block download: a two-block regtest chain
-/// whose tip header is stamped with the current wall-clock second, so the
-/// work floor (zero on regtest) and the tip-age rule both pass on the first
-/// read and the answer latches off for good.
 pub(crate) fn synced_ibd_latch() -> Arc<InitialBlockDownload> {
     let applied_tip = Arc::new(ArcSwapOption::empty());
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
@@ -381,7 +363,6 @@ pub(crate) fn synced_ibd_latch() -> Arc<InitialBlockDownload> {
     ))
 }
 
-/// Mine real bodies, then extend their header chain without applying anything.
 pub(crate) fn mined_chain(
     body_height: u32,
     header_only: u32,
