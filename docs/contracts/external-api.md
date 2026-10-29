@@ -40,7 +40,7 @@ scanning and wallet interoperability remain unverified.
   `crates/rpc/tests/manifest_coverage.rs` enforces set equality between
   the registry and the live dispatch table in both directions and
   regenerates the reference. Regenerate with:
-  `REGEN_RPC_REFERENCE=1 cargo test -p bitcoin-rs-rpc --test suite manifest_coverage::regenerate_reference -- --ignored`
+  `REGEN_RPC_REFERENCE=1 cargo test -p bitcoin-rs-rpc --test manifest_coverage -- --ignored regenerate_reference`
 
 ### `API-02`: JSON-RPC mechanics and the wallet-free surface
 
@@ -1368,7 +1368,7 @@ only. It does not establish mainnet memory, throughput, or commit-blocking time.
   same-block inputs, disconnects, later forks, pruning, genesis, and restart.
   It also compares raw transaction verbosity 1/2 and boolean true through
   explicit-block and txindex lookups, including unavailable stale history.
-  `crates/chainstate/src/block_spends/tests.rs` covers durable receipts,
+  `crates/chainstate/tests/unit/block_spends_tests.rs` covers durable receipts,
   archive progress, lease expiry, missing/corrupt records, and ancestry bounds;
   `crates/storage/tests/bounded_value_read.rs` covers borrowed/pinned copy
   limits and unsupported defaults across the supported storage engines.
@@ -1400,7 +1400,7 @@ only. It does not establish mainnet memory, throughput, or commit-blocking time.
     checks that a named-pipe import input is refused as non-regular without
     blocking (Unix, not Apple).
   - `lifecycle_progress_omits_missing_and_unauthenticated_counts` in
-    `crates/chainstate/src/assumeutxo/tests.rs` checks that verification
+    `crates/chainstate/tests/unit/assumeutxo_tests.rs` checks that verification
     progress is omitted when the transaction count is missing or unknown.
   - `live_archive_reservation_is_not_reclaimed`,
     `abandoned_native_reservations_are_reclaimed_without_touching_unknowns` and

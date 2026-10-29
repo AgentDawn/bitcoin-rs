@@ -138,9 +138,9 @@ a running pinned binary, not a replay of captured JSON.
   seven days, including failed runs. Node databases and RPC cookies are
   excluded. Failures before evidence generation can leave only partial logs;
   failures before log creation can leave no files to upload.
-- `cargo test -p bitcoin-rs-p2p --test suite core_interop_live:: -- --ignored`
+- `cargo test -p bitcoin-rs-p2p --test core_interop_live -- --ignored`
   with `P2P_CORE_INTEROP_EVIDENCE` set by the driver.
-- `cargo test --locked -p bitcoin-rs-e2e --test suite acceptance::`, after building
+- `cargo test --locked -p bitcoin-rs-e2e --test acceptance`, after building
   the daemon and provisioning the pinned Core fixture. `BITCOIN_RS_NODE`
   and `BITCOIN_RS_REFERENCE_BITCOIND` can name the exact binaries.
 - The existing `ci.yml` `test-workspace` lane discovers the acceptance test

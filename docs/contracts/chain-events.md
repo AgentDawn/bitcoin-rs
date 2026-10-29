@@ -130,7 +130,7 @@ Owners:
   Unknown headers, unavailable ancestry and missing/pruned bodies are explicit
   errors. Fetch bodies separately with `block_by_hash`; never mark a failed
   body applied. Replay reconstructs a path, not a historical event log.
-- Proof: `chain_feed::tests` (`crates/node/src/chain_feed/tests.rs`) covers
+- Proof: `chain_feed::tests` (`crates/node/tests/unit/chain_feed.rs`) covers
   bounded batches, missed commits, stale targets, disconnect-before-connect,
   restart, refusal and unsettled fences.
 

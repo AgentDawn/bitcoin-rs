@@ -295,7 +295,7 @@ section. Daemon `run()` exposes teardown failures as `anyhow` errors.
 - `crates/node/tests/embed.rs::dropped_node_releases_services_and_datadir_for_reopen`
   and `startup_failure_after_state_open_rolls_back_releases_state` exercise
   abandoned-run cleanup and startup rollback.
-- `crates/node/src/state/tests/data_dir_lock.rs`
+- `crates/node/tests/unit/state/tests/data_dir_lock.rs`
   (`idle_keepalive_rpc_connection_keeps_the_directory_locked_after_shutdown`,
   `retained_chainstate_handle_keeps_the_directory_locked_until_dropped`,
   `retained_block_body_store_keeps_the_directory_locked_until_dropped`,
@@ -305,7 +305,7 @@ section. Daemon `run()` exposes teardown failures as `anyhow` errors.
   lock lifetime against a retained RPC connection, chainstate handle,
   block-body store, block files, index query adapter, and the index open spec
   and store opened on a worker thread.
-- `crates/node/src/lifecycle/tests.rs` contains checkpoint failure,
+- `crates/node/tests/unit/lifecycle/tests.rs` contains checkpoint failure,
   worker join failure, daemon/embedded identity, repeated teardown, rollback,
   queued-wake, and owned-startup-result regressions.
 - `crates/node/src/embed.rs::tests::broadcast_publishes_one_ordered_a_event_through_the_shared_gateway`

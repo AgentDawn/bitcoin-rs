@@ -21,7 +21,7 @@ Owners:
 - Authoritative durable root and ordered commit protocol:
   `crates/chainstate/src/connect.rs`, `disconnect.rs`, and `durable.rs`
 - Recovery and schema admission: `crates/chainstate/src/recovery.rs`;
-  process-composition tests remain in `crates/node/src/state/tests/`
+  process-composition tests remain in `crates/node/tests/unit/state/tests/`
 - Persistent coin transition boundary: `crates/utxo/src/set.rs`
   (transition types); durable form in
   `crates/storage/src/durable_head.rs`
@@ -151,9 +151,9 @@ committed `Finalized` head. Cleanup failures are warnings, not recovery failures
 ordinary checkpoints and unknown files are preserved.
 
 Snapshot recovery is exercised by
-`crates/chainstate/src/assumeutxo/tests.rs` (commitment verification,
+`crates/chainstate/tests/unit/assumeutxo_tests.rs` (commitment verification,
 isolated replay, terminal-write failures and role guards) and
-`crates/chainstate/src/assumeutxo/tests/recovery.rs` (real-storage
+`crates/chainstate/tests/unit/assumeutxo_recovery_tests.rs` (real-storage
 restart, process-kill boundaries, lost failure receipts, root-preserving
 archive replay, checkpoint pin binding, pruning and below-base reorg restart).
 
@@ -223,12 +223,12 @@ positive case (the worker finishes the direct tip child while the body sync is
 held) and the no-publish side (the applied tip and ordinary templates still
 reference the old parent); no dedicated test pins the reorg-connect-never-fires
 case;
-`crates/chainstate/src/tests/window_tx_count_tests.rs` test
+`crates/chainstate/tests/unit/apply/window_tx_count_tests.rs` test
 `a_grouped_window_stages_only_its_newest_block_before_the_sync` and
-`crates/chainstate/src/tests/window_invalidation_tests.rs` test
+`crates/chainstate/tests/unit/apply/window_invalidation_tests.rs` test
 `a_failing_window_stages_only_its_last_successful_block` pin the grouped
 newest-block handoff before the sync;
-`crates/chainstate/src/durable/tests.rs` test
+`crates/chainstate/tests/unit/durable_replay_tests.rs` test
 `replay_of_a_committed_gap_never_fires_the_staged_tip_hook` pins the Replay
 arm. The IBD enqueue gate lives in `crates/node/src/state/open.rs` (the
 `set_tip_staged` closure over the chainstate IBD latch); no dedicated test
@@ -561,7 +561,7 @@ persists branch state.
   active-only artifact restores with no side branches), and
   `reader_rejects_malformed_side_sections` (truncated, inflated, duplicate,
   orphan, tip-displacing, and version-mismatched side sections are
-  rejected); `crates/chainstate/src/journal/replay_tests.rs`
+  rejected); `crates/chainstate/tests/unit/chainstate_journal_replay.rs`
   `replay_reuses_a_header_the_checkpoint_tree_already_holds` (journal
   replay over a restored node reuses the held header instead of inserting
   a duplicate).
@@ -578,7 +578,7 @@ persists branch state.
   certifies — replays the whole head chain from genesis when no chainstate
   was restored, and fails startup closed on a gap that is not an ancestor
   prefix of stored bodies (`RCV-02`, `RCV-04`).
-- `crates/chainstate/src/durable/tests.rs`:
+- `crates/chainstate/tests/unit/durable_replay_tests.rs`:
   - `committed_gap_replays_to_head_without_recommitting_it` proves replay
     lands exactly on the stored head and consumes its existing `commit_id`
     instead of issuing a second durable receipt;
@@ -598,7 +598,7 @@ persists branch state.
     preserving its recovery marker and journal head while closing admission;
   - `replay_of_a_committed_gap_never_fires_the_staged_tip_hook` proves replay
     of an authenticated gap never fires the speculative staged-tip hook (`RCV-02`).
-- `crates/chainstate/src/tests/`:
+- `crates/chainstate/tests/unit/apply/`:
   - `window_tx_count_tests::a_grouped_window_stages_only_its_newest_block_before_the_sync`
     proves a grouped IBD window stages only its newest block before the durable sync (`RCV-02`);
   - `window_invalidation_tests::a_failing_window_stages_only_its_last_successful_block`
@@ -630,7 +630,7 @@ persists branch state.
   the rewound head (`RCV-15`), and
   `checkpoint_fallback_replays_wide_gap_to_durable_head` proves an
   authenticated gap of any width replays from stored bodies (`RCV-10`).
-- `crates/node/src/state/tests/recovery.rs`:
+- `crates/node/tests/unit/state/tests/recovery.rs`:
   `restart_without_periodic_publication_restores_tip_and_commit_id` proves
   the durable head replays past the last checkpoint with `commit_id`
   preserved across restarts (`RCV-10`).
@@ -686,13 +686,13 @@ persists branch state.
   `failed_publication_preserves_current`; `side_branches.rs` covers
   side-branch restart retention in learn order, invalid-subtree exclusion,
   version-1 loading, and side-section corruption, and
-  `crates/chainstate/src/journal/replay_tests.rs`
+  `crates/chainstate/tests/unit/chainstate_journal_replay.rs`
   `replay_reuses_a_header_the_checkpoint_tree_already_holds` covers journal
   replay over a restored node;
-  `crates/chainstate/src/tests/checkpoint_debt_tests.rs`
+  `crates/chainstate/tests/unit/checkpoint_debt_tests.rs`
   `checkpoint_refuses_inflight_disconnect_and_preserves_state` proves an
   `InFlight` marker refuses publication with marker, `CURRENT`, and
-  generations untouched; `crates/node/src/lifecycle/tests.rs`
+  generations untouched; `crates/node/tests/unit/lifecycle/tests.rs`
   `shutdown_checkpoint_io_failure_is_returned_and_preserves_current` proves
   clean-shutdown publication errors propagate through `run` without skipping
   worker teardown; `crates/storage/src/checkpoint/tests.rs`

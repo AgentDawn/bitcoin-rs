@@ -324,10 +324,10 @@ fields stay in tracing, where they can change with the implementation.
 | 50 | `crates/node/src/event_loop.rs:90` | `counter!` | `node.event_loop.sync_ticks` | operational signal (rate/total) | kept (name unchanged) |
 | 51 | `crates/node/src/event_loop.rs:92` | `histogram!` | `node.event_loop.tick_seconds` | stable operator latency and HPA-04 ledger hook | kept (name unchanged) |
 | 52 | `crates/node/src/metrics.rs:380` | `gauge!` | `TXINDEX_READINESS_GAUGE` | operational signal (state/backlog gauge) | kept (name unchanged) |
-| 53 | `crates/node/src/metrics/tests.rs:96` | `counter!` | `node_metrics_retry_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
-| 54 | `crates/node/src/metrics/tests.rs:112` | `counter!` | `node_metrics_scrape_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
-| 55 | `crates/node/src/metrics/tests.rs:132` | `counter!` | `node_metrics_sequential_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
-| 56 | `crates/node/src/metrics/tests.rs:140` | `counter!` | `node_metrics_sequential_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
+| 53 | `crates/node/tests/unit/metrics/tests.rs:96` | `counter!` | `node_metrics_retry_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
+| 54 | `crates/node/tests/unit/metrics/tests.rs:112` | `counter!` | `node_metrics_scrape_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
+| 55 | `crates/node/tests/unit/metrics/tests.rs:132` | `counter!` | `node_metrics_sequential_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
+| 56 | `crates/node/tests/unit/metrics/tests.rs:140` | `counter!` | `node_metrics_sequential_probe` | test-only fixture (not a shipped signal) | kept (test-only) |
 | 57 | `crates/p2p/src/download_window.rs:757` | `counter!` | `node.sync.stall_episodes_cleared` | operational signal (count) | kept (name unchanged) |
 | 58 | `crates/p2p/src/download_window.rs:1454` | `counter!` | `node.sync.stall_episodes_started` | operational signal (count) | kept (name unchanged) |
 | 59 | `crates/p2p/src/download_window.rs:1513` | `histogram!` | `node.sync.apply_idle_seconds` | stable operator starvation latency and HPA-04 ledger hook | kept (name unchanged) |
@@ -405,7 +405,7 @@ fields stay in tracing, where they can change with the implementation.
 - The chainstate observability fixtures check retired metric names only on the
   caller thread with coinbase-only apply/window fixtures connected on top of a
   directly published genesis seed. Seeding alone (`seed_genesis` in
-  `crates/chainstate/src/test_fixtures.rs`) publishes the genesis tip
+  `crates/chainstate/tests/unit/test_fixtures.rs`) publishes the genesis tip
   with count 1 without connect and without hooks, so it emits no apply/window
   observations. Nonzero stage observations require connecting at least one
   mined coinbase-only child (`apply_block` for the apply timers, a

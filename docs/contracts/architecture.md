@@ -292,7 +292,7 @@ Crate names use the `bitcoin-rs-` prefix except for the `bitcoin-rs` binary.
   user and password. After the fold, the winning `network` value fills the
   profile-owned fields once through `NetworkProfile::for_selection`, and
   `rpc_auth` chooses the final credential style from the winning values.
-  Proofs: `crates/node/src/config/tests.rs`
+  Proofs: `crates/node/tests/unit/config/tests.rs`
   `resolve_prefers_higher_layers_field_by_field`,
   `rpc_cookie_and_credential_layers_keep_one_auth_source`, and
   `earlier_set_fields_survive_a_later_bare_network_selection`.
@@ -921,16 +921,16 @@ backend construction), [ARCH-05](#arch-05-node-composition-and-orchestration-bou
 - `crates/storage/tests/bounded_prefix_scan.rs` and
   `crates/storage/tests/redb_txindex.rs`: bounded prefix scan limits, seek
   points, completeness, and snapshot isolation (`ARCH-02`).
-- `crates/chainstate/src/tests/admission_tests.rs` and
-  `crates/chainstate/src/tests/chain_tx_count_tests.rs` cover admission
+- `crates/chainstate/tests/unit/apply/admission_tests.rs` and
+  `crates/chainstate/tests/unit/apply/chain_tx_count_tests.rs` cover admission
   shutdown and coherent chain transaction-count publication. Checkpoint and
-  journal tests moved with their owner under `crates/chainstate/src/`.
+  journal tests moved with their owner under `crates/chainstate/tests/unit/`.
 - `crates/node/src/chain_effects.rs` and node mining/sync/reorg integration
   tests prove that mempool/follower work consumes committed chainstate outcomes
   without making chainstate depend on those consumers.
-- `crates/node/src/state/tests/construction.rs` test
+- `crates/node/tests/unit/state/tests/construction.rs` test
   `runtime_accessors_borrow_their_subsystem_owner` and
-  `crates/node/src/lifecycle/tests.rs` test
+  `crates/node/tests/unit/lifecycle/tests.rs` test
   `rpc_network_handles_borrow_p2p_service_state` prove that node and RPC
   composition reuse the owning service's handles rather than retaining
   parallel runtime projections.
@@ -939,13 +939,13 @@ backend construction), [ARCH-05](#arch-05-node-composition-and-orchestration-bou
   `disconnect_does_not_pop_a_different_tail`: post-commit RPC/ZMQ work is
   owned by `ChainFollowers`, not by apply; the connect/disconnect test also
   proves that the configured ZMQ publisher receives the committed effects.
-- `crates/node/src/config/tests.rs` tests
+- `crates/node/tests/unit/config/tests.rs` tests
   `resolve_prefers_higher_layers_field_by_field` and
   `rpc_cookie_and_credential_layers_keep_one_auth_source`: later `UserConfig`
   layers win on set fields, including nested `ChainstateJournalOverrides`, and
   the RPC credential style is settled per layer and again after the fold
   (`ARCH-05`).
-- `crates/node/src/config/tests.rs` test
+- `crates/node/tests/unit/config/tests.rs` test
   `earlier_set_fields_survive_a_later_bare_network_selection`: the network
   profile fills unset fields only (`ARCH-05`).
 - `crates/node/tests/config_layered.rs` test
