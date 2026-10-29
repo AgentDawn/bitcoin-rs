@@ -1217,9 +1217,11 @@ fn flags_from_bits(bits: u32) -> VerifyFlags {
     flags
 }
 
-/// `tx_valid.json` names the flags Core turns OFF: it verifies with the
-/// complement (`transaction_tests.cpp`). A row whose complement is not a
-/// filled combination is bad test data, which Core reports rather than runs.
+/// `tx_valid.json` names the flags Core turns OFF: it verifies with the complement
+/// (`transaction_tests.cpp`).
+///
+/// A row whose complement is not a filled combination is bad test data, which Core
+/// reports rather than runs.
 fn tx_valid_flags(names: &str) -> Result<VerifyFlags, String> {
     let parsed = VerifyFlags::from_core_names(names).map_err(|e| e.to_string())?;
     let effective = flags_from_bits(FULL_FLAGS.bits() & !parsed.bits());

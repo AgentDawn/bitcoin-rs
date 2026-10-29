@@ -1,9 +1,10 @@
 //! Node-owned derived-index runtime and reconciliation worker.
-//! A bounded wake channel follows committed applied-tip publication. Exact
-//! reset, revision, and capability-watermark CAS conditions fence every write;
-//! a transient `StaleIndexState` discards pending work and re-derives it.
-//! Queries refuse temporary lag. Aligned families share a parse and commit;
-//! divergent families backfill independently. See `docs/contracts/indexing.md`.
+//!
+//! A bounded wake channel follows committed applied-tip publication. Exact reset,
+//! revision, and capability-watermark CAS conditions fence every write; a transient
+//! `StaleIndexState` discards pending work and re-derives it. Queries refuse temporary
+//! lag. Aligned families share a parse and commit; divergent families backfill
+//! independently. See `docs/contracts/indexing.md`.
 
 use arc_swap::ArcSwap;
 

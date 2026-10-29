@@ -1,9 +1,10 @@
 //! Bounds-checked borrowed block/transaction wire layout.
-//! `ByteSpan` offsets belong to one immutable borrowed image; `MetadataRange`
-//! indexes parsed vectors instead. Parsing establishes BIP144/CompactSize shape
-//! and rejects counts that cannot fit remaining bytes before allocation.
-//! Consensus amounts, maturity, scripts, and weight belong to materialization's
-//! callers. Offsets are u32; unrepresentable lengths report `EndOfData`.
+//!
+//! `ByteSpan` offsets belong to one immutable borrowed image; `MetadataRange` indexes
+//! parsed vectors instead. Parsing establishes BIP144/CompactSize shape and rejects
+//! counts that cannot fit remaining bytes before allocation. Consensus amounts,
+//! maturity, scripts, and weight belong to materialization's callers. Offsets are u32;
+//! unrepresentable lengths report `EndOfData`.
 
 use std::ops::Range;
 

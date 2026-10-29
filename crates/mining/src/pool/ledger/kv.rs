@@ -475,7 +475,7 @@ impl<V: Value> Table<'_, u64, V> {
     /// (at most `limit + 1` decoded rows). Linearizable seek; snapshot
     /// isolation per read; idempotent callers retry from the returned cursor.
     /// Read-only fast path: reconcile pages run on `begin_read` with an empty
-    /// overlay, so no BTreeMap materializes the whole table before
+    /// overlay, so no `BTreeMap` materializes the whole table before
     /// offset/limit. Returns `(rows, more)` where `more` means another page
     /// exists after the last returned key.
     pub(crate) fn page_after(

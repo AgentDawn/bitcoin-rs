@@ -1,6 +1,7 @@
 //! Job projection, extranonce allocation, and share validation for SV1/SV2.
-//! `MiningControl` builds templates and validates blocks; `JobBook` owns the
-//! bounded job/session state. Money, keys, and difficulty policy are inputs.
+//!
+//! `MiningControl` builds templates and validates blocks; `JobBook` owns the bounded
+//! job/session state. Money, keys, and difficulty policy are inputs.
 //!
 //! `coinbase_prefix || session || rolled || coinbase_suffix` must be the exact
 //! non-witness coinbase encoding. Growth must satisfy `CoinbaseBudget`, its size

@@ -435,10 +435,11 @@ fn serves_blocktxn_by_depth_on_the_wire() -> Result<(), Error> {
     node.stop()
 }
 
-/// An empty `getblocktxn` index list ends the connection at the inbound
-/// boundary (Core 31.1 `net_processing.cpp`). A ping/pong proves
-/// the socket was alive immediately before the request, so the drop is
-/// attributed to the malformed message and not to an idle timeout.
+/// An empty `getblocktxn` index list ends the connection at the inbound boundary (Core
+/// 31.1 `net_processing.cpp`).
+///
+/// A ping/pong proves the socket was alive immediately before the request, so the drop
+/// is attributed to the malformed message and not to an idle timeout.
 #[test]
 fn empty_getblocktxn_disconnects_on_the_wire() -> Result<(), Error> {
     let (mut node, mut peer, _chain) = synced_peer("empty-txn")?;
@@ -553,9 +554,10 @@ fn wrong_root_compact_block_falls_back_to_same_peer() -> Result<(), Error> {
     )))
 }
 
-/// Hold a compact-block reconstruction across a real chain switch. Core v31.1
-/// GETBLOCKTXN resolves stored bodies by hash even after they leave the chain
-/// (9be056a8a72b624dae9623b2f7bded92c2a21c91, net_processing.cpp).
+/// Hold a compact-block reconstruction across a real chain switch.
+///
+/// Core v31.1 GETBLOCKTXN resolves stored bodies by hash even after they leave the
+/// chain (9be056a8a72b624dae9623b2f7bded92c2a21c91, `net_processing.cpp`).
 #[test]
 fn stale_compact_block_finishes_reconstruction_after_reorg() -> Result<(), Error> {
     use NetworkMessage::{BlockTxn, NotFound};

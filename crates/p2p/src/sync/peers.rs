@@ -315,9 +315,11 @@ impl BlockSync {
 
     /// Executes the window's single recovery decision against the canonical
     /// `next_required` body: exact-owner conviction, unblamed staged eviction, or
-    /// bounded hedge. Same-address replacement cannot inherit blame.
-    /// Fatal settlement suppresses all recovery: delivery cannot apply, so retain
-    /// staged bodies for the re-created apply path and blame no peer.
+    /// bounded hedge.
+    ///
+    /// Same-address replacement cannot inherit blame. Fatal settlement suppresses all
+    /// recovery: delivery cannot apply, so retain staged bodies for the re-created
+    /// apply path and blame no peer.
     pub(super) fn reconcile_window_recovery(&self, chain: &ChainFrontier, now: Instant) {
         if chain.apply_halted {
             return;
@@ -404,10 +406,12 @@ impl BlockSync {
         }
     }
 
-    /// Evicts a stuck staged body without peer blame. Recheck the observed
-    /// frontier hash before removal so branch replacement cannot evict unrelated
-    /// work. Remove from stager, resolve height, then drop-for-retry in the window;
-    /// normal scheduling owns refetch and any later non-delivery conviction.
+    /// Evicts a stuck staged body without peer blame.
+    ///
+    /// Recheck the observed frontier hash before removal so branch replacement cannot
+    /// evict unrelated work. Remove from stager, resolve height, then drop-for-retry in
+    /// the window; normal scheduling owns refetch and any later non-delivery
+    /// conviction.
     fn escalate_stuck_staged_body(
         &self,
         next_apply_height: u32,

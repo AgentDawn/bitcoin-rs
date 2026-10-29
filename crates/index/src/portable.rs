@@ -1,6 +1,7 @@
 //! Versioned `TxLookup` bundle export and restore on the derived-index worker.
-//! `artifact` owns the wire layout, `export` coherent reads and publication,
-//! and `restore` validation and fenced import through `IndexWriter`.
+//!
+//! `artifact` owns the wire layout, `export` coherent reads and publication, and
+//! `restore` validation and fenced import through `IndexWriter`.
 //!
 //! `ScriptHistory` is refused until its occurrence layout is qualified;
 //! `ScriptLive` is always reseeded from the UTXO set, never a bundle capability.

@@ -1,8 +1,9 @@
 //! SV1 framing, dialect, handshake, difficulty policy, and connection bounds.
-//! `session` owns per-connection state; `PoolCore` and `JobBook` own shared work
-//! and verdicts. The adapter performs no independent coinbase, hash, or target
-//! validation and holds no keys or wallet. Before JSON decoding, `LineBuffer`,
-//! `MAX_JSON_DEPTH`, and `MAX_PARAMS` bound untrusted frames.
+//!
+//! `session` owns per-connection state; `PoolCore` and `JobBook` own shared work and
+//! verdicts. The adapter performs no independent coinbase, hash, or target validation
+//! and holds no keys or wallet. Before JSON decoding, `LineBuffer`, `MAX_JSON_DEPTH`,
+//! and `MAX_PARAMS` bound untrusted frames.
 #![forbid(unsafe_code)]
 
 mod session;

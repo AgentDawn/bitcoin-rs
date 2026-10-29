@@ -1,7 +1,8 @@
 //! Compatibility projection of `registry::REGISTRY`, the dispatcher authority.
+//!
 //! `Status` owns row semantics; `core-compat.toml` owns the pinned reference and
-//! comparison requirements. The manifest-coverage gate checks registry/manifest
-//! set equality and generates `docs/rpc-reference.md`.
+//! comparison requirements. The manifest-coverage gate checks registry/manifest set
+//! equality and generates `docs/rpc-reference.md`.
 //!
 //! The Core v31.0 command-table comparison covers RPC, wallet, REST, and ZMQ
 //! registrations. Hidden test/administration commands remain outside the manifest:

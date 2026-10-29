@@ -249,10 +249,10 @@ pub(crate) struct BlockDownloadPolicy {
 }
 
 /// Shared service/range gate for all body-selection paths, before dynamic rules.
-/// Requires witness service. During IBD also requires `NODE_NETWORK`;
-/// a limited peer afterwards can serve only the last
-/// `NODE_NETWORK_LIMITED_MIN_BLOCKS` of its demonstrated chain and never a
-/// height above it (Core `net_processing.cpp`).
+///
+/// Requires witness service. During IBD also requires `NODE_NETWORK`; a limited peer
+/// afterwards can serve only the last `NODE_NETWORK_LIMITED_MIN_BLOCKS` of its
+/// demonstrated chain and never a height above it (Core `net_processing.cpp`).
 pub(crate) fn serves_requested_height(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> bool {
     let network = ServiceFlags::NETWORK.to_u64();
     let witness = ServiceFlags::WITNESS.to_u64();

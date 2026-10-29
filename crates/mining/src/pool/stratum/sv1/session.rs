@@ -1,8 +1,9 @@
 //! SV1 connection state and bounded TCP server.
-//! `PoolCore` owns shared locking/publication; `JobBook::validate` owns share
-//! verdicts. This adapter maps errors, chooses session difficulty, and hands
-//! accepted shares to `ShareLedger`. A session's `Lease` closes it on unwind;
-//! shared locks recover from poison.
+//!
+//! `PoolCore` owns shared locking/publication; `JobBook::validate` owns share verdicts.
+//! This adapter maps errors, chooses session difficulty, and hands accepted shares to
+//! `ShareLedger`. A session's `Lease` closes it on unwind; shared locks recover from
+//! poison.
 
 use std::collections::HashMap;
 use std::error::Error;

@@ -516,11 +516,12 @@ impl Drop for BlockForwardCredit {
 }
 
 /// Per-connection item and full-frame byte accounting.
+///
 /// `OutboundCredit` charges local bounds then the node aggregate before enqueue,
-/// travels in `QueuedFrame`, and releases on any drop path. Testing local
-/// high-water marks before addition admits one oversized message to an empty queue.
-/// Local refusal cancels the lease; aggregate refusal preserves it and the
-/// caller's intent. Bulk production reserves before loading a body.
+/// travels in `QueuedFrame`, and releases on any drop path. Testing local high-water
+/// marks before addition admits one oversized message to an empty queue. Local refusal
+/// cancels the lease; aggregate refusal preserves it and the caller's intent. Bulk
+/// production reserves before loading a body.
 ///
 /// Wait predicates read atomics. Each decrease updates counters, takes the
 /// condvar lock, then notifies, so the check/park boundary loses no wake.
@@ -1169,10 +1170,11 @@ impl PeerLease {
         self.source(Some(crate::accepted_ip_identity(addr)))
     }
 
-    /// Nonblocking enqueue with a frame-owned charge. `Ok` means queued.
-    /// `Closed` returns the message and cancels this lease for local failure
-    /// (including encoding, budget, writer, or channel refusal). `Saturated` returns
-    /// the message while preserving the live lease and caller's intent.
+    /// Nonblocking enqueue with a frame-owned charge.
+    ///
+    /// `Ok` means queued. `Closed` returns the message and cancels this lease for local
+    /// failure (including encoding, budget, writer, or channel refusal). `Saturated`
+    /// returns the message while preserving the live lease and caller's intent.
     /// `OutboundCredit` releases accounting wherever the frame is dropped.
     #[expect(clippy::result_large_err)]
     pub fn send(&self, message: crate::Message) -> Result<(), OutboundRefusal> {

@@ -1,9 +1,11 @@
-//! Durable PPLNS accounting over a host-supplied `KvStore`; no keys, wallet RPC,
-//! engine opening, or transaction broadcast. Each mutation is one revision-guarded
-//! durable batch: a revision conflict changes nothing, but durability errors
-//! are ambiguous and require reconciliation by the operation's idempotent identity.
-//! Creation requires an empty namespace; opening verifies immutable configuration.
-//! No implicit migration from the experimental ledger format is supported.
+//! Durable PPLNS accounting over a host-supplied `KvStore`; no keys, wallet RPC, engine
+//! opening, or transaction broadcast.
+//!
+//! Each mutation is one revision-guarded durable batch: a revision conflict changes
+//! nothing, but durability errors are ambiguous and require reconciliation by the
+//! operation's idempotent identity. Creation requires an empty namespace; opening
+//! verifies immutable configuration. No implicit migration from the experimental ledger
+//! format is supported.
 //!
 //! `store` owns transitions, `kv` owns coherent views/commits, and this module
 //! owns arithmetic and signer codecs. Hashes use internal byte order, money is

@@ -372,9 +372,10 @@ enum ChecksumRequirement {
     Required,
 }
 
-/// Core's `CheckChecksum` (`script/descriptor.cpp`): reject multiple `#`,
-/// then a present checksum of the wrong length, then a mismatch. Return only
-/// the body and computed checksum; descriptor parsers must not receive the
+/// Core's `CheckChecksum` (`script/descriptor.cpp`): reject multiple `#`, then a
+/// present checksum of the wrong length, then a mismatch.
+///
+/// Return only the body and computed checksum; descriptor parsers must not receive the
 /// `#checksum` suffix or silently replace a supplied wrong checksum.
 fn checked_checksum(
     descriptor: &str,
@@ -1160,9 +1161,10 @@ fn descriptor_address(
         })
 }
 
-/// Checks extended-key `NetworkKind` before address derivation. Unlike Core's
-/// chain-specific `DecodeExtPubKey`, rust-bitcoin parses both prefixes into one
-/// type and can re-encode for another network without rejecting the mismatch.
+/// Checks extended-key `NetworkKind` before address derivation.
+///
+/// Unlike Core's chain-specific `DecodeExtPubKey`, rust-bitcoin parses both prefixes
+/// into one type and can re-encode for another network without rejecting the mismatch.
 /// Test networks share the BIP32 prefix set; only mainnet versus test matters.
 fn ensure_keys_match_network(
     descriptor: &MiniscriptDescriptor<DescriptorPublicKey>,

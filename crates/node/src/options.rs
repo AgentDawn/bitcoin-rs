@@ -1,8 +1,10 @@
 //! Canonical operator-option rows consumed by CLI, environment, TOML, and
-//! `bitcoin.conf` parsers. Each names an initially unset `UserConfig` slot and
-//! one value grammar; an absent surface column means unsupported there.
-//! Journal bounds use environment rows or the grouped TOML table; notification
-//! adapters are a TOML-only whole-value option. `option_rows!` owns the grammar.
+//! `bitcoin.conf` parsers.
+//!
+//! Each names an initially unset `UserConfig` slot and one value grammar; an absent
+//! surface column means unsupported there. Journal bounds use environment rows or the
+//! grouped TOML table; notification adapters are a TOML-only whole-value option.
+//! `option_rows!` owns the grammar.
 
 use std::convert::Infallible;
 use std::ffi::OsStr;

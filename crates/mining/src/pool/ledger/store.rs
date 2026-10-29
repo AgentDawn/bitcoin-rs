@@ -36,8 +36,9 @@ pub const MAX_SIGNED_TXS_PER_BATCH: usize = 32;
 /// a block body and decode it, so an unbounded scan would stall chain
 /// transitions that need the same stores.
 pub const RECONCILE_ROUND_BATCH_LIMIT: usize = 32;
-/// Maximum payout batches observed per bounded reconcile commit. Each batch
-/// scans signed transactions and script indexes, so the work per commit stays
+/// Maximum payout batches observed per bounded reconcile commit.
+///
+/// Each batch scans signed transactions and script indexes, so the work per commit stays
 /// bounded while the generation check keeps every financial commit coherent.
 pub const RECONCILE_PAYOUT_BATCH_LIMIT: usize = 16;
 const MAX_INPUTS_PER_TX: usize = 100_000;

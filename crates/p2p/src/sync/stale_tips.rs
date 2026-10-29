@@ -221,9 +221,10 @@ impl StaleTipRetainer {
     }
 
     /// Learns a branch's newest stale tip from admission or invalidation.
-    /// `from` is its header announcer; `staletip` announcers use `note_heard`.
-    /// Return true only for a newly retained, eligible tip that has no held descendant
-    /// and outranks the weakest at capacity. Remove held ancestors and remember all
+    ///
+    /// `from` is its header announcer; `staletip` announcers use `note_heard`. Return
+    /// true only for a newly retained, eligible tip that has no held descendant and
+    /// outranks the weakest at capacity. Remove held ancestors and remember all
     /// announcers. Replays and ineligible/superseded tips return false; an already-held
     /// tip still records new announcers to prevent echoes.
     pub(crate) fn learn(&self, tree: &BlockTree, hash: Hash256, from: Option<PeerSource>) -> bool {
@@ -312,13 +313,14 @@ impl StaleTipRetainer {
         self.state.lock().prune(tree);
     }
 
-    /// Offers retained tips best-first without marking them known. First call,
-    /// after the peer demonstrates a usable fork point, selects at most
+    /// Offers retained tips best-first without marking them known.
+    ///
+    /// First call, after the peer demonstrates a usable fork point, selects at most
     /// `MAX_ADVERTISED_STALETIPS` from the backlog; later calls offer new tips and
-    /// unacknowledged selections, never the unselected old backlog.
-    /// `relayable` runs outside the mutex in rank order until the cap is met.
-    /// Refused or unsent tips remain offerable until retired or marked known;
-    /// the caller uses `mark_known` only after a successful send.
+    /// unacknowledged selections, never the unselected old backlog. `relayable` runs
+    /// outside the mutex in rank order until the cap is met. Refused or unsent tips
+    /// remain offerable until retired or marked known; the caller uses `mark_known`
+    /// only after a successful send.
     pub(crate) fn pending_for(
         &self,
         peer: PeerSource,

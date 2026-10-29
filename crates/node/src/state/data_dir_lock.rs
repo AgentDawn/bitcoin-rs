@@ -1,9 +1,10 @@
 //! Process-exclusive datadir lock, acquired before schema/epoch inspection.
-//! Capability-scoped open rejects symlinks and nonregular files (Core's
-//! `LockDirectory` in `init.cpp`). Every writable store retains a `StoreGuard`
-//! clone and drops it after its engine/file handles, so detached consumers
-//! cannot outlive lock ownership. `DATA_DIR_LOCK_FILE` belongs to storage's
-//! checkpoint classifier, which exempts it from fresh-directory checks.
+//!
+//! Capability-scoped open rejects symlinks and nonregular files (Core's `LockDirectory`
+//! in `init.cpp`). Every writable store retains a `StoreGuard` clone and drops it after
+//! its engine/file handles, so detached consumers cannot outlive lock ownership.
+//! `DATA_DIR_LOCK_FILE` belongs to storage's checkpoint classifier, which exempts it
+//! from fresh-directory checks.
 
 use bitcoin_rs_storage::checkpoint::fs::DATA_DIR_LOCK_FILE;
 use cap_fs_ext::FollowSymlinks;

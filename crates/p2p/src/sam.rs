@@ -1,6 +1,7 @@
-//! I2P SAM v3 client for the pinned IVNP bridge. One persistent streaming root
-//! serves fresh connect/accept bridges. Resolve names only through SAM; never
-//! fall back to direct TCP or log private destination material.
+//! I2P SAM v3 client for the pinned IVNP bridge.
+//!
+//! One persistent streaming root serves fresh connect/accept bridges. Resolve names
+//! only through SAM; never fall back to direct TCP or log private destination material.
 //!
 //! A root's generation rises only on installation; stale `INVALID_ID` retires
 //! only the generation the caller used. `PendingRoot` resumes exchanges after
@@ -1470,10 +1471,12 @@ impl SamSession {
     }
 
     /// Closes future dials and wakes in-flight root I/O, then drains pending and
-    /// installed roots under `recovery` then `control`. Installation holds recovery
-    /// and rechecks `closed`, so none can follow the drain. Release the leaf `wake`
-    /// lock before taking either. Before a socket exists, close waits for at most
-    /// one uninterruptible TCP attempt (`EXCHANGE_BUDGET`), never the readiness budget.
+    /// installed roots under `recovery` then `control`.
+    ///
+    /// Installation holds recovery and rechecks `closed`, so none can follow the drain.
+    /// Release the leaf `wake` lock before taking either. Before a socket exists, close
+    /// waits for at most one uninterruptible TCP attempt (`EXCHANGE_BUDGET`), never the
+    /// readiness budget.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         {

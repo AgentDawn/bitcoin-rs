@@ -23,11 +23,12 @@ pub fn block_undo_key(height: u32, hash: Hash256) -> [u8; KEY_LEN] {
     key
 }
 
-/// Required per-block undo storage, keyed by height and block hash so a stale
-/// branch's record cannot undo a different block. Missing undo strands an
-/// applied chain; implementations must round-trip, never silently discard.
-/// `InMemoryUndoStore` serves nondurable callers. See `KvUndoStore::persist_undo`
-/// for the deferred-write/durable-head boundary.
+/// Required per-block undo storage, keyed by height and block hash so a stale branch's
+/// record cannot undo a different block.
+///
+/// Missing undo strands an applied chain; implementations must round-trip, never
+/// silently discard. `InMemoryUndoStore` serves nondurable callers. See
+/// `KvUndoStore::persist_undo` for the deferred-write/durable-head boundary.
 pub trait UndoStore: Send + Sync {
     /// Writes the undo record for one block.
     fn persist_undo(&self, height: u32, hash: Hash256, record: &[u8]) -> Result<(), StorageError>;
@@ -276,10 +277,11 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
         )
     }
 
-    /// Makes undo readable for planning through a deferred write. RCV-02's
-    /// atomic durable-head commit makes the row authoritative and names it in
-    /// `undo_extent`; before that receipt it is a discardable orphan tail.
-    /// Durability belongs to that commit, not a per-block fsync here.
+    /// Makes undo readable for planning through a deferred write.
+    ///
+    /// RCV-02's atomic durable-head commit makes the row authoritative and names it in
+    /// `undo_extent`; before that receipt it is a discardable orphan tail. Durability
+    /// belongs to that commit, not a per-block fsync here.
     fn persist_undo(&self, height: u32, hash: Hash256, record: &[u8]) -> Result<(), StorageError> {
         let mut batch = self.store.new_batch();
         batch.put(

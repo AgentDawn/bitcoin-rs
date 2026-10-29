@@ -356,11 +356,12 @@ pub(crate) fn drain_relay_queue(
     processed
 }
 
-/// Runs the single relay worker against a weak live gateway. At send time the
-/// queued wtxid must still be resident; removed or witness-replaced transactions
-/// are consumed silently. Exclude the source connection and release mempool
-/// guards before sending. Hold no strong gateway reference while waiting;
-/// exit on shutdown or queue close. `drain_relay_queue` uses the same rule.
+/// Runs the single relay worker against a weak live gateway.
+///
+/// At send time the queued wtxid must still be resident; removed or witness-replaced
+/// transactions are consumed silently. Exclude the source connection and release
+/// mempool guards before sending. Hold no strong gateway reference while waiting; exit
+/// on shutdown or queue close. `drain_relay_queue` uses the same rule.
 pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
     sink: S,
     rx: Receiver<RelayRequest>,

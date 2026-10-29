@@ -77,9 +77,10 @@ impl AcceptHeaders {
 }
 
 /// Returns the old tip displaced by a partially accepted, then rejected header batch.
-/// Capture `pre_tip` before `accept_headers` and pass the same tree after `Err`.
-/// The accepted prefix may have demoted that tip even though the error cannot
-/// report it. Linear extension, unchanged tips, and unknown tips return `None`.
+///
+/// Capture `pre_tip` before `accept_headers` and pass the same tree after `Err`. The
+/// accepted prefix may have demoted that tip even though the error cannot report it.
+/// Linear extension, unchanged tips, and unknown tips return `None`.
 #[must_use]
 pub fn demoted_tip_after_rejection(tree: &BlockTree, pre_tip: Option<Hash256>) -> Option<Hash256> {
     let pre_hash = pre_tip?;

@@ -57,10 +57,11 @@ pub const fn feature_messages() -> [Message; 3] {
     ]
 }
 
-/// Sends offered BIP434 features after `feature_messages`, before `verack`,
-/// using the remote version already received by `dispatch_inbound_full`.
-/// Below `FEATURE_VERSION` send none. Otherwise send offered BIP332 only;
-/// BIP330/331 use their own negotiation messages. Both roles use this call site.
+/// Sends offered BIP434 features after `feature_messages`, before `verack`, using the
+/// remote version already received by `dispatch_inbound_full`.
+///
+/// Below `FEATURE_VERSION` send none. Otherwise send offered BIP332 only; BIP330/331
+/// use their own negotiation messages. Both roles use this call site.
 pub(crate) fn negotiated_features<S>(
     peer: &Peer<S>,
     remote_version: u32,
@@ -150,11 +151,12 @@ pub fn start<S>(
 }
 
 /// Handshakes an accepted peer with matching network magic and its own lease.
-/// Sends our version/services, negotiation, and verack; success leaves `Ready`
-/// and sends post-verack messages. Transient read timeouts permit polling until
-/// the absolute deadline; cancellation reports lease revocation immediately.
-/// Wire/FSM errors and deadline expiry propagate as `PeerError`; the caller
-/// owns teardown and the wrapped stream owns byte accounting.
+///
+/// Sends our version/services, negotiation, and verack; success leaves `Ready` and
+/// sends post-verack messages. Transient read timeouts permit polling until the
+/// absolute deadline; cancellation reports lease revocation immediately. Wire/FSM
+/// errors and deadline expiry propagate as `PeerError`; the caller owns teardown and
+/// the wrapped stream owns byte accounting.
 pub fn run_inbound_handshake<S: Read + Write>(
     peer: &mut Peer<S>,
     our_nonce: u64,

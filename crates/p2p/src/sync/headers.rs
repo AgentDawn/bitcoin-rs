@@ -313,11 +313,11 @@ impl BlockSync {
         }
     }
 
-    /// Requests the body of a freshly announced near-tip header from the
-    /// connection that proved it, without waiting for the next scheduler
-    /// tick. Core direct-fetches in the same situation
-    /// (`HeadersDirectFetchBlocks`, `net_processing.cpp`, gated by
-    /// `CanDirectFetch`).
+    /// Requests the body of a freshly announced near-tip header from the connection
+    /// that proved it, without waiting for the next scheduler tick.
+    ///
+    /// Core direct-fetches in the same situation (`HeadersDirectFetchBlocks`,
+    /// `net_processing.cpp`, gated by `CanDirectFetch`).
     ///
     /// PRE: `source` is the connection that delivered `announced_tip`.
     /// POST: the eligible body is requested through
@@ -503,9 +503,11 @@ impl BlockSync {
             .is_none_or(|tip| tip.chainwork < minimum_work)
     }
 
-    /// Resolves deferred fetches after header admission. Call on the sync thread
-    /// outside locks. Unknown headers and capacity refusals keep their marks;
-    /// departed connections lose theirs. Snapshot tree/peer reads outside scheduler.
+    /// Resolves deferred fetches after header admission.
+    ///
+    /// Call on the sync thread outside locks. Unknown headers and capacity refusals
+    /// keep their marks; departed connections lose theirs. Snapshot tree/peer reads
+    /// outside scheduler.
     ///
     /// Hold exact-source peer authority across the scheduler lock and recheck the
     /// mark before installation. Conversion to pending never removes ownership

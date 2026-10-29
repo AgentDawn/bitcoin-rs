@@ -370,12 +370,14 @@ pub trait ChainContextSource: Send + Sync {
     fn signalling_rules(&self, tip: &TipSnapshot, height: u32) -> Vec<AvailableMiningRule>;
 }
 
-/// Owns template caching, single-flight assembly, long-poll publication, and
-/// staged preparation. Pool selection uses one read guard; generation/cache
-/// publication is serialized by the coordinator mutex. Identical notifications
-/// are idempotent. `budgeted_candidate` owns finite admission and retry bounds.
-/// Proposal validation and block submission remain on the node's authoritative
-/// apply path. Cache entry limits do not bound caller-held `Arc` lifetimes.
+/// Owns template caching, single-flight assembly, long-poll publication, and staged
+/// preparation.
+///
+/// Pool selection uses one read guard; generation/cache publication is serialized by
+/// the coordinator mutex. Identical notifications are idempotent. `budgeted_candidate`
+/// owns finite admission and retry bounds. Proposal validation and block submission
+/// remain on the node's authoritative apply path. Cache entry limits do not bound
+/// caller-held `Arc` lifetimes.
 pub struct MiningService {
     /// Network whose genesis anchors an empty applied chain.
     network: Network,

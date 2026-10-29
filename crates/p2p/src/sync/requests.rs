@@ -136,11 +136,12 @@ fn not_found_block_hash(item: &Inventory) -> Option<Hash256> {
 }
 
 /// Releases only `source`'s matching request, under scheduler lock inside
-/// `PeerTable::with_current(source)`. Ordinary window release also clears its
-/// timeout/cold-front observation and rewinds the cursor; a deferred mark drops.
-/// Remember a tracked probe/hedge alternate's refusal without releasing the
-/// owner. An untracked hash changes nothing. Return whether ownership released;
-/// this path never blames or disconnects a peer.
+/// `PeerTable::with_current(source)`.
+///
+/// Ordinary window release also clears its timeout/cold-front observation and rewinds
+/// the cursor; a deferred mark drops. Remember a tracked probe/hedge alternate's
+/// refusal without releasing the owner. An untracked hash changes nothing. Return
+/// whether ownership released; this path never blames or disconnects a peer.
 fn release_unavailable_body(
     scheduler: &mut SchedulerState,
     source: PeerSource,
@@ -175,11 +176,12 @@ fn release_unavailable_body(
 
 impl BlockSync {
     /// Routes block `notfound` vectors under exact-source peer authority.
+    ///
     /// Release this connection's foreground, deferred, or historical request without
     /// blame and suppress its retry for `BODY_UNAVAILABLE_RETRY`. Return whether
-    /// anything released so the caller can wake sync. Ignore unasked vectors;
-    /// a stale source or same-address replacement cannot release or poison another
-    /// connection's request. Non-block vectors belong to their respective owners.
+    /// anything released so the caller can wake sync. Ignore unasked vectors; a stale
+    /// source or same-address replacement cannot release or poison another connection's
+    /// request. Non-block vectors belong to their respective owners.
     pub(crate) fn block_not_found(&self, source: PeerSource, items: &[Inventory]) -> bool {
         if !items
             .iter()

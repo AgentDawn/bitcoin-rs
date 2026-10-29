@@ -199,10 +199,11 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
 const MIN_TIME_OFFSET_SAMPLES: usize = 5;
 
 /// Median offset from current outbound peers, zero below the sample floor.
-/// Outbound-only sampling prevents inbound peers from inducing a clock warning;
-/// zero cannot distinguish insufficient data from agreement.
-/// Core retains its last 50 samples across disconnects; this projection uses
-/// currently connected peers and can differ after churn.
+///
+/// Outbound-only sampling prevents inbound peers from inducing a clock warning; zero
+/// cannot distinguish insufficient data from agreement. Core retains its last 50
+/// samples across disconnects; this projection uses currently connected peers and can
+/// differ after churn.
 fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
     // **Outbound peers only.** Core's reason, in its own words at the call
     // site in `net_processing.cpp`: "Don't use timedata samples from inbound
@@ -228,10 +229,12 @@ fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
     offsets.get(offsets.len() / 2).copied().unwrap_or(0)
 }
 
-/// Renders all handshake-complete sessions, including anonymous overlays,
-/// in connection order. `PeerInfoWire` preserves the full u64 `PeerLease::node_id`
-/// for `disconnectnode`; the pinned corepc type's u32 would fail or alias after
-/// counter growth. Array positions are never connection identities.
+/// Renders all handshake-complete sessions, including anonymous overlays, in connection
+/// order.
+///
+/// `PeerInfoWire` preserves the full u64 `PeerLease::node_id` for `disconnectnode`; the
+/// pinned corepc type's u32 would fail or alias after counter growth. Array positions
+/// are never connection identities.
 pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     // `sessions` carries the lease — role and manual flag — that `infos`
@@ -591,11 +594,12 @@ fn control_error_to_rpc_error(error: bitcoin_rs_p2p::P2pControlError) -> RpcErro
 }
 
 /// Disconnects a ready session by address, nodeid, or their conjunction.
-/// An empty address with nodeid selects by id (Core spelling); a nonempty
-/// address plus nodeid is a bitcoin-rs extension Core rejects. Absent or still
-/// handshaking sessions return NotFound. PeerTable checks readiness and removes
-/// the exact target under one write guard, excluding same-address replacement
-/// races. Nodeid also selects anonymous sessions without an endpoint.
+///
+/// An empty address with nodeid selects by id (Core spelling); a nonempty address plus
+/// nodeid is a bitcoin-rs extension Core rejects. Absent or still handshaking sessions
+/// return `NotFound`. `PeerTable` checks readiness and removes the exact target under one
+/// write guard, excluding same-address replacement races. Nodeid also selects anonymous
+/// sessions without an endpoint.
 pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let bound = super::bind_named_params(params, &["address", "nodeid"])?;
     let array = params_array(&bound)?;

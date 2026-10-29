@@ -206,11 +206,13 @@ impl ChainFollowers {
         Ok(())
     }
 
-    /// Dispatches committed connect effects under the held mempool fence:
-    /// RPC log, hash/raw ZMQ, index wake plus sequence `C`, mining wake, then orphan
-    /// re-evaluation. Block removals commit before `C` and emit no separate `R`;
-    /// the mining wake carries their receipt for staged preparation installation.
-    /// Consumer failure cannot invalidate chainstate.
+    /// Dispatches committed connect effects under the held mempool fence: RPC log,
+    /// hash/raw ZMQ, index wake plus sequence `C`, mining wake, then orphan
+    /// re-evaluation.
+    ///
+    /// Block removals commit before `C` and emit no separate `R`; the mining wake
+    /// carries their receipt for staged preparation installation. Consumer failure
+    /// cannot invalidate chainstate.
     pub(crate) fn on_connect(&self, block: &Block, outcome: &ConnectOutcome) {
         let on_connect_started = quanta::Instant::now();
         // A follower set without an admission gate removed nothing, so its

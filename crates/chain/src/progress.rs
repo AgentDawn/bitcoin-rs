@@ -143,11 +143,12 @@ impl ChainProgressReader {
     }
 }
 
-/// Core's `GuessVerificationProgress`: verified transactions divided by an
-/// estimate from the network's `ChainTxData`, clamped to `[0, 1]`.
-/// Past the pinned observation, use the node's own count as the baseline.
-/// For tips within two hours of `now`, estimate age from the header-height gap
-/// rather than trusting the miner-set timestamp.
+/// Core's `GuessVerificationProgress`: verified transactions divided by an estimate
+/// from the network's `ChainTxData`, clamped to `[0, 1]`.
+///
+/// Past the pinned observation, use the node's own count as the baseline. For tips
+/// within two hours of `now`, estimate age from the header-height gap rather than
+/// trusting the miner-set timestamp.
 fn verification_progress(
     network: Network,
     chain_tx_count: u64,

@@ -1,4 +1,5 @@
 //! Operator metrics and optional Prometheus exposition.
+//!
 //! `docs/observability.md` owns signal/label policy and migration guidance;
 //! `docs/contracts/hot-path-attribution.md` owns ledger histogram exceptions.
 //! `EvidenceIdentity` stays in benchmark evidence, never metric labels.

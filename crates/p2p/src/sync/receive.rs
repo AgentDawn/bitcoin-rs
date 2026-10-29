@@ -219,9 +219,10 @@ impl BlockSync {
         );
     }
 
-    /// Retries staged headers missing from the tree: MissingParent requests
-    /// ancestry, future timestamps retry each drain, and permanent peer faults
-    /// discard the body and fault its delivering peer.
+    /// Retries staged headers missing from the tree: `MissingParent` requests ancestry,
+    /// future timestamps retry each drain, and permanent peer faults discard the body
+    /// and fault its delivering peer.
+    ///
     /// Unknown-header arrivals carry `gate_pending`; once any path resolves their
     /// headers, `recheck_staged_gates` applies ordinary unrequested admission unless
     /// live pending/owned-fetch evidence authorizes them. `resolve_owned_body_fetches`
@@ -732,13 +733,13 @@ impl BlockSync {
     }
 }
 
-/// Gate for bodies with no live pending request (Core's `AcceptBlock`,
-/// `fRequested == false`, in `validation.cpp`, plus active-branch membership).
-/// An unknown header may stage with `gate_pending`; after resolution require:
-/// 1. membership on the header-tip branch;
-/// 2. at least the applied tip's chainwork;
-/// 3. the network minimum chainwork;
-/// 4. at most `CORE_REORG_SAFETY_MARGIN` blocks ahead of the applied tip.
+/// Gate for bodies with no live pending request (Core's `AcceptBlock`, `fRequested ==
+/// false`, in `validation.cpp`, plus active-branch membership).
+///
+/// An unknown header may stage with `gate_pending`; after resolution require: 1.
+/// membership on the header-tip branch; 2. at least the applied tip's chainwork; 3. the
+/// network minimum chainwork; 4. at most `CORE_REORG_SAFETY_MARGIN` blocks ahead of the
+/// applied tip.
 ///
 /// Read only the tree and tip snapshots. Live requested arrivals bypass this
 /// gate; after expiry, rejection, or purge they must pass it again using the

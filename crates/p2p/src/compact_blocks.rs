@@ -1,8 +1,9 @@
 //! BIP152 reconstruction, owned by each connection's message loop.
-//! Completed bodies enter the ordinary validation/apply sink. Ambiguous or
-//! missing hints and bound misses fall back to same-peer full-block `getdata`;
-//! expired entries drop silently, leaving recovery to connection stall handling.
-//! Completion, replacement, timeout, and owner drop release retained state.
+//!
+//! Completed bodies enter the ordinary validation/apply sink. Ambiguous or missing
+//! hints and bound misses fall back to same-peer full-block `getdata`; expired entries
+//! drop silently, leaving recovery to connection stall handling. Completion,
+//! replacement, timeout, and owner drop release retained state.
 //!
 //! Incoming identity uses our advertised `COMPACT_BLOCK_VERSION` (v2 wtxids
 //! and witness-bearing prefills); serving uses the peer's `servable_version`.
@@ -257,26 +258,23 @@ impl Reconstruction {
     }
 }
 
-/// PRE: `filled` holds the declared prefill plus one slot per declared short
-/// ID for one reconstruction whose transaction request, if any, has been
-/// answered.
-/// POST: return a block only when every slot holds a body, the
-/// transaction-ID merkle root of the assembled body equals
-/// `header.merkle_root`, the transaction-ID tree is not mutated, and the body
-/// is not a coinbase-less body with a 64-byte transaction; otherwise return
-/// `Err`. The slot count needs no re-check here: the vector
-/// is sized from the declared short IDs and prefills, `place_prefills`
-/// rejects a prefill outside the declared slots, and `fill_from_hints`
-/// rejects a short-ID count that does not match the unfilled slots.
-/// INVARIANT: no unverified compact reconstruction reaches
+/// PRE: `filled` holds the declared prefill plus one slot per declared short ID for one
+/// reconstruction whose transaction request, if any, has been answered.
+///
+/// POST: return a block only when every slot holds a body, the transaction-ID merkle
+/// root of the assembled body equals `header.merkle_root`, the transaction-ID tree is
+/// not mutated, and the body is not a coinbase-less body with a 64-byte transaction;
+/// otherwise return `Err`. The slot count needs no re-check here: the vector is sized
+/// from the declared short IDs and prefills, `place_prefills` rejects a prefill outside
+/// the declared slots, and `fill_from_hints` rejects a short-ID count that does not
+/// match the unfilled slots. INVARIANT: no unverified compact reconstruction reaches
 /// [`Outcome::Complete`]. The root check alone cannot detect the
-/// duplicate-final-transaction collision (CVE-2012-2459): `[a, b, c]` and
-/// `[a, b, c, c]` hash to the same root, so the reduction also rejects a
-/// mutated tree and the caller answers with the same-peer full-block
-/// fallback (Core 31.1 `READ_STATUS_FAILED` before delivery,
-/// `blockencodings.cpp`). A 64-byte transaction in a body without a
-/// coinbase can pose as an inner tree node and reach the header's root with
-/// fabricated leaves (CVE-2017-12842), so that body takes the same fallback
+/// duplicate-final-transaction collision (CVE-2012-2459): `[a, b, c]` and `[a, b, c,
+/// c]` hash to the same root, so the reduction also rejects a mutated tree and the
+/// caller answers with the same-peer full-block fallback (Core 31.1
+/// `READ_STATUS_FAILED` before delivery, `blockencodings.cpp`). A 64-byte transaction
+/// in a body without a coinbase can pose as an inner tree node and reach the header's
+/// root with fabricated leaves (CVE-2017-12842), so that body takes the same fallback
 /// (Core `IsBlockMutated`, `validation.cpp`).
 fn complete_block(header: Header, filled: Vec<Option<Tx>>) -> Result<Block, ()> {
     if filled.iter().any(Option::is_none) {
@@ -292,15 +290,15 @@ fn complete_block(header: Header, filled: Vec<Option<Tx>>) -> Result<Block, ()> 
     Ok(block)
 }
 
-/// Matches the message's short IDs against the hint identities and fills
-/// their slots. `short_ids` covers exactly the unfilled slots, in slot
-/// order. Two structural faults mean the message cannot be trusted and the
-/// reconstruction falls back rather than guess: fewer or more short IDs
-/// than unfilled slots, and one short ID declared twice — a collapsed slot
-/// map would silently misplace bodies. Two distinct hint identities that
-/// collide on one short ID retire only that slot, which the `getblocktxn`
-/// request then carries; a later candidate never refills it (Core 31.1
-/// clears only the colliding slot, `blockencodings.cpp`).
+/// Matches the message's short IDs against the hint identities and fills their slots.
+///
+/// `short_ids` covers exactly the unfilled slots, in slot order. Two structural faults
+/// mean the message cannot be trusted and the reconstruction falls back rather than
+/// guess: fewer or more short IDs than unfilled slots, and one short ID declared twice
+/// — a collapsed slot map would silently misplace bodies. Two distinct hint identities
+/// that collide on one short ID retire only that slot, which the `getblocktxn` request
+/// then carries; a later candidate never refills it (Core 31.1 clears only the
+/// colliding slot, `blockencodings.cpp`).
 ///
 /// PRE: `filled` holds one body per prefill and `None` per short-ID slot;
 /// `retained_bytes` counts the short IDs and the prefilled bodies.

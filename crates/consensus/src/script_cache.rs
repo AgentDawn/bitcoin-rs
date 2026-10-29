@@ -1,4 +1,5 @@
 //! Bounded script-execution cache keyed by wtxid and exact script flags.
+//!
 //! Mempool admission fills it; block connect consumes it (Core's
 //! `CheckInputsFromMempoolAndCache` and `ConnectBlock` in `validation.cpp`).
 //!

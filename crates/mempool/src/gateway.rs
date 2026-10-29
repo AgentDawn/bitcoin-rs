@@ -613,12 +613,12 @@ struct ExtraTxn {
 }
 
 /// Bounded reconstruction-only FIFO (Core's `vExtraTxnForCompact`).
-/// Replaced bodies, peer orphans, and policy rejects are keyed by wtxid;
-/// reinsertion neither grows the ring nor refreshes eviction order. Coinbase
-/// transactions are refused. `BLOCK_RECONSTRUCTION_EXTRA_TXN` bounds entries;
-/// standardness bounds admitted/orphan bodies, and `EXTRA_TXN_MAX_MEMORY_BYTES`
-/// also bounds policy rejects. Inventory, relay, admission, and pool queries
-/// never consult this hint state.
+///
+/// Replaced bodies, peer orphans, and policy rejects are keyed by wtxid; reinsertion
+/// neither grows the ring nor refreshes eviction order. Coinbase transactions are
+/// refused. `BLOCK_RECONSTRUCTION_EXTRA_TXN` bounds entries; standardness bounds
+/// admitted/orphan bodies, and `EXTRA_TXN_MAX_MEMORY_BYTES` also bounds policy rejects.
+/// Inventory, relay, admission, and pool queries never consult this hint state.
 #[derive(Default)]
 pub(crate) struct ExtraTxnRing {
     entries: VecDeque<ExtraTxn>,
@@ -680,10 +680,11 @@ struct PublishState {
 }
 
 /// Serializes mempool mutations and ordered publication through `Self::commit`.
-/// The commit-ordering lock spans mutation and FIFO enqueue; the pool write
-/// lock is released before joining accepted bodies. No gateway lock spans an
-/// observer call, so reentrant publication can enqueue without deadlocking.
-/// See MPL-01 in `docs/contracts/mempool-mutations.md` for publication guarantees.
+///
+/// The commit-ordering lock spans mutation and FIFO enqueue; the pool write lock is
+/// released before joining accepted bodies. No gateway lock spans an observer call, so
+/// reentrant publication can enqueue without deadlocking. See MPL-01 in
+/// `docs/contracts/mempool-mutations.md` for publication guarantees.
 pub struct MempoolGateway {
     pub(crate) pool: Arc<RwLock<Mempool>>,
     /// Pool guards precede this lock. Never held during observer calls,
@@ -1520,13 +1521,13 @@ impl MempoolGateway {
         self.read().prioritised_transactions()
     }
 
-    /// The single commit-and-publish path every publishing mutation flows
-    /// through. A failed `mutate` returns before the publish mutex is taken
-    /// and means nothing was committed. A successful mutation publishes
-    /// every accepted/removed change from its prevalidated plan.
-    /// The ordering guard spans mutation and enqueue; the pool guard drops
-    /// before joining bodies and taking the publish mutex. Observers run
-    /// only after all gateway guards are released.
+    /// The single commit-and-publish path every publishing mutation flows through.
+    ///
+    /// A failed `mutate` returns before the publish mutex is taken and means nothing
+    /// was committed. A successful mutation publishes every accepted/removed change
+    /// from its prevalidated plan. The ordering guard spans mutation and enqueue; the
+    /// pool guard drops before joining bodies and taking the publish mutex. Observers
+    /// run only after all gateway guards are released.
     pub(crate) fn commit<T, E>(
         &self,
         origin: AdmissionOrigin,

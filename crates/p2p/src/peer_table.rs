@@ -886,9 +886,10 @@ impl PeerTable {
 
     /// Atomically removes and cancels the handshake-complete session named by
     /// `PeerLease::node_id` (`getpeerinfo.id`), including anonymous inbound sessions.
-    /// Resolution and removal share one table write guard, so same-address
-    /// replacement cannot redirect the target. Returns false without mutation
-    /// when that exact ready session is absent.
+    ///
+    /// Resolution and removal share one table write guard, so same-address replacement
+    /// cannot redirect the target. Returns false without mutation when that exact ready
+    /// session is absent.
     pub fn disconnect_ready_node_id(&self, node_id: u64) -> bool {
         let mut entries = self.entries.write();
         let Some(key) = entries

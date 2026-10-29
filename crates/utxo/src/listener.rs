@@ -1,9 +1,10 @@
 //! Internal, order-independent commit delivery to `CoinStatsListener`.
-//! Single-shard runs deliver directly; multi-shard commits collect landed events
-//! and deliver once after all attempts, including before returning a shard error.
-//! Chunking and shard order do not affect the result. The required local order
-//! is removal before insertion of a replacement outpoint: one-element
-//! `RemoveBatch` precedes its replacement `InsertBatch`.
+//!
+//! Single-shard runs deliver directly; multi-shard commits collect landed events and
+//! deliver once after all attempts, including before returning a shard error. Chunking
+//! and shard order do not affect the result. The required local order is removal before
+//! insertion of a replacement outpoint: one-element `RemoveBatch` precedes its
+//! replacement `InsertBatch`.
 
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use smallvec::SmallVec;

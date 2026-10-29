@@ -1,8 +1,9 @@
 //! Block download orchestration over `SyncChain`, peers, and inbound channels.
+//!
 //! P2P owns scheduling, staging, and recovery; node owns authoritative applied-tip
-//! mutation through the ARCH-07 seam. Each tick reconciles one canonical chain/
-//! peer frontier before releasing, recovering, or scheduling work.
-//! Cross-module guarantees belong to `docs/contracts/synchronization.md`.
+//! mutation through the ARCH-07 seam. Each tick reconciles one canonical chain/ peer
+//! frontier before releasing, recovering, or scheduling work. Cross-module guarantees
+//! belong to `docs/contracts/synchronization.md`.
 
 mod branches;
 pub mod chain;
@@ -212,9 +213,10 @@ pub struct BlockSync {
 /// never admit. The oldest mark is evicted first.
 const MAX_DEFERRED_OWNED_FETCHES: usize = 16;
 
-/// Blocks above the applied tip within which an unrequested compact block
-/// earns the mempool scan, as in Core (`net_processing.cpp`). A block
-/// further ahead, which the mempool is unlikely to help reconstruct, routes
+/// Blocks above the applied tip within which an unrequested compact block earns the
+/// mempool scan, as in Core (`net_processing.cpp`).
+///
+/// A block further ahead, which the mempool is unlikely to help reconstruct, routes
 /// only its header to admission and downloads through the window.
 const COMPACT_RECONSTRUCTION_MAX_AHEAD: u32 = 2;
 
@@ -474,13 +476,14 @@ impl BlockSync {
             .or_insert(hash);
     }
 
-    /// Enqueues and publishes a deferred fetch under exact-source peer authority,
-    /// then scheduler lock; release any tree guard before entry. `enqueue` must
-    /// nonblockingly spend the held reply reservation on this source's follow-up.
-    /// Only a successful enqueue publishes `(source, hash)`, deduplicated under
-    /// `MAX_DEFERRED_OWNED_FETCHES`; stale sources or failed sends return false.
-    /// The peer guard spans send and publication, excluding replacement races.
-    /// Do not use `send_then`: it would charge again instead of spending the credit.
+    /// Enqueues and publishes a deferred fetch under exact-source peer authority, then
+    /// scheduler lock; release any tree guard before entry.
+    ///
+    /// `enqueue` must nonblockingly spend the held reply reservation on this source's
+    /// follow-up. Only a successful enqueue publishes `(source, hash)`, deduplicated
+    /// under `MAX_DEFERRED_OWNED_FETCHES`; stale sources or failed sends return false.
+    /// The peer guard spans send and publication, excluding replacement races. Do not
+    /// use `send_then`: it would charge again instead of spending the credit.
     pub(crate) fn enqueue_owned_body_fetch(
         &self,
         source: PeerSource,
@@ -521,13 +524,14 @@ impl BlockSync {
                 .any(|(owner, owned)| *owner == source && *owned == hash)
     }
 
-    /// Pre-scan gate for a compact block's embedded header: valid PoW, no invalid
+    /// Pre-scan gate for a compact block's embedded header: valid proof of work, no invalid
     /// block/parent, a known parent, and the same contextual checks as admission.
+    ///
     /// It must either answer this source's owned fetch or have more work than applied
     /// and lie within `COMPACT_RECONSTRUCTION_MAX_AHEAD`. Enforcing required nBits
-    /// makes a fabricated scan-earning header cost a block at chain difficulty.
-    /// Release the tree read before taking scheduler; no nesting. Reconstructed
-    /// bodies still face `unrequested_body_admissible` like ordinary deliveries.
+    /// makes a fabricated scan-earning header cost a block at chain difficulty. Release
+    /// the tree read before taking scheduler; no nesting. Reconstructed bodies still
+    /// face `unrequested_body_admissible` like ordinary deliveries.
     #[must_use]
     pub(crate) fn compact_reconstruction_admissible(
         &self,

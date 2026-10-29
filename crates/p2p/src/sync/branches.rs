@@ -9,10 +9,11 @@ use std::time::Instant;
 
 impl BlockSync {
     /// Switches an outweighed applied chain through `SyncChain`'s authority.
-    /// The switch may commit an available winning prefix before `MissingBody`;
-    /// only a zero-length connect prefix guarantees no mutation. Do not pre-check
-    /// availability outside that transition. Returns a failed connect's displaced
-    /// valid tip for stale-tip retention; a committed/no-op switch reports none.
+    ///
+    /// The switch may commit an available winning prefix before `MissingBody`; only a
+    /// zero-length connect prefix guarantees no mutation. Do not pre-check availability
+    /// outside that transition. Returns a failed connect's displaced valid tip for
+    /// stale-tip retention; a committed/no-op switch reports none.
     pub(super) fn switch_branch_if_outweighed(&self) -> Option<Hash256> {
         let target = self.outweighed_branch_target()?;
         let outcome = self.chain.switch_to_branch(

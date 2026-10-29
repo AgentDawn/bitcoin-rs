@@ -639,10 +639,12 @@ impl Mempool {
     }
 
     /// Explicit wholesale reset for standalone pools and fixtures: clear entries,
-    /// indexes, prioritisation, and fee history. Entries emit `Removed(Clear)` in
-    /// entry-id order with consecutive sequences; an empty clear advances none.
-    /// Block, reorg, and snapshot paths must not use this reset: their fee history
-    /// survives, and disconnected transactions return through reconsideration.
+    /// indexes, prioritisation, and fee history.
+    ///
+    /// Entries emit `Removed(Clear)` in entry-id order with consecutive sequences; an
+    /// empty clear advances none. Block, reorg, and snapshot paths must not use this
+    /// reset: their fee history survives, and disconnected transactions return through
+    /// reconsideration.
     pub fn clear(&mut self) -> MutationResult {
         // Every entry leaves the pool here, so this is the same retire funnel
         // Core walks during a bulk clear: fire `mempool:removed` per entry
@@ -1417,10 +1419,11 @@ impl Mempool {
     }
 
     /// Copies all mining inputs and both sequences under one read guard, allowing
-    /// selection after releasing it. Entries follow maintained chunk order;
-    /// ancestor positions refer to the returned vector, never a later pool view.
-    /// Consumers needing only top chunks should use `Self::chunks_by_feerate`
-    /// instead of copying the whole pool.
+    /// selection after releasing it.
+    ///
+    /// Entries follow maintained chunk order; ancestor positions refer to the returned
+    /// vector, never a later pool view. Consumers needing only top chunks should use
+    /// `Self::chunks_by_feerate` instead of copying the whole pool.
     #[must_use]
     pub fn mining_snapshot(&self) -> MempoolMiningSnapshot {
         let order: Vec<EntryId> = self

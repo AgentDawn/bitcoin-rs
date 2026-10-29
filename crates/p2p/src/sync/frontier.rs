@@ -90,10 +90,12 @@ pub(crate) struct UsablePeer {
     pub connected_at: Instant,
 }
 
-/// Maximum of the peer's own claimed and active-chain demonstrated heights;
-/// None only if neither is usable. Off-branch evidence must not lower the claim:
-/// otherwise repeated fork replies strand a peer below the request frontier.
-/// Ask at the claimed height and let `expired_release` judge non-delivery.
+/// Maximum of the peer's own claimed and active-chain demonstrated heights; None only
+/// if neither is usable.
+///
+/// Off-branch evidence must not lower the claim: otherwise repeated fork replies strand
+/// a peer below the request frontier. Ask at the claimed height and let
+/// `expired_release` judge non-delivery.
 #[must_use]
 pub(crate) fn body_capability(claimed: i32, active_height: Option<u32>) -> Option<u32> {
     match (u32::try_from(claimed).ok(), active_height) {
@@ -111,14 +113,15 @@ impl UsablePeer {
         body_capability(self.info.best_known_height, self.active_height)
     }
 
-    /// The height this connection PROVED it can serve by handing us headers
-    /// that entered the block tree. `None` while it has announced nothing we
-    /// accepted, whatever its handshake claimed: Core's eviction rule reads
-    /// `pindexBestKnownBlock`, a tip the peer actually sent, and never the
-    /// version height (`net_processing.cpp`). Where `capability`
-    /// falls back to the claimed height to choose whom to ask for a body,
-    /// this one has no fallback, because the rule that reads it decides
-    /// whether to keep the connection.
+    /// The height this connection PROVED it can serve by handing us headers that
+    /// entered the block tree.
+    ///
+    /// `None` while it has announced nothing we accepted, whatever its handshake
+    /// claimed: Core's eviction rule reads `pindexBestKnownBlock`, a tip the peer
+    /// actually sent, and never the version height (`net_processing.cpp`). Where
+    /// `capability` falls back to the claimed height to choose whom to ask for a body,
+    /// this one has no fallback, because the rule that reads it decides whether to keep
+    /// the connection.
     pub(crate) fn demonstrated_height(&self) -> Option<u32> {
         if self.demonstrated_tips.is_empty() {
             return None;

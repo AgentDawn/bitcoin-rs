@@ -338,8 +338,9 @@ pub fn dispatch_inbound<S>(
 }
 
 /// Dispatches against the chain view and optional transaction inventory.
-/// Responses preserve order; send errors abort and propagate. `headroom`
-/// reserves before each body load, and the next send spends that reservation.
+///
+/// Responses preserve order; send errors abort and propagate. `headroom` reserves
+/// before each body load, and the next send spends that reservation.
 ///
 /// Inventory suppresses requests for held/orphan/rejected transactions and
 /// serves held bodies, reporting misses as `notfound`. Inventory type selects

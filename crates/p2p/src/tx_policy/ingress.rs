@@ -1,8 +1,9 @@
 //! Bounded BIP331 ingress under the transaction-policy owner.
-//! Before peer-controlled allocation: `plan_package_charge` validates count and
-//! weight, scans wtxids and decoded sizes; `begin_package_resolution` checks the
-//! exact-source request claim; `PackageCapacity` reserves frame plus decoded
-//! bytes; then queue the encoded frame on the bounded ingress channel.
+//!
+//! Before peer-controlled allocation: `plan_package_charge` validates count and weight,
+//! scans wtxids and decoded sizes; `begin_package_resolution` checks the exact-source
+//! request claim; `PackageCapacity` reserves frame plus decoded bytes; then queue the
+//! encoded frame on the bounded ingress channel.
 //!
 //! The single consumer's `InboundPackage::open` rechecks exact plan equality,
 //! uses `try_reserve_exact`, and reconciles measured heap. Rejection before

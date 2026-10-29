@@ -1,9 +1,10 @@
-//! Stages body/undo deletion and metadata in one atomic batch, then reclaims
-//! flat files after row commit. `stage_block_and_undo_prune` owns the durable-tip
-//! and retention constraints; `PrunePolicy` owns byte/reorg limits.
-//! `ExecutedFrontier` is committed deletion evidence, distinct from requested
-//! operator height and the retention/target-adjusted effective line. Restart
-//! and lease refusal use that evidence, never operator intent.
+//! Stages body/undo deletion and metadata in one atomic batch, then reclaims flat files
+//! after row commit.
+//!
+//! `stage_block_and_undo_prune` owns the durable-tip and retention constraints;
+//! `PrunePolicy` owns byte/reorg limits. `ExecutedFrontier` is committed deletion
+//! evidence, distinct from requested operator height and the retention/target-adjusted
+//! effective line. Restart and lease refusal use that evidence, never operator intent.
 
 use alloc::sync::Arc;
 use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
@@ -116,9 +117,10 @@ pub fn load_executed_frontier<S: crate::KvStore>(
 }
 
 /// One past the highest row deleted by a committed prune; `NONE` means none.
+///
 /// Stored in the same atomic batch as body/undo deletions, it is monotonic and
-/// reconstructible after restart. No lease may pin below it. Requested operator
-/// height and the effective policy line cannot substitute for this evidence.
+/// reconstructible after restart. No lease may pin below it. Requested operator height
+/// and the effective policy line cannot substitute for this evidence.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ExecutedFrontier(u32);
 

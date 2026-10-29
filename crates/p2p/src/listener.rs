@@ -81,13 +81,14 @@ pub struct ListenerExtras {
     /// The node's one ledger of retained `pkgtxns` bytes. `None` means
     /// package bodies are never accepted for admission.
     pub package_capacity: Option<crate::PackageCapacity>,
-    /// Chain-owned initial-block-download latch paired with the node's
-    /// configured consensus network. `None` means transaction relay is open
-    /// (callers without a chain, and tests). While `Some` and active,
-    /// tx-typed `inv` vectors are not requested and `tx` bodies are dropped
-    /// before ingress (Core 31.1 `net_processing.cpp`). The
-    /// network travels with the latch because the wire magic is not an
-    /// identity: a `--p2p-magic` override can carry another network's bytes.
+    /// Chain-owned initial-block-download latch paired with the node's configured
+    /// consensus network.
+    ///
+    /// `None` means transaction relay is open (callers without a chain, and tests).
+    /// While `Some` and active, tx-typed `inv` vectors are not requested and `tx`
+    /// bodies are dropped before ingress (Core 31.1 `net_processing.cpp`). The network
+    /// travels with the latch because the wire magic is not an identity: a
+    /// `--p2p-magic` override can carry another network's bytes.
     pub ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
     /// Block-download orchestrator, used to route block inventory announcements
     /// and to ask whether an inbound body was requested.
@@ -465,10 +466,11 @@ impl ConnectionShared {
     }
 
     /// Queues a body before its carried header to suppress duplicate scheduling.
+    ///
     /// `lease` must identify the delivering connection. The unsolicited per-source
-    /// bound drops both body and header on refusal; requested window-owned bodies
-    /// are exempt. The header is not a wire `headers` response and must not consume
-    /// an outstanding `getheaders` request.
+    /// bound drops both body and header on refusal; requested window-owned bodies are
+    /// exempt. The header is not a wire `headers` response and must not consume an
+    /// outstanding `getheaders` request.
     fn send_block(
         &self,
         lease: &crate::PeerLease,
@@ -701,13 +703,14 @@ pub fn bind_listener(addr: std::net::SocketAddr) -> Result<TcpListener, Listener
     Ok(listener)
 }
 
-/// Accepts on a bound nonblocking listener with complete wiring until shutdown
-/// or session cancellation. Each socket passes ban/activity checks and uses
-/// `configure_peer_stream` plus the handshake/message-loop timeout owners.
-/// Transient accept failures back off and retry. Connection threads are not
-/// joined here and can outlive the listener until their timeout; each removes
-/// its peer-table entry on exit. `ListenerError::Accept` reports failure to
-/// read the listener's local address.
+/// Accepts on a bound nonblocking listener with complete wiring until shutdown or
+/// session cancellation.
+///
+/// Each socket passes ban/activity checks and uses `configure_peer_stream` plus the
+/// handshake/message-loop timeout owners. Transient accept failures back off and retry.
+/// Connection threads are not joined here and can outlive the listener until their
+/// timeout; each removes its peer-table entry on exit. `ListenerError::Accept` reports
+/// failure to read the listener's local address.
 #[expect(clippy::needless_pass_by_value)]
 pub fn serve(
     listener: TcpListener,
@@ -1580,11 +1583,12 @@ fn run_connected_session(
 }
 
 /// Enforces the connection's relay role before dispatch.
-/// Block-relay-only peers sending `tx` or transaction `inv` are disconnected
-/// (Core's `RejectIncomingTxs`). Strip transaction `getdata` items and drop an
-/// empty remainder; drop `addr`/`addrv2` without punishment (`SetupAddressRelay`).
-/// Full-relay messages are unrestricted. Returns the message, a silent drop,
-/// or the protocol error ending the connection.
+///
+/// Block-relay-only peers sending `tx` or transaction `inv` are disconnected (Core's
+/// `RejectIncomingTxs`). Strip transaction `getdata` items and drop an empty remainder;
+/// drop `addr`/`addrv2` without punishment (`SetupAddressRelay`). Full-relay messages
+/// are unrestricted. Returns the message, a silent drop, or the protocol error ending
+/// the connection.
 fn enforce_relay_role(
     role: crate::peer_info::PeerRole,
     message: crate::Message,
@@ -1944,11 +1948,12 @@ mod keepalive_tests {
     }
 }
 
-/// Reserves before materializing outbound data. Holds at most one worst-case
-/// production credit and one request-scoped reply credit; sends spend production
-/// first, shrink to exact length, and transfer the credit to the queued frame.
-/// Drop returns unused credit. `headroom` reuses held credit, so repeated lookup
-/// misses cannot charge the aggregate twice.
+/// Reserves before materializing outbound data.
+///
+/// Holds at most one worst-case production credit and one request-scoped reply credit;
+/// sends spend production first, shrink to exact length, and transfer the credit to the
+/// queued frame. Drop returns unused credit. `headroom` reuses held credit, so repeated
+/// lookup misses cannot charge the aggregate twice.
 struct ProductionSink<'a> {
     lease: &'a crate::PeerLease,
     /// At most one live production credit.
@@ -3054,9 +3059,11 @@ fn process_compact_wire_message(
 }
 
 /// Maps a BIP152 outcome from the sink's leased connection, under its reply
-/// reservation. Completed bodies enter the ordinary sink; Idle does nothing.
-/// Return compact/fallback follow-ups unsent for the single send/publication
-/// site in `enqueue_owned_body_fetch`, which owns exact-source linearizability.
+/// reservation.
+///
+/// Completed bodies enter the ordinary sink; Idle does nothing. Return compact/fallback
+/// follow-ups unsent for the single send/publication site in
+/// `enqueue_owned_body_fetch`, which owns exact-source linearizability.
 fn handle_compact_outcome(
     outcome: crate::compact_blocks::Outcome,
     sink: &ProductionSink<'_>,

@@ -855,9 +855,11 @@ impl Context {
         })
     }
 
-    /// Composes the complete production capability set. Supply the chain owner's
-    /// transition barrier; `ContextHandles::default` mints a private fixture barrier.
-    /// Production attaches nothing afterwards, though public fields allow fixtures to.
+    /// Composes the complete production capability set.
+    ///
+    /// Supply the chain owner's transition barrier; `ContextHandles::default` mints a
+    /// private fixture barrier. Production attaches nothing afterwards, though public
+    /// fields allow fixtures to.
     #[must_use]
     pub fn from_handles(handles: ContextHandles) -> Self {
         let ContextHandles {
@@ -1009,12 +1011,14 @@ fn retained_tx_bytes(txs: &[Tx]) -> usize {
 }
 
 /// BIP337 resolver run under `ChainHandles::with_stable_chainstate` with one
-/// block-render permit. Tip, coins, index heights, and bodies must share the
-/// captured chainstate; tip movement cancels rather than mixing branches.
-/// Retain materialized transactions/output prefixes per height, charge them to
-/// body and combined budgets, and evict with the body. Drop each parsed view
-/// before the next read. Cumulative load/byte limits bound work under exclusion;
-/// missing, corrupt, and unreadable bodies keep distinct `LookupError` results.
+/// block-render permit.
+///
+/// Tip, coins, index heights, and bodies must share the captured chainstate; tip
+/// movement cancels rather than mixing branches. Retain materialized
+/// transactions/output prefixes per height, charge them to body and combined budgets,
+/// and evict with the body. Drop each parsed view before the next read. Cumulative
+/// load/byte limits bound work under exclusion; missing, corrupt, and unreadable bodies
+/// keep distinct `LookupError` results.
 pub(crate) struct RpcPrevoutResolver<'ctx> {
     ctx: &'ctx Context,
     view: AppliedView,
@@ -1365,8 +1369,9 @@ impl ChainHandles {
         self.sync_progress_at(&applied)
     }
 
-    /// Projects Chainstate progress from this response's retained `AppliedView`,
-    /// adding difficulty and storage facts without reloading applied state.
+    /// Projects Chainstate progress from this response's retained `AppliedView`, adding
+    /// difficulty and storage facts without reloading applied state.
+    ///
     /// Header height is sampled separately and may lead applied height.
     #[must_use]
     pub(crate) fn sync_progress_at(&self, applied: &AppliedView) -> SyncProgress {
@@ -1631,9 +1636,10 @@ impl ChainHandles {
 }
 
 /// One immutable applied publication shared by every fact in a response.
-/// Capture is exactly one tip load: no transition/tree/UTXO lock, separate
-/// count register, or retry. Height, hash, work, and count stay coherent even
-/// after the publisher advances.
+///
+/// Capture is exactly one tip load: no transition/tree/UTXO lock, separate count
+/// register, or retry. Height, hash, work, and count stay coherent even after the
+/// publisher advances.
 pub(crate) struct AppliedView {
     tip: Option<Arc<TipSnapshot>>,
 }

@@ -1,9 +1,10 @@
 //! Download-twice header presync keeps unverified low-work chains out of the tree.
-//! PRESYNC checks continuity, PoW, difficulty transitions, and cumulative work,
-//! retaining one salted bit per `HeadersSyncParams::commitment_period` headers.
-//! After minimum work, REDOWNLOAD replays from the fork, checks commitments,
-//! and releases only headers behind its bounded buffer to `SyncChain::admit_headers`.
-//! Core authority: `HeadersSyncState` in `headerssync.h` and `headerssync.cpp`.
+//!
+//! PRESYNC checks continuity, proof of work, difficulty transitions, and cumulative work,
+//! retaining one salted bit per `HeadersSyncParams::commitment_period` headers. After
+//! minimum work, REDOWNLOAD replays from the fork, checks commitments, and releases
+//! only headers behind its bounded buffer to `SyncChain::admit_headers`. Core
+//! authority: `HeadersSyncState` in `headerssync.h` and `headerssync.cpp`.
 
 use std::collections::VecDeque;
 
@@ -219,12 +220,12 @@ impl CompressedHeader {
     }
 }
 
-/// A FIFO of the one-bit commitments a PRESYNC pass leaves for the
-/// REDOWNLOAD check (`headerssync.h` keeps the same bits), packed
-/// 64 per word. A mainnet pass can retain millions of commitments — see the
-/// honest-chain estimate in [`HeadersSyncState::new`] — so one byte apiece
-/// would make every open sync state a memory-amplification surface per
-/// connection.
+/// A FIFO of the one-bit commitments a PRESYNC pass leaves for the REDOWNLOAD check
+/// (`headerssync.h` keeps the same bits), packed 64 per word.
+///
+/// A mainnet pass can retain millions of commitments — see the honest-chain estimate in
+/// [`HeadersSyncState::new`] — so one byte apiece would make every open sync state a
+/// memory-amplification surface per connection.
 #[derive(Default)]
 struct CommitmentBits {
     /// Packed bit words; only `live` leading bits (from `head`) are live.

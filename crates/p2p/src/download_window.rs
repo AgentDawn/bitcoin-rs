@@ -365,9 +365,11 @@ pub(crate) struct DownloadWindow {
     ewma_block_bytes: usize,
     next_request_height: u32,
     request_tip: Option<(Hash256, u32)>,
-    /// Per-owner block-download queue start: the local equivalent of
-    /// Core's per-peer `m_downloading_since` (`net_processing.cpp`, Core 31.1 `m_downloading_since`). Keyed by the exact `PeerSource`; an entry exists exactly
-    /// while that owner has validated in-flight blocks.
+    /// Per-owner block-download queue start: the local equivalent of Core's per-peer
+    /// `m_downloading_since` (`net_processing.cpp`, Core 31.1 `m_downloading_since`).
+    ///
+    /// Keyed by the exact `PeerSource`; an entry exists exactly while that owner has
+    /// validated in-flight blocks.
     owner_downloading_since: HashMap<PeerSource, Instant>,
     /// Eligible outbound witness peers available for new block assignments.
     /// The count sizes each stripe; engagement keeps one-peer hysteresis so a
@@ -674,11 +676,13 @@ impl DownloadWindow {
     }
 
     /// Returns at most one action after the canonical apply drain, using injected
-    /// `now`, the coupled stager, and tree-resolved heights. Evaluate intervals,
-    /// apply-side bound, no-blame guard, cold-front/stall, pending timeout, then hedge.
-    /// Blame always names the exact `PeerSource`, never a same-address replacement.
-    /// While apply is busy only the apply-side bound may return `EvictStaged`;
-    /// otherwise return the owed disconnect, unblamed eviction, hedge, or no action.
+    /// `now`, the coupled stager, and tree-resolved heights.
+    ///
+    /// Evaluate intervals, apply-side bound, no-blame guard, cold-front/stall, pending
+    /// timeout, then hedge. Blame always names the exact `PeerSource`, never a
+    /// same-address replacement. While apply is busy only the apply-side bound may
+    /// return `EvictStaged`; otherwise return the owed disconnect, unblamed eviction,
+    /// hedge, or no action.
     pub(crate) fn observe_blocked(
         &mut self,
         ctx: BlockedContext,
@@ -737,11 +741,12 @@ impl DownloadWindow {
     }
 
     /// Convicts an expired request owner only on a second idle tick.
+    ///
     /// Inbound delivery may wait behind synchronous apply: the first observation
-    /// records suspicion, and delivery clears it. On the next tick the exact
-    /// connection must still own the same pending hash and remain expired;
-    /// otherwise clear suspicion without blame. Conviction adds its address to
-    /// cooldown. Call only when the apply side is not busy.
+    /// records suspicion, and delivery clears it. On the next tick the exact connection
+    /// must still own the same pending hash and remain expired; otherwise clear
+    /// suspicion without blame. Conviction adds its address to cooldown. Call only when
+    /// the apply side is not busy.
     fn advance_pending_timeout(
         &mut self,
         now: Instant,
@@ -782,13 +787,14 @@ impl DownloadWindow {
     }
 
     /// Bounds apply-side suppression without blaming a peer for local slowness.
-    /// Start the clock only after a body stages at `(height, frontier_hash)`;
-    /// retain elapsed busy time across expiry/refetch seams. A frontier change or
-    /// missing frontier resets it, so a late first delivery is not evicted.
-    /// At twice `SyncBudget::received_timeout`, return the body and elapsed time
-    /// for unblamed eviction/refetch, then re-arm. This allows one complete expiry
-    /// and refetch attempt while preventing repeated arrivals from resetting
-    /// recovery indefinitely. The clock accrues only while `apply_side_busy`.
+    ///
+    /// Start the clock only after a body stages at `(height, frontier_hash)`; retain
+    /// elapsed busy time across expiry/refetch seams. A frontier change or missing
+    /// frontier resets it, so a late first delivery is not evicted. At twice
+    /// `SyncBudget::received_timeout`, return the body and elapsed time for unblamed
+    /// eviction/refetch, then re-arm. This allows one complete expiry and refetch
+    /// attempt while preventing repeated arrivals from resetting recovery indefinitely.
+    /// The clock accrues only while `apply_side_busy`.
     fn advance_apply_side_stuck(
         &mut self,
         next_apply_height: u32,
@@ -860,13 +866,13 @@ impl DownloadWindow {
     }
 
     /// Advances the blocked-window stall observation when apply is not busy.
+    ///
     /// `next_apply_height` is the apply frontier. No chain-tail arm is used: ordinary
-    /// tip latency and the IBD tail remain covered by pending timeouts.
-    /// Cold starts use the initial floor; `stall_decay_floor` owns cadence bounds.
-    /// On fire, return the exact owner to disconnect, add its address to cooldown,
-    /// and double the threshold up to `stall_timeout_max`. Any failed predicate
-    /// or delivery from that connection clears the episode rather than freezing it
-    /// (Core's `m_stalling_since`).
+    /// tip latency and the IBD tail remain covered by pending timeouts. Cold starts use
+    /// the initial floor; `stall_decay_floor` owns cadence bounds. On fire, return the
+    /// exact owner to disconnect, add its address to cooldown, and double the threshold
+    /// up to `stall_timeout_max`. Any failed predicate or delivery from that connection
+    /// clears the episode rather than freezing it (Core's `m_stalling_since`).
     fn advance_stall(
         &mut self,
         next_apply_height: u32,
@@ -967,10 +973,11 @@ impl DownloadWindow {
         )
     }
 
-    /// Clamps decay and conviction to twice the demonstrated front cadence,
-    /// between `stall_timeout_initial` and `stall_timeout_max`. Cold starts
-    /// use the initial floor. The 2x margin tolerates honest cadence jitter;
-    /// same-chunk arrivals below `EWMA_MIN_SAMPLE_MS` cannot lower the EWMA.
+    /// Clamps decay and conviction to twice the demonstrated front cadence, between
+    /// `stall_timeout_initial` and `stall_timeout_max`.
+    ///
+    /// Cold starts use the initial floor. The 2x margin tolerates honest cadence
+    /// jitter; same-chunk arrivals below `EWMA_MIN_SAMPLE_MS` cannot lower the EWMA.
     fn stall_decay_floor(&self) -> Duration {
         self.front_interval_ewma_ms
             .map_or(Duration::ZERO, |ewma_ms| {
@@ -1013,11 +1020,12 @@ impl DownloadWindow {
         Some((front.owner, *front_hash))
     }
 
-    /// Current stall observation, if one is running: the blamed peer and when
-    /// the episode started. A
-    /// peer delivering each front block just under the adaptive threshold is
-    /// never disconnected (same exposure as Core) but is visible here and on
-    /// the `node.sync.stall_seconds` gauge.
+    /// Current stall observation, if one is running: the blamed peer and when the
+    /// episode started.
+    ///
+    /// A peer delivering each front block just under the adaptive threshold is never
+    /// disconnected (same exposure as Core) but is visible here and on the
+    /// `node.sync.stall_seconds` gauge.
     pub(crate) fn stalling_peer(&self) -> Option<(Option<crate::PeerEndpoint>, Instant)> {
         self.stall
             .map(|episode| (episode.owner.endpoint, episode.since))
@@ -1325,11 +1333,12 @@ impl DownloadWindow {
     }
 
     /// Updates one owner's queue start after removing its pending entry.
+    ///
     /// Drop the clock when no entries remain. If the removed request was strictly
     /// oldest, reset to injected `now`; equal-stamped survivors adopt that stamp
-    /// without regression; otherwise leave the clock unchanged.
-    /// This mirrors Core 31.1 `m_downloading_since` in `net_processing.cpp`:
-    /// batched requests share a stamp, so non-front trickles cannot delay timeout.
+    /// without regression; otherwise leave the clock unchanged. This mirrors Core 31.1
+    /// `m_downloading_since` in `net_processing.cpp`: batched requests share a stamp,
+    /// so non-front trickles cannot delay timeout.
     fn reset_owner_queue_start(
         &mut self,
         owner: PeerSource,
@@ -2028,10 +2037,11 @@ impl DownloadWindow {
         }
     }
 
-    /// Records delivery after removing `hash` from pending. Any requested body
-    /// from the exact blamed connection clears its stall; other connections,
-    /// including same-address replacements, do not. Front-only credit would falsely
-    /// blame slow peers still streaming into a saturated window.
+    /// Records delivery after removing `hash` from pending.
+    ///
+    /// Any requested body from the exact blamed connection clears its stall; other
+    /// connections, including same-address replacements, do not. Front-only credit
+    /// would falsely blame slow peers still streaming into a saturated window.
     ///
     /// A front advance samples cadence, excluding same-chunk `EWMA_MIN_SAMPLE_MS`
     /// artifacts, and decays the threshold by 0.85 toward `stall_decay_floor`.
@@ -2083,10 +2093,11 @@ impl DownloadWindow {
         self.front_interval_ewma_ms
     }
 
-    /// Test-only cold-start disarm: installs a front-cadence estimate as if
-    /// the network had demonstrated `ewma_ms` with its last front advance at
-    /// `now`. Sync-layer tests whose fixtures never advance the window front
-    /// use this instead of replaying two real front deliveries.
+    /// Test-only cold-start disarm: installs a front-cadence estimate as if the network
+    /// had demonstrated `ewma_ms` with its last front advance at `now`.
+    ///
+    /// Sync-layer tests whose fixtures never advance the window front use this instead
+    /// of replaying two real front deliveries.
     #[cfg(test)]
     pub(crate) const fn seed_front_cadence_for_test(&mut self, ewma_ms: u64, now: Instant) {
         self.front_interval_ewma_ms = Some(ewma_ms);
@@ -2191,12 +2202,13 @@ impl DownloadWindow {
         entries
     }
 
-    /// Tracks an already-issued compact/fallback fetch without advancing the
-    /// window's request frontier. Delivery resolves it; expiry/disconnect returns
-    /// it to normal scheduling. Apply ordinary window/per-peer capacity bounds and
-    /// refuse below-frontier heights so expiry cannot rewind over applied work.
-    /// On refusal the caller retains deferred ownership, ensuring fast delivery
-    /// still counts as requested.
+    /// Tracks an already-issued compact/fallback fetch without advancing the window's
+    /// request frontier.
+    ///
+    /// Delivery resolves it; expiry/disconnect returns it to normal scheduling. Apply
+    /// ordinary window/per-peer capacity bounds and refuse below-frontier heights so
+    /// expiry cannot rewind over applied work. On refusal the caller retains deferred
+    /// ownership, ensuring fast delivery still counts as requested.
     pub(crate) fn mark_owned_fetch(
         &mut self,
         stager: &mut BlockStager,

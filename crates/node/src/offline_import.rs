@@ -1,6 +1,7 @@
 //! Foreground, full-validation import of one pinned Core-framed archive.
-//! `docs/contracts/reference-set.md` owns corpus custody; this path never accepts
-//! the multi-file `sources` directory. Core's counterpart is `-loadblock` through
+//!
+//! `docs/contracts/reference-set.md` owns corpus custody; this path never accepts the
+//! multi-file `sources` directory. Core's counterpart is `-loadblock` through
 //! `ImportBlocks`/`LoadExternalBlockFile` in `init.cpp` and `validation.cpp`.
 //!
 //! Mutation uses the chain-transition exclusion; certified reads use a stable
@@ -319,12 +320,13 @@ fn read_record(
     Ok(FramedRecord { framed, payload })
 }
 
-/// Connects an archive batch without a maintenance worker. A retention-limit
-/// `JournalBackpressure` refusal commits nothing: publish one synchronous clean
-/// checkpoint, then retry that block exactly once. Other errors, skipped
-/// publication, or a second refusal propagate. Neither the refused attempt nor
-/// the checkpoint advances the tip; cross-process resume still requires the
-/// matching full-validation provenance described by this module.
+/// Connects an archive batch without a maintenance worker.
+///
+/// A retention-limit `JournalBackpressure` refusal commits nothing: publish one
+/// synchronous clean checkpoint, then retry that block exactly once. Other errors,
+/// skipped publication, or a second refusal propagate. Neither the refused attempt nor
+/// the checkpoint advances the tip; cross-process resume still requires the matching
+/// full-validation provenance described by this module.
 fn connect_batch(
     node: &crate::state::NodeState,
     batch: &mut Vec<bitcoin_rs_primitives::BlockPayload>,

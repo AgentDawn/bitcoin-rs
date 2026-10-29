@@ -1,11 +1,12 @@
 //! Owns journal segments, durable cursor, and the `head.json` commit marker.
-//! `record.rs` owns encoding. Publication orders storage flush (including undo),
-//! log fsync, then atomic head rename and directory fsync: undo must be durable
-//! before the head claims it. Crash tails beyond the head are ignored.
-//! Partial append truncates to the last good cursor and fails closed before
-//! another mutation. Append/boundary errors use `JournalWriterError` and the
-//! caller's degraded-recovery policy, never consensus rejection; corrupt boot
-//! input fails closed in replay. See `docs/contracts/recovery.md`.
+//!
+//! `record.rs` owns encoding. Publication orders storage flush (including undo), log
+//! fsync, then atomic head rename and directory fsync: undo must be durable before the
+//! head claims it. Crash tails beyond the head are ignored. Partial append truncates to
+//! the last good cursor and fails closed before another mutation. Append/boundary
+//! errors use `JournalWriterError` and the caller's degraded-recovery policy, never
+//! consensus rejection; corrupt boot input fails closed in replay. See
+//! `docs/contracts/recovery.md`.
 
 mod append;
 mod durability;

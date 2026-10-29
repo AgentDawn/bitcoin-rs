@@ -1,6 +1,7 @@
 //! Read-only verification shared by startup and `verifychain`.
-//! `verify_recent_blocks` owns cancellation, retention, and failure semantics.
-//! RPC checks stop at `CheckUndo`; startup also verifies header-body commitments.
+//!
+//! `verify_recent_blocks` owns cancellation, retention, and failure semantics. RPC
+//! checks stop at `CheckUndo`; startup also verifies header-body commitments.
 
 use core::num::NonZeroU32;
 use std::sync::Arc;

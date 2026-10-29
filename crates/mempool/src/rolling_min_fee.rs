@@ -1,8 +1,9 @@
-//! Core rolling minimum fee (`CTxMemPool::GetMinFee`, `trackPackageRemoved`,
-//! and `removeForBlock` in `txmempool.cpp`). Capacity eviction raises the floor;
-//! committed block connection permits decay. The pool owns synchronization.
-//! Capacity uses virtual size against `max_total_bytes`, whereas Core uses
-//! allocator usage; see "Rolling minimum fee" in `CONCEPTS.md`.
+//! Core rolling minimum fee (`CTxMemPool::GetMinFee`, `trackPackageRemoved`, and
+//! `removeForBlock` in `txmempool.cpp`).
+//!
+//! Capacity eviction raises the floor; committed block connection permits decay. The
+//! pool owns synchronization. Capacity uses virtual size against `max_total_bytes`,
+//! whereas Core uses allocator usage; see "Rolling minimum fee" in `CONCEPTS.md`.
 
 use crate::policy::ROLLING_FEE_HALFLIFE_SECS;
 

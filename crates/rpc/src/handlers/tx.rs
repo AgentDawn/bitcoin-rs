@@ -333,11 +333,12 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     proof_from_block_log(ctx, &wanted)
 }
 
-/// Tries every wanted txid for a confirming block, avoiding HashSet-order
-/// fallback when only some have usable index rows. The chosen block must contain
-/// all wanted txids: BIP30 permits one coinbase txid in multiple blocks.
-/// Missing/stale rows, pruned bodies, mismatched candidates, and logged index
-/// errors (including temporary Retry) return None for the full scan; index
+/// Tries every wanted txid for a confirming block, avoiding HashSet-order fallback when
+/// only some have usable index rows.
+///
+/// The chosen block must contain all wanted txids: BIP30 permits one coinbase txid in
+/// multiple blocks. Missing/stale rows, pruned bodies, mismatched candidates, and
+/// logged index errors (including temporary Retry) return None for the full scan; index
 /// availability must not turn a scan-answerable request into an error.
 fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Option<Value> {
     let derived_index = ctx.indexes.derived_index.as_ref()?;

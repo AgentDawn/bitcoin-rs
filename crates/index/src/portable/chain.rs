@@ -301,10 +301,10 @@ pub(super) fn is_top_level_span(position: TxPosition, start: u32, len: u32) -> b
 }
 
 /// Parsed-body LRU bound for transaction-id-ordered locator reads.
-/// Interleaved heights need more than a one-body memo; each entry retains the
-/// body and top-level transaction spans for strict boundary validation.
-/// Each body is bounded by `MAX_SERIALIZED_BLOCK_BYTES`, so this count also
-/// bounds transient body memory.
+///
+/// Interleaved heights need more than a one-body memo; each entry retains the body and
+/// top-level transaction spans for strict boundary validation. Each body is bounded by
+/// `MAX_SERIALIZED_BLOCK_BYTES`, so this count also bounds transient body memory.
 const BODY_CACHE_BLOCKS: usize = 8;
 
 pub(super) struct BodyReader<'a> {

@@ -94,9 +94,11 @@ impl<S: KvStore> IndexWriter<S> {
     }
 
     /// Seeds every live `(outpoint, scripthash)` at `seed_tip` through fenced writes
-    /// (IDX-07 in `docs/contracts/indexing.md`). Reset state, ordinary revision, and
-    /// all capability watermarks must match each batch and the final watermark.
-    /// A lost fence returns `StaleIndexState`/`ResetInProgress`; storage errors propagate.
+    /// (IDX-07 in `docs/contracts/indexing.md`).
+    ///
+    /// Reset state, ordinary revision, and all capability watermarks must match each
+    /// batch and the final watermark. A lost fence returns
+    /// `StaleIndexState`/`ResetInProgress`; storage errors propagate.
     ///
     /// Refuses an existing watermark (`LiveAlreadySeeded`). Un-watermarked leftovers
     /// are reset first; only the last batch publishes the watermark, so interrupted
@@ -236,9 +238,11 @@ impl<S: KvStore> IndexWriter<S> {
     }
 
     /// Imports verified `TxLookup` rows through the ordinary reset/revision/watermark
-    /// fence. A lost fence returns `StaleIndexState` or `ResetInProgress`.
-    /// The final commit stamps the watermark and coverage floor only after `produce`
-    /// returns; earlier failures leave partial rows unqueryable.
+    /// fence.
+    ///
+    /// A lost fence returns `StaleIndexState` or `ResetInProgress`. The final commit
+    /// stamps the watermark and coverage floor only after `produce` returns; earlier
+    /// failures leave partial rows unqueryable.
     ///
     /// An existing watermark is refused with `WatermarkMismatch`. Un-watermarked
     /// leftovers are reset before writing. Returns the number of rows imported.
@@ -352,9 +356,10 @@ impl<S: KvStore> IndexWriter<S> {
     }
 
     /// Anchors history-derived capabilities before the first surviving body height.
-    /// `floor` must be `anchor.height + 1`; queries below it cannot prove absence.
-    /// The next prepared block must be the anchor's child. Ordinary reset/revision
-    /// fences still apply (`ResetInProgress`/`StaleIndexState`).
+    ///
+    /// `floor` must be `anchor.height + 1`; queries below it cannot prove absence. The
+    /// next prepared block must be the anchor's child. Ordinary reset/revision fences
+    /// still apply (`ResetInProgress`/`StaleIndexState`).
     ///
     /// Never anchor `ScriptLive`: it needs rows reseeded from an immutable artifact
     /// or retained history before its watermark can be published.

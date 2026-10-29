@@ -1,8 +1,8 @@
 //! Retention authority for prunable bodies and undo (RCV-08).
-//! The lowest live floor binds pruning. `reserve` is the linearization point:
-//! earlier leases constrain deletion; later requests below the reserved or
-//! executed line fail with `RetentionError`. Only committed deletion advances
-//! the executed frontier.
+//!
+//! The lowest live floor binds pruning. `reserve` is the linearization point: earlier
+//! leases constrain deletion; later requests below the reserved or executed line fail
+//! with `RetentionError`. Only committed deletion advances the executed frontier.
 //!
 //! Mandatory `RetentionLease` pins never expire. Optional `HistoryLease` pins
 //! expire when they lag policy beyond their `RetentionBudget`; pruned consumers
@@ -460,10 +460,12 @@ impl MandatoryRetention {
     }
 }
 
-/// A prune claim minted by `RetentionRegistry::reserve`, held through the
-/// storage commit. Below-line leases are refused while it exists. `commit`
-/// promotes only the line actually deleted; Drop releases an unapplied claim.
-/// The executed frontier never regresses or advances for uncommitted deletion.
+/// A prune claim minted by `RetentionRegistry::reserve`, held through the storage
+/// commit.
+///
+/// Below-line leases are refused while it exists. `commit` promotes only the line
+/// actually deleted; Drop releases an unapplied claim. The executed frontier never
+/// regresses or advances for uncommitted deletion.
 #[derive(Debug)]
 pub struct PruneReservation {
     registry: Arc<RetentionRegistry>,

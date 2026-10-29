@@ -1,7 +1,8 @@
 //! Outbound header, compact-block, and inventory announcements.
-//! `BlockAnnounceQueue` coalesces wakes; `BlockAnnouncer` rereads the committed
-//! tip and peer preferences so reorgs cannot publish stale work. Selection
-//! bounds and announcement priority live in the enforcing methods below.
+//!
+//! `BlockAnnounceQueue` coalesces wakes; `BlockAnnouncer` rereads the committed tip and
+//! peer preferences so reorgs cannot publish stale work. Selection bounds and
+//! announcement priority live in the enforcing methods below.
 
 #[cfg(test)]
 use std::net::SocketAddr;
