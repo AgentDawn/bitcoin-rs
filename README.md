@@ -148,8 +148,6 @@ External interoperability is tracked per surface in [`docs/api/ecosystem-compat.
 
 Externally verified on regtest against unmodified Bitcoin Core 31.1: P2P v1 wire, BIP152 compact blocks, BIP324 v2 transport, and BIP157/158 filters. Proactive block announcements still await a retained qualification run. JSON-RPC, REST, ZMQ, Esplora, and mining templates are implemented with in-tree suites. BIP352 Silent Payments and the Stratum V2 adapter are experimental. Wallet RPCs and Core IPC are intentionally unsupported; `stop` is unimplemented over RPC ([rpc-reference](docs/rpc-reference.md)), so shutdown uses process signals.
 
-No claim is made of full Core parity, production safety, or mainnet qualification. [Synchronization evidence](docs/benchmarks/end-to-end-sync.md) owns all benchmark methodology; its target end-state cells are `planned_not_executed`, so quote no speed comparison from historical runs.
-
 Maps: [docs index](docs/README.md), [contracts](docs/contracts/README.md), [BIP support](docs/bip-support.md), [concepts](CONCEPTS.md).
 
 ---
