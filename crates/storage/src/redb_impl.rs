@@ -5,8 +5,7 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use redb::{
-    Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
-    TableDefinition,
+    Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
 };
 
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteCondition};
@@ -431,28 +430,14 @@ impl RedbTxIndexStore {
                 .open_table(TXINDEX_BLOCK_HEADERS)
                 .map_err(StorageError::backend)?,
         );
-        match write_txn.open_table(TXINDEX_SCRIPT_LIVE) {
-            Ok(table) => drop(table),
-            Err(redb::TableError::TableTypeMismatch { .. }) => {
-                // The former 44-byte declaration could not accept index-owned
-                // 43-byte rows. Replace only an empty table, never operator data.
-                let old: FixedTable<44> = TableDefinition::new("txindex_v1_script_live");
-                let table = write_txn.open_table(old).map_err(StorageError::backend)?;
-                if !table.is_empty().map_err(StorageError::backend)? {
-                    return Err(StorageError::InvalidOperation(
-                        "non-empty 44-byte ScriptLive table; rebuild the derived index in a separately named directory",
-                    ));
-                }
-                drop(table);
-                write_txn.delete_table(old).map_err(StorageError::backend)?;
-                drop(
-                    write_txn
-                        .open_table(TXINDEX_SCRIPT_LIVE)
-                        .map_err(StorageError::backend)?,
-                );
+        drop(write_txn.open_table(TXINDEX_SCRIPT_LIVE).map_err(|error| {
+            match error {
+                redb::TableError::TableTypeMismatch { .. } => StorageError::IncompatibleData(
+                    "incompatible ScriptLive table; rebuild the derived index in a separately named directory".into(),
+                ),
+                error => StorageError::backend(error),
             }
-            Err(error) => return Err(StorageError::backend(error)),
-        }
+        })?);
         drop(
             write_txn
                 .open_table(TXINDEX_META)

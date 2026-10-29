@@ -29,9 +29,7 @@ const ORDINARY_STATE_REVISION_KEY: &[u8] = &[0x00, b'O'];
 /// `Idle = [0xFF, version(u64 LE)]` (9 bytes) or as a claim
 /// `[mask, process_epoch(u64 LE), base_version(u64 LE)]` (17 bytes).
 /// The process epoch records provenance only; any process can complete the
-/// exact claim. Interrupted 1-byte (`[mask]`) and 9-byte
-/// (`[mask, process_epoch(u64 LE)]`) claims from earlier binaries are adopted
-/// with a base version of zero; every other shape is a typed error. Completion
+/// exact claim. Any other shape is a typed error. Completion
 /// never deletes the key: it CASes the exact claim to
 /// `Idle(base_version + 1)`, which makes stale fences un-reusable (no ABA)
 /// across repeated resets.
@@ -139,23 +137,9 @@ fn decode_state_revision(bytes: &[u8]) -> Result<u64, IndexError> {
 
 fn parse_reset_state(bytes: &[u8]) -> Result<ResetState, IndexError> {
     match bytes {
-        [mask] if valid_reset_mask(*mask) => Ok(ResetState::Claim {
-            mask: *mask,
-            process_epoch: 0,
-            base_version: 0,
-        }),
         [RESET_IDLE_TAG, version @ ..] if version.len() == size_of::<u64>() => {
             Ok(ResetState::Idle {
                 version: decode_le_u64(version)?,
-            })
-        }
-        [mask, process_epoch_bytes @ ..]
-            if process_epoch_bytes.len() == size_of::<u64>() && valid_reset_mask(*mask) =>
-        {
-            Ok(ResetState::Claim {
-                mask: *mask,
-                process_epoch: decode_le_u64(process_epoch_bytes)?,
-                base_version: 0,
             })
         }
         [mask, process_epoch_and_base @ ..]
@@ -297,28 +281,21 @@ fn ensure_raw_reset_live<S: KvStore>(
 #[derive(Clone, Copy)]
 struct ExactResetClaim {
     bytes: [u8; RESET_CLAIM_LEN],
-    len: usize,
 }
 
 impl ExactResetClaim {
     fn from_observed(observed: &[u8]) -> Self {
         let mut bytes = [0_u8; RESET_CLAIM_LEN];
-        bytes[..observed.len()].copy_from_slice(observed);
-        Self {
-            bytes,
-            len: observed.len(),
-        }
+        bytes.copy_from_slice(observed);
+        Self { bytes }
     }
 
     fn full(bytes: [u8; RESET_CLAIM_LEN]) -> Self {
-        Self {
-            bytes,
-            len: RESET_CLAIM_LEN,
-        }
+        Self { bytes }
     }
 
     fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.len]
+        &self.bytes
     }
 
     fn with_mask(mut self, mask: u8) -> Self {
@@ -336,8 +313,7 @@ impl ExactResetClaim {
 }
 
 /// A cooperative reset obligation. The process epoch is provenance only; any
-/// process can complete the exact raw claim. Same-mask adoption preserves its
-/// 1/9/17-byte encoding.
+/// process can complete the exact raw claim. Same-mask adoption preserves its bytes.
 struct ResetWork {
     mask: u8,
     claim: ExactResetClaim,

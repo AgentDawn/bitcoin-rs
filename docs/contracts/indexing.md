@@ -193,10 +193,21 @@ Proof: these tests establish the memo-retention rule:
   and `open_writer` in `crates/index/src/runtime/startup.rs` full-resets
   the derived store for rebuild. No in-place upgrade path
   exists. (`IDX-04` selective reset still covers corrupt watermarks, not versions.)
-- The dedicated redb store corrects the former 44-byte ScriptLive table
-  declaration only when that table is empty. A populated incompatible table
-  refuses open without changing its data; the operator must rebuild the derived
-  index in a separately named directory. No live-row conversion is performed.
+- Reset recovery accepts only current 17-byte claims and 9-byte Idle states.
+  Idle versions remain monotonic ABA-prevention generations. Obsolete or
+  malformed claims return `InvalidResetMarker` without modifying derived
+  rows; the worker reports failure through its existing startup boundary.
+- The dedicated redb store opens only the canonical 43-byte ScriptLive table.
+  An incompatible declaration, empty or populated, refuses open without
+  changing its data; the operator must rebuild the derived index in a
+  separately named directory. No live-row conversion is performed.
+- Current writers emit position values only for nonempty transaction groups.
+  Queries reject empty values as corrupt derived state with a storage error
+  directing a derived-index rebuild. Other invalid or mismatched positions
+  retain full-block verification for collision and correctness handling.
+  Proof: `empty_position_rows_are_refused_before_body_reads` and the
+  position-mismatch/full-block tests in `runtime/query_tests.rs`;
+  `tests/tx_positions.rs` exercises current writer position values.
 - On node startup, index workers read their persisted watermarks and reconcile
   against `Chainstate::chain_snapshot()` (via `NodeState::chainstate()`):
   - If the watermark is an ancestor of the restored tip, the worker connects

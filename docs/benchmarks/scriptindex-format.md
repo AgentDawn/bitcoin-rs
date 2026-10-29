@@ -155,8 +155,8 @@ as a benchmark corpus or a data file.
 - The common case is n = 1 (one transaction at one height funds one script),
   so the typical Funding and TxConfirmed row is **18 bytes** (12 key + 6 value).
 - Spending rows carry positions for the transactions that spend the outpoint.
-  An empty value never means "no spending" — it is a legacy row value that
-  requires a full-block scan.
+  An empty position value is corrupt derived state and queries refuse it with a
+  rebuild diagnostic. Other invalid positions retain full-block verification.
 - BlockHeaders rows are keyed by the raw 80-byte block header (which is also
   the block hash). The value is empty.
 

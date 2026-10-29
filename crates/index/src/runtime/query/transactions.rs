@@ -100,8 +100,13 @@ impl DerivedIndexQueryEngine {
         Ok(block)
     }
 
-    pub(super) fn validated_positions(value: &[u8]) -> Option<&[TxPosition]> {
-        TxPositionValue::decode(value).filter(|positions| positions_are_valid(positions))
+    pub(super) fn validated_positions(value: &[u8]) -> Result<Option<&[TxPosition]>, TxQueryError> {
+        if value.is_empty() {
+            return Err(TxQueryError::Storage(
+                "empty transaction position row; rebuild the derived index".into(),
+            ));
+        }
+        Ok(TxPositionValue::decode(value).filter(|positions| positions_are_valid(positions)))
     }
 
     pub(super) fn resolve_positioned_transaction(
@@ -188,7 +193,7 @@ impl DerivedIndexQueryEngine {
             if !prefix.covers(height) {
                 continue;
             }
-            let Some(positions) = Self::validated_positions(&row.value) else {
+            let Some(positions) = Self::validated_positions(&row.value)? else {
                 let hash = self.resolve_hash_at_height(height, prefix)?;
                 if let Some(transaction) =
                     self.transaction_from_full_block(budget, height, hash, txid)?

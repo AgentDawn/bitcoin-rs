@@ -183,55 +183,22 @@ impl ExecutedFrontier {
         if self.0 >= other.0 { self } else { other }
     }
 
-    /// Reconstructs a store's executed frontier, migrating a datadir that
-    /// was pruned before the record existed.
+    /// Loads the committed frontier without inferring deletions from surviving rows.
     ///
-    /// POST: the persisted record wins when it exists. Otherwise only a
-    /// datadir that ran a pass before the record existed can have deleted
-    /// history, and every such pass persisted its requested line, so:
-    ///
-    /// - no requested line at all means no pass ever ran, and the frontier
-    ///   is [`Self::NONE`];
-    /// - a family with surviving rows shows that every lower height of it is
-    ///   gone, so the frontier is the *highest* of the two families' lowest
-    ///   surviving heights: one pass prunes bodies and undo through one
-    ///   line, so a floor must be safe for both — `min` would grant a lease
-    ///   over rows the other family already lost, while `max` at worst
-    ///   refuses a lease over rows that still exist;
-    /// - an empty family proves nothing, because a node that never wrote
-    ///   undo records also has an empty undo family;
-    /// - with no rows in either family, the requested line is the only
-    ///   bound left, and taking it refuses a lease rather than grant one
-    ///   over rows that may already be gone.
-    ///
-    /// INVARIANT: the result never grants a lease over deleted rows. A raw
-    /// `node:pruneheight` is intent: a pass clamped by a lease may have
-    /// stopped below it, so while rows survive the intent line never sets
-    /// the frontier.
+    /// Every current prune pass commits the frontier, requested height and batch
+    /// receipt atomically with its deletions, including passes deleting nothing.
+    /// Absence is legitimate only before any pass committed. A missing frontier
+    /// alongside either prune record is incompatible data, never an empty frontier.
     pub fn reconstruct<S: crate::KvStore>(store: &S) -> Result<Self, StorageError> {
         if let Some(frontier) = load_executed_frontier(store)? {
             return Ok(frontier);
         }
-        let Some(requested) = load_pruneheight(store)? else {
-            return Ok(Self::NONE);
-        };
-        let bodies = block_pruner::lowest_stored_height(
-            store,
-            block_pruner::BLOCK_DATA_CF,
-            block_pruner::BLOCK_BODY_PREFIX_BYTES,
-        )?;
-        let undo = block_pruner::lowest_stored_height(
-            store,
-            crate::ColumnFamily::UndoData,
-            crate::undo::BLOCK_UNDO_PREFIX_BYTES,
-        )?;
-        let frontier = match (bodies, undo) {
-            (Some(bodies), Some(undo)) => bodies.max(undo),
-            (Some(bodies), None) => bodies,
-            (None, Some(undo)) => undo,
-            (None, None) => requested,
-        };
-        Ok(Self::new(frontier))
+        if load_pruneheight(store)?.is_some() || load_prune_batch(store)?.is_some() {
+            return Err(StorageError::IncompatibleData(
+                "missing executed prune frontier; preserve this store and replay into a separately named datadir".into(),
+            ));
+        }
+        Ok(Self::NONE)
     }
 }
 

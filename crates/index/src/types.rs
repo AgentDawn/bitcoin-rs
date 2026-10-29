@@ -386,9 +386,9 @@ pub(crate) fn positions_are_valid(positions: &[TxPosition]) -> bool {
 
 /// Codec for the row value carrying a row's transaction byte positions.
 ///
-/// Layout: a packed `TxPosition[n]`, `n >= 1`. An empty value means the row
-/// predates this format, not that the block has no matching transactions, so
-/// readers treat empty and malformed values identically: scan the block.
+/// Layout: a packed `TxPosition[n]`, `n >= 1`. Writers emit a row only for
+/// a nonempty group of positioned transactions. An empty value is corrupt
+/// derived state and queries refuse it; it never represents an older format.
 ///
 /// The value carries no block identity; the watermark committed with every row
 /// change supplies it, and snapshot queries accept rows only while that
@@ -406,8 +406,8 @@ impl TxPositionValue {
 
     /// Decodes a row value into its positions.
     ///
-    /// Returns `None` for an empty or malformed value. The resolver treats an
-    /// unavailable position list as a signal to use its all-or-scan safety path.
+    /// Returns `None` for an empty or malformed value. Queries reject empty
+    /// rows before using the all-or-scan safety path for other invalid positions.
     #[must_use]
     pub fn decode(value: &[u8]) -> Option<&[TxPosition]> {
         if value.is_empty() {

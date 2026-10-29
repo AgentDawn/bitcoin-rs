@@ -51,7 +51,7 @@ fn assert_invalid<T>(result: Result<T, StorageError>) {
 }
 
 #[test]
-fn txindex_reopens_empty_old_live_table_but_preserves_populated_table() -> TestResult<()> {
+fn txindex_refuses_incompatible_live_table_without_mutating_it() -> TestResult<()> {
     let old: redb::TableDefinition<&[u8; 44], ()> =
         redb::TableDefinition::new("txindex_v1_script_live");
     for populated in [false, true] {
@@ -69,22 +69,11 @@ fn txindex_reopens_empty_old_live_table_but_preserves_populated_table() -> TestR
             txn.commit()?;
         }
         let result = bitcoin_rs_storage::open_redb_tx_index_store(temp.path());
-        if populated {
-            assert_invalid(result);
-            let db = redb::Database::open(&path)?;
-            let txn = db.begin_read()?;
-            assert!(txn.open_table(old)?.get(&[7_u8; 44])?.is_some());
-        } else {
-            let store = result?;
-            store.put(ColumnFamily::ScriptLive, &script_live_43(1), b"")?;
-            store.flush()?;
-            drop(store);
-            let reopened = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
-            assert_eq!(
-                reopened.get(ColumnFamily::ScriptLive, &script_live_43(1))?,
-                Some(Vec::new())
-            );
-        }
+        assert!(matches!(result, Err(StorageError::IncompatibleData(_))));
+        let db = redb::Database::open(&path)?;
+        let txn = db.begin_read()?;
+        let table = txn.open_table(old)?;
+        assert_eq!(table.get(&[7_u8; 44])?.is_some(), populated);
     }
     Ok(())
 }

@@ -433,7 +433,7 @@ fn filter_failure_refuses_filters_but_preserves_durable_progress_and_tx_queries(
         scans: vec![scan_response(
             ColumnFamily::TxConfirmed,
             TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
             true,
         )],
         watermark: None,
@@ -552,7 +552,7 @@ fn transaction_rejects_watermark_from_rival_tip() -> Result<(), Box<dyn std::err
         scans: vec![scan_response(
             ColumnFamily::TxConfirmed,
             prefix,
-            vec![(indexed_row, Vec::new())],
+            vec![(indexed_row, vec![0])],
             true,
         )],
         watermark: Some(IndexWatermark {
@@ -582,7 +582,7 @@ fn transaction_rejects_incomplete_prefix_scan() -> Result<(), Box<dyn std::error
         scans: vec![scan_response(
             ColumnFamily::TxConfirmed,
             prefix,
-            vec![(tempting_row, Vec::new())],
+            vec![(tempting_row, vec![0])],
             false,
         )],
         watermark: None,
@@ -610,7 +610,7 @@ fn transaction_reports_unavailable_when_indexed_body_is_missing()
         scans: vec![scan_response(
             ColumnFamily::TxConfirmed,
             prefix,
-            vec![(indexed_row, Vec::new())],
+            vec![(indexed_row, vec![0])],
             true,
         )],
         watermark: None,
@@ -720,7 +720,7 @@ fn transaction_reports_unavailable_when_body_source_returns_none()
         vec![scan_response(
             ColumnFamily::TxConfirmed,
             prefix,
-            vec![(indexed_row, Vec::new())],
+            vec![(indexed_row, vec![0])],
             true,
         )],
         Some(Arc::new(MissingBody)),
@@ -746,7 +746,7 @@ fn transaction_reports_storage_when_body_read_fails() -> Result<(), Box<dyn std:
         vec![scan_response(
             ColumnFamily::TxConfirmed,
             prefix,
-            vec![(indexed_row, Vec::new())],
+            vec![(indexed_row, vec![0])],
             true,
         )],
         bitcoin_rs_chain::BlockBodyReadError::Read("injected read failure".into()),
@@ -770,7 +770,7 @@ fn transaction_reports_storage_when_body_is_corrupt() -> Result<(), Box<dyn std:
         vec![scan_response(
             ColumnFamily::TxConfirmed,
             prefix,
-            vec![(indexed_row, Vec::new())],
+            vec![(indexed_row, vec![0])],
             true,
         )],
         bitcoin_rs_chain::BlockBodyReadError::Corrupt("injected corruption".into()),
@@ -780,6 +780,59 @@ fn transaction_reports_storage_when_body_is_corrupt() -> Result<(), Box<dyn std:
         engine.transaction(&txid),
         Err(TxQueryError::Storage(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn empty_position_rows_are_refused_before_body_reads() -> Result<(), Box<dyn std::error::Error>> {
+    let (block, outpoint, scripthash, _) = block_with_spending_transaction()?;
+    let txid = block.txs[0].txid();
+    let fixture = QueryFixture::new(FixtureConfig {
+        block,
+        retain_body: true,
+        scans: vec![
+            scan_response(
+                ColumnFamily::TxConfirmed,
+                TxidRow::scan_prefix(&txid),
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                true,
+            ),
+            scan_response(
+                ColumnFamily::Funding,
+                ScriptHashRow::scan_prefix(scripthash),
+                vec![(
+                    ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
+                    Vec::new(),
+                )],
+                true,
+            ),
+            scan_response(
+                ColumnFamily::Spending,
+                SpendingPrefixRow::scan_prefix(&outpoint),
+                vec![(
+                    SpendingPrefixRow::row(&outpoint, 0).to_db_row().to_vec(),
+                    Vec::new(),
+                )],
+                true,
+            ),
+        ],
+        watermark: None,
+        extra_blocks: Vec::new(),
+        utxo_adds: Vec::new(),
+    })?;
+    assert!(matches!(
+        fixture.engine.transaction(&txid),
+        Err(TxQueryError::Storage(_))
+    ));
+    assert!(matches!(
+        fixture.engine.confirmed_history(scripthash),
+        Err(TxQueryError::Storage(_))
+    ));
+    assert!(matches!(
+        fixture.engine.spender(outpoint),
+        Err(TxQueryError::Storage(_))
+    ));
+    assert_eq!(fixture.full_reads()?, 0);
     Ok(())
 }
 
@@ -822,7 +875,7 @@ fn confirmed_history_fetches_shared_block_once_per_query_and_refetches_next_quer
     // `resolve_block` calls for one `(height, hash)` inside a single public
     // query: `funding_outputs_for` resolves the block for the funding row,
     // then `spender_for` resolves the same block for the spending row. Both
-    // rows carry an empty value so each falls back to the full-block path.
+    // rows carry malformed positions so each falls back to the full-block path.
     let (block, outpoint, scripthash, spend_txid) = block_with_spending_transaction()?;
     let funding_txid = block.txs[0].txid();
     let fixture = QueryFixture::new(FixtureConfig {
@@ -834,7 +887,7 @@ fn confirmed_history_fetches_shared_block_once_per_query_and_refetches_next_quer
                 ScriptHashRow::scan_prefix(scripthash),
                 vec![(
                     ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
-                    Vec::new(),
+                    vec![0],
                 )],
                 true,
             ),
@@ -843,7 +896,7 @@ fn confirmed_history_fetches_shared_block_once_per_query_and_refetches_next_quer
                 SpendingPrefixRow::scan_prefix(&outpoint),
                 vec![(
                     SpendingPrefixRow::row(&outpoint, 0).to_db_row().to_vec(),
-                    Vec::new(),
+                    vec![0],
                 )],
                 true,
             ),
@@ -993,7 +1046,7 @@ fn outpoint_value_returns_confirmed_output_value() -> Result<(), Box<dyn std::er
         scans: vec![scan_response(
             ColumnFamily::TxConfirmed,
             TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
             true,
         )],
         watermark: None,
@@ -1020,7 +1073,7 @@ fn outpoint_value_returns_none_for_out_of_range_vout() -> Result<(), Box<dyn std
         scans: vec![scan_response(
             ColumnFamily::TxConfirmed,
             TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
             true,
         )],
         watermark: None,
@@ -1188,15 +1241,15 @@ fn confirmed_history_orders_funding_rows_by_height_then_txid()
             vec![
                 (
                     ScriptHashRow::row(scripthash, 2).to_db_row().to_vec(),
-                    Vec::new(),
+                    vec![0],
                 ),
                 (
                     ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
-                    Vec::new(),
+                    vec![0],
                 ),
                 (
                     ScriptHashRow::row(scripthash, 1).to_db_row().to_vec(),
-                    Vec::new(),
+                    vec![0],
                 ),
             ],
             true,
@@ -1290,7 +1343,7 @@ fn confirmed_history_with_nonmatching_script_falls_back_per_height_and_stays_emp
 -> Result<(), Box<dyn std::error::Error>> {
     // Hostile shape from the finding: one unauthenticated scripthash query
     // fans out to full-block fallbacks at several candidate heights. The
-    // funding rows below are filed under the queried hash but carry empty
+    // funding rows below are filed under the queried hash but carry malformed
     // values, so every height falls back to a full-block decode that matches
     // nothing; the memo holds at most one decoded block at a time.
     let (genesis, chain, _) = paying_chain()?;
@@ -1302,18 +1355,9 @@ fn confirmed_history_with_nonmatching_script_falls_back_per_height_and_stays_emp
             ColumnFamily::Funding,
             ScriptHashRow::scan_prefix(foreign),
             vec![
-                (
-                    ScriptHashRow::row(foreign, 2).to_db_row().to_vec(),
-                    Vec::new(),
-                ),
-                (
-                    ScriptHashRow::row(foreign, 0).to_db_row().to_vec(),
-                    Vec::new(),
-                ),
-                (
-                    ScriptHashRow::row(foreign, 1).to_db_row().to_vec(),
-                    Vec::new(),
-                ),
+                (ScriptHashRow::row(foreign, 2).to_db_row().to_vec(), vec![0]),
+                (ScriptHashRow::row(foreign, 0).to_db_row().to_vec(), vec![0]),
+                (ScriptHashRow::row(foreign, 1).to_db_row().to_vec(), vec![0]),
             ],
             true,
         )],
@@ -1675,7 +1719,7 @@ fn historical_extension_during_read_keeps_same_anchor() -> Result<(), Box<dyn st
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
-                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
                 true,
             )],
         },
@@ -1728,7 +1772,7 @@ fn historical_wake_without_tip_move_stays_valid_while_strict_retries()
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
-                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
                 true,
             )],
         },
@@ -1739,7 +1783,7 @@ fn historical_wake_without_tip_move_stays_valid_while_strict_retries()
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
-                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
                 true,
             )],
             chain_transition: chain_transition.clone(),
@@ -1824,7 +1868,7 @@ fn historical_reorg_above_anchor_stays_valid() -> Result<(), Box<dyn std::error:
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
-                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
                 true,
             )],
         },
@@ -1869,7 +1913,7 @@ fn historical_reset_completing_after_snapshot_stays_valid() -> Result<(), Box<dy
         scans: vec![scan_response(
             ColumnFamily::TxConfirmed,
             TxidRow::scan_prefix(&txid),
-            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+            vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
             true,
         )],
     }));
@@ -1956,8 +2000,8 @@ fn historical_reorg_below_anchor_retries() -> Result<(), Box<dyn std::error::Err
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
                 vec![
-                    (TxidRow::row(&txid, 1).to_db_row().to_vec(), Vec::new()),
-                    (TxidRow::row(&txid, 2).to_db_row().to_vec(), Vec::new()),
+                    (TxidRow::row(&txid, 1).to_db_row().to_vec(), vec![0]),
+                    (TxidRow::row(&txid, 2).to_db_row().to_vec(), vec![0]),
                 ],
                 true,
             )],
@@ -2058,10 +2102,7 @@ fn historical_stale_watermark_anchors_at_fork_and_excludes_orphans()
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 stale_prefix,
-                vec![(
-                    TxidRow::row(&stale_txid, 1).to_db_row().to_vec(),
-                    Vec::new(),
-                )],
+                vec![(TxidRow::row(&stale_txid, 1).to_db_row().to_vec(), vec![0])],
                 true,
             )],
         },
@@ -2109,7 +2150,7 @@ fn historical_tx_positive_floor_scopes_absence_and_rejects_anchor_below_floor()
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
-                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
                 true,
             )],
             bodies: vec![
@@ -2174,7 +2215,7 @@ fn historical_full_history_positive_floor_is_unproven() -> Result<(), Box<dyn st
                 ScriptHashRow::scan_prefix(scripthash),
                 vec![(
                     ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
-                    Vec::new(),
+                    vec![0],
                 )],
                 true,
             )],
@@ -2217,7 +2258,7 @@ fn historical_standalone_spender_scoped_none_above_floor() -> Result<(), Box<dyn
                 SpendingPrefixRow::scan_prefix(&outpoint),
                 vec![(
                     SpendingPrefixRow::row(&outpoint, 0).to_db_row().to_vec(),
-                    Vec::new(),
+                    vec![0],
                 )],
                 true,
             )],
@@ -2259,15 +2300,15 @@ fn historical_mixed_cap_script_anchors_at_sh_watermark() -> Result<(), Box<dyn s
         vec![
             (
                 ScriptHashRow::row(scripthash, 0).to_db_row().to_vec(),
-                Vec::new(),
+                vec![0],
             ),
             (
                 ScriptHashRow::row(scripthash, 1).to_db_row().to_vec(),
-                Vec::new(),
+                vec![0],
             ),
             (
                 ScriptHashRow::row(scripthash, 2).to_db_row().to_vec(),
-                Vec::new(),
+                vec![0],
             ),
         ],
         true,
@@ -2322,7 +2363,7 @@ fn historical_mixed_cap_tx_anchors_at_tx_watermark() -> Result<(), Box<dyn std::
             TxidRow::row(&funding_txid_height_two, 2)
                 .to_db_row()
                 .to_vec(),
-            Vec::new(),
+            vec![0],
         )],
         true,
     )];
@@ -2381,18 +2422,9 @@ fn historical_duplicate_txid_returns_earliest_verified_and_skips_stale()
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&target_txid),
                 vec![
-                    (
-                        TxidRow::row(&target_txid, 1).to_db_row().to_vec(),
-                        Vec::new(),
-                    ),
-                    (
-                        TxidRow::row(&target_txid, 2).to_db_row().to_vec(),
-                        Vec::new(),
-                    ),
-                    (
-                        TxidRow::row(&target_txid, 3).to_db_row().to_vec(),
-                        Vec::new(),
-                    ),
+                    (TxidRow::row(&target_txid, 1).to_db_row().to_vec(), vec![0]),
+                    (TxidRow::row(&target_txid, 2).to_db_row().to_vec(), vec![0]),
+                    (TxidRow::row(&target_txid, 3).to_db_row().to_vec(), vec![0]),
                 ],
                 true,
             )],
@@ -2470,7 +2502,7 @@ fn historical_budgets_truncation_and_missing_map_to_shared()
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
-                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
                 false,
             )],
             bodies: Vec::new(),
@@ -2499,7 +2531,7 @@ fn historical_budgets_truncation_and_missing_map_to_shared()
             scans: vec![scan_response(
                 ColumnFamily::TxConfirmed,
                 TxidRow::scan_prefix(&txid),
-                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), Vec::new())],
+                vec![(TxidRow::row(&txid, 0).to_db_row().to_vec(), vec![0])],
                 true,
             )],
             bodies: Vec::new(),

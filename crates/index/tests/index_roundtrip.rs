@@ -52,15 +52,6 @@ fn commit_rollback_one_for<S: KvStore>(
 
 const ORDINARY_STATE_REVISION_KEY: &[u8] = &[0x00, b'O'];
 
-/// Interrupted 9-byte claim from an earlier binary: mask plus process epoch,
-/// with no base version.
-fn fenced_marker(mask: u8, process_epoch: u64) -> Vec<u8> {
-    let mut value = Vec::with_capacity(9);
-    value.push(mask);
-    value.extend_from_slice(&process_epoch.to_le_bytes());
-    value
-}
-
 /// Current claim grammar: mask, process epoch, base idle version.
 fn claim_bytes(mask: u8, process_epoch: u64, base_version: u64) -> Vec<u8> {
     let mut value = Vec::with_capacity(17);
@@ -127,10 +118,6 @@ struct CallTrackingStore {
 impl CallTrackingStore {
     fn count(&self, cf: ColumnFamily) -> usize {
         self.inner.count(cf)
-    }
-
-    fn rows(&self, cf: ColumnFamily) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.inner.rows(cf)
     }
 
     fn logged_batches(&self) -> Vec<BatchLog> {
@@ -1046,7 +1033,7 @@ fn open_resumes_interrupted_capability_reset() -> Result<(), Box<dyn std::error:
     // A crashed fenced reset: the marker names generation 3; the next open
     // (generation 1) adopts it, finishes the deletion, and clears it.
     let mut interrupted = store.new_batch();
-    interrupted.put(ColumnFamily::UtxoMeta, RESET_KEY, &fenced_marker(0b10, 3));
+    interrupted.put(ColumnFamily::UtxoMeta, RESET_KEY, &claim_bytes(0b10, 3, 0));
     interrupted.delete(ColumnFamily::UtxoMeta, &[0x00, b'S']);
     interrupted.delete(ColumnFamily::UtxoMeta, CURSOR_KEY);
     store.write_durable(interrupted)?;
@@ -1157,7 +1144,7 @@ fn ordinary_commits_are_excluded_by_a_reset_claim() -> Result<(), Box<dyn std::e
         }
 
         let mut claim = store.new_batch();
-        claim.put(ColumnFamily::UtxoMeta, RESET_KEY, &fenced_marker(mask, 9));
+        claim.put(ColumnFamily::UtxoMeta, RESET_KEY, &claim_bytes(mask, 9, 0));
         claim.delete(ColumnFamily::UtxoMeta, dropped_watermark);
         claim.delete(ColumnFamily::UtxoMeta, CURSOR_KEY);
         store.write_durable(claim)?;
@@ -1206,7 +1193,7 @@ fn rollback_is_excluded_by_a_reset_fence() -> Result<(), Box<dyn std::error::Err
     claim.put(
         ColumnFamily::UtxoMeta,
         RESET_KEY,
-        &fenced_marker(SCRIPT_HISTORY_MASK, 9),
+        &claim_bytes(SCRIPT_HISTORY_MASK, 9, 0),
     );
     claim.put(ColumnFamily::UtxoMeta, FORMAT_KEY, &FORMAT_VALUE);
     claim.delete(ColumnFamily::UtxoMeta, SCRIPT_WATERMARK_KEY);
@@ -1223,55 +1210,37 @@ fn rollback_is_excluded_by_a_reset_fence() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
-fn legacy_one_byte_marker_is_adopted_durably_then_completed()
+fn obsolete_and_malformed_reset_claims_are_rejected_without_writes()
 -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(CallTrackingStore::default());
-    seed_populated_store(&store, 1)?;
-    // A pre-C2 binary crashed right after committing its unfenced 1-byte
-    // marker and the selected watermark delete.
-    let mut interrupted = store.new_batch();
-    interrupted.put(ColumnFamily::UtxoMeta, RESET_KEY, &[0b10]);
-    interrupted.delete(ColumnFamily::UtxoMeta, &[0x00, b'S']);
-    interrupted.delete(ColumnFamily::UtxoMeta, CURSOR_KEY);
-    store.write_durable(interrupted)?;
-    let baseline = store.logged_batches().len();
-    let tx_rows_before = store.rows(ColumnFamily::TxConfirmed);
-
-    let writer = IndexWriter::open(Arc::clone(&store), 7)?;
-
-    let logs = store.logged_batches();
-    let post = &logs[baseline..];
-    // Cooperative same-mask adoption writes no claim of its own: the only
-    // marker PUT is the durable completion, CASed from the crashed writer's
-    // exact raw 1-byte claim.
-    let markers: Vec<BatchLog> = post
-        .iter()
-        .filter(|entry| entry.marker_put.is_some())
-        .cloned()
-        .collect();
-    assert_eq!(markers.len(), 1, "no adoption rewrite: {markers:?}");
-    assert!(markers[0].durable, "the completion is durable");
-    assert_eq!(
-        markers[0].marker_put.as_deref(),
-        Some(idle_bytes(1).as_slice())
-    );
-
-    assert!(writer.watermarks()?.tx_lookup.is_some());
-    assert!(writer.watermarks()?.script_history.is_none());
-    assert_eq!(store.count(ColumnFamily::Funding), 0);
-    assert_eq!(store.count(ColumnFamily::Spending), 0);
-    assert_eq!(
-        store.count(ColumnFamily::BlockHeaders),
-        1,
-        "the unselected cursor keeps the shared identity rows"
-    );
-    assert_eq!(
-        store.rows(ColumnFamily::TxConfirmed),
-        tx_rows_before,
-        "sibling rows are byte-identical across the adopted reset"
-    );
-    assert_eq!(stored_idle_version(&store)?, 1);
-    assert_state_revision(&store, Some(2))?;
+    let mut old_claim = vec![SCRIPT_HISTORY_MASK];
+    old_claim.extend_from_slice(&9_u64.to_le_bytes());
+    for marker in [
+        vec![SCRIPT_HISTORY_MASK],
+        old_claim,
+        vec![0; 17],
+        vec![0xff],
+    ] {
+        let store = Arc::new(CallTrackingStore::default());
+        seed_populated_store(&store, 1)?;
+        let mut writer = IndexWriter::open(Arc::clone(&store), 4)?;
+        store.put(ColumnFamily::UtxoMeta, RESET_KEY, &marker)?;
+        let before = dump_all(&store.inner);
+        let baseline = store.logged_batches().len();
+        assert!(matches!(
+            IndexWriter::open(Arc::clone(&store), 7),
+            Err(IndexError::InvalidResetMarker)
+        ));
+        assert!(matches!(
+            writer.fenced_watermarks(),
+            Err(IndexError::InvalidResetMarker)
+        ));
+        assert!(matches!(
+            writer.reset_capabilities(IndexCapabilities::SCRIPT_HISTORY),
+            Err(IndexError::InvalidResetMarker)
+        ));
+        assert_eq!(dump_all(&store.inner), before);
+        assert_eq!(store.logged_batches().len(), baseline);
+    }
     Ok(())
 }
 
@@ -1303,7 +1272,7 @@ fn seed_populated_store(
 /// watermark already gone.
 fn crash_after_marker_commit(store: &MemoryStore) -> Result<(), Box<dyn std::error::Error>> {
     let mut batch = store.new_batch();
-    batch.put(ColumnFamily::UtxoMeta, RESET_KEY, &fenced_marker(0b10, 3));
+    batch.put(ColumnFamily::UtxoMeta, RESET_KEY, &claim_bytes(0b10, 3, 0));
     batch.delete(ColumnFamily::UtxoMeta, &[0x00, b'S']);
     batch.delete(ColumnFamily::UtxoMeta, CURSOR_KEY);
     store.write_durable(batch)?;
@@ -1432,7 +1401,7 @@ fn crash_mid_fence(store: &ForeignFenceStore, mask: u8, epoch: u64) -> Result<()
     crashed.put(
         ColumnFamily::UtxoMeta,
         RESET_KEY,
-        &fenced_marker(mask, epoch),
+        &claim_bytes(mask, epoch, 0),
     );
     crashed.delete(ColumnFamily::UtxoMeta, TX_WATERMARK_KEY);
     crashed.delete(ColumnFamily::UtxoMeta, CURSOR_KEY);
@@ -1455,13 +1424,9 @@ impl ForeignFenceStore {
                 })?,
             ),
             Some(bytes) => {
-                let base = if bytes.len() == claim_bytes(0, 0, 0).len() {
-                    decode_u64_le(bytes, 9).ok_or_else(|| {
-                        StorageError::IncompatibleData("claim marker truncated".into())
-                    })?
-                } else {
-                    0
-                };
+                let base = decode_u64_le(bytes, 9).ok_or_else(|| {
+                    StorageError::IncompatibleData("claim marker truncated".into())
+                })?;
                 (bytes[0], base)
             }
         };
@@ -1663,7 +1628,7 @@ fn reset_index_adopts_a_foreign_fence_as_an_all_capability_reset()
     foreign.put(
         ColumnFamily::UtxoMeta,
         RESET_KEY,
-        &fenced_marker(SCRIPT_HISTORY_MASK, 9),
+        &claim_bytes(SCRIPT_HISTORY_MASK, 9, 0),
     );
     foreign.delete(ColumnFamily::UtxoMeta, SCRIPT_WATERMARK_KEY);
     foreign.delete(ColumnFamily::UtxoMeta, CURSOR_KEY);
@@ -2599,84 +2564,6 @@ fn reset_counter_overflow_is_rejected_before_any_write() -> Result<(), Box<dyn s
         );
     }
     Ok(())
-}
-/// Interrupted 9-byte claim from an earlier binary: mask plus process epoch,
-/// with no base version.
-fn legacy_nine_byte_claim(mask: u8, process_epoch: u64) -> Vec<u8> {
-    let mut value = Vec::with_capacity(9);
-    value.push(mask);
-    value.extend_from_slice(&process_epoch.to_le_bytes());
-    value
-}
-
-/// A fence captured before a legacy claim round-trip must not come back
-/// alive just because adoption completed back to byte-identical idle bytes.
-fn legacy_aba_rejection(marker: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(CallTrackingStore::default());
-    let mut initial = store.new_batch();
-    initial.put(ColumnFamily::UtxoMeta, RESET_KEY, &idle_bytes(1));
-    initial.put(
-        ColumnFamily::UtxoMeta,
-        ORDINARY_STATE_REVISION_KEY,
-        &7_u64.to_le_bytes(),
-    );
-    store.write_durable(initial)?;
-
-    let mut writer = IndexWriter::open(Arc::clone(&store), 4)?;
-    let (stale_fence, watermarks) = writer.fenced_watermarks()?;
-    assert_eq!(watermarks, IndexWatermarks::default());
-
-    // A pre-revision binary replaces Idle(1) with a legacy claim. Completion
-    // returns to the same reset bytes, so only the ordinary revision can
-    // invalidate the stale fence.
-    let mut crash = store.new_batch();
-    crash.put(ColumnFamily::UtxoMeta, RESET_KEY, marker);
-    store.write_durable(crash)?;
-
-    let baseline = store.logged_batches().len();
-    assert!(matches!(
-        writer.fenced_watermarks(),
-        Err(IndexError::ResetInProgress)
-    ));
-    assert_state_revision(&store, Some(8))?;
-    let markers: Vec<BatchLog> = store.logged_batches()[baseline..]
-        .iter()
-        .filter(|entry| entry.marker_put.is_some())
-        .cloned()
-        .collect();
-    assert_eq!(markers.len(), 1, "no adoption rewrite, one completion");
-    assert!(markers[0].durable, "the completion is durable");
-    assert_eq!(
-        markers[0].marker_put.as_deref(),
-        Some(idle_bytes(1).as_slice())
-    );
-
-    let result = writer.commit_consumer_cursor(stale_fence, b"stale");
-    assert!(
-        matches!(result, Err(IndexError::StaleIndexState)),
-        "an ABA-identical idle state must reject via the revision: {result:?}"
-    );
-    assert!(writer.consumer_cursor()?.is_none());
-
-    let (fresh_fence, _) = writer.fenced_watermarks()?;
-    writer.commit_consumer_cursor(fresh_fence, b"fresh")?;
-    assert_eq!(
-        writer.consumer_cursor()?.as_deref(),
-        Some(b"fresh".as_slice())
-    );
-    assert_state_revision(&store, Some(9))?;
-    assert_eq!(stored_idle_version(&store)?, 1);
-    Ok(())
-}
-
-/// Both interrupted legacy claim encodings adopt back to byte-identical idle
-/// bytes, so only the revision can reject a fence captured before the
-/// round-trip.
-#[test]
-fn legacy_markers_reject_aba_commits() -> Result<(), Box<dyn std::error::Error>> {
-    let mask = TX_LOOKUP_MASK | SCRIPT_HISTORY_MASK;
-    legacy_aba_rejection(&[mask])?;
-    legacy_aba_rejection(&legacy_nine_byte_claim(mask, 9))
 }
 #[test]
 fn same_mask_claim_is_adopted_cooperatively_without_rewrite()
