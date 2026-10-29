@@ -219,6 +219,59 @@ fn compare_formats(core: &mut ProcessNode, node: &mut ProcessNode, hash: &str) -
     node.rpc("getblock", &json!([hash, 3]))
 }
 
+fn compare_uncertified_history(
+    core: &mut ProcessNode,
+    node: &mut ProcessNode,
+    txid: &str,
+    block: &str,
+) -> Result<()> {
+    // Exact declared deviation: a later receipt no longer certifies the old
+    // branch. Its stored rows must not be promoted to trusted history.
+    let native = node.rpc("getblock", &json!([block, 3]))?;
+    let reference = core.rpc("getblock", &json!([block, 3]))?;
+    assert_eq!(native["confirmations"], reference["confirmations"]);
+    assert!(native.get("nextblockhash").is_none());
+    assert!(reference.get("nextblockhash").is_none());
+    assert!(native["tx"][1]["vin"][0].get("prevout").is_none());
+    assert!(native["tx"][1].get("fee").is_none());
+    let native_raw = node.rpc("getrawtransaction", &json!([txid, 2, block]))?;
+    let reference_raw = core.rpc("getrawtransaction", &json!([txid, 2, block]))?;
+    assert!(native_raw.get("fee").is_none());
+    assert!(native_raw["vin"][0].get("prevout").is_none());
+    assert!(reference_raw.get("fee").is_some());
+    // The documented certification deviation affects only undo fields.
+    let mut without_undo = reference_raw;
+    without_undo
+        .as_object_mut()
+        .ok_or_else(|| Error::Protocol("transaction object missing".into()))?
+        .remove("fee");
+    for input in without_undo["vin"]
+        .as_array_mut()
+        .ok_or_else(|| Error::Protocol("inputs missing".into()))?
+    {
+        input
+            .as_object_mut()
+            .ok_or_else(|| Error::Protocol("input object missing".into()))?
+            .remove("prevout");
+    }
+    compare_reply(
+        "uncertified stale raw transaction",
+        &without_undo,
+        &native_raw,
+    )?;
+    assert_eq!(
+        node.http_get(&format!("/rest/spenttxouts/{block}.json"))?
+            .status,
+        404
+    );
+    assert_eq!(
+        core.http_get(&format!("/rest/spenttxouts/{block}.json"))?
+            .status,
+        200
+    );
+    Ok(())
+}
+
 #[test]
 fn undo_formats_same_block_inputs_stale_extent_and_restart() -> Result<()> {
     let mut core = ProcessNode::spawn_with(
@@ -308,50 +361,7 @@ fn undo_formats_same_block_inputs_stale_extent_and_restart() -> Result<()> {
     assert!(stale.get("nextblockhash").is_none());
     submit_common(&mut core, &mut node, &[])?;
     let replacement = submit_common(&mut core, &mut node, &[])?;
-    // Exact declared deviation: a later receipt no longer certifies the old
-    // branch. Its stored rows must not be promoted to trusted history.
-    let native = node.rpc("getblock", &json!([block, 3]))?;
-    let reference = core.rpc("getblock", &json!([block, 3]))?;
-    assert_eq!(native["confirmations"], reference["confirmations"]);
-    assert!(native.get("nextblockhash").is_none());
-    assert!(reference.get("nextblockhash").is_none());
-    assert!(native["tx"][1]["vin"][0].get("prevout").is_none());
-    assert!(native["tx"][1].get("fee").is_none());
-    let native_raw = node.rpc("getrawtransaction", &json!([txid, 2, block]))?;
-    let reference_raw = core.rpc("getrawtransaction", &json!([txid, 2, block]))?;
-    assert!(native_raw.get("fee").is_none());
-    assert!(native_raw["vin"][0].get("prevout").is_none());
-    assert!(reference_raw.get("fee").is_some());
-    // The documented certification deviation affects only undo fields.
-    let mut without_undo = reference_raw;
-    without_undo
-        .as_object_mut()
-        .ok_or_else(|| Error::Protocol("transaction object missing".into()))?
-        .remove("fee");
-    for input in without_undo["vin"]
-        .as_array_mut()
-        .ok_or_else(|| Error::Protocol("inputs missing".into()))?
-    {
-        input
-            .as_object_mut()
-            .ok_or_else(|| Error::Protocol("input object missing".into()))?
-            .remove("prevout");
-    }
-    compare_reply(
-        "uncertified stale raw transaction",
-        &without_undo,
-        &native_raw,
-    )?;
-    assert_eq!(
-        node.http_get(&format!("/rest/spenttxouts/{block}.json"))?
-            .status,
-        404
-    );
-    assert_eq!(
-        core.http_get(&format!("/rest/spenttxouts/{block}.json"))?
-            .status,
-        200
-    );
+    compare_uncertified_history(&mut core, &mut node, &txid, &block)?;
     let datadir = node.stop_keep_datadir()?;
     let mut node = ProcessNode::spawn_in_datadir(Kind::BitcoinRs, &indexed_options(), datadir)?;
     compare_formats(&mut core, &mut node, &replacement)?;
