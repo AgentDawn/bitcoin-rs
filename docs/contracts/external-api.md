@@ -2,7 +2,7 @@
 
 `API-01`–`API-35` govern RPC, REST, Esplora and ZMQ under the
 [contracts precedence rule](README.md). The clauses below own each behavior;
-[Proven by](#proven-by) separates existing tests from planned comparisons.
+[Verification boundaries](#verification-boundaries) distinguish current coverage from unverified comparisons.
 
 The opt-in BIP352 `getblocktweaks` extension uses the retained-input owner below.
 Its [service documentation](../silent-payments.md) owns the experimental RPC shape,

@@ -4,16 +4,16 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, 
 
 | Boundary | Authoritative owner | Evidence boundary |
 | --- | --- | --- |
-| Operator configuration | `node/src/options.rs`, `config.rs` | Owner-local configuration refusal tests. |
-| Composition and shutdown | `node/src/lifecycle.rs`, `pool.rs::composed_core_config` | Lifecycle and pool composition tests; no deployment certification. |
-| Jobs and SV1 | `mining/src/pool/job.rs`, `core.rs`, `stratum/sv1.rs` | In-tree job and SV1 protocol tests. |
-| SV2 protocol | `mining/src/pool/stratum/sv2.rs` | `crates/mining/tests/pool_sv2.rs`; no external miner interoperability claim. |
-| Node SV2 adapter | `node/src/pool/sv2.rs`, `authority.rs` | Adapter and authority-file refusal tests. |
-| Accounting | `mining/src/pool/ledger.rs`, `ledger/store.rs`, `ledger/kv.rs` | Shared ledger cases and the independent backend crash-worker target. |
-| Applied-chain observations | `node/src/pool/ledger.rs` | Local observation/reconciliation evidence, qualified by available indexes. |
-| Management API | `rpc/src/handlers/pool.rs` | Handler and authenticated HTTP tests. |
+| Operator configuration | `crates/node/src/options.rs`, `crates/node/src/config.rs` | Owner-local configuration refusal tests. |
+| Composition and shutdown | `crates/node/src/lifecycle.rs`, `crates/node/src/pool.rs::composed_core_config` | Lifecycle and pool composition tests; no deployment certification. |
+| Jobs and SV1 | `crates/mining/src/pool/job.rs`, `crates/mining/src/pool/core.rs`, `crates/mining/src/pool/stratum/sv1.rs` | In-tree job and SV1 protocol tests. |
+| SV2 protocol | `crates/mining/src/pool/stratum/sv2.rs` | `crates/mining/tests/pool_sv2.rs`; no external miner interoperability claim. |
+| Node SV2 adapter | `crates/node/src/pool/sv2.rs`, `crates/node/src/pool/authority.rs` | Adapter and authority-file refusal tests. |
+| Accounting | `crates/mining/src/pool/ledger.rs`, `crates/mining/src/pool/ledger/store.rs`, `crates/mining/src/pool/ledger/kv.rs` | Shared ledger cases and the independent backend crash-worker target. |
+| Applied-chain observations | `crates/node/src/pool/ledger.rs` | Local observation/reconciliation evidence, qualified by available indexes. |
+| Management API | `crates/rpc/src/handlers/pool.rs` | Handler and authenticated HTTP tests. |
 
-Source owners in the table are relative to `crates/`.
+Source owners in the table use repository-relative paths.
 
 ## Clauses
 ### `POOL-01`: Explicit enablement and operator configuration
