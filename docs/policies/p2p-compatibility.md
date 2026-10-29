@@ -39,6 +39,13 @@ An outbound bitcoin-rs connection sends, in order: `version`, `wtxidrelay` (BIP3
 
 BIP434 `feature` announcements, when there are any, follow those messages and precede `verack` on both roles, and go only to a peer whose `version` is `70017` or higher (`crates/p2p/src/feature.rs`, `handshake.rs`). Local feature announcements are disabled by default: `RelayOffers::stale_tip_relay` defaults off, so `Peer::stale_tip_offer` stays `None` and `negotiated_features` is empty, and no `feature` frame ever reaches a peer below `70017`. When stale-tip relay is enabled, `ConnectionShared::offer_relay_capabilities` calls `Peer::offer_stale_tip_relay` with the configured `stale_tip_prefers_blocks` byte, and `negotiated_features` emits one `BIP332` announcement carrying that byte in the same slot (`crates/p2p/src/listener.rs`, `peer.rs`).
 
+`Peer::send` enforces the BIP434 send window: a remote version at least
+`70017` must be known and our own `verack` must not have been successfully
+written. Receiving the remote `verack` closes only the receive window.
+The post-handshake `PeerLease` queue refuses `feature` as a local caller
+error, cancels the lease, and releases any reserved credit; it never turns
+this refusal into shared-budget backpressure.
+
 
 The `version` message pins:
 
@@ -53,7 +60,7 @@ The `version` message pins:
 
 Rules, each enforced by the FSM (`crates/p2p/src/fsm.rs`) and identical to Core's posture unless noted:
 
-- `verack` before `version` → disconnect. Duplicate `version` after completion → disconnect (Core: misbehavior; ours: disconnect without ban scoring, §6).
+- `verack` before `version` → disconnect. A duplicate `version`, including before readiness, is a typed handshake-ordering violation (§6). It does not replace the accepted version or its receive timestamp and does not replay negotiation responses. Protected connections ignore the violation under the existing handshake deadline.
 - Any non-handshake message before readiness → disconnect. Core has the same rule except for a small handshake whitelist (`sendtxrcncl`); see §7 for the one practical divergence.
 - After `verack`, unknown commands are ignored and the connection stays up — identical to Core's handling of unrecognized commands.
 - A `feature` message is accepted only after the peer's `version` and before its `verack`, and only from a peer that advertised `70017` or higher; received before `version`, after `verack`, or from a lower-version peer it is a handshake-ordering violation (§6). A payload that is truncated, uses a non-minimal `CompactSize`, carries an identifier length outside 4 to 80 bytes or more than 512 data bytes, or leaves trailing bytes is an invalid decoded payload (§6). Identifier bytes are not otherwise restricted on receipt. Unknown identifiers, and invalid data for a recognised identifier, are ignored without disconnect. Only a recognised identifier with valid data is retained per peer, and for a repeated identifier the first valid announcement wins; today the only such identifier is `BIP332` with a one-byte `0` or `1` payload. Identifiers this node advertises are limited to printable ASCII (`0x20..=0x7e`).

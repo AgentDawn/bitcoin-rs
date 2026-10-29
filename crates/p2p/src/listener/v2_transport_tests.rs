@@ -118,6 +118,93 @@ fn handshake_and_ping(addr: PeerEndpoint, stream: TcpStream, negotiated: Negotia
 }
 
 #[test]
+fn bip434_windows_preserve_bip332_and_package_negotiation_on_v1_and_v2() -> TestResult {
+    use crate::feature::{FEATURE_VERSION, FeatureAnnouncement};
+    use crate::packages::{PKG_RELAY_ANC, PKG_RELAY_PKGTXNS, SendPackages};
+    for v2 in [false, true] {
+        for version in [FEATURE_VERSION - 1, FEATURE_VERSION] {
+            let (mut listener_shared, table) = shared(v2);
+            listener_shared.relay_offers = super::RelayOffers {
+                package_relay: true,
+                stale_tip_relay: true,
+                stale_tip_prefers_blocks: true,
+            };
+            let (addr, shutdown, handle) = listen(listener_shared)?;
+            let result = (|| -> TestResult {
+                let mut stream = connect(addr)?;
+                let negotiated = if v2 {
+                    let mut handshake =
+                        Handshake::initiator(MAGIC, &mut StdRng::seed_from_u64(434));
+                    establish(&mut stream, &mut handshake, MAGIC, &lease(), deadline())?
+                } else {
+                    Negotiated::v1(MAGIC)
+                };
+                let mut peer = Peer::with_transport(stream, MAGIC, negotiated);
+                let mut announcement = crate::handshake::version_message(
+                    434,
+                    0,
+                    PeerRole::FullRelay,
+                    ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                );
+                announcement.version = version;
+                peer.send(&Message::Version(announcement))?;
+                let until = deadline();
+                let mut commands = Vec::new();
+                loop {
+                    if Instant::now() >= until {
+                        return Err("server handshake timed out".into());
+                    }
+                    match peer.read_message() {
+                        Ok(Some((message, _))) => {
+                            commands.push(message.command().to_string());
+                            crate::fsm::step(&mut peer, &message)?;
+                            if message == Message::Verack {
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(PeerError::Io(error)) if crate::recv::is_poll_timeout(&error) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                let mut expected = vec!["version", "wtxidrelay", "sendaddrv2", "sendheaders"];
+                if version >= FEATURE_VERSION {
+                    expected.push("feature");
+                }
+                expected.extend(["sendpackages", "verack"]);
+                assert_eq!(commands, expected);
+                assert_eq!(
+                    peer.remote_feature(b"BIP332"),
+                    (version >= FEATURE_VERSION).then_some([1].as_slice())
+                );
+                // We received the server's VERACK, but have not sent ours:
+                // our BIP434 send window is still open.
+                if version >= FEATURE_VERSION {
+                    peer.send(&Message::Feature(FeatureAnnouncement::bip332(true)))?;
+                }
+                peer.send(&Message::WtxidRelay)?;
+                peer.send(&Message::SendPackages(SendPackages {
+                    versions: PKG_RELAY_PKGTXNS | PKG_RELAY_ANC,
+                }))?;
+                peer.send(&Message::Verack)?;
+                assert!(matches!(
+                    peer.send(&Message::Feature(FeatureAnnouncement::bip332(true))),
+                    Err(PeerError::Protocol(_))
+                ));
+                peer.send(&Message::Ping(434))?;
+                read_until(&mut peer, &Message::Pong(434))?;
+                Ok(())
+            })();
+            table.cancel_all();
+            shutdown.store(true, Ordering::Relaxed);
+            handle.join().map_err(|_| "listener panicked")?;
+            result?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn a_v2_listener_negotiates_bip324_with_a_v2_initiator() -> TestResult {
     let (listener_shared, _) = shared(true);
     let (addr, shutdown, handle) = listen(listener_shared)?;

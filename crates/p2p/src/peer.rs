@@ -298,6 +298,8 @@ pub struct Peer<S> {
     pub version_received_time: Option<u64>,
     /// Whether a remote verack has been received.
     pub received_verack: bool,
+    /// Whether our VERACK was successfully written; closes the BIP434 send window.
+    sent_verack: bool,
     /// Local view of negotiated feature flags.
     pub capabilities: PeerCapabilities,
     /// BIP152 compact-block negotiation state for the peer.
@@ -375,6 +377,7 @@ impl<S> Peer<S> {
             remote_version: None,
             version_received_time: None,
             received_verack: false,
+            sent_verack: false,
             capabilities: PeerCapabilities::default(),
             compact_blocks: CompactBlockNegotiation::default(),
             wtxid_relay: WtxidRelayState::default(),
@@ -505,12 +508,27 @@ impl<S: Read + Write> Peer<S> {
     /// payload before the write attempt, the way Core's `CSerializedNetMsg` is
     /// shared by its send path and the probe.
     pub fn send(&mut self, message: &Message) -> Result<usize, PeerError> {
+        if matches!(message, Message::Feature(_))
+            && (self.sent_verack
+                || self
+                    .remote_version
+                    .as_ref()
+                    .is_none_or(|version| version.version < crate::feature::FEATURE_VERSION))
+        {
+            return Err(PeerError::Protocol(
+                "feature outside negotiated send window",
+            ));
+        }
         let transport = self.send.as_mut().ok_or(PeerError::Protocol(
             "send transport moved to the writer thread",
         ))?;
         let frame = transport.encode(message)?;
         crate::net_trace::outbound_message(self.net_trace.as_ref(), message, frame.payload());
-        crate::wire::write_frame(&mut self.stream, &frame)
+        let written = crate::wire::write_frame(&mut self.stream, &frame)?;
+        if matches!(message, Message::Verack) {
+            self.sent_verack = true;
+        }
+        Ok(written)
     }
 }
 
@@ -598,6 +616,73 @@ pub(crate) const MAX_BLOCK_SERIALIZED_SIZE_USIZE: usize = 4_000_000;
 mod tests {
     use super::*;
     use crate::wire::write_message;
+
+    #[test]
+    fn bip434_send_window_uses_remote_version_and_local_verack() -> Result<(), PeerError> {
+        use std::io::Cursor;
+        let mut peer = Peer::new(Cursor::new(Vec::new()), Magic::BITCOIN);
+        let feature = Message::Feature(crate::feature::FeatureAnnouncement::bip332(true));
+        assert!(matches!(peer.send(&feature), Err(PeerError::Protocol(_))));
+        assert_eq!(peer.stream.get_ref().as_slice(), [0_u8; 0]);
+
+        let mut version = crate::handshake::version_message(
+            1,
+            0,
+            crate::PeerRole::FullRelay,
+            bitcoin::p2p::ServiceFlags::NETWORK,
+        );
+        version.version = crate::feature::FEATURE_VERSION - 1;
+        peer.remote_version = Some(version.clone());
+        assert!(matches!(peer.send(&feature), Err(PeerError::Protocol(_))));
+        assert_eq!(peer.stream.get_ref().as_slice(), [0_u8; 0]);
+
+        version.version = crate::feature::FEATURE_VERSION;
+        peer.remote_version = Some(version);
+        peer.send(&feature)?;
+        // Receiving the remote VERACK closes only the receive window.
+        crate::fsm::step(&mut peer, &Message::Verack)?;
+        peer.send(&feature)?;
+        peer.send(&Message::Verack)?;
+        let written = peer.stream.get_ref().len();
+        assert!(matches!(peer.send(&feature), Err(PeerError::Protocol(_))));
+        assert_eq!(peer.stream.get_ref().len(), written);
+        Ok(())
+    }
+
+    #[test]
+    fn bip434_send_window_closes_only_after_a_successful_verack_write() -> Result<(), PeerError> {
+        struct FailOnce(bool);
+        impl Read for FailOnce {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for FailOnce {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.0) {
+                    Err(std::io::Error::other("injected write failure"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut peer = Peer::new(FailOnce(true), Magic::BITCOIN);
+        peer.remote_version = Some(crate::handshake::version_message(
+            1,
+            0,
+            crate::PeerRole::FullRelay,
+            bitcoin::p2p::ServiceFlags::NETWORK,
+        ));
+        let feature = Message::Feature(crate::feature::FeatureAnnouncement::bip332(true));
+        assert!(matches!(peer.send(&Message::Verack), Err(PeerError::Io(_))));
+        peer.send(&feature)?;
+        peer.send(&Message::Verack)?;
+        assert!(matches!(peer.send(&feature), Err(PeerError::Protocol(_))));
+        Ok(())
+    }
 
     fn filter_request() -> crate::dispatch::FilterRequest {
         crate::dispatch::FilterRequest::new(crate::Message::GetAddr)

@@ -6232,7 +6232,7 @@ mod discouragement_tests {
     }
 
     #[test]
-    fn accepted_version_updates_each_time_without_replaying_on_later_steps()
+    fn accepted_version_updates_once_without_replaying_on_later_steps()
     -> Result<(), Box<dyn std::error::Error>> {
         for (repeated_version, protected) in
             [(true, false), (true, true), (false, false), (false, true)]
@@ -6303,12 +6303,14 @@ mod discouragement_tests {
                 &shared,
             );
             if repeated_version {
-                assert!(matches!(
-                    result,
-                    Err(PeerError::Protocol(
-                        "outbound peer lacks desirable services"
-                    ))
-                ));
+                if protected {
+                    assert!(matches!(result, Err(PeerError::Io(_))));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(PeerError::Misbehavior("duplicate version message"))
+                    ));
+                }
             } else {
                 result?;
                 assert_eq!(peer.state, crate::PeerState::Ready);
@@ -6318,7 +6320,7 @@ mod discouragement_tests {
             let stored: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 32])?;
             assert_eq!(
                 stored["records"][0]["services"],
-                if repeated_version { 1 } else { 1033 },
+                if repeated_version { 9 } else { 1033 },
                 "accepted VERSION replaces flags; later feature/VERACK must preserve a fresh gossip update"
             );
             assert_eq!(stored["records"][0]["last_success"], 0);

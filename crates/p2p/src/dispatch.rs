@@ -2939,6 +2939,7 @@ mod tests {
         let both = PKG_RELAY_PKGTXNS | PKG_RELAY_ANC;
         let mut peer = Peer::new(Cursor::new(Vec::<u8>::new()), Magic::BITCOIN);
         peer.offer_package_relay(both | (1 << 40));
+        peer.offer_stale_tip_relay(true);
 
         let first = dispatch_inbound(&mut peer, &version_at(PROTOCOL_VERSION))?;
 
@@ -2952,12 +2953,14 @@ mod tests {
         expected.push(Message::Verack);
         assert_eq!(first, expected);
 
-        let second = dispatch_inbound(&mut peer, &version_at(PROTOCOL_VERSION))?;
-        assert!(
-            !second
-                .iter()
-                .any(|response| matches!(response, Message::SendPackages(_)))
-        );
+        let before = peer_snapshot(&peer);
+        let remote_version = peer.remote_version.clone();
+        assert!(matches!(
+            dispatch_inbound(&mut peer, &version_at(PROTOCOL_VERSION - 1)),
+            Err(PeerError::Misbehavior("duplicate version message"))
+        ));
+        assert_eq!(peer_snapshot(&peer), before);
+        assert_eq!(peer.remote_version, remote_version);
         Ok(())
     }
 

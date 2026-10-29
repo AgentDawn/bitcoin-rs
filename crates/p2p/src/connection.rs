@@ -1228,6 +1228,12 @@ impl PeerLease {
         if self.is_cancelled() {
             return Err(OutboundRefusal::Closed(message));
         }
+        // Feature advertisements belong to Peer::send's handshake window,
+        // never the post-handshake queue, even when the shared budget is full.
+        if matches!(message, crate::Message::Feature(_)) {
+            self.cancel();
+            return Err(OutboundRefusal::Closed(message));
+        }
         let Ok(wire_len) = crate::wire::wire_len(&message) else {
             self.cancel();
             return Err(OutboundRefusal::Closed(message));
@@ -1261,6 +1267,11 @@ impl PeerLease {
             "a credit is spent only on the lease that charged it"
         );
         if self.is_cancelled() {
+            return Err(OutboundRefusal::Closed(message));
+        }
+        // A reserved credit is released on this local protocol refusal.
+        if matches!(message, crate::Message::Feature(_)) {
+            self.cancel();
             return Err(OutboundRefusal::Closed(message));
         }
         let Ok(wire_len) = crate::wire::wire_len(&message) else {
@@ -1731,6 +1742,31 @@ mod tests {
         );
         assert!(lease.is_cancelled());
         assert_eq!(lease.budget_handle().pending(), (0, 0));
+    }
+
+    #[test]
+    fn bip434_features_never_enter_the_post_handshake_queue() {
+        for reserved in [false, true] {
+            let shared = Arc::new(SharedOutboundBudget::with_limits(10_000, 1_000));
+            let (lease, rx) = shared_lease_with_reserve(&shared, 1_000);
+            let message =
+                crate::Message::Feature(crate::feature::FeatureAnnouncement::bip332(true));
+            let credit = reserved.then(|| reserve(&lease.budget_handle()));
+            // Even under aggregate pressure this is a local caller error,
+            // never retryable Shared backpressure.
+            let (other, _rx) = shared_lease_with_reserve(&shared, 1_000);
+            let held = charge(&other.budget_handle(), 10_000 - shared.pending());
+            let result = match credit {
+                Some(credit) => lease.send_with(credit, message.clone()),
+                None => lease.send(message.clone()),
+            };
+            assert_eq!(result, Err(OutboundRefusal::Closed(message)));
+            assert!(lease.is_cancelled());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(lease.budget_handle().pending(), (0, 0));
+            drop(held);
+            assert_eq!(shared.pending(), 0);
+        }
     }
 
     #[test]
