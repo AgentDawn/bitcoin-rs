@@ -43,8 +43,7 @@ static EXPORT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn staged_temp_name(name: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |elapsed| elapsed.as_nanos());
     let counter = EXPORT_TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!(
         "{name}.{pid}.{nanos:x}-{counter:x}.incomplete",

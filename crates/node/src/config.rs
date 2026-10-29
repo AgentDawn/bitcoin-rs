@@ -5,12 +5,12 @@ use anyhow::Result;
 use bitcoin_rs_chainstate::{ChainstateJournalConfig, ValidationMode};
 use bitcoin_rs_consensus::ValidationEngine;
 use bitcoin_rs_index::IndexCapabilities;
+#[cfg(feature = "pool")]
+use bitcoin_rs_mining::pool::ledger as pool_ledger;
 use bitcoin_rs_p2p::PeerNetwork;
 use bitcoin_rs_p2p::endpoint::{ClassifiedEndpoint, classify_endpoint};
 use bitcoin_rs_primitives::Network;
 use bitcoin_rs_storage::StorageBackend;
-#[cfg(feature = "pool")]
-use bitcoin_rs_mining::pool::ledger as pool_ledger;
 use core::fmt;
 use crossbeam_channel::Receiver;
 use serde::Deserialize;
@@ -518,6 +518,10 @@ impl NodeConfig {
     /// profile's value for a field no layer set.
     /// INVARIANT: a network selection never overwrites a field an operator
     /// set on any layer; it only fills the gaps (`ARCH-05`).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "One fold of every resolved field keeps precedence auditable in one place"
+    )]
     fn materialize(settings: &UserConfig, selection: NetworkSelection) -> Self {
         let profile = NetworkProfile::for_selection(selection);
         let mut chainstate_journal = ChainstateJournalConfig::default();
@@ -634,10 +638,6 @@ impl NodeConfig {
     /// This is the fail-early gate for engine selection: an engine this build
     /// cannot execute is rejected here — before the data directory opens,
     /// chainstate exists, or any worker starts.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Keep resolved cross-field checks in one ordered fail-early gate before startup"
-    )]
     pub fn validate(&self) -> Result<()> {
         if let Some(pool) = &self.pool {
             pool.validate()?;
@@ -804,17 +804,11 @@ impl NodeConfig {
             "proxy/overlay routing requires --dns-seeds-enabled=false; DNS seeds resolve via local DNS and would bypass the privacy route"
         );
         anyhow::ensure!(
-            !overlay
-                .onlynet
-                .contains(&PeerNetwork::Onion)
-                || onion_route,
+            !overlay.onlynet.contains(&PeerNetwork::Onion) || onion_route,
             "--onlynet=onion requires an onion route (--onion-proxy or --proxy)"
         );
         anyhow::ensure!(
-            !overlay
-                .onlynet
-                .contains(&PeerNetwork::I2p)
-                || overlay.i2p_sam.is_some(),
+            !overlay.onlynet.contains(&PeerNetwork::I2p) || overlay.i2p_sam.is_some(),
             "--onlynet=i2p requires an I2P SAM bridge (--i2p-sam)"
         );
         anyhow::ensure!(
