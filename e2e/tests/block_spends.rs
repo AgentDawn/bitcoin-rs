@@ -25,15 +25,23 @@ fn compare_raw_transaction(
     txid: &str,
     block: Option<&str>,
 ) -> Result<Value> {
-    let params = if let Some(block) = block {
-        json!([txid, true, block])
-    } else {
-        json!([txid, true])
-    };
-    let reference = core.rpc("getrawtransaction", &params)?;
-    let native = node.rpc("getrawtransaction", &params)?;
-    compare_reply("verbose raw transaction", &reference, &native)?;
-    Ok(native)
+    let mut detailed = Value::Null;
+    for verbosity in [json!(true), json!(1), json!(2)] {
+        let params = if let Some(block) = block {
+            json!([txid, verbosity, block])
+        } else {
+            json!([txid, verbosity])
+        };
+        let reference = core.rpc("getrawtransaction", &params)?;
+        let native = node.rpc("getrawtransaction", &params)?;
+        compare_reply("verbose raw transaction", &reference, &native)?;
+        if verbosity != 2 {
+            assert!(native.get("fee").is_none());
+            assert!(native["vin"][0].get("prevout").is_none());
+        }
+        detailed = native;
+    }
+    Ok(detailed)
 }
 
 fn compare_raw_lookup_sources(
@@ -46,6 +54,10 @@ fn compare_raw_lookup_sources(
     let explicit = compare_raw_transaction(core, node, txid, Some(block))?;
     assert_eq!(explicit["version"], u32::MAX);
     assert_eq!(explicit["in_active_chain"], true);
+    assert_eq!(explicit["fee"], json!(0.000_01));
+    assert_eq!(explicit["vin"][0]["prevout"]["height"], 1);
+    assert_eq!(explicit["vin"][1]["prevout"]["height"], 2);
+    assert_eq!(explicit["vin"][0]["prevout"]["generated"], true);
     for process in [&mut *core, &mut *node] {
         process.wait_for(
             "txindex reaches high-version block",
@@ -61,6 +73,16 @@ fn compare_raw_lookup_sources(
     let indexed = compare_raw_transaction(core, node, txid, None)?;
     assert!(indexed.get("in_active_chain").is_none());
     assert_eq!(indexed["version"], u32::MAX);
+    let mut explicit_without_flag = explicit;
+    explicit_without_flag
+        .as_object_mut()
+        .ok_or_else(|| Error::Protocol("transaction object missing".into()))?
+        .remove("in_active_chain");
+    compare_reply(
+        "explicit and indexed raw transaction",
+        &explicit_without_flag,
+        &indexed,
+    )?;
     // Standard version 2 can enter both mempools without a policy override.
     // The high-bit version above is covered through actual block admission.
     let (outpoint, prevout) = funds.confirmed_output(2)?;
@@ -76,12 +98,14 @@ fn compare_raw_lookup_sources(
         "time",
         "blocktime",
         "in_active_chain",
+        "fee",
     ] {
         assert!(
             unconfirmed.get(field).is_none(),
             "mempool field {field} must be absent"
         );
     }
+    assert!(unconfirmed["vin"][0].get("prevout").is_none());
     Ok(())
 }
 
@@ -232,6 +256,26 @@ fn undo_formats_same_block_inputs_stale_extent_and_restart() -> Result<()> {
     let txid = parent.compute_txid().to_string();
     compare_raw_lookup_sources(&mut core, &mut node, &funds, &txid, &block)?;
     let result = compare_formats(&mut core, &mut node, &block)?;
+    let child_tx = compare_raw_transaction(
+        &mut core,
+        &mut node,
+        &child.compute_txid().to_string(),
+        Some(&block),
+    )?;
+    assert_eq!(child_tx["fee"], json!(0.000_02));
+    assert_eq!(child_tx["vin"][0]["prevout"]["height"], 103);
+    assert_eq!(child_tx["vin"][0]["prevout"]["generated"], false);
+    compare_raw_transaction(
+        &mut core,
+        &mut node,
+        &child.compute_txid().to_string(),
+        None,
+    )?;
+    let coinbase_id = result["tx"][0].str_field("txid")?;
+    let coinbase = compare_raw_transaction(&mut core, &mut node, coinbase_id, Some(&block))?;
+    assert!(coinbase.get("fee").is_none());
+    assert!(coinbase["vin"][0].get("prevout").is_none());
+    compare_raw_transaction(&mut core, &mut node, coinbase_id, None)?;
     assert_eq!(result["tx"][1]["version"], u32::MAX);
     assert_eq!(
         result["version"],
@@ -273,6 +317,31 @@ fn undo_formats_same_block_inputs_stale_extent_and_restart() -> Result<()> {
     assert!(reference.get("nextblockhash").is_none());
     assert!(native["tx"][1]["vin"][0].get("prevout").is_none());
     assert!(native["tx"][1].get("fee").is_none());
+    let native_raw = node.rpc("getrawtransaction", &json!([txid, 2, block]))?;
+    let reference_raw = core.rpc("getrawtransaction", &json!([txid, 2, block]))?;
+    assert!(native_raw.get("fee").is_none());
+    assert!(native_raw["vin"][0].get("prevout").is_none());
+    assert!(reference_raw.get("fee").is_some());
+    // The documented certification deviation affects only undo fields.
+    let mut without_undo = reference_raw;
+    without_undo
+        .as_object_mut()
+        .ok_or_else(|| Error::Protocol("transaction object missing".into()))?
+        .remove("fee");
+    for input in without_undo["vin"]
+        .as_array_mut()
+        .ok_or_else(|| Error::Protocol("inputs missing".into()))?
+    {
+        input
+            .as_object_mut()
+            .ok_or_else(|| Error::Protocol("input object missing".into()))?
+            .remove("prevout");
+    }
+    compare_reply(
+        "uncertified stale raw transaction",
+        &without_undo,
+        &native_raw,
+    )?;
     assert_eq!(
         node.http_get(&format!("/rest/spenttxouts/{block}.json"))?
             .status,
@@ -306,7 +375,14 @@ fn pruned_undo_is_unavailable_and_retained_undo_survives_restart() -> Result<()>
         ..SpawnOptions::default()
     };
     let mut node = ProcessNode::spawn_with(Kind::BitcoinRs, &opts)?;
-    for _ in 0..8 {
+    let funds = mine_common_chain(&mut core, &mut node, 102)?;
+    let spend = funds.signed_spend(1000, Sequence::MAX)?;
+    let spend_id = spend.compute_txid().to_string();
+    let spend_block = submit_common(&mut core, &mut node, &[serialize_hex(&spend)])?;
+    // Explicit-block verbosity 2 needs no txindex, including on prune nodes.
+    let raw = compare_raw_transaction(&mut core, &mut node, &spend_id, Some(&spend_block))?;
+    assert_eq!(raw["fee"], json!(0.000_01));
+    for _ in 0..7 {
         mine_common_chain(&mut core, &mut node, 100)?;
     }
     let old = core.rpc("getblockhash", &json!([1]))?;
@@ -317,6 +393,11 @@ fn pruned_undo_is_unavailable_and_retained_undo_survives_restart() -> Result<()>
     let mut node = ProcessNode::spawn_in_datadir(Kind::BitcoinRs, &opts, datadir)?;
     for process in [&mut core, &mut node] {
         process.rpc("pruneblockchain", &json!([400]))?;
+        let raw = process.rpc_raw(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"getrawtransaction",
+            "params":[spend_id, 2, spend_block]
+        }))?;
+        assert_eq!(raw["error"]["code"], -1);
         let reply = process
             .rpc_raw(&json!({"jsonrpc":"2.0", "id":1, "method":"getblock", "params":[old,3]}))?;
         assert_eq!(reply["error"]["code"], -1);

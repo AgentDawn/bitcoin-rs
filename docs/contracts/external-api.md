@@ -106,6 +106,8 @@ scanning and wallet interoperability remain unverified.
   projection, preserving unsigned transaction versions across mempool,
   explicit-block, and txindex lookups. Inactive explicit blocks report zero
   confirmations and omit time fields; mempool replies omit chain fields.
+  Numeric verbosity 2 extends that projection with certified fees and input
+  prevouts; verbosity 1 and boolean true retain the ordinary projection.
 - Core script JSON has one projection owner in `tx_render.rs`: decimal short
   pushes, malformed-instruction markers, checksummed inferred descriptors,
   and optional address/hex fields. Transaction inputs alone decode defined
@@ -132,7 +134,8 @@ scanning and wallet interoperability remain unverified.
 
 #### Retained block inputs
 
-- `getblock` verbosity 2/3 and `/rest/spenttxouts` use the same read-only
+- `getblock` verbosity 2/3, `getrawtransaction` verbosity 2, and
+  `/rest/spenttxouts` use the same read-only
   `utxo::contract::BlockUndoSource`, implemented by the chainstate owner.
   RPC captures one `AppliedView` for confirmations/next-block linkage and
   passes its hash into the owner. A moved applied hash, durable receipt
@@ -144,8 +147,9 @@ scanning and wallet interoperability remain unverified.
   No present-day UTXO lookup or invented coin is used. The native version-1
   undo format and its mutation/recovery path are unchanged.
 - A retained body with uncertified or pruned undo can be returned without
-  fee/prevout fields by `getblock`; REST reports undo unavailable. Missing or
-  unreadable *expected* undo remains a typed error, never an empty success.
+  fee/prevout fields by `getblock` and `getrawtransaction`; REST reports undo
+  unavailable. Missing or unreadable *expected* undo remains a typed error,
+  never an empty success.
   A missing body under a granted lease retains `HistoryUnavailable::Missing`
   and is transient (REST 503). Pruned bodies/undo stay unavailable. Genesis
   has one empty spent-output row without requiring an undo record; getblock
@@ -159,14 +163,18 @@ scanning and wallet interoperability remain unverified.
   DTO cannot represent that complete integer range. Header versions and
   raw/txid payload shapes retain their existing semantics. Stale block
   headers omit the active competing branch's successor hash, matching Core.
+  `getrawtransaction` verbosity 2 includes both fees and prevouts, pairing
+  the requested transaction with its row in the authenticated block for
+  explicit-block and txindex lookups. Mempool and coinbase replies omit both.
 - This remains a declared deviation: after a later branch receipt replaces
   the retained undo extent, older stale rows lack current certification and
   their undo fields are omitted even if raw rows remain. Snapshot history
   is unavailable until its archive receipt certifies it. Transient absence
   and explicit resource limits can return retry responses unlike Core.
   `/rest/block` retains its separate projection without undo fields.
-- Full block REST rendering, spent outputs, and detailed getblock responses
-  share two materialization permits. The owner bounds body copies to
+- Full block REST rendering, spent outputs, detailed getblock responses,
+  and getrawtransaction verbosity 2 block reads share two materialization
+  permits. The owner bounds body copies to
   4,000,000 bytes and undo copies to 64 MiB. Undo counts are bounded by the
   authenticated block and remaining record bytes; script lengths must fit the
   record before allocation. Spent-input rows derive from that block, and each
@@ -1330,6 +1338,8 @@ only. It does not establish mainnet memory, throughput, or commit-blocking time.
 - Retained block inputs: `e2e/tests/block_spends.rs` compares actual pinned Core
   processes for full v2/v3 JSON, unsigned transaction versions, REST formats,
   same-block inputs, disconnects, later forks, pruning, genesis, and restart.
+  It also compares raw transaction verbosity 1/2 and boolean true through
+  explicit-block and txindex lookups, including unavailable stale history.
   `crates/chainstate/tests/unit/block_spends_tests.rs` covers durable receipts,
   archive progress, lease expiry, missing/corrupt records, and ancestry bounds;
   `crates/storage/tests/bounded_value_read.rs` covers borrowed/pinned copy

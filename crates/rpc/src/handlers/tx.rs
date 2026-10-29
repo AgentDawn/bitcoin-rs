@@ -16,7 +16,7 @@ use bitcoin_rs_script::{opcode, push_data};
 use miniscript::psbt::PsbtExt as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueMutTrait as _, JsonValueTrait, Value, json};
 
-use crate::context::Context;
+use crate::context::{AppliedView, Context};
 use crate::convert::{self, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls};
 use crate::error::RpcError;
 use crate::handlers::{optional_bool, params_array, parse_txid, required_str, required_u64};
@@ -62,6 +62,7 @@ fn block_hash_param_error(value: &str, label: &str) -> RpcError {
 pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let txid = parse_txid(required_str(params, 0, "txid is required")?, "parameter 1")?;
     let verbose = raw_transaction_verbosity(params)?;
+    let view = ctx.chain.applied_view();
     let blockhash = params_array(params)?
         .get(2)
         .filter(|value| !value.is_null())
@@ -76,17 +77,24 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         .transpose()?;
 
     if let Some(hash) = blockhash {
-        let record = ctx
-            .chain
-            .block_by_hash(hash)
-            .ok_or(RpcError::NotFound("block not found"))?;
+        // Detailed reads resolve only header identity before entering the
+        // certified, bounded body/undo owner under the shared render budget.
+        let record = if verbose == 2 && ctx.chain.block_undo_source.is_some() {
+            ctx.chain.header_record(hash)
+        } else {
+            ctx.chain.block_by_hash(hash)
+        }
+        .ok_or(RpcError::NotFound("block not found"))?;
+        if verbose == 2 {
+            return raw_transaction_with_spends(ctx, txid, &record, &view, true);
+        }
         let block = load_block(ctx, &record)?;
         let tx = block
             .txs
             .iter()
             .find(|tx| tx.txid() == txid)
             .ok_or(RpcError::NotFound("transaction not in specified block"))?;
-        return render_raw_transaction(ctx, tx, verbose, Some(&record), true);
+        return render_raw_transaction(ctx, tx, verbose, Some(&record), true, &view, None);
     }
 
     let pooled_tx = {
@@ -94,7 +102,7 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         pool.entry_by_txid(&txid).map(|entry| Arc::clone(&entry.tx))
     };
     if let Some(tx) = pooled_tx {
-        return render_raw_transaction(ctx, tx.as_ref(), verbose, None, false);
+        return render_raw_transaction(ctx, tx.as_ref(), verbose, None, false, &view, None);
     }
     if let Some(derived_index) = ctx.indexes.derived_index.as_ref() {
         let tx = derived_index.transaction(&txid).map_err(RpcError::from)?;
@@ -102,27 +110,40 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
             let record = derived_index
                 .transaction_height(&txid)
                 .map_err(RpcError::from)?
-                .and_then(|height| ctx.chain.block_by_height(height));
-            return render_raw_transaction(ctx, &tx, verbose, record.as_ref(), false);
+                .and_then(|height| {
+                    if verbose == 2 && ctx.chain.block_undo_source.is_some() {
+                        ctx.chain
+                            .block_hash_at_height_in_view(&view, height)
+                            .and_then(|hash| ctx.chain.header_record(hash))
+                    } else {
+                        ctx.chain.block_by_height_in_view(&view, height)
+                    }
+                });
+            if verbose == 2 && !tx.is_coinbase() {
+                let record = record.as_ref().ok_or_else(|| {
+                    RpcError::Misc("transaction block changed during the query; retry".to_owned())
+                })?;
+                return raw_transaction_with_spends(ctx, txid, record, &view, false);
+            }
+            return render_raw_transaction(ctx, &tx, verbose, record.as_ref(), false, &view, None);
         }
     }
 
     Err(RpcError::NotFound("transaction not found"))
 }
 
-fn raw_transaction_verbosity(params: &Value) -> Result<bool, RpcError> {
+fn raw_transaction_verbosity(params: &Value) -> Result<u64, RpcError> {
     let Some(value) = params_array(params)?.get(1) else {
-        return Ok(false);
+        return Ok(0);
     };
     if value.is_null() {
-        return Ok(false);
+        return Ok(0);
     }
     if let Some(verbose) = value.as_bool() {
-        return Ok(verbose);
+        return Ok(u64::from(verbose));
     }
     match value.as_u64() {
-        Some(0) => Ok(false),
-        Some(1 | 2) => Ok(true),
+        Some(verbosity @ 0..=2) => Ok(verbosity),
         Some(_) => Err(RpcError::InvalidParams("verbosity must be 0, 1, or 2")),
         None => Err(RpcError::InvalidType(
             "verbosity must be a boolean or integer".to_owned(),
@@ -142,22 +163,20 @@ fn load_block(ctx: &Context, record: &BlockRecord) -> Result<NativeBlock, RpcErr
 fn render_raw_transaction(
     ctx: &Context,
     tx: &Tx,
-    verbose: bool,
+    verbose: u64,
     record: Option<&BlockRecord>,
     explicit_block: bool,
+    view: &AppliedView,
+    coins: Option<&[bitcoin_rs_utxo::UtxoCoin]>,
 ) -> Result<Value, RpcError> {
-    if !verbose {
+    if verbose == 0 {
         return typed_to_sonic(&v31::GetRawTransaction(
             consensus_bytes(tx).to_lower_hex_string(),
         ));
     }
     let chain = record.map(|record| {
-        let confirmations = super::chain::confirmations(
-            ctx,
-            &ctx.chain.applied_view(),
-            record.hash.into(),
-            record.height,
-        );
+        let confirmations =
+            super::chain::confirmations(ctx, view, record.hash.into(), record.height);
         crate::tx_render::TransactionChainContext {
             block_hash: record.hash,
             confirmations: confirmations.max(0),
@@ -165,11 +184,47 @@ fn render_raw_transaction(
             in_active_chain: explicit_block.then_some(confirmations > 0),
         }
     });
-    Ok(crate::tx_render::transaction_json(
+    crate::tx_render::transaction_json_with_spends(
         tx,
         ctx.chain.chain_network,
         chain,
-    ))
+        coins,
+        verbose == 2,
+    )
+}
+
+fn raw_transaction_with_spends(
+    ctx: &Context,
+    txid: Txid,
+    record: &BlockRecord,
+    view: &AppliedView,
+    explicit_block: bool,
+) -> Result<Value, RpcError> {
+    let _render = ctx
+        .try_acquire_block_render()
+        .ok_or_else(|| RpcError::Misc("too many concurrent full-block reads; retry".to_owned()))?;
+    let (block, spent) = super::chain::block_with_spends(ctx, record, view, 2)?;
+    let (index, tx) = block
+        .txs
+        .iter()
+        .enumerate()
+        .find(|(_, tx)| tx.txid() == txid)
+        .ok_or_else(|| {
+            if explicit_block {
+                RpcError::NotFound("transaction not in specified block")
+            } else {
+                RpcError::Misc("transaction block changed during the query; retry".to_owned())
+            }
+        })?;
+    render_raw_transaction(
+        ctx,
+        tx,
+        2,
+        Some(record),
+        explicit_block,
+        view,
+        spent.as_ref().map(|rows| rows[index].as_slice()),
+    )
 }
 
 pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -1362,6 +1417,145 @@ mod tests {
             )
             .unwrap_or_else(|err| panic!("getrawtransaction with blockhash: {err}"));
         assert!(result.is_str(), "expected hex string, got {result:?}");
+    }
+
+    #[test]
+    fn getrawtransaction_detailed_read_preserves_undo_failures_and_render_budget() {
+        use bitcoin_rs_utxo::contract::{BlockSpends, BlockSpendsError, BlockUndoSource};
+
+        struct FailingSource(fn() -> BlockSpendsError);
+        impl BlockUndoSource for FailingSource {
+            fn block_spends(
+                &self,
+                _: Hash256,
+                _: Hash256,
+            ) -> Result<BlockSpends, BlockSpendsError> {
+                Err((self.0)())
+            }
+        }
+        let block = fixture_genesis();
+        let context = |failure| {
+            let mut ctx = Context::new();
+            ctx.chain
+                .block_tree
+                .write()
+                .insert_node(None, block.header, NodeStatus::Active)
+                .expect("header");
+            ctx.chain.block_undo_source = Some(Arc::new(FailingSource(failure)));
+            Arc::new(ctx)
+        };
+        let args = json!([
+            block.txs[0].txid().to_string(),
+            2,
+            block.block_hash().to_string()
+        ]);
+        // No body reader is installed: detailed reads must go directly to the
+        // bounded owner, and must not fall back after its typed refusal.
+        let retry: fn() -> BlockSpendsError = || BlockSpendsError::Retry;
+        for (failure, code) in [
+            (retry, -1),
+            (|| BlockSpendsError::Closed, -1),
+            (|| BlockSpendsError::ResourceLimit, -1),
+            (|| BlockSpendsError::Corrupt("fixture"), -32603),
+            (
+                || {
+                    BlockSpendsError::Undo(bitcoin_rs_utxo::contract::UndoLoadError::Missing {
+                        hash: Hash256::default(),
+                        height: 1,
+                    })
+                },
+                -32603,
+            ),
+        ] {
+            assert_eq!(
+                getrawtransaction(&context(failure), &args)
+                    .expect_err("read failure")
+                    .code(),
+                code
+            );
+        }
+        let ctx = context(|| BlockSpendsError::Corrupt("fixture"));
+        let first = ctx.try_acquire_block_render().expect("first permit");
+        let second = ctx.try_acquire_block_render().expect("second permit");
+        let error = getrawtransaction(&ctx, &args).expect_err("budget refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("too many concurrent full-block reads")
+        );
+        drop((first, second));
+        assert_eq!(
+            getrawtransaction(&ctx, &args)
+                .expect_err("undo failure")
+                .code(),
+            -32603
+        );
+    }
+
+    #[test]
+    fn getrawtransaction_detailed_read_omits_unavailable_undo_and_rejects_partial_rows() {
+        use bitcoin_rs_primitives::Amount;
+        use bitcoin_rs_utxo::contract::{
+            BlockSpends, BlockSpendsError, BlockUndoSource, HistoryUnavailable,
+        };
+
+        struct Source {
+            block: Block,
+            mode: u8,
+            expected: Hash256,
+        }
+        impl BlockUndoSource for Source {
+            fn block_spends(
+                &self,
+                hash: Hash256,
+                expected: Hash256,
+            ) -> Result<BlockSpends, BlockSpendsError> {
+                assert_eq!(hash, Hash256::from(self.block.block_hash()));
+                assert_eq!(expected, self.expected);
+                let spent = match self.mode {
+                    0 => Err(HistoryUnavailable::Missing),
+                    1 => Err(HistoryUnavailable::Pruned { below: 1 }),
+                    2 => Ok(vec![vec![]]), // Missing the spend's row is not omission.
+                    _ => Ok(vec![vec![], vec![]]), // Nor is a partial input row.
+                };
+                Ok(BlockSpends {
+                    block: self.block.clone(),
+                    spent,
+                })
+            }
+        }
+        let mut block = fixture_genesis();
+        let mut spend = block.txs[0].clone();
+        spend.inputs[0].previous_output = OutPoint::new(block.txs[0].txid(), 0);
+        spend.outputs[0].value = Amount::from_sat(49);
+        block.txs.push(spend.clone());
+        block.header.merkle_root =
+            bitcoin_rs_chain::regtest_fixture::merkle_root(&block.txs).expect("merkle root");
+        for mode in 0..4 {
+            let mut ctx = Context::new();
+            ctx.chain
+                .block_tree
+                .write()
+                .insert_node(None, block.header, NodeStatus::Active)
+                .expect("header");
+            ctx.chain.block_undo_source = Some(Arc::new(Source {
+                block: block.clone(),
+                mode,
+                expected: ctx.chain.applied_hash(),
+            }));
+            let result = getrawtransaction(
+                &Arc::new(ctx),
+                &json!([spend.txid().to_string(), 2, block.block_hash().to_string()]),
+            );
+            if mode < 2 {
+                let value = result.expect("uncertified undo is omitted");
+                assert!(value.get("fee").is_none());
+                assert!(value["vin"][0].get("prevout").is_none());
+                assert_eq!(value["in_active_chain"].as_bool(), Some(false));
+            } else {
+                assert_eq!(result.expect_err("partial undo").code(), -32603);
+            }
+        }
     }
 
     #[test]

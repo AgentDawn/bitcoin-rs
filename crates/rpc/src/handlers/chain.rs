@@ -1889,7 +1889,7 @@ fn render_block_header_verbose(
 
 type SpentCoins = Vec<Vec<bitcoin_rs_utxo::UtxoCoin>>;
 
-fn block_with_spends(
+pub(super) fn block_with_spends(
     ctx: &Context,
     record: &BlockRecord,
     view: &AppliedView,
@@ -1913,6 +1913,14 @@ fn block_with_spends(
                 ));
             }
         };
+        if spent
+            .as_ref()
+            .is_some_and(|rows| rows.len() != result.block.txs.len())
+        {
+            return Err(RpcError::CoreInternal(
+                "block undo transaction count differs".to_owned(),
+            ));
+        }
         return Ok((result.block, spent));
     }
     let (_, block) = decode_block(ctx, record)?;
@@ -1938,18 +1946,13 @@ fn render_detailed_block(
     verbosity: u64,
     network: Network,
 ) -> Result<Value, RpcError> {
-    if spent.is_some_and(|spent| spent.len() != block.txs.len()) {
-        return Err(RpcError::CoreInternal(
-            "block undo transaction count differs".to_owned(),
-        ));
-    }
     let tx = block
         .txs
         .iter()
         .enumerate()
         .map(|(index, tx)| {
             let coins = spent.and_then(|spent| spent.get(index)).map(Vec::as_slice);
-            crate::tx_render::transaction_json_with_spends(tx, network, coins, verbosity >= 3)
+            crate::tx_render::transaction_json_with_spends(tx, network, None, coins, verbosity >= 3)
         })
         .collect::<Result<Vec<_>, RpcError>>()?;
     // Header/common fields retain the pinned DTO. Transaction values use the
