@@ -38,7 +38,7 @@ curl -s http://127.0.0.1:18443/api/blocks/tip/height
 # 0
 ```
 
-Contents: [Install](#install) · [Quick start](#quick-start) · [Why bitcoin-rs](#why-bitcoin-rs) · [Architecture](#architecture) · [Compatibility and limitations](#compatibility-and-limitations) · [Development](#development) · [License](#license)
+Contents: [Install](#install) · [Quick start](#quick-start) · [Why bitcoin-rs](#why-bitcoin-rs) · [Experimental BIP Adoption](#experimental-bip-adoption) · [Architecture](#architecture) · [Compatibility and limitations](#compatibility-and-limitations) · [Development](#development) · [License](#license)
 
 ---
 
@@ -176,6 +176,28 @@ Bitcoin is not defined by the continued preservation of one codebase. **The code
 can change; consensus is what must remain.** `bitcoin-rs` aims to provide an
 independently designed implementation that can be compared against Bitcoin Core
 and other implementations through reproducible evidence.
+
+
+---
+
+## Experimental BIP Adoption
+
+`bitcoin-rs` aims to make Bitcoin protocol experimentation easier. An
+independent implementation can prototype proposed P2P, relay, policy, and
+wallet-facing BIPs before they land in Bitcoin Core, giving BIP authors another
+implementation to test against and helping uncover interoperability issues
+early.
+
+Experiments start small, reversible, and opt-in. Active mainnet consensus stays
+unchanged; unactivated consensus proposals are tested only on regtest or
+explicitly isolated test networks. We evaluate adoption through reference
+vectors, external interoperability, and measured resource costs—not whether
+Core merged a proposal first.
+
+See the [BIP adoption policy](docs/policies/bip-adoption.md) for the
+research-to-shipped process, the [BIP support matrix](docs/bip-support.md) for
+current implementation status, and [contributing BIPs](CONTRIBUTING.md#proposing-and-implementing-bips)
+to propose an experiment.
 
 ---
 
