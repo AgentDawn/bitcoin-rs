@@ -1,77 +1,16 @@
-//! Native Stratum V2 mining-pool adapter.
+//! Sans-IO native Stratum V2 mining adapter.
 //!
-//! A pool-side Stratum V2 server for `bitcoin-rs`, built from three layers:
+//! `Connection` owns authenticated Noise transport using the pinned SRI crates;
+//! `ProtocolSession` owns mining messages. Authority keys cross the dependency
+//! boundary as bytes, not as another crate's secp256k1 types. Version pins live
+//! in the workspace manifest.
 //!
-//! 1. **Authenticated transport** ([`Connection`]): the `Noise_NX_Secp256k1+
-//!    EllSwift_ChaChaPoly_SHA256` responder of the Stratum V2 specification,
-//!    run by the Stratum Reference Implementation's own `noise_sv2` and
-//!    `codec_sv2` (never home-grown crypto). The pool authority key crosses
-//!    this crate as 32 raw bytes ([`AuthorityKeypair`]), so no `secp256k1`
-//!    type is shared with the repository's `secp256k1 0.29` graph:
-//!    `noise_sv2 2.0.0` resolves its own `secp256k1 0.28.2` and the two meet
-//!    only at the byte boundary.
-//! 2. **Protocol session** ([`ProtocolSession`]): `SetupConnection`, standard,
-//!    extended and group channels, `NewMiningJob` / `NewExtendedMiningJob` /
-//!    `SetNewPrevHash` / `SetTarget` / `SubmitShares*`, `UpdateChannel`,
-//!    `CloseChannel`, `Reconnect`, and the error and cancel semantics around
-//!    them, using the official message layouts from `mining_sv2 12.0.0` and
-//!    `common_messages_sv2 9.0.0`.
-//! 3. **The one job and share owner**, [`crate::pool::JobBook`]. This
-//!    crate never assembles a template, never builds a coinbase, and never
-//!    validates a share or a block: it passes the owner's `Job` to the wire
-//!    and maps the owner's `ShareError` to an official error code.
-//!
-//! # What is real, and what is not
-//!
-//! Implemented and exercised by `tests/protocol.rs` with real Noise
-//! handshakes, real encrypted frames and real regtest candidates: the Mining
-//! Protocol server role. [`ROLES`] states every other role explicitly; none of
-//! them is advertised in `SetupConnection`:
-//!
-//! - Job Declaration server and work selection (`SetCustomMiningJob`,
-//!   `REQUIRES_WORK_SELECTION`) are not implemented: the owner exposes no way
-//!   to install a miner-declared job (`JobBook::install` takes a pool-built
-//!   `Candidate`), and adding one here would be a second template and
-//!   validation path. `SetupConnection` for the Job Declaration protocol is
-//!   refused with `unsupported-protocol`; the work-selection flag with
-//!   `unsupported-feature-flags`; a stray `SetCustomMiningJob` with
-//!   `jd-not-supported`.
-//! - Template Distribution (serving or consuming) is not needed by a native
-//!   pool, whose templates come from `MiningControl`, and is not implemented.
-//! - Extension negotiation is not implemented; frames with a non-zero
-//!   `extension_type` are discarded as §3.4.1 requires.
-//!
-//! Not run: a network daemon, a real key, a real funds path. Nothing in this
-//! crate opens a socket: [`Connection`] is sans-IO (`feed` bytes in,
-//! `take_transmit` bytes out).
-//!
-//! # Host loop
-//!
-//! ```text
-//! let mut conn = Connection::accept(&authority, validity, config, &book)?;
-//! loop {
-//!     // read up to conn.read_hint().max(4096) bytes from the socket, then
-//!     conn.feed(&bytes, &mut book)?;
-//!     socket.write_all(&conn.take_transmit());
-//!     while let Some(event) = conn.poll_event() {
-//!         match event {
-//!             Event::ShareAccepted(e) => {
-//!                 ledger.record(&e.outcome);
-//!                 conn.confirm_share(e.ticket)?;
-//!             }
-//!             Event::BlockFound(pending) => {
-//!                 let submitted = pending.submit(&*mining_control)?;
-//!                 // The pool service maps pending.found_block() plus
-//!                 // submitted.receipt() into its ledger BlockFound record here.
-//!                 conn.confirm_block(&submitted)?;
-//!             }
-//!             ...
-//!         }
-//!     }
-//!     // when the node installs a job: conn.announce(&installed)?;
-//! }
-//! conn.release(&mut book); // always, on every exit path
-//! ```
+//! `crate::pool::JobBook` remains the sole job/share validator. Hosts feed bytes,
+//! drain transmit bytes and events, persist share/block outcomes before their
+//! confirmation calls, and call `Connection::release` on every exit path.
+//! [`ROLES`] owns protocol support and refusal details. Configuration and
+//! the lifecycle/accounting guarantees live in `docs/pool.md` and its linked
+//! pool contract.
 
 #![forbid(unsafe_code)]
 

@@ -922,13 +922,8 @@ impl PeerLease {
         )
     }
 
-    /// Creates an outbound block-relay-only lease.
-    ///
-    /// PRE: none.
-    /// POST: the lease is outbound and its role is
-    ///   [`crate::peer_info::PeerRole::BlockRelayOnly`], so the connection
-    ///   carries blocks and headers only, in either direction.
-    /// INVARIANT: the role is fixed for the life of the lease.
+    /// Creates an outbound block-relay-only lease. Its role is immutable for
+    /// the connection's lifetime and excludes transaction relay in both directions.
     #[must_use]
     pub(crate) fn new_block_relay(outbound: Sender<QueuedFrame>) -> Self {
         Self::with_direction(
@@ -945,7 +940,7 @@ impl PeerLease {
     /// POST: the lease is outbound, carries `role`, and is manual.
     /// INVARIANT: Core's `ConnectionType::MANUAL` is exempt from the
     ///   chain-sync timeout and the extra-peer retirement
-    ///   (`net_processing.cpp:5502`, `net_processing.cpp:5558-5604`):
+    ///   (`net_processing.cpp`, `net_processing.cpp`):
     ///   replacing a hand-pinned connection would undo an explicit
     ///   instruction, so the flag must outlive every policy check.
     #[must_use]
@@ -1094,12 +1089,8 @@ impl PeerLease {
         self.inbound
     }
 
-    /// What this connection relays. See [`crate::peer_info::PeerRole`].
-    ///
-    /// PRE: none.
-    /// POST: the role assigned when the lease was created.
-    /// INVARIANT: never changes; a replacement connection gets its own lease
-    ///   and therefore its own role.
+    /// Returns this connection's immutable relay role. A replacement connection
+    /// gets its own lease and role; see [`crate::peer_info::PeerRole`].
     #[must_use]
     pub const fn role(&self) -> crate::peer_info::PeerRole {
         self.role
@@ -1111,7 +1102,7 @@ impl PeerLease {
     /// POST: true exactly for a dial asked for by `--connect` or `addnode`.
     /// INVARIANT: never changes, like the role: the exemption the flag
     ///   carries is Core's `ConnectionType::MANUAL`
-    ///   (`net_processing.cpp:5502`), and a connection that could lose it
+    ///   (`net_processing.cpp`), and a connection that could lose it
     ///   mid-life could be evicted by a rule that never applied to it.
     #[must_use]
     pub const fn is_manual(&self) -> bool {

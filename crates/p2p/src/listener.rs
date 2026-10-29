@@ -38,17 +38,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
 /// How often an otherwise quiet connection is probed with one `ping`: Core's
-/// `PING_INTERVAL` is 2 * 60 seconds (`net_processing.cpp:125`).
+/// `PING_INTERVAL` is 2 * 60 seconds (`net_processing.cpp`).
 const PING_INTERVAL: Duration = Duration::from_mins(2);
 
 /// How long send or receive silence may last before the connection ends:
-/// Core's `TIMEOUT_INTERVAL` is 20 * 60 seconds (`net.h:59`), enforced by its
-/// `InactivityCheck` (`net.cpp:2043-2090`).
+/// Core's `TIMEOUT_INTERVAL` is 20 * 60 seconds (`net.h`), enforced by its
+/// `InactivityCheck` (`net.cpp`).
 const TIMEOUT_INTERVAL: Duration = Duration::from_mins(20);
 
 /// Blocks of tip staleness (in target-spacing units) within which Core will
 /// still connect to a `NODE_NETWORK_LIMITED` peer:
-/// `NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` (`net_processing.cpp:161`).
+/// `NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` (`net_processing.cpp`).
 const NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS: u64 = 144;
 
 /// Proof-of-work target spacing used to express the local tip age in blocks
@@ -85,7 +85,7 @@ pub struct ListenerExtras {
     /// configured consensus network. `None` means transaction relay is open
     /// (callers without a chain, and tests). While `Some` and active,
     /// tx-typed `inv` vectors are not requested and `tx` bodies are dropped
-    /// before ingress (Core 31.1 `net_processing.cpp:4401`, `:4716`). The
+    /// before ingress (Core 31.1 `net_processing.cpp`, `:4716`). The
     /// network travels with the latch because the wire magic is not an
     /// identity: a `--p2p-magic` override can carry another network's bytes.
     pub ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
@@ -117,15 +117,9 @@ pub struct RelayOffers {
     pub stale_tip_prefers_blocks: bool,
 }
 
-/// Share the wiring for one P2P start epoch.
-///
-/// The listener, every outbound dial, and every connection thread they
-/// spawn read the same stores, sinks, and start token through clones of
-/// this value.
-///
-/// PRE: Construct the required handles before any worker starts.
-/// POST: Each clone refers to the same stores and start token.
-/// INVARIANT: Count socket bytes once. Read the IBD decision lazily.
+/// Wiring shared by connections in one P2P start epoch.
+/// Construct the handles before starting workers; clones share the stores,
+/// start token, and byte-accounting owner. Read the IBD decision lazily.
 #[derive(Clone)]
 pub struct ConnectionShared {
     /// Authoritative live-peer table shared with the node.
@@ -175,12 +169,12 @@ pub struct ConnectionShared {
     pub block_announcer: Option<Arc<crate::block_announce::BlockAnnouncer>>,
     /// Inbound connection capacity: the automatic-connection maximum minus
     /// the outbound slot counts. At this count an inbound newcomer evicts an
-    /// inbound connection or is refused (Core `m_max_inbound`, `net.h:1118`,
-    /// applied at `net.cpp:1819-1826`).
+    /// inbound connection or is refused (Core `m_max_inbound`, `net.h`,
+    /// applied at `net.cpp`).
     pub max_inbound: usize,
     /// The services this node advertises in every `version`, inbound or
     /// outbound: `WITNESS | NETWORK` normally, `WITNESS | NETWORK_LIMITED`
-    /// when pruned (Core `init.cpp:2022-2026`).
+    /// when pruned (Core `init.cpp`).
     pub local_services: ServiceFlags,
     /// Whether connections try BIP324 v2: inbound detects v1 and v2, and
     /// outbound starts v2 to manual peers and to addresses advertising
@@ -272,16 +266,9 @@ impl ConnectionShared {
         }
     }
 
-    /// Offers the opt-in relay capabilities this start epoch enabled.
-    ///
-    /// PRE: `peer` has written nothing yet; call before the handshake starts.
-    /// POST: with [`RelayOffers::package_relay`] set, `peer` will send one
-    ///   `sendpackages` carrying both BIP331 version bits during the
-    ///   handshake; with [`RelayOffers::stale_tip_relay`] set, it announces
-    ///   BIP332 with [`RelayOffers::stale_tip_prefers_blocks`] as the
-    ///   feature's data byte; otherwise `peer` offers nothing.
-    /// INVARIANT: both the inbound and the outbound handshake go through
-    ///   here, so the offer cannot depend on direction.
+    /// Offers this epoch's configured BIP331/BIP332 capabilities before any
+    /// handshake writes. Both connection directions use this path; transaction
+    /// relay offers also respect the connection role.
     fn offer_relay_capabilities<S>(&self, peer: &mut Peer<S>, role: crate::PeerRole) {
         if self.relay_offers.package_relay && role.relays_transactions() {
             peer.offer_package_relay(
@@ -388,14 +375,9 @@ impl ConnectionShared {
         }
     }
 
-    /// Routes one block-typed inventory hash into header sync.
-    ///
-    /// PRE: `source` identifies the current connection and `hash` is a block
-    /// inventory hash.
-    /// POST: the sync layer records the connection's best-known block and
-    /// schedules `getheaders`; no block body request is emitted here.
-    /// INVARIANT: block inventory never bypasses header admission and the
-    /// download-window budget.
+    /// Records a block inventory hash for the current connection and schedules
+    /// header discovery through sync. This path cannot bypass header admission
+    /// or the download-window budget by requesting a body directly.
     fn announce_block(&self, source: crate::PeerSource, hash: bitcoin_rs_primitives::Hash256) {
         let Some(sync) = self.block_sync.as_ref() else {
             return;
@@ -404,17 +386,10 @@ impl ConnectionShared {
         wake_sync(self.wake_tx.as_ref());
     }
 
-    /// Routes the block vectors of one inbound `notfound` to the body fetch
-    /// each answers.
-    ///
-    /// PRE: `source` is the connection that sent `items`.
-    /// POST: a block vector `source` owns the request for releases that
-    /// request without blame, and the sync loop is woken to replan it
-    /// through the ordinary scheduler. Transaction and package vectors are
-    /// left to their own request lifecycles
-    /// ([`Self::update_transaction_requests`]).
-    /// INVARIANT: only the exact owning connection releases, so an unsolicited
-    /// or stale-session `notfound` changes nothing and wakes nothing.
+    /// Releases block requests owned by the responding connection without blame
+    /// and wakes sync to replan them. Unsolicited or stale-session replies neither
+    /// release another connection's work nor wake it. Transaction/package vectors
+    /// remain owned by `update_transaction_requests`.
     fn block_not_found(
         &self,
         source: crate::PeerSource,
@@ -876,7 +851,7 @@ fn admit_inbound_remote(
     // count followed by an unconstrained spawn races concurrent
     // accepts. Registration stays identity-checked, so the
     // reservation itself is the handshaking-peer accounting
-    // Core's connman performs (`net.cpp:1819-1826`).
+    // Core's connman performs (`net.cpp`).
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::QueuedFrame>();
     let lease = crate::PeerLease::new_inbound(outbound_tx)
         .with_shared_budget(&shared.shared_outbound)
@@ -1224,15 +1199,11 @@ fn dial(
     run_connected_session(&mut peer, addr, shared, lease, outbound_rx, info).map(|()| Dialed::Done)
 }
 
-/// Drives the outbound handshake until the peer is ready.
-///
-/// PRE: `peer` wraps a connected outbound stream, `lease` belongs to it,
-///   and `shared` holds this dial's chain query and service policy.
-/// POST: a feeler has an accepted VERSION; an ordinary `peer` is `Ready`,
-///   post-verack messages are sent, and the remote offered desirable services ([`has_all_desirable_service_flags`]).
-/// INVARIANT: This function counts no bytes; the stream that `peer` wraps
-///   owns byte accounting. The service check runs once the remote `version`
-///   is decoded and before the peer can be published as usable.
+/// Drives a connected outbound peer through its role's handshake.
+/// The lease and shared policy must belong to this dial. A feeler needs an
+/// accepted VERSION; other peers must reach Ready and send post-verack work.
+/// Check desirable services after VERSION and before publishing usability.
+/// The wrapped stream owns byte accounting; this function does not count it.
 fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,
     nonce: u64,
@@ -1314,8 +1285,8 @@ pub(crate) fn approximate_best_block_depth(query: Option<&dyn crate::ChainQuery>
 ///   every other service set is rejected.
 /// INVARIANT: this is the only outbound desirable-service predicate
 ///   (Core `HasAllDesirableServiceFlags` / `GetDesirableServiceFlags`,
-///   `net_processing.cpp:1857-1872`, applied to outbound connections at
-///   `net_processing.cpp:3864-3871`); inbound peers are exempt.
+///   `net_processing.cpp`, applied to outbound connections at
+///   `net_processing.cpp`); inbound peers are exempt.
 #[must_use]
 pub fn has_all_desirable_service_flags(
     remote_services: ServiceFlags,
@@ -1670,15 +1641,15 @@ fn run_connected_session(
 /// INVARIANT: a block-relay-only connection carries blocks and headers and
 ///   nothing else. A `tx` message or a transaction `inv` is a protocol
 ///   violation and ends the connection, as Core's `RejectIncomingTxs`
-///   requires (`net_processing.cpp:4706-4711`, and the `inv` branch at
-///   `net_processing.cpp:4385-4390`). A `getdata` from such a connection is
+///   requires (`net_processing.cpp`, and the `inv` branch at
+///   `net_processing.cpp`). A `getdata` from such a connection is
 ///   answered with block inventory alone: transaction inventory is stripped
 ///   before dispatch, and a request that asked for nothing else is dropped
 ///   unheard, so the role cannot obtain a transaction body through
 ///   `getdata`. `addr` and `addrv2` are dropped
 ///   without punishment, because Core declines address relay for such a
 ///   peer rather than faulting it (`SetupAddressRelay`,
-///   `net_processing.cpp:5952-5970`). A full-relay connection is never
+///   `net_processing.cpp`). A full-relay connection is never
 ///   restricted.
 fn enforce_relay_role(
     role: crate::peer_info::PeerRole,
@@ -1880,7 +1851,7 @@ impl Keepalive {
     /// [`PING_INTERVAL`] and an end once either direction is silent past
     /// [`TIMEOUT_INTERVAL`].
     ///
-    /// INVARIANT: Core's `InactivityCheck` (`net.cpp:2043-2090`) ends a
+    /// INVARIANT: Core's `InactivityCheck` (`net.cpp`) ends a
     ///   connection when the send timeout or the receive timeout fires, so
     ///   either direction alone expiring is enough here.
     ///

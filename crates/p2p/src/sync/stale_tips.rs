@@ -1,43 +1,14 @@
-//! Bounded retention of recent stale tips for BIP332 relay.
+//! Bounded BIP332 stale-tip hints; `BlockTree` remains the chain authority.
 //!
-//! A stale tip is the newest header of a branch that is neither on the active
-//! chain nor an extension of it. `BlockTree` keeps every header it has ever
-//! admitted, so side-branch headers are only reachable by scanning the whole
-//! tree; this module keeps the few that are worth announcing, as hashes.
+//! Every tree-facing operation rechecks active-chain membership, validity,
+//! ancestry and the recent-window bound. Only a branch's newest tip is retained.
+//! Per-peer knowledge is scoped to retained tips and suppresses echoes/repeats.
+//! The first `pending_for` call offers at most `MAX_ADVERTISED_STALETIPS` older
+//! tips; later calls offer new tips and selected, unacknowledged earlier tips.
+//! Retention itself is bounded by `MAX_RETAINED_STALE_TIPS`.
 //!
-//! The tree stays the one authority over chain facts. The retainer stores a
-//! hash, the tip's chainwork (a ranking key, immutable per node), and the order
-//! it was learned in; height, status, ancestry, and the active chain are
-//! always read from the `&BlockTree` each call receives. It never validates a
-//! header, never admits one, and never mutates the tree: a retained tip is a
-//! hint that can only make a node announce something it already holds.
-//!
-//! # Invariants
-//!
-//! - At most [`MAX_RETAINED_STALE_TIPS`] tips are held.
-//! - Every call that receives a tree first drops tips that are no longer stale
-//!   candidates (active, on or above the active chain, invalid, unknown, or
-//!   more than [`STALETIP_RECENT_WINDOW`] blocks behind the active tip), so
-//!   what it then reports is current for that tree.
-//! - A tip and one of its ancestors are never both held: extending a retained
-//!   branch replaces its tip, and a header below a retained tip is not learned.
-//! - A peer is recorded as knowing a tip only while the tip is retained, so
-//!   the per-peer record is bounded by the retention cap and cleared with the
-//!   tip. "Knows" covers both directions: the peer announced the tip to us
-//!   (never echo it back) and we announced it to the peer (never repeat it).
-//! - Relay with a peer opens once ([`StaleTipRetainer::pending_for`]): the
-//!   first call offers at most [`MAX_ADVERTISED_STALETIPS`] of the tips already
-//!   held, every later call only tips learned after it plus the selected
-//!   earlier tips the peer has not acknowledged. A peer therefore
-//!   receives at most ten earlier tips however many are held, plus each tip
-//!   learned while it is connected, once.
-//!
-//! # Locking
-//!
-//! One internal mutex, a leaf lock: callers hold at most their `BlockTree`
-//! read guard when calling in, and no method calls back out except
-//! [`StaleTipRetainer::pending_for`], which releases the mutex before invoking
-//! its predicate.
+//! The internal mutex is a leaf lock. Callers may hold a `BlockTree` read guard;
+//! `pending_for` releases the mutex before calling its predicate.
 
 use std::cmp::Reverse;
 use std::collections::VecDeque;

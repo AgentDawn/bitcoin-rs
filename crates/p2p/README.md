@@ -65,7 +65,7 @@ also filters transaction inventory through the `TxInventory` trait and receives
 the chain-owned initial-block-download gate that the `listener` supplies to it
 through its `tx_relay_open` callback: while the gate is closed, transaction-typed
 `inv` vectors are never requested and `tx` bodies are dropped before ingress
-(Core 31.1 `net_processing.cpp:4401-4404`, `:4713-4716`); `inbound` hands over
+(Core 31.1 `net_processing.cpp`, `:4713-4716`); `inbound` hands over
 `InboundBlock`, `InboundHeaders`, and `InboundTx` with their delivering peer
 stamped.
 

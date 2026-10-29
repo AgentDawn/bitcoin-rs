@@ -366,7 +366,7 @@ pub(crate) struct DownloadWindow {
     next_request_height: u32,
     request_tip: Option<(Hash256, u32)>,
     /// Per-owner block-download queue start: the local equivalent of
-    /// Core's per-peer `m_downloading_since` (`net_processing.cpp:1323-1332,
+    /// Core's per-peer `m_downloading_since` (`net_processing.cpp,
     /// 1363-1368`). Keyed by the exact `PeerSource`; an entry exists exactly
     /// while that owner has validated in-flight blocks.
     owner_downloading_since: HashMap<PeerSource, Instant>,
@@ -582,25 +582,9 @@ impl DownloadWindow {
         stager.received_bytes() >= self.budget.max_received_bytes
     }
 
-    /// Staging bytes still free if every in-flight pending block arrives at
-    /// the current per-block estimate. Request sizing is clamped to this so a
-    /// gate-open burst cannot top a partially full stager over its budget and
-    /// trigger refuse/re-download churn in the high-height regime (the
-    /// staged-byte gate alone is headroom-blind: it only closes once staging
-    /// is already exhausted).
-    ///
-    /// The clamp engages only while blocks are actually staged. With an empty
-    /// stager liveness wins: the window-front request must stay issuable even
-    /// when one estimated block exceeds the staging budget (the stager's
-    /// expected-block exemption and drop-for-retry are the degrade path
-    /// there), and the default budget pair (`max_pending_bytes ==
-    /// max_received_bytes`) already bounds a from-empty burst to exactly the
-    /// staging budget.
-    ///
-    /// PRE: `stager` is the staging set coupled to this window.
-    /// POST: the free staging bytes after subtracting in-flight pending
-    ///      bytes; `usize::MAX` while nothing is staged.
-    /// INVARIANT: the staged byte total is read from `stager`.
+    /// Free staging bytes after accounting for pending deliveries.
+    /// The coupled stager owns the received total. With no staged bytes, leave the
+    /// request path open for progress; pending admission still enforces its budget.
     fn staged_byte_headroom(&self, stager: &BlockStager) -> usize {
         let staged_bytes = stager.received_bytes();
         if staged_bytes == 0 {
@@ -612,45 +596,14 @@ impl DownloadWindow {
             .saturating_sub(self.pending_bytes)
     }
 
-    /// Staging slots still free if every in-flight pending block arrives: the
-    /// count-denominated twin of [`Self::staged_byte_headroom`]. The twin is
-    /// load-bearing, not symmetry for its own sake: the stager enforces its
-    /// byte budget as admission backpressure but its count budget by
-    /// **evicting the oldest staged blocks** (`block_stager.rs`,
-    /// `evict_over_budget`) — the blocks nearest the apply frontier. A window
-    /// clamped on bytes alone keeps requesting while a stalled front-stripe
-    /// peer freezes the frontier, and the healthy peers' next wave pushes the
-    /// staged count over budget into evict → drop-for-retry → re-request →
-    /// evict churn (the recorded live-collapse signature). Clamping requests
-    /// so staged + pending never exceeds `max_received_blocks` turns count
-    /// overflow into request backpressure, exactly like the byte bound.
+    /// Free staging slots after accounting for live pending deliveries.
+    /// The coupled stager owns the received count. With nothing staged, leave the
+    /// request path open; pending admission still enforces its own budget.
     ///
-    /// Same from-empty engagement rule as the byte twin: with nothing staged
-    /// the clamp stands down for liveness, and the default budget pair
-    /// (`max_pending_blocks == max_received_blocks`) bounds a from-empty
-    /// burst at exactly the count budget — and the stager evicts only
-    /// strictly *above* `max_received_blocks`, so even a fully delivered
-    /// burst lands at the budget without eviction.
-    ///
-    /// `expired_pending_blocks` credits pendings past the re-request timeout
-    /// back to headroom. Unlike the byte clamp (which leaves expired bytes
-    /// uncredited and recovers through the staged-block prune, the tested U5
-    /// chain), the count clamp must credit them in the scan limit: a stalled
-    /// front whose pendings hold staged + pending at the budget would
-    /// otherwise pin the scan limit at zero — and expiry runs only inside
-    /// [`Self::next_peer_request`], so the wedge could not process its own
-    /// deadlines until the prune discarded every staged block into
-    /// re-download. With the credit, the scan limit reopens at the pending
-    /// timeout and the normal request path expires and re-requests the front
-    /// while the staged set survives intact. Late arrival of an expired
-    /// original deduplicates against its re-request by hash, so the credit
-    /// cannot double-fill staging.
-    ///
-    /// PRE: `stager` is the staging set coupled to this window.
-    /// POST: the free staging slots after subtracting live pendings
-    ///      (crediting `expired_pending_blocks`); `usize::MAX` while nothing
-    ///      is staged.
-    /// INVARIANT: the staged count is read from `stager`.
+    /// Credit expired pendings so the scan can reach `next_peer_request`, which
+    /// expires and re-requests them. Otherwise a full window could prevent its own
+    /// timeout recovery. Hash deduplication prevents late originals from filling
+    /// another slot. This clamp applies backpressure before staging eviction.
     fn staged_count_headroom(&self, stager: &BlockStager, expired_pending_blocks: usize) -> usize {
         if stager.received_len() == 0 {
             return usize::MAX;
@@ -661,13 +614,8 @@ impl DownloadWindow {
             .saturating_sub(self.pending.len().saturating_sub(expired_pending_blocks))
     }
 
-    /// Maximum number of blocks to request from one peer this tick.
-    ///
-    /// PRE: `stager` is the staging set coupled to this window; expiry has
-    ///      run this tick.
-    /// POST: the per-peer scan bound derived from the pending budgets and
-    ///      the stager's staged byte and slot headroom.
-    /// INVARIANT: staged totals are read from `stager`.
+    /// Per-peer request bound from pending budgets and the coupled stager's
+    /// byte/slot headroom. Expired pendings are credited for timeout recovery.
     pub(crate) fn request_peer_scan_limit(&self, stager: &BlockStager, now: Instant) -> usize {
         if self.staged_bytes_exhausted(stager) {
             return 0;
@@ -1138,47 +1086,13 @@ impl DownloadWindow {
             .min(self.budget.stall_timeout_max)
     }
 
-    /// The stall predicate: the window cannot progress and exactly one peer's
-    /// in-flight front block is why. The terms read the pending set, the
-    /// stager, and the block tree:
+    /// Identifies a single peer blocking the apply frontier: its pending block
+    /// must be at `next_apply_height`, with a staged successor and at least half
+    /// the staging count window occupied. An unrequested frontier gap or a
+    /// generally slow download does not blame a peer.
     ///
-    /// 1. **Front in flight at the apply frontier**: the minimum-height
-    ///    pending entry sits exactly at `next_apply_height`. This is also the
-    ///    structural half of the no-blame rule — if anything applicable were
-    ///    staged instead, the frontier would be the apply side's to drain and
-    ///    the front pending could not be at `next_apply_height`. It equally
-    ///    discriminates "frontier block never requested / expired" (front
-    ///    above the frontier): no peer owns the gap, so no peer is blamed.
-    /// 2. **Delivered successors are waiting**: at least one staged block
-    ///    above the front. Without arrivals the download is generally slow or
-    ///    just started — download-bound, not window-blocked, no single
-    ///    blocker.
-    /// 3. **Deep staged backlog**: at least half the staged count window
-    ///    (`max_received_blocks / 2`, integer division) is occupied. Staged
-    ///    blocks pile up only when the frontier is slow while the rest of the
-    ///    window is fast (apply outruns download by orders of magnitude, so
-    ///    healthy staged occupancy stays near zero between frontier waits) —
-    ///    the term encodes the asymmetric-frontier-blockage signature that
-    ///    defines a staller. As a fixed fraction of the window it scales with
-    ///    depth by construction, and a single apply cannot drop the staged
-    ///    count below half the window, so the tick-ordering flap that zeroed
-    ///    episodes during partial progress under the previous term
-    ///    (`!has_request_capacity()`, which one freed slot per applied block
-    ///    momentarily reopened) cannot clear it. The U5 count/byte clamps are
-    ///    read by the request path, not here; the recorded R+P count-wedge
-    ///    shapes (staged + pending pinned at the count budget) satisfy this
-    ///    term trivially, so wedge conviction is preserved. The chain tail
-    ///    (nothing above the window left to request) is deliberately not an
-    ///    arm of this term — see [`Self::advance_stall`].
-    ///
-    /// PRE: `stager` is the coupled staging set and `tree` resolves staged
-    ///      hashes to heights.
-    /// POST: `Some((owner, front_hash))` exactly when every predicate term
-    ///      holds: the lowest pending sits at the frontier, at least one
-    ///      staged body resolves above it, and the staged count covers half
-    ///      the count window.
-    /// INVARIANT: staged identity, count, and heights come from `stager`
-    ///      and `tree`; the window holds no staged-body copy.
+    /// Read staged identity/count from the coupled stager and heights from `tree`;
+    /// the window keeps no second copy. Tail behavior belongs to `advance_stall`.
     fn window_blocked_on(
         &self,
         stager: &BlockStager,
@@ -1455,7 +1369,7 @@ impl DownloadWindow {
 
     /// Distinct exact connections owning validated in-flight blocks: the
     /// per-owner block-download budget's peer count (Core's
-    /// `m_peers_downloading_from`, `net_processing.cpp:153-168`).
+    /// `m_peers_downloading_from`, `net_processing.cpp`).
     ///
     /// POST: equals the population of `owner_downloading_since`.
     /// INVARIANT: announced or merely-assigned peers never count; only
@@ -1528,7 +1442,7 @@ impl DownloadWindow {
     ///      adopts that stamp without ever regressing; otherwise the
     ///      entry is untouched.
     /// INVARIANT: the local equivalent of Core's `m_downloading_since`
-    ///      start-and-oldest-removal reset (`net_processing.cpp:1323-1332,
+    ///      start-and-oldest-removal reset (`net_processing.cpp,
     ///      1363-1368`); `requested_at` stays the ordering and diagnostic
     ///      record, never the sole source of the queue age. One batched
     ///      `mark_requested` stamps every entry with one `requested_at`,

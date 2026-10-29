@@ -1,46 +1,18 @@
-//! Outbound transaction relay worker.
+//! Best-effort outbound transaction announcements.
 //!
-//! Announces mempool-accepted transactions to connected peers as `inv`
-//! messages, **excluding the peer that delivered the transaction** (by its
-//! node id). Bitcoin Core never re-advertises a transaction to the peer it
-//! just received it from; this worker encodes that policy.
+//! `TxRelayQueue` bounds producer work and drops the newest announcement on
+//! saturation, so relay cannot block admission. The worker drives request and
+//! relay timers, including bounded retries of pending local broadcasts.
 //!
-//! # Architecture
+//! Peer-origin accepts enqueue after ingress commits; RPC/reorg accepts use
+//! `LocalTxRelayObserver`, whose weak gateway reference cannot retain the owner.
+//! The observer resolves a wtxid only while that acceptance remains resident.
 //!
-//! [`TxRelayQueue`] is the producer side: a bounded crossbeam channel of
-//! [`RelayRequest`]s plus drop accounting. The admission path calls
-//! [`TxRelayQueue::announce`] without blocking — relay is best-effort and
-//! must never stall mempool admission.
-//!
-//! [`PeerRelaySink`] queues identities and admission epochs in the shared
-//! transaction-policy owner. Its timer drains fee-filtered, dependency-ordered
-//! batches after randomized per-connection deadlines; known inventory and
-//! source exclusion prevent repeats. A delayed item is checked against the
-//! gateway again before enqueueing the wire message. A later removal can
-//! still race the peer's eventual `getdata`, which then answers `notfound`.
-//!
-//! [`spawn_tx_relay_worker`] drives both request deadlines and relay timers.
-//! Admission callbacks only write the bounded producer queue and never wait
-//! for a peer or a timer.
-//!
-//! # Queue saturation
-//!
-//! The relay queue is bounded. When full, the newest announcement is
-//! **dropped** (the producer never blocks). Later inventory exchanges may
-//! advertise it again; relay stays best-effort and admission never stalls.
-//! Pending local initial broadcasts also retry through this worker in bounded
-//! batches until a successful getdata body response clears the live entry flag.
-//! Per-peer outbound saturation follows the existing
-//! p2p disconnect policy on [`crate::PeerLease::send`]: a peer whose
-//! outbound queue is full is disconnected (its lease is cancelled), never
-//! silently dropped while the connection remains live.
-//!
-//! Peer-origin accepts are announced by the ingress caller after the gateway
-//! returns a committed admission. RPC and reorg accepts announce through
-//! [`LocalTxRelayObserver`] on the same queue. These triggers intentionally
-//! retain their separate timing. Local notifications look up the accepted
-//! entry's real wtxid only while that acceptance remains resident. The
-//! gateway reference is weak so its observer cannot retain the gateway.
+//! `PeerRelaySink` delegates inventory, source exclusion, fee/dependency policy
+//! and delayed-item revalidation to the shared transaction-policy owner. A
+//! later removal may race `getdata` and produce `notfound`. Per-peer output
+//! saturation follows `PeerLease::send`; it cannot silently lose a queued
+//! message while leaving that connection live.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};

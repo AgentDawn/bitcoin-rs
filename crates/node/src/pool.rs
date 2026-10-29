@@ -59,14 +59,19 @@ impl crate::storage_backend::StoreConsumer for LedgerComposer {
     }
 }
 
-/// Composition-time bounds for the single shared pool core.
-///
-/// Every protocol listener shares one [`PoolCore`]: at most 64 retained jobs,
-/// one session slot per configured connection plus a spare set for reconnects
-/// (twice the connection cap), 65,536 duplicate-tracked shares per job, and a
-/// deferred share-ledger outbox of 1024 records / 8 MiB. Owner sessions are
-/// not live TCP connections; the aggregate TCP caps live in the shared
-/// [`ConnectionLimiter`](bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter).
+/// Retained jobs shared by every protocol listener.
+const MAX_RETAINED_JOBS: usize = 64;
+/// Session slots per live connection, including spare slots for reconnects.
+const SESSION_SLOTS_PER_CONNECTION: usize = 2;
+/// Duplicate-tracked shares retained per job.
+const MAX_SHARES_PER_JOB: usize = 65_536;
+/// Deferred accounting records shared by the composed core.
+const MAX_OUTBOX_RECORDS: usize = 1024;
+/// Deferred accounting byte budget for the composed core.
+const MAX_OUTBOX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Shared core bounds. Owner sessions are not live TCP connections; the
+/// aggregate connection caps belong to the shared `ConnectionLimiter`.
 struct ComposedCore {
     book: JobBookConfig,
     outbox_items: usize,
@@ -75,7 +80,7 @@ struct ComposedCore {
 
 fn composed_core_config(max_connections: u32) -> Result<ComposedCore> {
     let sessions = usize::try_from(max_connections)?
-        .checked_mul(2)
+        .checked_mul(SESSION_SLOTS_PER_CONNECTION)
         .context("pool session bound overflow")?;
     Ok(ComposedCore {
         book: JobBookConfig {
@@ -87,12 +92,12 @@ fn composed_core_config(max_connections: u32) -> Result<ComposedCore> {
             coinbase_tag: b"/btcrs/".to_vec(),
             version_mask: bitcoin_rs_mining::pool::BIP320_VERSION_MASK,
             ntime_forward_secs: bitcoin_rs_mining::pool::MAX_NTIME_FORWARD_SECS,
-            max_jobs: 64,
+            max_jobs: MAX_RETAINED_JOBS,
             max_sessions: sessions,
-            max_shares_per_job: 65_536,
+            max_shares_per_job: MAX_SHARES_PER_JOB,
         },
-        outbox_items: 1024,
-        outbox_bytes: 8 * 1024 * 1024,
+        outbox_items: MAX_OUTBOX_RECORDS,
+        outbox_bytes: MAX_OUTBOX_BYTES,
     })
 }
 
