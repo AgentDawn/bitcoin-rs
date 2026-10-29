@@ -2,11 +2,12 @@
 //! real mainnet block bodies), signed round-trips per spend type, and
 //! malformed/context failure modes.
 //!
-//! The fixture at `crates/rpc/tests/bip337_vectors.json` was derived
-//! once from the published vectors plus mempool.space mainnet block
-//! bodies at heights 833265..833280 by a throwaway generator; no context
-//! field was written by hand. The ignored `mainnet_bodies_truth` test
-//! re-derives every field from the bodies themselves.
+//! The fixture at `crates/rpc/tests/bip337_vectors.json` was derived once from the
+//! published vectors plus mempool.space mainnet block bodies at heights 833265..833280
+//! by a throwaway generator; no context field was written by hand.
+//!
+//! The ignored `mainnet_bodies_truth` test re-derives every field from the bodies
+//! themselves.
 
 #![expect(
     clippy::expect_used,
@@ -1084,11 +1085,12 @@ fn missing_context_degrades_compress_but_refuses_decompress() {
     );
 }
 
-/// Production resolver integration: a Context whose block log and body
-/// source serve one crafted block must compress the spend's outpoint
-/// (no warning) and restore it through the handlers. Exercises
-/// `RpcPrevoutResolver` against `block_by_height_in_view` and the body
-/// source directly, not a codec fake.
+/// Production resolver integration: a Context whose block log and body source serve one
+/// crafted block must compress the spend's outpoint (no warning) and restore it through
+/// the handlers.
+///
+/// Exercises `RpcPrevoutResolver` against `block_by_height_in_view` and the body source
+/// directly, not a codec fake.
 #[test]
 fn production_resolver_resolves_through_block_bodies() {
     use std::sync::Arc;
@@ -1246,7 +1248,7 @@ fn malformed_streams_are_rejected() {
 /// run, so a stale fixture cannot pass against itself.
 #[cfg(test)]
 struct BodyResolver {
-    heights: HashMap<Txid, (u32, u32, u32, u32)>, // txid -> (height, tx index, first flat, output count)
+    heights: HashMap<Txid, (u32, u32, u32, u32)>,
     txouts: HashMap<OutPoint, (TxOut, u32)>,
     at: HashMap<(u32, u32), OutPoint>,
 }
@@ -1355,10 +1357,11 @@ impl PrevoutResolver for BodyResolver {
     }
 }
 
-/// Truth loop over the downloaded mainnet bodies: re-derives every
-/// fixture field, then compresses and decompresses every published
-/// vector against body-derived context, reporting ratio and cost per
-/// representative type. Absent bodies are BLOCKED, not a pass.
+/// Truth loop over the downloaded mainnet bodies: re-derives every fixture field, then
+/// compresses and decompresses every published vector against body-derived context,
+/// reporting ratio and cost per representative type.
+///
+/// Absent bodies are BLOCKED, not a pass.
 #[test]
 #[ignore = "requires BITCOIN_RS_BIP337_MAINNET_BODIES with mainnet block bodies"]
 #[allow(
@@ -1800,9 +1803,10 @@ impl bitcoin_rs_chain::BlockBodySource for CountingBodies {
     }
 }
 
-/// Builds one single-output funding block per `heights` entry, wires the
-/// records plus a counting body source into a fresh [`Context`], and funds
-/// the UTXO set so the compress pass resolves prevouts without body reads.
+/// Builds one single-output funding block per `heights` entry, wires the records plus a
+/// counting body source into a fresh [`Context`], and funds the UTXO set so the
+/// compress pass resolves prevouts without body reads.
+///
 /// Returns the context, the source, and the funding txids in height order.
 fn cycling_fixture(
     heights: &[u32],
@@ -1898,12 +1902,12 @@ fn assert_loads(source: &CountingBodies, heights: &[u32], per_height: usize) {
     assert_eq!(total, heights.len() * per_height);
 }
 
-/// Five heights cycling through the four-body cache: grouped resolution
-/// loads each body once instead of paying a full body read, parse,
-/// materialization, and txid pass per input inside the stable-chainstate
-/// exclusion. Ten inputs round-robin five heights; the counting source
-/// proves five total loads (one per height), and both codec passes
-/// round-trip the spending transaction.
+/// Five heights cycling through the four-body cache: grouped resolution loads each body
+/// once instead of paying a full body read, parse, materialization, and txid pass per
+/// input inside the stable-chainstate exclusion.
+///
+/// Ten inputs round-robin five heights; the counting source proves five total loads
+/// (one per height), and both codec passes round-trip the spending transaction.
 #[test]
 fn five_heights_cycling_loads_each_body_once() {
     use std::sync::Arc;

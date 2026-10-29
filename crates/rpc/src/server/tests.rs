@@ -1219,9 +1219,11 @@ struct Exchange {
     served: io::Result<()>,
 }
 
-/// Serves one loopback connection with `serve_connection`, writes `request`
-/// and nothing more, and reports what the client saw. The client keeps its
-/// side open until the response ends, as a client still uploading would.
+/// Serves one loopback connection with `serve_connection`, writes `request` and nothing
+/// more, and reports what the client saw.
+///
+/// The client keeps its side open until the response ends, as a client still uploading
+/// would.
 fn exchange(request: &[u8]) -> io::Result<Exchange> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let mut client = TcpStream::connect(listener.local_addr()?)?;
@@ -1285,9 +1287,10 @@ fn json_rpc_head(token: Option<&str>, content_length: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A JSON-RPC request without valid credentials is answered from its head:
-/// the client withholds all 16 MiB it declared and still gets Core's exact
-/// 401 and a FIN. A wrong password waits out Core's brute-force delay first.
+/// A JSON-RPC request without valid credentials is answered from its head: the client
+/// withholds all 16 MiB it declared and still gets Core's exact 401 and a FIN.
+///
+/// A wrong password waits out Core's brute-force delay first.
 #[test]
 fn unauthorized_json_rpc_is_answered_from_the_head_with_core_s_tuple() -> io::Result<()> {
     for (token, delayed) in [(None, false), (Some(BAD_TOKEN), true)] {
@@ -1366,11 +1369,12 @@ fn unauthorized_request_with_buffered_body_returns_without_the_drain_hold() -> i
     Ok(())
 }
 
-/// Runs the unauthorized path on the server side of one loopback pair and
-/// returns the client's view of the response plus the next `take` bytes
-/// the server reads once the handler returns. The server thread starts
-/// first and reads while the client writes, so neither side waits on a
-/// buffer the other has not drained.
+/// Runs the unauthorized path on the server side of one loopback pair and returns the
+/// client's view of the response plus the next `take` bytes the server reads once the
+/// handler returns.
+///
+/// The server thread starts first and reads while the client writes, so neither side
+/// waits on a buffer the other has not drained.
 fn serve_unauthorized(request: &[u8], take: usize) -> io::Result<(String, Vec<u8>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
@@ -1589,7 +1593,7 @@ fn accept_recovers_from_resource_and_connection_errors() -> io::Result<()> {
             errors.push(error);
         }
         #[cfg(windows)]
-        errors.push(io::Error::from_raw_os_error(10024)); // WSAEMFILE
+        errors.push(io::Error::from_raw_os_error(10024));
         let mut errors = errors.into_iter();
         let start = Instant::now();
         server.serve_accept_loop(&stop.into(), RpcSurface::Shared, |listener| {

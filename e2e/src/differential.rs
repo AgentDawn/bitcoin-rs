@@ -1,21 +1,15 @@
 //! The differential lane: one pinned reference process and one candidate.
-//!
-//! The reference is an independent binary; a comparison either passes with
-//! identical values or fails with a typed difference naming both replies.
 
 use std::path::Path;
 
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::{Block, OutPoint};
-use serde_json::{Value, json};
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
 
 use crate::error::{Error, Result};
 use crate::helpers;
 use crate::node::ProcessNode;
 
-/// Verify the reference binary at `path` matches the digest the compiled
-/// `core-compat.toml` manifest pins. A mismatch is a typed
-/// [`Error::Reference`] naming the pinned digest, never a skipped check.
 pub fn verify_reference_binary(path: &Path) -> Result<()> {
     let expected = crate::node::manifest_reference_sha256()?;
     let actual = crate::node::file_sha256(path).map_err(|error| Error::Reference {
@@ -33,9 +27,8 @@ pub fn verify_reference_binary(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Exact comparison: callers choose deterministic observations; no fields vanish.
 pub fn compare_reply(observation: &str, reference: &Value, candidate: &Value) -> Result<()> {
-    if reference == candidate {
+    if equivalent(reference, candidate) {
         Ok(())
     } else {
         Err(Error::Difference {
@@ -46,10 +39,51 @@ pub fn compare_reply(observation: &str, reference: &Value, candidate: &Value) ->
     }
 }
 
-/// Call one method on both processes and require identical replies.
-///
-/// The reference and candidate calls are independent; running them
-/// concurrently halves the serial request latency of every paired check.
+/// Core prints doubles with 16 significant digits, so a value at the edge of
+/// that grid parses back one ULP away from ours. Compare numbers within one
+/// ULP and everything else strictly.
+fn equivalent(reference: &Value, candidate: &Value) -> bool {
+    if let (Some(left), Some(right)) = (reference.as_f64(), candidate.as_f64()) {
+        if reference.is_number() && candidate.is_number() {
+            return within_one_ulp(left, right);
+        }
+    }
+    if let (Some(left), Some(right)) = (reference.as_object(), candidate.as_object()) {
+        return left.len() == right.len()
+            && left.iter().all(|(key, value)| {
+                right
+                    .get(&key)
+                    .is_some_and(|other| equivalent(value, other))
+            });
+    }
+    if let (Some(left), Some(right)) = (reference.as_array(), candidate.as_array()) {
+        return left.len() == right.len()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(value, other)| equivalent(value, other));
+    }
+    reference == candidate
+}
+
+fn within_one_ulp(left: f64, right: f64) -> bool {
+    if left.to_bits() == right.to_bits() {
+        return true;
+    }
+    if !left.is_finite() || !right.is_finite() {
+        return false;
+    }
+    let ordered = |value: f64| -> i128 {
+        let bits = i128::from(value.to_bits());
+        if value.is_sign_negative() {
+            -bits
+        } else {
+            bits
+        }
+    };
+    (ordered(left) - ordered(right)).abs() <= 1
+}
+
 #[expect(
     clippy::expect_used,
     reason = "a scoped differential request thread panicking is a harness bug"
@@ -74,18 +108,12 @@ pub fn compare_rpc(
     Ok(reference)
 }
 
-/// Blocks and coinbase outpoints both processes agreed on.
 #[derive(Debug)]
 pub struct CommonFunds {
-    /// Consensus-encoded block bytes, in height order.
     pub common_block_bytes: Vec<Vec<u8>>,
-    /// The coinbase outpoint of each block, in height order.
     pub common_outpoints: Vec<OutPoint>,
 }
 
-/// Mine `blocks` blocks on Core, feed the identical bytes to the candidate,
-/// and collect the shared coinbase funds. Block bytes come only from the
-/// independent reference process.
 pub fn mine_common_chain(
     core: &mut ProcessNode,
     node: &mut ProcessNode,
@@ -120,7 +148,7 @@ pub fn mine_common_chain(
             .ok_or_else(|| Error::Protocol("getblock did not return hex".into()))?;
         let block: Block =
             deserialize_hex(hex).map_err(|error| Error::Protocol(error.to_string()))?;
-        if Value::String(block.block_hash().to_string()) != *hash {
+        if json!(block.block_hash().to_string()) != *hash {
             return Err(Error::Protocol(
                 "block hash differs from mining result".into(),
             ));
@@ -144,7 +172,6 @@ pub fn mine_common_chain(
 }
 
 impl CommonFunds {
-    /// Resolve only bytes returned by the independent Core process.
     pub fn confirmed_output(&self, index: usize) -> Result<(OutPoint, bitcoin::TxOut)> {
         let bytes = self
             .common_block_bytes
@@ -163,8 +190,6 @@ impl CommonFunds {
         Ok((OutPoint::new(coinbase.compute_txid(), 0), output.clone()))
     }
 
-    /// A spend of the first common coinbase, signed under the deterministic
-    /// funding key, paying `fee_sats` less to the same script.
     pub fn signed_spend(
         &self,
         fee_sats: u64,
