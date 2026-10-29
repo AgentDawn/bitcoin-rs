@@ -1,15 +1,8 @@
 # Reference set contract
 
-A readable projection of the `[reference]` record in
-`crates/rpc/core-compat.toml` and its typed validation in
-`e2e/src/reference_set.rs`. `ReferenceSet` is the parsed
-identity record shared by the existing e2e harness and fixture/formal gates.
-It is not a separate registry.
-
-This page is a readable projection only. On conflict,
-`crates/rpc/core-compat.toml` governs the reference values and
-`e2e/src/reference_set.rs` governs their typed validation.
-A version label alone is never custody.
+Reference identity and custody requirements for test and formal evidence.
+The clauses distinguish the released product, kernel, and primitive/script
+oracles.
 
 ## Clauses
 
