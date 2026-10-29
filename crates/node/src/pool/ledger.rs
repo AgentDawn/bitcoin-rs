@@ -7,9 +7,6 @@ use std::sync::{
 use bitcoin_rs_chainstate::Chainstate;
 use bitcoin_rs_index::{DerivedIndexQuery, ScriptIndexQuery};
 use bitcoin_rs_mempool::MempoolReader;
-use bitcoin_rs_primitives::encode::deserialize;
-use bitcoin_rs_primitives::{Block, Hash256, OutPoint as NodeOutPoint, Txid};
-use bitcoin_rs_storage::block_body::BlockBodyStore;
 use bitcoin_rs_mining::pool::ledger as pool_ledger;
 use bitcoin_rs_mining::pool::ledger::{
     BlockFound as LedgerBlockFound, BlockLocation, ChainView, ChainViewError, ConfirmedSpend,
@@ -21,6 +18,9 @@ use bitcoin_rs_mining::pool::{
     AcceptedShare, BlockReceipt, BlockStatus, FoundBlock, LedgerUnavailable, RecordOutcome,
     ShareLedger, WorkerIdentity,
 };
+use bitcoin_rs_primitives::encode::deserialize;
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint as NodeOutPoint, Txid};
+use bitcoin_rs_storage::block_body::BlockBodyStore;
 
 /// Node-backed observation of the fully applied chain.
 ///
@@ -384,9 +384,7 @@ impl Drop for QueuedRecoveryHold {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.reserved = pending.reserved.saturating_sub(1);
-            pending.bytes = pending
-                .bytes
-                .saturating_sub(MAX_BLOCK_RECORD_BYTES);
+            pending.bytes = pending.bytes.saturating_sub(MAX_BLOCK_RECORD_BYTES);
         }
     }
 }
@@ -492,10 +490,7 @@ impl BlockRecordPermit {
                     token: Arc::new(()),
                 });
             }
-            let hold = QueuedRecoveryHold {
-                host,
-                state,
-            };
+            let hold = QueuedRecoveryHold { host, state };
             return (
                 BlockRecordOutcome::Queued,
                 Some(DeferredCharge::Queued(hold)),
@@ -781,13 +776,12 @@ impl LedgerHost {
             let aborted = || !tip_unchanged(&before, &chain.tip_generation());
             let result: Result<(bool, bool, Option<u64>, Option<u64>), pool_ledger::LedgerError> =
                 (|| {
-                    let (_, round_more, round_next) =
-                        self.ledger.reconcile_rounds_checked_limit(
-                            &observation,
-                            &aborted,
-                            pool_ledger::RECONCILE_ROUND_BATCH_LIMIT,
-                            round_after,
-                        )?;
+                    let (_, round_more, round_next) = self.ledger.reconcile_rounds_checked_limit(
+                        &observation,
+                        &aborted,
+                        pool_ledger::RECONCILE_ROUND_BATCH_LIMIT,
+                        round_after,
+                    )?;
                     let (_, payout_more, payout_next) =
                         self.ledger.reconcile_payouts_checked_limit(
                             &observation,

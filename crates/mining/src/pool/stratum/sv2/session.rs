@@ -38,12 +38,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use binary_sv2::{B032, B064K, Decodable, Encodable, GetSize, Seq0255, Str0255, Sv2Option, U256};
-use crate::{MiningControl, MiningControlError};
 use crate::pool::{
     AcceptedShare, BlockReceipt, Extranonce, FoundBlock, Job, JobBook, JobError, JobId, Session,
     SessionId, ShareError, ShareOutcome, ShareSubmission, ShareTarget,
 };
+use crate::{MiningControl, MiningControlError};
+use binary_sv2::{B032, B064K, Decodable, Encodable, GetSize, Seq0255, Str0255, Sv2Option, U256};
 use bitcoin_rs_primitives::{BlockHash, Hash256};
 use common_messages_sv2::{
     CHANNEL_BIT_RECONNECT, CHANNEL_BIT_SETUP_CONNECTION, CHANNEL_BIT_SETUP_CONNECTION_ERROR,
@@ -1398,10 +1398,7 @@ impl ProtocolSession {
     /// previous hash. Connections that did not set
     /// `REQUIRES_STANDARD_JOBS` receive one group-addressed
     /// `NewExtendedMiningJob`; the others, one job per channel.
-    pub fn announce(
-        &mut self,
-        installed: &crate::pool::Installed,
-    ) -> Result<(), SessionError> {
+    pub fn announce(&mut self, installed: &crate::pool::Installed) -> Result<(), SessionError> {
         // Delivery is driven by per-connection channel state, not the
         // owner's `fresh` flag: a channel opened after the install (or one
         // whose `SetNewPrevHash` never landed) still needs the current job
@@ -1921,8 +1918,11 @@ impl ProtocolSession {
         // Queue before removing the ticket: a full outbound queue must leave
         // the pending acknowledgement in place for a later retry instead of
         // dropping a share the ledger already recorded.
-        let (channel_id, sequence_number, difficulty) =
-            (pending.channel_id, pending.sequence_number, pending.difficulty);
+        let (channel_id, sequence_number, difficulty) = (
+            pending.channel_id,
+            pending.sequence_number,
+            pending.difficulty,
+        );
         if !self.channels.contains_key(&channel_id) {
             self.pending.remove(&ticket.0);
             return Ok(false);
@@ -1960,8 +1960,11 @@ impl ProtocolSession {
         // Queue before removing the ticket: a full outbound queue must leave
         // the pending acknowledgement in place for a later retry instead of
         // dropping a block the ledger already recorded.
-        let (channel_id, sequence_number, difficulty) =
-            (pending.channel_id, pending.sequence_number, pending.difficulty);
+        let (channel_id, sequence_number, difficulty) = (
+            pending.channel_id,
+            pending.sequence_number,
+            pending.difficulty,
+        );
         if !self.channels.contains_key(&channel_id) {
             self.pending.remove(&submission.ticket.0);
             return Ok(false);

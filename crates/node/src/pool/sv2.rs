@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use bitcoin_rs_mining::MiningControl;
-use bitcoin_rs_primitives::BlockHash;
+use bitcoin_rs_mining::pool::ledger::MinerId;
 use bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter;
 use bitcoin_rs_mining::pool::stratum::sv2::{
     AdmitError, AuthorityKeypair, BlockSubmission, Connection, ERROR_CODE_SHARE_NOT_RECORDED,
     ERROR_CODE_SUBMIT_SHARES_STALE_SHARE, Event, Limits, MAX_FEED_LEN, PendingBlock, ServerConfig,
 };
 use bitcoin_rs_mining::pool::{BlockStatus, PoolCore, RecordOutcome};
-use bitcoin_rs_mining::pool::ledger::MinerId;
+use bitcoin_rs_primitives::BlockHash;
 
 use super::authority;
 use super::ledger::{BlockRecordOutcome, BlockRecordPermit, DeferredCharge, LedgerHost};
@@ -87,8 +87,7 @@ fn settle_one_deferred(
             }
             Ok(fresh) if fresh.receipt().status() == BlockStatus::Rejected => {
                 if fresh.receipt().is_stale_parent() {
-                    let _ = connection
-                        .reject_block(&fresh, ERROR_CODE_SUBMIT_SHARES_STALE_SHARE);
+                    let _ = connection.reject_block(&fresh, ERROR_CODE_SUBMIT_SHARES_STALE_SHARE);
                 }
                 return None;
             }
@@ -559,9 +558,7 @@ fn handle_events(
                             // `charge`; dropping the waiter releases it. Shed
                             // past capacity instead of growing unbounded.
                             let Some(charge) = charge else {
-                                return Err(anyhow!(
-                                    "SV2 durable recovery has no reservation"
-                                ));
+                                return Err(anyhow!("SV2 durable recovery has no reservation"));
                             };
                             deferred.push(DeferredBlock {
                                 hash,
@@ -593,9 +590,7 @@ fn handle_events(
                             // state; dropping the waiter releases exactly once.
                             // Shed past capacity instead of retaining uncharged.
                             let Some(charge) = charge else {
-                                return Err(anyhow!(
-                                    "SV2 queued recovery has no reservation"
-                                ));
+                                return Err(anyhow!("SV2 queued recovery has no reservation"));
                             };
                             deferred.push(DeferredBlock {
                                 hash,
@@ -626,9 +621,7 @@ fn handle_events(
                         // growing unbounded: never confirm an unapplied block.
                         // Linearizable capacity; at-least-once delivery stays
                         // idempotent on retry.
-                        return Err(anyhow!(
-                            "SV2 Undetermined block lost its reservation"
-                        ));
+                        return Err(anyhow!("SV2 Undetermined block lost its reservation"));
                     }
                     BlockStatus::Rejected if submission.receipt().is_stale_parent() => {
                         connection
@@ -775,13 +768,7 @@ mod tests {
     use bitcoin::secp256k1::{Keypair, Secp256k1};
     use bitcoin_rs_chain::compact_is_met_by;
     use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-    use bitcoin_rs_mining::{
-        Candidate, CandidateContext, CoinbaseBudget, FakeMiningControl, MiningControl,
-        assemble_candidate,
-    };
-    use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Network};
-    use bitcoin_rs_rpc::context::PoolOperator as _;
-    use bitcoin_rs_storage::KvStore;
+    use bitcoin_rs_mining::pool::ledger::{Ledger, MinerId, PayoutPolicy, PoolConfig};
     use bitcoin_rs_mining::pool::stratum::sv2::{
         AdmitError, AuthorityKeypair, Connection, FLAG_REQUIRES_STANDARD_JOBS, Limits, ServerConfig,
     };
@@ -789,6 +776,13 @@ mod tests {
         BIP320_VERSION_MASK, Extranonce, ExtranonceLayout, Job, JobBookConfig,
         MAX_NTIME_FORWARD_SECS, PoolCore, ShareLedger, ShareTarget,
     };
+    use bitcoin_rs_mining::{
+        Candidate, CandidateContext, CoinbaseBudget, FakeMiningControl, MiningControl,
+        assemble_candidate,
+    };
+    use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256, Network};
+    use bitcoin_rs_rpc::context::PoolOperator as _;
+    use bitcoin_rs_storage::KvStore;
     use codec_sv2::{
         Decoded, Decrypted, Handshake, InitiatorSent, MessageFrame, NoiseDecoder, NoiseEncoder,
         TransportDecryptState, TransportEncryptState,
@@ -805,7 +799,6 @@ mod tests {
         SubmitSharesStandard,
     };
     use noise_sv2::{INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE, Initiator};
-    use bitcoin_rs_mining::pool::ledger::{Ledger, MinerId, PayoutPolicy, PoolConfig};
     use zeroize::Zeroizing;
 
     use super::{BlockPipeline, DeferredBlock, LedgerHost, announce_current_job, handle_events};
@@ -1341,8 +1334,7 @@ mod tests {
 
         // Journal backpressure leaves the chain outcome unknown: the host must
         // retain the submission instead of confirming an unapplied block.
-        *host.control.submit.lock() =
-            bitcoin_rs_mining::BlockValidationResult::Inconclusive;
+        *host.control.submit.lock() = bitcoin_rs_mining::BlockValidationResult::Inconclusive;
         let pending = host.submit(&channel, 1, &job, winner)?;
         assert!(
             !has(&pending, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS),
@@ -1364,8 +1356,15 @@ mod tests {
             &mut host.connection,
             &host.core,
         );
-        assert!(waiter.is_none(), "Applied retry confirms and drops the waiter");
-        assert_eq!(host.node_submissions(), 2, "deferred retry re-queries node state");
+        assert!(
+            waiter.is_none(),
+            "Applied retry confirms and drops the waiter"
+        );
+        assert_eq!(
+            host.node_submissions(),
+            2,
+            "deferred retry re-queries node state"
+        );
         let confirmed = host.miner.open(&host.connection.take_transmit())?;
         assert!(has(&confirmed, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS));
         Ok(())

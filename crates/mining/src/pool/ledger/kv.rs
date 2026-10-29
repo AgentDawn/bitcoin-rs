@@ -531,9 +531,10 @@ impl<V: Value> Table<'_, u64, V> {
                 }
             }
             let logical = full_key[self.prefix.len()..].to_vec();
-            let key_bytes: [u8; 8] = logical.as_slice().try_into().map_err(|_| {
-                LedgerError::Invariant("non-u64 key in u64 table page".into())
-            })?;
+            let key_bytes: [u8; 8] = logical
+                .as_slice()
+                .try_into()
+                .map_err(|_| LedgerError::Invariant("non-u64 key in u64 table page".into()))?;
             let key = u64::from_be_bytes(key_bytes);
             if let Some(cursor) = after
                 && key <= cursor

@@ -1,8 +1,8 @@
 use bitcoin_rs_consensus::MAX_TIMEWARP;
 use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
 
-pub use pow::{compact_is_met_by, compact_to_target};
 use pow::target_to_compact;
+pub use pow::{compact_is_met_by, compact_to_target};
 
 use crate::{
     ChainError,

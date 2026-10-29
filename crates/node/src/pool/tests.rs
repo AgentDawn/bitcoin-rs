@@ -2,10 +2,6 @@
 
 use std::{path::Path, sync::Arc};
 
-use bitcoin_rs_mining::{BlockValidationResult, MiningControlError};
-use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, Txid};
-use bitcoin_rs_rpc::context::PoolOperator;
-use bitcoin_rs_storage::KvStore;
 use bitcoin_rs_mining::pool::ledger as pool_ledger;
 use bitcoin_rs_mining::pool::ledger::{
     Balance, Ledger, MinerId, PayoutPolicy, PoolConfig, RoundState, ShareCredit, ShareReceipt,
@@ -15,6 +11,10 @@ use bitcoin_rs_mining::pool::{
     AcceptedShare, BlockReceipt, FoundBlock, JobId, LedgerUnavailable, RecordOutcome, SessionId,
     ShareClass, ShareLedger, ShareTarget, WorkerIdentity,
 };
+use bitcoin_rs_mining::{BlockValidationResult, MiningControlError};
+use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, Txid};
+use bitcoin_rs_rpc::context::PoolOperator;
+use bitcoin_rs_storage::KvStore;
 
 use super::ledger::LedgerHost;
 
@@ -340,9 +340,7 @@ fn block_record_reservations_are_bounded_and_released(open: OpenStore) -> TestRe
     Ok(())
 }
 
-fn durable_undetermined_keeps_reservation_until_waiter_removed(
-    open: OpenStore,
-) -> TestResult {
+fn durable_undetermined_keeps_reservation_until_waiter_removed(open: OpenStore) -> TestResult {
     // An `Undetermined` submission releases no capacity when its record is
     // already durable: the full waiter stays charged to the shared
     // `MAX_PENDING_BLOCK_RECORDS` budget until removed. Fill capacity with
@@ -379,8 +377,7 @@ fn durable_undetermined_keeps_reservation_until_waiter_removed(
         let permit = host
             .try_reserve_block_slot()
             .ok_or("slot refused below capacity")?;
-        let (outcome, charge) =
-            permit.record_or_enqueue(MinerId(42), &found, &Ok(receipt));
+        let (outcome, charge) = permit.record_or_enqueue(MinerId(42), &found, &Ok(receipt));
         assert!(
             matches!(outcome, BlockRecordOutcome::Durable),
             "good block must record durably"
@@ -414,9 +411,7 @@ fn durable_undetermined_keeps_reservation_until_waiter_removed(
 
 #[test]
 fn protocol_admissions_share_total_capacity_and_release_it_on_drop() -> TestResult {
-    let shared = Arc::new(
-        bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter::new(1, 1)?,
-    );
+    let shared = Arc::new(bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter::new(1, 1)?);
     let sv1 = Arc::clone(&shared);
     let sv2 = Arc::clone(&shared);
     let first = sv1
@@ -439,9 +434,7 @@ fn protocol_admissions_share_total_capacity_and_release_it_on_drop() -> TestResu
 
 #[test]
 fn protocol_admissions_share_per_ip_capacity_without_consuming_refused_slots() -> TestResult {
-    let shared = Arc::new(
-        bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter::new(3, 1)?,
-    );
+    let shared = Arc::new(bitcoin_rs_mining::pool::stratum::sv1::ConnectionLimiter::new(3, 1)?);
     let sv1 = Arc::clone(&shared);
     let sv2 = Arc::clone(&shared);
     let same_ip = "192.0.2.1".parse()?;

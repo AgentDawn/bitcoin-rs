@@ -19,6 +19,11 @@ use bitcoin_rs_mempool::{
     AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolGateway,
     MempoolLimits, SubmitOutcome,
 };
+use bitcoin_rs_mining::pool::{
+    BIP320_VERSION_MASK, BlockStatus, Extranonce, ExtranonceLayout, Job, JobBook, JobBookConfig,
+    JobError, JobId, Session, SessionId, ShareClass, ShareError, ShareOutcome, ShareSubmission,
+    ShareTarget, ShareWork, StaleReason, fetch_template,
+};
 use bitcoin_rs_mining::{
     BlockTemplate, BlockTemplateMode, BlockTemplateRequest, BlockTemplateResult,
     BlockValidationResult, Candidate, CandidateContext, CoinbaseBudget, GenerateRequest,
@@ -29,11 +34,6 @@ use bitcoin_rs_primitives::{
     Script, Sequence, Tx, TxIn, TxOut, Txid, Witness, encode::consensus_bytes,
 };
 use bitcoin_rs_script::VerifyFlags;
-use bitcoin_rs_mining::pool::{
-    BIP320_VERSION_MASK, BlockStatus, Extranonce, ExtranonceLayout, Job, JobBook, JobBookConfig,
-    JobError, JobId, Session, SessionId, ShareClass, ShareError, ShareOutcome, ShareSubmission,
-    ShareTarget, ShareWork, StaleReason, fetch_template,
-};
 use compact_str::CompactString;
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
@@ -435,20 +435,31 @@ fn unburn_releases_duplicate_key_for_retry() -> TestResult {
     let mut fx = fixture(config(), 100, 2)?;
     let target = easy()?;
     let job = Arc::clone(&fx.job);
-    let first = fx.book.validate(&submit_for(&fx.session, &job, 41), &target)?;
+    let first = fx
+        .book
+        .validate(&submit_for(&fx.session, &job, 41), &target)?;
     let hash = first.share().hash;
-    let replay = fx.book.validate(&submit_for(&fx.session, &job, 41), &target);
+    let replay = fx
+        .book
+        .validate(&submit_for(&fx.session, &job, 41), &target);
     assert!(
         matches!(replay, Err(ShareError::Duplicate { first_job, .. }) if first_job == job.id())
     );
     // Unknown keys release nothing.
-    assert!(!fx.book.unburn(&BlockHash::from(Hash256::from_le_bytes(&[0xcc; 32]))));
+    assert!(
+        !fx.book
+            .unburn(&BlockHash::from(Hash256::from_le_bytes(&[0xcc; 32])))
+    );
     // The burned key releases once; a retry then validates fresh.
     assert!(fx.book.unburn(&hash));
     assert!(!fx.book.unburn(&hash));
-    let retry = fx.book.validate(&submit_for(&fx.session, &job, 41), &target)?;
+    let retry = fx
+        .book
+        .validate(&submit_for(&fx.session, &job, 41), &target)?;
     assert_eq!(retry.share().hash, hash);
-    let replay = fx.book.validate(&submit_for(&fx.session, &job, 41), &target);
+    let replay = fx
+        .book
+        .validate(&submit_for(&fx.session, &job, 41), &target);
     assert!(
         matches!(replay, Err(ShareError::Duplicate { first_job, .. }) if first_job == job.id())
     );

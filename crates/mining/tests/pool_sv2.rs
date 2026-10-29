@@ -23,6 +23,16 @@ use bitcoin_rs_mempool::{
     AdmissionChain, AdmissionOrigin, ChainAdmissionSnapshot, Mempool, MempoolGateway,
     MempoolLimits, SubmitOutcome,
 };
+use bitcoin_rs_mining::pool::stratum::sv2::{
+    AuthorityKeypair, CloseReason, Connection, Error, Event, FLAG_REQUIRES_STANDARD_JOBS,
+    FLAG_REQUIRES_VERSION_ROLLING, FLAG_REQUIRES_WORK_SELECTION, Limits, ROLES, RoleStatus,
+    SUCCESS_FLAG_REQUIRES_FIXED_VERSION, ServerConfig, SessionError, TransportError,
+    target_difficulty,
+};
+use bitcoin_rs_mining::pool::{
+    BIP320_VERSION_MASK, Extranonce, ExtranonceLayout, Installed, Job, JobBook, JobBookConfig,
+    JobId, ShareClass, ShareError, ShareTarget,
+};
 use bitcoin_rs_mining::{
     BlockTemplateRequest, BlockTemplateResult, BlockValidationResult, Candidate, CandidateContext,
     CoinbaseBudget, GenerateRequest, GeneratedBlock, MiningControl, MiningControlError, MiningInfo,
@@ -33,16 +43,6 @@ use bitcoin_rs_primitives::{
     Sequence, Tx, TxIn, TxOut, Txid, Witness, encode::double_sha256,
 };
 use bitcoin_rs_script::VerifyFlags;
-use bitcoin_rs_mining::pool::{
-    BIP320_VERSION_MASK, Extranonce, ExtranonceLayout, Installed, Job, JobBook, JobBookConfig,
-    JobId, ShareClass, ShareError, ShareTarget,
-};
-use bitcoin_rs_mining::pool::stratum::sv2::{
-    AuthorityKeypair, CloseReason, Connection, Error, Event, FLAG_REQUIRES_STANDARD_JOBS,
-    FLAG_REQUIRES_VERSION_ROLLING, FLAG_REQUIRES_WORK_SELECTION, Limits, ROLES, RoleStatus,
-    SUCCESS_FLAG_REQUIRES_FIXED_VERSION, ServerConfig, SessionError, TransportError,
-    target_difficulty,
-};
 use codec_sv2::{
     Decoded, Decrypted, Handshake, InitiatorSent, MessageFrame, NoiseDecoder, NoiseEncoder,
     TransportDecryptState, TransportEncryptState,
@@ -2754,8 +2754,8 @@ fn active_refresh_upgrades_a_channel_that_missed_its_parent_to_future() {
         .unwrap_or_else(|error| panic!("book: {error:?}"));
     let mut cfg = server_config();
     cfg.limits.max_outbound_frames = 3;
-    let mut session = ProtocolSession::new(cfg, &book)
-        .unwrap_or_else(|error| panic!("session: {error:?}"));
+    let mut session =
+        ProtocolSession::new(cfg, &book).unwrap_or_else(|error| panic!("session: {error:?}"));
     let setup = SetupConnection {
         protocol: Protocol::MiningProtocol,
         min_version: 2,

@@ -35,11 +35,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::pool::core::{Completion, Credited, Lease, ShareRequest, SubmitFailure};
 use crate::pool::{
     BlockOutcome, JobId, PoolCore, SessionId, ShareClass, ShareError, ShareTarget, StaleReason,
     WorkerIdentity,
 };
-use crate::pool::core::{Completion, Credited, Lease, ShareRequest, SubmitFailure};
 use bitcoin_rs_primitives::BlockHash;
 
 use super::{

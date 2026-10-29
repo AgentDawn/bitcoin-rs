@@ -521,9 +521,8 @@ impl Ledger {
                     .ok_or(LedgerError::Overflow("count"))?
                     .min(boundary);
                 let mut doomed: Vec<u64> = Vec::new();
-                doomed.reserve(
-                    usize::try_from(batch_end - start).unwrap_or(Self::PRUNE_BATCH_SIZE),
-                );
+                doomed
+                    .reserve(usize::try_from(batch_end - start).unwrap_or(Self::PRUNE_BATCH_SIZE));
                 for seq in start..batch_end {
                     if tables.shares.get(seq)?.is_some() {
                         doomed.push(seq);
@@ -549,8 +548,8 @@ impl Ledger {
                     for seq in &doomed {
                         tables.shares.remove(*seq)?;
                     }
-                    let batch = u64::try_from(doomed.len())
-                        .map_err(|_| LedgerError::Overflow("count"))?;
+                    let batch =
+                        u64::try_from(doomed.len()).map_err(|_| LedgerError::Overflow("count"))?;
                     if floor > previous {
                         tables.meta_u64.insert(M_PRUNED_BELOW, floor)?;
                     }
@@ -655,9 +654,8 @@ impl Ledger {
             let txn = self.db.begin_write()?;
             let tables = Tables::open(&txn)?;
             if let Some(id) = round_id_for_block(&tables.round_by_block, &block_hash)? {
-                let round = load_round(&tables.rounds, id)?.ok_or_else(|| {
-                    LedgerError::Corrupt("round index points at no round".into())
-                })?;
+                let round = load_round(&tables.rounds, id)?
+                    .ok_or_else(|| LedgerError::Corrupt("round index points at no round".into()))?;
                 Self::check_round_claim(&round, found)?;
                 let seq = round.solving_seq;
                 return Ok(BlockRecorded {
@@ -698,9 +696,8 @@ impl Ledger {
         let recorded = {
             let tables = Tables::open(&txn)?;
             if let Some(id) = round_id_for_block(&tables.round_by_block, &block_hash)? {
-                let round = load_round(&tables.rounds, id)?.ok_or_else(|| {
-                    LedgerError::Corrupt("round index points at no round".into())
-                })?;
+                let round = load_round(&tables.rounds, id)?
+                    .ok_or_else(|| LedgerError::Corrupt("round index points at no round".into()))?;
                 Self::check_round_claim(&round, found)?;
                 let seq = round.solving_seq;
                 return Ok(BlockRecorded {
