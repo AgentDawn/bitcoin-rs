@@ -205,6 +205,15 @@ pub(crate) fn finish_package(
         facts.package_error = Some(error.into());
         return facts;
     }
+    // Core's RPC package submission checks its aggregate fee floor before
+    // cluster and ephemeral-spend policy. Other planner errors and native
+    // submission keep their existing precedence.
+    if matches!(mode, crate::gateway::AdmissionMode::PackageRpcSubmit(_))
+        && aggregate_error == Some(AcceptanceRejectReason::MinRelayFeeNotMet)
+    {
+        facts.package_error = aggregate_error;
+        return facts;
+    }
     match checks
         .graph
         .and_then(|graph| graph.check_limits(checks.limits))

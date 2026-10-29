@@ -63,7 +63,13 @@ holds the reference pins and the admission-profile evidence.
   `CFeeRate::GetFee(vsize)` rather than a rounded rate quote. An invalid transaction cannot
   select a more convenient maximum-fee error. The `submit_rpc_package`
   pre-script `check_package_max_feerate` is an explicit exception: for over-cap
-  members, `MaxFeeExceeded` precedes script-failure reporting.
+  members, `MaxFeeExceeded` precedes script-failure reporting. It compares the
+  captured signed modified fee/vsize ratio exactly against maxfeerate/1,000,
+  as Core 31.1's `CFeeRate` comparison does, without rounding the quote or
+  applying `GetFee`'s one-satoshi minimum. An absent cap or RPC maxfeerate=0
+  disables the guard. After TRUC checks, RPC aggregate minimum-fee failure
+  precedes cluster and ephemeral-spend checks; other planner errors and native
+  submission retain their existing precedence.
 - A verified plan carries prepared insertion and ordered removals. The writer
   rechecks its stamp before any mutation. Capacity refusal, stale preparation
   or a rejected replacement changes no pool membership, fee overlay, estimator
@@ -132,6 +138,11 @@ holds the reference pins and the admission-profile evidence.
   and `package::tests::rpc_package_capacity_and_replacement_refusals_preserve_authoritative_state`
   in `crates/mempool/src/package/tests.rs` cover package cap,
   unsupported-shape, capacity and replacement outcomes.
+- Proof: `package::tests::rpc_package_fee_cap_compares_signed_fees_without_rounding`
+  and `package::tests::rpc_package_fee_failure_precedence_preserves_other_planner_errors`
+  cover cap boundaries, disabled caps, fee/cluster/dust precedence and refusal
+  without mutation. `gateway::tests::package_fee_cap_keeps_signed_extremes_exact`
+  covers signed fees even when no displayable rate exists.
 - TRUC requires matching unconfirmed versions, at most one ancestor/descendant,
   10,000 adjusted vB for a root and 1,000 for a child. An eligible sole sibling
   joins single-transaction RBF and remains subject to its fees and diagrams.
