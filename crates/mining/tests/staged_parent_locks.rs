@@ -1,7 +1,6 @@
 //! Relative locks of staged-confirmation parents in projected template selection.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::error::Error;
 use std::sync::Arc;

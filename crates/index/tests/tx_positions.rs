@@ -7,8 +7,7 @@
 // A malformed fixture is a test failure; panicking reports it at the call site.
 #![allow(clippy::expect_used)]
 
-#[path = "support/common.rs"]
-mod common;
+use crate::support::common;
 
 use std::sync::Arc;
 

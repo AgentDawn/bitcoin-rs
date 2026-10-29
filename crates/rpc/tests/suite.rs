@@ -12,3 +12,6 @@ mod scantxoutset_lifecycle;
 mod setban_expiry;
 mod tip_wait_admission;
 mod transaction_methods;
+
+mod mining_fixture;
+mod support;

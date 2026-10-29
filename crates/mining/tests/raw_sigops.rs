@@ -4,8 +4,7 @@
 //! and witness activation. rust-bitcoin independently checks active costs;
 //! these fixtures exercise accounting, not script validity or admission.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::error::Error;
 

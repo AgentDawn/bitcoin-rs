@@ -1,8 +1,7 @@
 //! Deep reorganization planner integration tests.
 use bitcoin_rs_chain::{BlockHeader, BlockTree, NodeId, NodeStatus, plan_reorg};
 
-#[path = "support/pow_oracle.rs"]
-mod pow_oracle;
+use crate::support::pow_oracle;
 use bitcoin_rs_primitives::{BlockHash, CompactTarget, Hash256};
 use pow_oracle::pow_is_met;
 

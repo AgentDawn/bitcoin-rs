@@ -16,3 +16,5 @@ mod raw_sigops;
 mod staged_parent_locks;
 mod template_shape;
 mod witness_commitment_vector;
+
+mod support;

@@ -7,3 +7,5 @@ mod portable_bundle;
 mod script_live;
 mod silent_payments;
 mod tx_positions;
+
+mod support;

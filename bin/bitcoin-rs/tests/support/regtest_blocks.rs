@@ -7,7 +7,7 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
-pub(super) fn coinbase(height: u32, outputs: Vec<TxOut>) -> Transaction {
+pub(crate) fn coinbase(height: u32, outputs: Vec<TxOut>) -> Transaction {
     Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -24,7 +24,7 @@ pub(super) fn coinbase(height: u32, outputs: Vec<TxOut>) -> Transaction {
     }
 }
 
-pub(super) fn block(prev: BlockHash, time: u32, txdata: Vec<Transaction>) -> Result<Block> {
+pub(crate) fn block(prev: BlockHash, time: u32, txdata: Vec<Transaction>) -> Result<Block> {
     let mut block = Block {
         header: bitcoin::block::Header {
             version: bitcoin::block::Version::from_consensus(0x2000_0000),
@@ -43,7 +43,7 @@ pub(super) fn block(prev: BlockHash, time: u32, txdata: Vec<Transaction>) -> Res
     Ok(block)
 }
 
-pub(super) fn submit(node: &ProcessNode, block: &Block) -> Result {
+pub(crate) fn submit(node: &ProcessNode, block: &Block) -> Result {
     // Bulk fixture bodies would exceed the process journal's 64 MiB bound.
     // Keep process custody and the common RPC transport; journal compact
     // block identities here instead of copying 140 MiB of generated hex.

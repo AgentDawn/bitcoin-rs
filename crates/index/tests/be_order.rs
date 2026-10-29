@@ -10,8 +10,7 @@
 //! without a numeric re-sort. Exact identity resolution against full blocks
 //! lives in the runtime query engine, not in these row scans.
 
-#[path = "support/common.rs"]
-mod common;
+use crate::support::common;
 
 use std::sync::Arc;
 

@@ -1,8 +1,7 @@
 #![allow(clippy::expect_used)]
 //! Package selection, limits, and adversarial candidate tests.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;

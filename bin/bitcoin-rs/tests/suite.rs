@@ -19,3 +19,5 @@ mod silent_payments;
 mod tx_ibd_gate_e2e;
 mod verifychain_block_rules;
 mod wallet_facing;
+
+mod support;

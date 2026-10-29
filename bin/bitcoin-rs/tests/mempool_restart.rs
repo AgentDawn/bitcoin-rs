@@ -12,8 +12,7 @@ use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-#[path = "support/wire_peer.rs"]
-mod wire_peer;
+use crate::support::wire_peer;
 
 fn options(enabled: bool) -> SpawnOptions<'static> {
     SpawnOptions {

@@ -4,12 +4,7 @@
 
 #![expect(clippy::expect_used, reason = "reference identity rejection tests")]
 
-#[expect(
-    dead_code,
-    reason = "the manifest gate reads the parser only, not the artifact selectors"
-)]
-#[path = "support/reference_set.rs"]
-mod reference_set;
+use crate::support::reference_set;
 
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin_rs_rpc::manifest::{MANIFEST, MANIFEST_TOML, Status};

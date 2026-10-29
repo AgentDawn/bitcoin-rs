@@ -16,8 +16,7 @@
 //! selection: parent skips, per-chunk finality, weight/size/sigop skips,
 //! signed-fee order, the aggregate fee floor, or the prefix tail.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::collections::HashSet;
 use std::ops::Range;

@@ -1,7 +1,6 @@
 //! Candidate scalar, dependency-index, and shape tests.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::error::Error;
 

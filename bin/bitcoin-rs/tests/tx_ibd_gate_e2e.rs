@@ -17,6 +17,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::support::wire_peer;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::hashes::Hash as _;
@@ -28,8 +29,6 @@ use bitcoin::{
 use bitcoin_rs_e2e::helpers::coinbase_script_sig;
 use bitcoin_rs_e2e::process_peer::is_soft_recv_error;
 use bitcoin_rs_e2e::{Error, Kind, ProcessNode};
-#[path = "support/wire_peer.rs"]
-mod wire_peer;
 use wire_peer::Peer;
 
 use serde_json::{Value, json};

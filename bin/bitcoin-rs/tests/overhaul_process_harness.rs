@@ -11,11 +11,7 @@
     reason = "process custody failures must name the offending identity"
 )]
 
-// The harness consumes only the release identity's binary digest; the rest
-// of the reference record stays dead in this binary.
-#[expect(dead_code, reason = "only the release bitcoind digest is read")]
-#[path = "support/reference_set.rs"]
-mod reference_set;
+use crate::support::reference_set;
 
 #[path = "support/script_decode_cases.rs"]
 mod script_decode_cases;

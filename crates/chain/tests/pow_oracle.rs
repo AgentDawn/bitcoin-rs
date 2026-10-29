@@ -1,7 +1,6 @@
 //! Self-check for the independent proof-of-work oracle used by chain tests.
 
-#[path = "support/pow_oracle.rs"]
-mod pow_oracle;
+use crate::support::pow_oracle;
 
 use bitcoin_rs_primitives::{BlockHash, Network};
 use pow_oracle::pow_is_met;

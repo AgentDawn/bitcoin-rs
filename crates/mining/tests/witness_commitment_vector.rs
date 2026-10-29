@@ -5,8 +5,7 @@
 //! `bitcoin::Block::witness_root` (rust-bitcoin's own BIP141 implementation),
 //! and against the byte layout of the `OP_RETURN` commitment script.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::error::Error;
 

@@ -4,8 +4,7 @@
 //! then returns immediately for coinbase. rust-bitcoin supplies an independent
 //! transaction-cost oracle; admitted pool costs are already scaled.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::error::Error;
 

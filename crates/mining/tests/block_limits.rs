@@ -5,8 +5,7 @@
 //! resource-skipped chunks contribute a fitting ancestor-closed prefix meeting
 //! the rate floor; finality and missing-ancestor skips contribute nothing.
 
-#[path = "support/fixtures.rs"]
-mod common;
+use crate::support::fixtures as common;
 
 use std::error::Error;
 use std::sync::Arc;
