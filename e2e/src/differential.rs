@@ -39,12 +39,18 @@ pub fn compare_reply(observation: &str, reference: &Value, candidate: &Value) ->
     }
 }
 
-/// Core prints doubles with 16 significant digits, so a value at the edge of
-/// that grid parses back one ULP away from ours. Compare numbers within one
-/// ULP and everything else strictly.
+/// Compares two replies for equivalence.
+///
+/// Integral JSON numbers compare exactly, because `f64` cannot separate them
+/// above 2^53. Floats compare within one ULP: Core prints doubles with 16
+/// significant digits, so a value at the edge of that grid parses back one ULP
+/// away from ours. Everything else compares strictly.
 fn equivalent(reference: &Value, candidate: &Value) -> bool {
-    if let (Some(left), Some(right)) = (reference.as_f64(), candidate.as_f64()) {
-        if reference.is_number() && candidate.is_number() {
+    if reference.is_number() && candidate.is_number() {
+        if let (Some(left), Some(right)) = (integral(reference), integral(candidate)) {
+            return left == right;
+        }
+        if let (Some(left), Some(right)) = (reference.as_f64(), candidate.as_f64()) {
             return within_one_ulp(left, right);
         }
     }
@@ -64,6 +70,14 @@ fn equivalent(reference: &Value, candidate: &Value) -> bool {
                 .all(|(value, other)| equivalent(value, other));
     }
     reference == candidate
+}
+
+/// Returns the exact integer an integral JSON number carries.
+fn integral(value: &Value) -> Option<i128> {
+    value
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| value.as_u64().map(i128::from))
 }
 
 fn within_one_ulp(left: f64, right: f64) -> bool {
@@ -203,5 +217,48 @@ impl CommonFunds {
             helpers::raw_spend_to(outpoint, &output, fee_sats, sequence, &output.script_pubkey);
         helpers::sign_p2pkh_inputs(&mut spend, std::slice::from_ref(&output))?;
         Ok(spend)
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test assertions")]
+mod tests {
+    use super::equivalent;
+    use sonic_rs::{json, to_value};
+
+    #[test]
+    fn integers_beyond_f64_precision_compare_exactly() {
+        let lower = json!(9_007_199_254_740_992_u64);
+        let upper = json!(9_007_199_254_740_993_u64);
+        assert_ne!(lower, upper);
+        assert!(!equivalent(&lower, &upper));
+        assert!(equivalent(&lower, &lower));
+        assert!(!equivalent(
+            &json!(-9_007_199_254_740_992_i64),
+            &json!(-9_007_199_254_740_993_i64)
+        ));
+    }
+
+    #[test]
+    fn floats_one_ulp_apart_are_equivalent() {
+        let lower = to_value(&4.656_542_373_906_924_7e-10_f64).expect("lower value");
+        let upper = to_value(&4.656_542_373_906_925e-10_f64).expect("upper value");
+        assert_ne!(lower, upper);
+        assert!(equivalent(&lower, &upper));
+        assert!(!equivalent(&json!(1.5), &json!(2.5)));
+    }
+
+    #[test]
+    fn nested_values_use_the_same_rules() {
+        let reference = json!({
+            "height": 9_007_199_254_740_992_u64,
+            "difficulty": 4.656_542_373_906_924_7e-10_f64,
+            "tx": [{"weight": 3_012_u64}],
+        });
+        let mut candidate = reference.clone();
+        candidate["difficulty"] = json!(4.656_542_373_906_925e-10_f64);
+        assert!(equivalent(&reference, &candidate));
+        candidate["tx"][0]["weight"] = json!(3_013_u64);
+        assert!(!equivalent(&reference, &candidate));
     }
 }
