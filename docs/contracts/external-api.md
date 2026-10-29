@@ -1231,6 +1231,18 @@ only. It does not establish mainnet memory, throughput, or commit-blocking time.
   and node lifecycle tests
   `split_rpc_listeners_start_and_join_through_node_services` and
   `public_bind_failure_rolls_back_management_binding_and_node_state`.
+  - An empty accept queue waits on listener readiness, rather than sleeping
+    before retrying accept. Connections wake that wait immediately. The
+    existing read-only atomic shutdown latch has no notifier, so the wait
+    uses a 20-ms readiness timeout to inspect it (subject to OS scheduling);
+    timeout alone does not retry accept.
+    Accepted streams retain blocking worker I/O and the configured idle
+    timeout. Readiness setup/wait failures stop the listener through its
+    existing exit path. Proof: `idle_accept_is_prompt_across_arrival_phases`
+    measures new arrivals after a real empty-queue observation;
+    `serve_with_shutdown_exits_on_signal` stops an idle listener without a
+    client connection. These are local timing proofs, not throughput or
+    whole-node latency guarantees.
   - Interrupted and aborted accepts retry immediately. Other accept errors,
     including descriptor exhaustion and Linux's pending-connection `EOPNOTSUPP`
     (`Unsupported`), warn and retry after 100 ms; shutdown is checked before

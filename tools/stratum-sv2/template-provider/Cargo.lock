@@ -439,6 +439,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "metrics",
  "miniscript",
+ "mio",
  "parking_lot",
  "serde",
  "serde_json",

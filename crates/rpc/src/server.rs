@@ -36,7 +36,10 @@ const MAX_DRAIN_BYTES: usize = 64 * 1_024;
 /// under the peer.
 const DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
-const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(100);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// The existing read-only atomic shutdown latch has no notification handle.
+/// Bound only cancellation checks; socket readiness wakes the wait immediately.
+const ACCEPT_SHUTDOWN_CHECK: Duration = Duration::from_millis(20);
 
 const PUBLIC_ESPLORA_METHODS: &[&str] = &["GET", "POST", "OPTIONS"];
 
@@ -125,9 +128,9 @@ impl RpcServer {
 
     /// Runs the accept loop until `shutdown` is set to `true`.
     ///
-    /// Polls non-blocking accept on a fixed cadence so the loop can observe
-    /// shutdown without parking on an open socket. Each accepted connection
-    /// is restored to blocking mode and handed to a bounded worker thread,
+    /// Waits for listener readiness when no connection is pending, with bounded
+    /// checks of the read-only shutdown latch. Each accepted connection is
+    /// restored to blocking mode and handed to a bounded worker thread,
     /// preserving the configured `idle_timeout` per connection.
     pub fn serve_with_shutdown(
         self,
@@ -143,23 +146,35 @@ impl RpcServer {
         shutdown: impl Into<bitcoin_rs_chain::LatchReader>,
         surface: RpcSurface,
     ) -> io::Result<()> {
-        self.serve_accept_loop(&shutdown.into(), surface, TcpListener::accept)
+        self.serve_accept_loop(&shutdown.into(), surface, mio::net::TcpListener::accept)
     }
 
     fn serve_accept_loop(
         self,
         shutdown: &bitcoin_rs_chain::LatchReader,
         surface: RpcSurface,
-        mut accept: impl FnMut(&TcpListener) -> io::Result<(TcpStream, SocketAddr)>,
+        mut accept: impl FnMut(&mio::net::TcpListener) -> io::Result<(mio::net::TcpStream, SocketAddr)>,
     ) -> io::Result<()> {
         let _stop = RpcStop(Arc::clone(&self.handler));
         self.handler
             .configure_blocking_admission(per_source_limit(self.max_connections));
-        self.listener.set_nonblocking(true)?;
+        let mut readiness = mio::Poll::new()?;
+        let listener = self.listener.try_clone()?;
+        // Configure the cloned handle itself: Windows clones can be blocking.
+        listener.set_nonblocking(true)?;
+        let mut listener = mio::net::TcpListener::from_std(listener);
+        readiness
+            .registry()
+            .register(&mut listener, mio::Token(0), mio::Interest::READABLE)?;
+        let mut events = mio::Events::with_capacity(1);
         let active = Arc::new(Mutex::new(ActiveConnections::default()));
         while !shutdown.is_triggered() {
-            match accept(&self.listener) {
+            // Use Mio's accept, including its WouldBlock rearming on Windows.
+            // Drain readiness before waiting again; accepted streams return to
+            // the existing blocking worker and admission path.
+            match accept(&listener) {
                 Ok((stream, addr)) => {
+                    let stream: TcpStream = stream.into();
                     if let Err(error) = stream
                         .set_nonblocking(false)
                         .and_then(|()| self.handle_accept(&active, stream, addr.ip(), surface))
@@ -168,7 +183,14 @@ impl RpcServer {
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(POLL_INTERVAL);
+                    while !shutdown.is_triggered() {
+                        match readiness.poll(&mut events, Some(ACCEPT_SHUTDOWN_CHECK)) {
+                            Ok(()) if !events.is_empty() => break,
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
                 }
                 Err(error) => match error.kind() {
                     io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => {
@@ -183,7 +205,7 @@ impl RpcServer {
                         // Back off unknown OS errors too, avoiding a busy loop,
                         // and recheck shutdown before the next accept attempt.
                         warn!(%error, "rpc accept failed; retrying after backoff");
-                        thread::sleep(POLL_INTERVAL);
+                        thread::sleep(ACCEPT_ERROR_BACKOFF);
                     }
                 },
             }
