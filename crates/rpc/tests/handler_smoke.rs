@@ -24,6 +24,7 @@ use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::contract::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
+#[path = "mining_fixture/mod.rs"]
 mod mining_fixture;
 
 /// Every required handler must answer with the facts the fixture chain,

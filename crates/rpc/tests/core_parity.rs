@@ -9,6 +9,7 @@
 //! tip identity — and exactly one relation each: `exact`, or `known_gap`
 //! with one concrete gap identifier pinning both sides of the divergence.
 
+#[path = "support/mod.rs"]
 mod support;
 
 use std::collections::BTreeSet;

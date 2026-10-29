@@ -79,7 +79,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 
   # 4. Verify schema and compact block relay assertions
   P2P_CORE_INTEROP_EVIDENCE=target/core-differential/evidence.json \
-    cargo test --locked -p bitcoin-rs-p2p --test core_interop_live -- --ignored
+    cargo test --locked -p bitcoin-rs-p2p --test suite core_interop_live:: -- --ignored
   ```
 - **Artifacts**: CI retains `target/core-differential/*.log` and `evidence.json`
   in the `core-differential-<run_attempt>` artifact for 7 days.
@@ -110,7 +110,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   cargo build --locked --release -p bitcoin-rs
   BITCOIN_RS_NODE="$PWD/target/release/bitcoin-rs" \
     BITCOIN_RS_REFERENCE_BITCOIND="$(scripts/install-bitcoind.sh --print-path)" \
-    cargo test --locked -p bitcoin-rs-e2e --test acceptance
+    cargo test --locked -p bitcoin-rs-e2e --test suite acceptance::
   ```
 - **Artifacts**: `acceptance-*.json` files recorded under the test process evidence
   directory.
@@ -135,8 +135,8 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     accept/reject decisions with those vectors' expected validity.
 - **Reproduce**:
   ```sh
-  cargo test --locked -p bitcoin-rs-script --test core_vectors
-  cargo test --locked -p bitcoin-rs-consensus --test vectors
+  cargo test --locked -p bitcoin-rs-script --test suite core_vectors::
+  cargo test --locked -p bitcoin-rs-consensus --test suite vectors::
   ```
 
 ---
@@ -156,10 +156,10 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
     `ANYONECANPAY`, `DEFAULT`) for legacy, BIP143 (SegWit v0), and BIP341 (Taproot).
 - **Reproduce**:
   ```sh
-  cargo test --locked -p bitcoin-rs-consensus --test shared_sighash
-  cargo test --locked -p bitcoin-rs-script --test proptest
-  cargo test --locked -p bitcoin-rs-primitives --test differential
-  cargo test --locked -p bitcoin-rs-primitives --test bip_vectors
+  cargo test --locked -p bitcoin-rs-consensus --test suite shared_sighash::
+  cargo test --locked -p bitcoin-rs-script --test suite proptest::
+  cargo test --locked -p bitcoin-rs-primitives --test suite differential::
+  cargo test --locked -p bitcoin-rs-primitives --test suite bip_vectors::
   ```
 
 ---
@@ -184,7 +184,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 - **Reproduce**:
   ```sh
   cargo test --locked -p bitcoin-rs-consensus --features kernel \
-    --test kernel_vector_parity --test kernel_block_parity -- --nocapture
+    --test suite -- kernel_vector_parity:: kernel_block_parity:: --nocapture
   ```
 
 ---
@@ -198,7 +198,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   - `crates/consensus/src/verify_block.rs`: Enforces BIP30 duplicate txid checks,
     BIP34 coinbase height, BIP68 relative locktimes, BIP141 SegWit commitments,
     and block weight limits.
-  - `crates/chainstate/tests/unit/apply/persistence_tests.rs`: Mutation failure
+  - `crates/chainstate/src/tests/persistence_tests.rs`: Mutation failure
     boundaries, undo persistence atomicity, and BIP30 overwrite undo coin restoration.
 - **Reproduce**:
   ```sh
@@ -244,7 +244,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   ```sh
   # Native codec roundtrip check over corpus seeds:
   BITCOIN_RS_FUZZ_CORPUS=../bitcoin-rs-fuzz-corpus/corpus \
-    cargo test --locked -p bitcoin-rs-primitives --test differential
+    cargo test --locked -p bitcoin-rs-primitives --test suite differential::
 
   # Run a bounded fuzz campaign with target, seconds, corpus, and output paths:
   ./scripts/run-fuzz-campaign.sh \
@@ -260,9 +260,9 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 - **Tier**: In-tree durability and recovery verification.
 - **Contract & clauses**: [`docs/contracts/recovery.md`](contracts/recovery.md).
 - **Owner suites**:
-  - `crates/chainstate/tests/unit/recovery_marker_order_tests.rs`: Recovery marker sequencing.
-  - `crates/chainstate/tests/unit/durable_replay_tests.rs`: Replay from durable commit points.
-  - `crates/chainstate/tests/unit/assumeutxo_recovery_tests.rs`: Simulates process
+  - `crates/chainstate/src/tests/recovery_marker_order_tests.rs`: Recovery marker sequencing.
+  - `crates/chainstate/src/durable/tests.rs`: Replay from durable commit points.
+  - `crates/chainstate/src/assumeutxo/tests/recovery.rs`: Simulates process
     termination (SIGKILL) mid-import, mid-activation, and mid-validation; verifies
     lost failure receipt retention, durable head checkpoint recovery, and below-base reorgs (Core v2 snapshot fixture provenance in [`crates/utxo/tests/fixtures/core-v2/README.md`](../crates/utxo/tests/fixtures/core-v2/README.md); offline snapshot inspection CLI in [`tools/snapshot/README.md`](../tools/snapshot/README.md)).
   - `crates/storage/tests/durable_head_store.rs`: Atomic head row commits and corruption refusal.
@@ -291,8 +291,8 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
   cargo test --locked -p bitcoin-rs-chainstate --lib durable::tests
   cargo test --locked -p bitcoin-rs-chainstate \
     --features fjall --lib assumeutxo::tests::recovery
-  cargo test --locked -p bitcoin-rs-storage --test durable_head_store
-  cargo test --locked -p bitcoin-rs-e2e --test reorg
+  cargo test --locked -p bitcoin-rs-storage --test suite durable_head_store::
+  cargo test --locked -p bitcoin-rs-e2e --test suite reorg::
   ```
 
 ---

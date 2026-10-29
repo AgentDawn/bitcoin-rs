@@ -95,7 +95,7 @@ publication/recovery races, IBD and backpressure. The
 P2PKH spend with three P2TR candidates and checks the exact tweak and each
 candidate through authenticated HTTP, reorg and restart. The 100 funding blocks
 are required for coinbase maturity. Source commit/recovery and lease tests remain
-with `crates/chainstate/tests/unit/block_spends_tests.rs`. The separate
+with `crates/chainstate/src/block_spends/tests.rs`. The separate
 `bin/bitcoin-rs/tests/block_inputs.rs` regression applies a signed spend with
 12,500 P2TR outputs, which exceeded the removed JSON estimate. It checks complete
 `getblock` verbosity 3, binary spent-output REST and BIP352 candidates using real

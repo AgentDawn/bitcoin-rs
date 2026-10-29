@@ -118,7 +118,7 @@ different frontier. `sync_progress` reports blocks and headers separately for
 this reason (`crates/rpc/src/context.rs`); a `blocks == headers` projection is
 not validation progress when an AssumeUTXO historical role is still replaying.
 
-- Proof: `crates/node/tests/unit/state/tests/events.rs`
+- Proof: `crates/node/src/state/tests/events.rs`
   (`record_returns_hints_in_commit_order_and_advances_the_snapshot`,
   `active_chain_snapshot_anchors_at_restored_tip_after_restart`);
   `crates/chainstate` post-commit publication tests (`EVT-02`);
@@ -140,7 +140,7 @@ remaining pipeline obligation: the eligible work item must actually reach its
 driver and be sent or executed.
 
 - Proof: `crates/p2p/src/sync/tests/` (frontier recovery, peer handover,
-  cold-start hedge regressions); `crates/node/tests/unit/state/tests/events.rs`
+  cold-start hedge regressions); `crates/node/src/state/tests/events.rs`
   `record_returns_hints_in_commit_order_and_advances_the_snapshot`.
 
 ### `SYNC-03`: Foreground progress, resource, and failure isolation

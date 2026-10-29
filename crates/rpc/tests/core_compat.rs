@@ -19,8 +19,10 @@ extern crate alloc;
     dead_code,
     reason = "core_compat reaches only the chaininfo decoder from this shared test-support module"
 )]
+#[path = "support/mod.rs"]
 mod support;
 
+#[path = "mining_fixture/mod.rs"]
 mod mining_fixture;
 
 use alloc::sync::Arc;

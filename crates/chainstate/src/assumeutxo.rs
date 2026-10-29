@@ -1405,7 +1405,6 @@ impl AssumeUtxoManager {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/assumeutxo_tests.rs"]
 mod tests;
 
 /// Never substitute a height fraction for an unknown transaction count.

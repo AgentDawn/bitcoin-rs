@@ -140,7 +140,7 @@ the applied-tip fence across GET and read-only POST requests.
 - **Closed namespaces:** `/api` and `/esplora` accept only their documented
   GET/POST routes, and unprefixed explorer paths remain 404. Evidence: the
   same integration test plus `listener_directory_table_is_closed_over_http`;
-  run with `cargo test -p bitcoin-rs --test wallet_facing`.
+  run with `cargo test -p bitcoin-rs --test suite wallet_facing::`.
 - **Consumer boundary:** the proof uses only HTTP against a spawned node.
   Evidence: the imports of that test target.
 

@@ -127,10 +127,10 @@ Run the production comparisons with the exact pinned binary supplied through
 `BITCOIN_RS_REFERENCE_BITCOIND`:
 
 ```sh
-cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_process_harness policy_cases:: -- --nocapture
-cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test overhaul_process_harness replacement_signaling_matches_pinned_core -- --exact --nocapture
+cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test suite overhaul_process_harness::policy_cases:: -- --nocapture
+cargo test --locked -p bitcoin-rs --no-default-features --features fjall --test suite overhaul_process_harness::replacement_signaling_matches_pinned_core -- --exact --nocapture
 cargo test --locked -p bitcoin-rs-mempool -p bitcoin-rs-mining -p bitcoin-rs-rpc
-cargo test --locked -p bitcoin-rs-mining --test overhaul_resource_bounds -- --nocapture
+cargo test --locked -p bitcoin-rs-mining --test suite overhaul_resource_bounds:: -- --nocapture
 bash scripts/ci-pr.sh clippy
 ```
 

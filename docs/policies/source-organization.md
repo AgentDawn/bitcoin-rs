@@ -30,20 +30,26 @@ its location:
 
 | Proof boundary | Default location |
 | --- | --- |
-| Owner-local behavior, including required private access | A short inline `#[cfg(test)] mod tests`; extract a larger suite to `src/owner/tests.rs`, declared under `#[cfg(test)]` by its owner. Further splits use behavioral names under `src/owner/tests/`. For crate-root behavior, use `src/tests.rs`. |
-| Behavior at the crate-consumer boundary or an independent public-surface oracle | A Cargo integration target under `tests/<behavior>.rs`. Keep helper modules under `tests/support/` so they are not accidental test targets. |
+| Owner-local behavior, including required private access | An inline `#[cfg(test)]` module of at most 300 lines; extract larger modules to `src/owner/tests.rs`, declared under `#[cfg(test)]` by their owner. Preserve existing named test modules at `src/owner/<name>.rs`. Further splits use behavioral names under `src/owner/tests/`. For crate-root behavior, use `src/tests.rs`. |
+| Behavior at the crate-consumer boundary or an independent public-surface oracle | Modules under `tests/<behavior>.rs`, registered by one `tests/suite.rs` integration target per package. Set `autotests = false` and declare the suite explicitly in `Cargo.toml`. Keep helper modules under `tests/support/`. |
 | Actual daemon lifecycle, restart, or cross-process/reference behavior | A target using the existing process harness at the package or e2e boundary that owns that behavior. Preserve real process and persistence evidence where the guarantee requires it. |
 
+Private-access tests stay owner-local under `src/`; do not expose production
+items solely to move tests into the integration suite. The inline-module limit
+applies to test code, not to production algorithms or owner boundaries.
+
 Reading a socket or reopening a store does not by itself require a separate
-integration target. Likewise, a file under `tests/unit/` imported by a library
-through `#[path]` is still a unit-test module. Use owner-local source paths
-for extracted private tests rather than creating another such cross-tree
-layout. Keep registry classification, dispatcher policy, transport behavior,
+integration target. Preserve feature/platform selection on suite modules.
+Retain a separate target only for a required compilation, artifact, or process
+isolation boundary, and explain that reason beside its `[[test]]` entry.
+Do not include private unit tests from `tests/` through `#[path]`; use ordinary
+module declarations under their source owner. Keep registry classification,
+dispatcher policy, transport behavior,
 and authoritative state transitions with their respective proof owners.
 Overlapping inputs are justified when the oracle or failure boundary differs.
 
 Fixtures and helpers belong to the smallest test scope that uses them. Keep
-a local fixture with its suite; share within a crate's integration targets
+a local fixture with its suite; share within a crate's integration modules
 through `tests/support/`. For cross-crate consumers, reuse an existing domain
 fixture or process-harness owner with its intended test feature and dependency
 boundary. Do not copy fixtures, reach into another package's private test tree,

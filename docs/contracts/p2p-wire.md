@@ -128,7 +128,7 @@ exercised by `with_current_rejects_stale_source_and_holds_live_identity` in
 
 For the process comparison, set `BITCOIN_RS_NODE` to a binary built from the
 tested commit and `BITCOIN_RS_REFERENCE_BITCOIND` to the pinned Core binary.
-`cargo test -p bitcoin-rs-e2e --test peer_discouragement` runs
+`cargo test -p bitcoin-rs-e2e --test suite peer_discouragement::` runs
 `e2e/tests/peer_discouragement.rs` against pinned Core 31.1 and the candidate on
 loopback: protected oversized-headers senders remain connected, unprotected
 local senders disconnect and can reconnect, RPC reflects `noban`, and no manual
@@ -737,7 +737,7 @@ default, and `docs/contracts/core-differential.md` CORE-06 owns the live Core
     and its near-tip `NETWORK_LIMITED` exception;
     `pruned_version_message_advertises_network_limited_only` and
     `unpruned_version_message_advertises_network` pin the advertised set;
-  - `cargo test -p bitcoin-rs-p2p --test core_compat` pins rust-bitcoin v1
+  - `cargo test -p bitcoin-rs-p2p --test suite core_compat::` pins rust-bitcoin v1
     envelopes, handshake fields, per-network framing, relay round-trips, the
     reject-or-ignore matrix, and peer-visible reorg/restart behavior.
 - `crates/p2p/tests/core_interop_live.rs`: live differential lane running via

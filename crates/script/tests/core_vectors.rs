@@ -22,8 +22,8 @@
 //! Run:
 //!
 //! ```sh
-//! cargo test -p bitcoin-rs-script --test core_vectors
-//! cargo test -p bitcoin-rs-script --features kernel --test core_vectors
+//! cargo test -p bitcoin-rs-script --test suite core_vectors::
+//! cargo test -p bitcoin-rs-script --features kernel --test suite core_vectors::
 //! ```
 
 #![cfg(test)]

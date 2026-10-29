@@ -468,7 +468,7 @@ state (`crates/mempool/src/orphan.rs`).
   `disconnect_without_pool_mutations_resets_rejects_and_preserves_orphan_retry`:
   committed chain changes run the mempool chain-change lifecycle even when the
   pool itself has no removal/insertion.
-- `crates/node/tests/unit/tx_ingress/tests.rs` (unit tests):
+- `crates/node/src/tx_ingress/tests.rs` (unit tests):
   `retry_poll_evicts_an_orphan_after_its_connection_is_gone`.
 - `crates/rpc/src/zmq.rs`:
   `admission_publishes_one_a_frame_with_core_payload_bytes`,

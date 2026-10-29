@@ -52,7 +52,7 @@ after promotion.
 
 | Cell | Required evidence | Command | Status |
 |---|---|---|---|
-| Core vector parity | Zero mismatches on runnable rows; pinned skip counts and skip reasons per corpus | `cargo test --locked -p bitcoin-rs-script --test core_vectors` | `planned_not_executed` |
+| Core vector parity | Zero mismatches on runnable rows; pinned skip counts and skip reasons per corpus | `cargo test --locked -p bitcoin-rs-script --test suite core_vectors::` | `planned_not_executed` |
 | Contextual and script qualification | Active/inactive boundaries and mandatory/policy flags; zero unexplained mismatches; exclusions counted and classified | No consolidated promotion matrix exists. Current regression commands are listed below; they do not establish complete qualification coverage. | `BLOCKED`: missing qualification matrix and coverage accounting |
 | Strict-Rust crypto qualification | Valid/invalid signatures and tweaks, integer/point boundaries, independent oracle agreement and audited dependency closure | No strict-Rust implementation or dedicated qualification target exists. | `BLOCKED`: missing implementation and qualification suite |
 | Signed-spend apply | Native median beats the pinned kernel median by the acceptance rule below, measured on the final strict artifact. Each arm selects its engine explicitly. | Diagnostic commands below exercise the current engines. | `BLOCKED`: final strict-Rust artifact unavailable |
@@ -70,11 +70,11 @@ qualification. The validation contract owns the detailed proof map.
 
 ```sh
 # Native Core-vector verdicts, including invalid rows and skip accounting
-cargo test --locked -p bitcoin-rs-script --test core_vectors
+cargo test --locked -p bitcoin-rs-script --test suite core_vectors::
 # Signed witness/input boundaries and signature encoding/error order
-cargo test --locked -p bitcoin-rs-script --test verifier_boundaries --test taproot_spend_rules --test ecdsa_encoding_order --test segwit_v0_sighash_edges
+cargo test --locked -p bitcoin-rs-script --test suite -- verifier_boundaries:: taproot_spend_rules:: ecdsa_encoding_order:: segwit_v0_sighash_edges::
 # Missing/duplicate inputs, block facts, witness activation and commitments
-cargo test --locked -p bitcoin-rs-consensus --no-default-features --test overhaul_prepared_inputs --test overhaul_parse_parity --test witness_sigop_activation --test witness_commitment_rules
+cargo test --locked -p bitcoin-rs-consensus --no-default-features --test suite -- overhaul_prepared_inputs:: overhaul_parse_parity:: witness_sigop_activation:: witness_commitment_rules::
 ```
 
 The existing signed-spend diagnostic compares current engines. Build each arm
