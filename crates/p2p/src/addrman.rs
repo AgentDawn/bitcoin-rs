@@ -955,17 +955,6 @@ impl AddressBook {
         gossip
     }
 
-    /// Failure count recorded for `addr` (test observability for dial
-    /// accounting proofs).
-    #[cfg(test)]
-    pub(crate) fn failure_count(&self, addr: PeerEndpoint) -> Option<u32> {
-        let addr = canonical(addr);
-        let manager = self.state.lock();
-        manager
-            .by_addr
-            .get(&addr)
-            .map(|index| manager.stored.records[*index].failures)
-    }
     pub(crate) fn connected(&self, addr: PeerEndpoint, now: u64) {
         let addr = canonical(addr);
         let mut manager = self.state.lock();
@@ -1785,15 +1774,25 @@ fn read_book(
 ) -> io::Result<Option<Loaded>> {
     #[derive(Deserialize)]
     struct Header {
-        #[serde(default, deserialize_with = "present_format")]
-        format: Option<String>,
+        #[serde(default)]
+        format: FormatMarker,
         version: u32,
         magic: [u8; 4],
     }
-    fn present_format<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<String>, D::Error> {
-        String::deserialize(deserializer).map(Some)
+    #[derive(Default)]
+    enum FormatMarker {
+        #[default]
+        Absent,
+        Null,
+        Present(String),
+    }
+    impl<'de> Deserialize<'de> for FormatMarker {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            Ok(match Option::<String>::deserialize(deserializer)? {
+                None => Self::Null,
+                Some(value) => Self::Present(value),
+            })
+        }
     }
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1819,7 +1818,7 @@ fn read_book(
     // Their records are never decoded or converted into the current schema.
     // Identification runs before scope: a cross-network pre-release file is
     // preserved and superseded, never misreported as a network refusal.
-    if header.format.is_none() && (1..=9).contains(&header.version) {
+    if matches!(header.format, FormatMarker::Absent) && (1..=9).contains(&header.version) {
         return Ok(Some(Loaded {
             stored: None,
             magic: header.magic,
@@ -1830,7 +1829,9 @@ fn read_book(
         return Err(invalid("address book network"));
     }
 
-    if header.format.as_deref() != Some(FORMAT) || header.version != SCHEMA_VERSION {
+    if !matches!(&header.format, FormatMarker::Present(value) if value == FORMAT)
+        || header.version != SCHEMA_VERSION
+    {
         return Err(invalid("unsupported address book format/version"));
     }
     let stored: Stored = serde_json::from_slice(&bytes[..payload_len]).map_err(io::Error::other)?;

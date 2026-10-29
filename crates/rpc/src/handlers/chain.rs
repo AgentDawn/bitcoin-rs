@@ -6503,7 +6503,8 @@ mod scantxoutset_tests {
         assert!(
             err_1024
                 .to_string()
-                .contains("At most 1024 scan descriptors are supported")
+                .contains("At most 1024 scan script expansions are supported"),
+            "unexpected scan error: {err_1024}"
         );
 
         // Omitted range on multipath descriptor defaults to [0, 1000] (1001 indices * 2 paths = 2002 scripts): fails
@@ -6515,7 +6516,8 @@ mod scantxoutset_tests {
         assert!(
             err_multipath
                 .to_string()
-                .contains("At most 1024 scan descriptors are supported")
+                .contains("At most 1024 scan script expansions are supported"),
+            "unexpected multipath scan error: {err_multipath}"
         );
     }
 

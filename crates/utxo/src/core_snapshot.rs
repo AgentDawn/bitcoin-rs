@@ -566,6 +566,8 @@ pub fn write_core_v2<W: Write + ?Sized>(
                 outputs.sort_unstable_by(|left, right| {
                     crate::compress::cmp_core_varint_key(left.vout, right.vout)
                 });
+                let mut commitment_outputs: Vec<_> = record.outputs().collect();
+                commitment_outputs.sort_unstable_by_key(|output| output.vout);
 
                 let group_count =
                     u64::try_from(outputs.len()).map_err(|_| SnapshotError::LimitExceeded {
@@ -595,9 +597,6 @@ pub fn write_core_v2<W: Write + ?Sized>(
                         .checked_add(entry_bytes)
                         .ok_or(SnapshotError::VarIntOverflow)?;
 
-                    // Accumulate state commitment
-                    commitment.add(txid_bytes, output, Some(base_height))?;
-
                     coins_written = coins_written
                         .checked_add(1)
                         .ok_or(SnapshotError::VarIntOverflow)?;
@@ -617,6 +616,9 @@ pub fn write_core_v2<W: Write + ?Sized>(
                             return Err(SnapshotError::Interrupted);
                         }
                     }
+                }
+                for output in commitment_outputs {
+                    commitment.add(txid_bytes, output, Some(base_height))?;
                 }
             }
             Ok::<(), SnapshotError>(())
@@ -974,13 +976,11 @@ impl<'a, R: Read> Decoder<'a, R> {
                     height,
                 ));
             }
-            // Core's coins-DB cursor order is bytewise VARINT-key order, not
-            // numeric vout order. Sorting by the VARINT key feeds the shared
-            // commitment in cursor order and still detects duplicates without
-            // hashing untrusted indices.
-            outputs.sort_unstable_by(|left, right| {
-                crate::compress::cmp_core_varint_key(left.vout, right.vout)
-            });
+            // Core's commitment iterates each txid's outputs in numeric vout
+            // order (`std::map<uint32_t, Coin>`), while the file itself is
+            // written in coins-DB cursor order. Sort numerically here so the
+            // decoder's commitment and duplicate check use the hash order.
+            outputs.sort_unstable_by_key(|output| output.vout);
             for pair in outputs.windows(2) {
                 if pair[0].vout == pair[1].vout {
                     return Err(SnapshotError::DuplicateOutpoint { vout: pair[0].vout });

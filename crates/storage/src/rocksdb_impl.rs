@@ -404,7 +404,7 @@ impl KvSnapshot for RocksDbSnapshot<'_> {
         let mut iterator = self
             .snapshot
             .iterator_cf_opt(handle, read_opts, IteratorMode::End);
-        for item in &mut iterator {
+        if let Some(item) = iterator.next() {
             let (key, value) = item.map_err(StorageError::backend)?;
             let key_slice: &[u8] = &key;
             let prefix_slice: &[u8] = &prefix;

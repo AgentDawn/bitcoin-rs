@@ -3654,7 +3654,22 @@ mod tests {
             assert_eq!(byte, *b"x");
         }
 
-        let commands: Vec<String> = fake.commands.try_iter().collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut commands = Vec::new();
+        let mut creates = 0_usize;
+        while creates < 2 && std::time::Instant::now() < deadline {
+            match fake.commands.recv_timeout(Duration::from_millis(50)) {
+                Ok(command) => {
+                    if command.starts_with("SESSION CREATE") {
+                        creates += 1;
+                    }
+                    commands.push(command);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        commands.extend(fake.commands.try_iter());
         let creates: Vec<&String> = commands
             .iter()
             .filter(|c| c.starts_with("SESSION CREATE"))

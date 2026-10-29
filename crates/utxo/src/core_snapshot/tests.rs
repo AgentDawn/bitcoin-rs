@@ -1030,7 +1030,7 @@ fn writer_preserves_invalid_height_precedence_over_varint_overflow() {
 }
 
 #[test]
-fn varint_key_order_spans_width_transition_at_16512() {
+fn core_file_cursor_order_and_hash_numeric_order_diverge_at_16512() {
     use core::cmp::Ordering;
 
     use crate::compress::cmp_core_varint_key;
@@ -1048,7 +1048,7 @@ fn varint_key_order_spans_width_transition_at_16512() {
     assert_eq!(cmp_core_varint_key(16_512, 16_513), Ordering::Less);
     assert_eq!(cmp_core_varint_key(5, 5), Ordering::Equal);
 
-    // Decoder stages file-numeric order into cursor order and commits there.
+    // The decoder stages records in numeric vout order and commits there.
     let bytes = group(7, &[16_511, 16_512]);
     let (records, hash) = Decoder::new(&mut Cursor::new(bytes), 100_000)
         .coins(2, 200, SnapshotLimits::default())
@@ -1058,30 +1058,30 @@ fn varint_key_order_spans_width_transition_at_16512() {
             .outputs()
             .map(|output| output.vout)
             .collect::<Vec<_>>(),
-        vec![16_512, 16_511]
+        vec![16_511, 16_512]
     );
     let txid_bytes = Hash256::from_le_bytes(&[7; 32]).to_le_bytes();
     let staged: Vec<_> = records[0].outputs().collect();
-    let mut varint_feed = SerializedUtxoHasher::new();
-    for output in &staged {
-        varint_feed
-            .add(txid_bytes, *output, Some(200))
-            .expect("varint feed");
-    }
-    assert_eq!(varint_feed.finish(), hash);
     let mut numeric_feed = SerializedUtxoHasher::new();
-    for output in staged.iter().rev() {
+    for output in &staged {
         numeric_feed
             .add(txid_bytes, *output, Some(200))
             .expect("numeric feed");
     }
+    assert_eq!(numeric_feed.finish(), hash);
+    let mut cursor_feed = SerializedUtxoHasher::new();
+    for output in staged.iter().rev() {
+        cursor_feed
+            .add(txid_bytes, *output, Some(200))
+            .expect("cursor feed");
+    }
     assert_ne!(
-        numeric_feed.finish(),
+        cursor_feed.finish(),
         hash,
         "the transition must distinguish cursor order from numeric order"
     );
 
-    // Writer emits cursor order; the file, the report and a re-decode agree.
+    // Writer emits cursor order; the decoder normalizes to numeric order.
     let set = crate::UtxoSet::new();
     let txid = Hash256::from_le_bytes(&[7; 32]);
     let low = OwnedUtxoOut::new(16_511, 5_000_000_000, vec![0x51], true, 1);
@@ -1116,7 +1116,8 @@ fn varint_key_order_spans_width_transition_at_16512() {
             .outputs()
             .map(|output| output.vout)
             .collect::<Vec<_>>(),
-        vec![16_512, 16_511]
+        vec![16_511, 16_512],
+        "the decoder normalizes file cursor order to numeric order"
     );
     assert_eq!(emitted_hash, report.txoutset_hash);
     assert_eq!(emitted_hash, hash);
@@ -1124,7 +1125,7 @@ fn varint_key_order_spans_width_transition_at_16512() {
         assert_eq!(view.hash_serialized_3().expect("stable-view hash"), hash);
     });
 
-    // Duplicate detection survives the new order in both duplicate positions.
+    // Duplicate detection survives the numeric hash order in both positions.
     assert!(matches!(
         body(&group(7, &[16_511, 16_511]), 2),
         Err(SnapshotError::DuplicateOutpoint { vout: 16_511 })

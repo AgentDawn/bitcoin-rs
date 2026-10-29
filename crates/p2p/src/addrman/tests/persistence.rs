@@ -188,9 +188,6 @@ fn corrupt_unknown_and_wrong_network_files_are_not_disposable_snapshots() {
     invalid_record["records"] = serde_json::json!([{"broken": true}]);
     cases.push(fixture_bytes(&invalid_record));
     cases.push(fixture_bytes(
-        &serde_json::json!({"version": 8, "magic": [2, 2, 2, 2]}),
-    ));
-    cases.push(fixture_bytes(
         &serde_json::json!({"version": 99, "magic": [1, 1, 1, 1]}),
     ));
     for bytes in cases {

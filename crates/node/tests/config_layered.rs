@@ -84,6 +84,7 @@ fn overlay_routing_is_opt_in_and_layered_without_implicit_fallback() -> Result<(
     let file: UserConfig = toml::from_str(
         r#"
         network = "regtest"
+        dns_seeds_enabled = false
         onion_proxy = "127.0.0.1:9050"
         onlynet = ["onion"]
         proxy_randomize_credentials = false

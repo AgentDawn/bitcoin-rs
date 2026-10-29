@@ -373,9 +373,7 @@ fn peer_info_wire(
 ) -> PeerInfoWire {
     PeerInfoWire {
         id: session.lease.node_id(),
-        address: peer
-            .endpoint
-            .map_or_else(|| "unknown".to_owned(), |endpoint| endpoint.to_string()),
+        address: peer.addr.to_string(),
         address_bind: Some(peer.addr_bind.to_string()),
         address_local: None,
         network: peer.network.as_str().to_owned(),
@@ -672,8 +670,9 @@ pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value
 
     match (address, nodeid) {
         (Some(address), None) => {
-            let addr = bitcoin_rs_p2p::parse_endpoint(address)
-                .ok_or(RpcError::InvalidParams("address must be a valid host:port"))?;
+            let addr = address
+                .parse::<bitcoin_rs_p2p::PeerRemote>()
+                .map_err(|_| RpcError::InvalidParams("address must be a valid host:port"))?;
             if !ctx.network.p2p.disconnect_ready(addr) {
                 return Err(RpcError::NotFound("Node not found in connected nodes"));
             }
@@ -684,8 +683,9 @@ pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value
             }
         }
         (Some(address), Some(id)) => {
-            let addr = bitcoin_rs_p2p::parse_endpoint(address)
-                .ok_or(RpcError::InvalidParams("address must be a valid host:port"))?;
+            let addr = address
+                .parse::<bitcoin_rs_p2p::PeerRemote>()
+                .map_err(|_| RpcError::InvalidParams("address must be a valid host:port"))?;
             if !ctx.network.p2p.disconnect_ready_node_id_at(addr, id) {
                 return Err(RpcError::NotFound("Node not found in connected nodes"));
             }
@@ -1728,8 +1728,8 @@ mod addnode_validation_tests {
         Ok(())
     }
 
-    /// An anonymous inbound overlay session has no logical endpoint, so no
-    /// address can name it; `nodeid` is the only handle that reaches it.
+    /// An anonymous inbound overlay session has no logical endpoint, but its
+    /// typed handle is visible and `nodeid` remains the stable selector.
     #[test]
     fn disconnectnode_nodeid_addresses_an_anonymous_inbound_session()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1766,9 +1766,10 @@ mod addnode_validation_tests {
             .publish_info_unidentified(&anon, info);
         assert!(published);
         let node_id = anon.node_id();
+        let handle = bitcoin_rs_p2p::PeerRemote::AnonymousTor(anon.connection_id()).to_string();
         let ctx = Arc::new(ctx);
 
-        // `getpeerinfo` exposes it with the documented `unknown` address.
+        // `getpeerinfo` exposes the anonymous handle, never a proxy address.
         let peers = getpeerinfo(&ctx, &json!(null))?;
         let Some(rows) = peers.as_array() else {
             return Err("getpeerinfo must return an array".into());
@@ -1776,7 +1777,7 @@ mod addnode_validation_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].get("addr").and_then(JsonValueTrait::as_str),
-            Some("unknown")
+            Some(handle.as_str())
         );
         assert_eq!(
             rows[0].get("id").and_then(JsonValueTrait::as_u64),
@@ -2715,6 +2716,8 @@ mod getnodeaddresses_tests {
         let remote = bitcoin_rs_p2p::PeerRemote::AnonymousTor(lease.connection_id());
         let mut info = peer("127.0.0.1:8333", 9);
         info.addr = remote;
+        info.endpoint = None;
+        info.network = bitcoin_rs_primitives::NetworkLabel::Onion;
         info.inbound = true;
         ctx.network.peer_table.register(remote, lease.clone());
         ctx.network.peer_table.publish_info(remote, &lease, info);
