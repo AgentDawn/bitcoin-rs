@@ -130,11 +130,12 @@ pub(crate) fn transaction_json(
 pub(crate) fn transaction_json_with_spends(
     tx: &Tx,
     network: Network,
+    chain: Option<TransactionChainContext>,
     coins: Option<&[bitcoin_rs_utxo::UtxoCoin]>,
     include_prevouts: bool,
 ) -> Result<Value, crate::error::RpcError> {
     use crate::error::RpcError;
-    let mut value = transaction_json(tx, network, None);
+    let mut value = transaction_json(tx, network, chain);
     let Some(coins) = coins.filter(|_| !tx.is_coinbase()) else {
         return Ok(value);
     };
