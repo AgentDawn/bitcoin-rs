@@ -302,7 +302,7 @@ expiry.
   connection that just proved a header for its body, inside the same drain
   that admitted it, instead of waiting for the next scheduler tick (Core
   `HeadersDirectFetchBlocks`, `net_processing.cpp`, gated by
-  `CanDirectFetch` at `:1450-1453`). The request goes through
+  `CanDirectFetch`). The request goes through
   `send_getdata_for_pending_blocks`, so the window's budget, the per-peer
   in-flight cap, the pending ownership stamp, and the compact-block flavor
   for a single near-tip fetch from a BIP152 peer all apply unchanged. A tip
@@ -394,8 +394,8 @@ expiry.
   already in progress may finish after disable; rejected registration closes
   it before publishing metadata or sending handshake messages.
 - Ordinary `run_outbound_handshake` ends the connection when the remote `version` does
-  not offer the desirable set (`net_processing.cpp`, read for
-  an outbound connection at `:3864-3871`): `NETWORK | WITNESS`, or
+  not offer the desirable set (Core `HasAllDesirableServiceFlags` in
+  `net_processing.cpp`): `NETWORK | WITNESS`, or
   `NETWORK_LIMITED | WITNESS` while the local tip is younger than 144 blocks.
   The check runs before the peer is published as usable, so a dial that cannot
   serve blocks never occupies a selection slot that maintenance cannot replace.
@@ -423,8 +423,7 @@ expiry.
   block download only a `NODE_NETWORK` peer qualifies
   (`net_processing.cpp`). Afterwards a peer without it qualifies only
   inside the last 288 blocks of its own demonstrated chain
-  (`NODE_NETWORK_LIMITED_MIN_BLOCKS` at `net_processing.cpp`, applied at
-  `:1637`), and a peer below the requested height never qualifies. Inbound
+  (Core `NODE_NETWORK_LIMITED_MIN_BLOCKS` in `net_processing.cpp`), and a peer below the requested height never qualifies. Inbound
   peers stay outside the set: they are attacker-chosen, and counting them is the
   recorded under-fill regression.
 - The service clause and the window's soft-block clause stay separate on

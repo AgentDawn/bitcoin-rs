@@ -2,7 +2,7 @@
 //! P2P wire against a spawned bitcoin-rs daemon (regtest, fjall).
 //!
 //! Bitcoin Core requests no announced transaction and drops unsolicited `tx`
-//! bodies while in initial block download (net_processing.cpp:4401-4404,
+//! bodies while in initial block download (net_processing.cpp,
 //! :4713-4716). This test pins the same behavior on the wire:
 //!
 //!  * phase 1: a fresh node reports `initialblockdownload == true`; an

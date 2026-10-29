@@ -32,8 +32,8 @@ pub(super) const BLOCK_DOWNLOAD_TIMEOUT_PER_PEER: u32 = 1;
 /// How far below a pruned peer's own tip this node may still ask it for
 /// blocks: Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`
 /// (`net_processing.cpp`), the 288 blocks a `NODE_NETWORK_LIMITED` peer
-/// keeps past its pruning horizon. Core holds a two-block race buffer at
-/// `:1637`; the handshake clause keeps the plain 288, and the
+/// keeps past its pruning horizon. Core holds a two-block race buffer;
+/// the handshake clause keeps the plain 288, and the
 /// demonstrated-height clause ([`peer_can_serve_height`]) applies the
 /// buffer.
 pub(super) const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;

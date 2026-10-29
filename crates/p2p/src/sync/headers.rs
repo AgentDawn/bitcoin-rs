@@ -317,7 +317,7 @@ impl BlockSync {
     /// connection that proved it, without waiting for the next scheduler
     /// tick. Core direct-fetches in the same situation
     /// (`HeadersDirectFetchBlocks`, `net_processing.cpp`, gated by
-    /// `CanDirectFetch` at `:1450-1453`).
+    /// `CanDirectFetch`).
     ///
     /// PRE: `source` is the connection that delivered `announced_tip`.
     /// POST: the eligible body is requested through

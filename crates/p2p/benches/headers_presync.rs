@@ -20,7 +20,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use parking_lot::RwLock;
 
 /// The wire page size a full `headers` message carries
-/// (`net_processing.h:48-57`).
+/// (`net_processing.h`).
 const PAGE: usize = 2_000;
 
 /// Regtest's minimum-difficulty compact target: the cheapest proof of work

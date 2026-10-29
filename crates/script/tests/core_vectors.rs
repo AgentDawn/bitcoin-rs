@@ -596,7 +596,7 @@ fn assert_pinned_native_column(
 // ===========================================================================
 
 // Core's `script_json_test` fills three markers the JSON corpus cannot express
-// as hex (`src/test/script_tests.cpp:925-945`, `:968-974`):
+// as hex (`src/test/script_tests.cpp`):
 //
 //   `#SCRIPT# <asm>`            - assemble `<asm>` with ParseScript, push the
 //                                 script bytes as the witness element;
@@ -605,7 +605,7 @@ fn assert_pinned_native_column(
 //                                 push the resulting control block;
 //   `0x51 0x20 #TAPROOTOUTPUT#` - scriptPubKey becomes OP_1 <output key>.
 //
-// `key0` is the fixed secret `vchKey0` at `script_tests.cpp:183`, the 32-byte
+// `key0` is the fixed secret `vchKey0` at `script_tests.cpp`, the 32-byte
 // big-endian scalar 1.
 
 /// Core's `vchKey0`: the secret scalar the placeholder tree commits to.
@@ -614,16 +614,16 @@ const CORE_TAPROOT_INTERNAL_SECRET: [u8; 32] = [
 ];
 
 /// Core's `#SCRIPT#` marker: the rest of the element is tapscript in Core's ASM
-/// dialect, not hex (`script_tests.cpp:931-935`).
+/// dialect, not hex (`script_tests.cpp`).
 const SCRIPT_PLACEHOLDER: &str = "#SCRIPT#";
 
 /// Core's `#CONTROLBLOCK#` marker: the witness element is replaced by the
 /// generated control block committing to the preceding `#SCRIPT#` leaf
-/// (`script_tests.cpp:937-944`).
+/// (`script_tests.cpp`).
 const CONTROL_BLOCK_PLACEHOLDER: &str = "#CONTROLBLOCK#";
 
 /// The `scriptPubKey` spelling Core matches before substituting the output key
-/// (`script_tests.cpp:968-974`).
+/// (`script_tests.cpp`).
 const TAPROOT_OUTPUT_ASM: &str = "0x51 0x20 #TAPROOTOUTPUT#";
 
 /// The single-leaf tree Core auto-generates for one `#SCRIPT#`/`#CONTROLBLOCK#`
@@ -721,7 +721,7 @@ fn load_script_tests(counts: &mut Counts) -> Result<Vec<ScriptTestRow>, String> 
                 // Core's reader treats a lone string the same way: it is the
                 // corpus's prose (format note, section header), not a test, and
                 // it reports `Bad test` only for other short shapes
-                // (`script_tests.cpp:955-960`). There is no scriptSig,
+                // (`script_tests.cpp`). There is no scriptSig,
                 // scriptPubKey, flags, or expected error to assemble.
                 counts.record_skip(SCRIPT_TESTS_PROSE_SKIP);
                 continue;
@@ -1218,7 +1218,7 @@ fn flags_from_bits(bits: u32) -> VerifyFlags {
 }
 
 /// `tx_valid.json` names the flags Core turns OFF: it verifies with the
-/// complement (`transaction_tests.cpp:224`). A row whose complement is not a
+/// complement (`transaction_tests.cpp`). A row whose complement is not a
 /// filled combination is bad test data, which Core reports rather than runs.
 fn tx_valid_flags(names: &str) -> Result<VerifyFlags, String> {
     let parsed = VerifyFlags::from_core_names(names).map_err(|e| e.to_string())?;
@@ -1233,7 +1233,7 @@ fn tx_valid_flags(names: &str) -> Result<VerifyFlags, String> {
 
 /// `tx_invalid.json` names the flags Core turns ON, unfilled and unedited, so
 /// an invalid combination is detected rather than repaired
-/// (`transaction_tests.cpp:310-315`).
+/// (`transaction_tests.cpp`).
 fn tx_invalid_flags(names: &str) -> Result<VerifyFlags, String> {
     let parsed = VerifyFlags::from_core_names(names).map_err(|e| e.to_string())?;
     if parsed != parsed.filled() {

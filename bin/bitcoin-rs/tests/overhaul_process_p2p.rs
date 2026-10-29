@@ -214,7 +214,7 @@ fn admit_over_p2p(process: &mut ProcessNode, transaction: &bitcoin::Transaction)
 /// clock. Core mines at a frozen launch-time mocktime, so a shared chain
 /// older than the tip-age bound leaves the candidate in initial block
 /// download — the phase where Core itself refuses relayed transactions
-/// (`net_processing.cpp:4713-4716`). Advancing the reference clock and
+/// (`net_processing.cpp`). Advancing the reference clock and
 /// mining one empty common block first makes wire admission observable on
 /// both binaries.
 fn advance_to_fresh_common_tip(core: &mut ProcessNode, node: &mut ProcessNode) {

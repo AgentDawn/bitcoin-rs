@@ -222,7 +222,7 @@ const FULL_FLAGS: VerifyFlags = VerifyFlags::STANDARD
     .union(VerifyFlags::MINIMALIF);
 
 /// `tx_valid.json` names the flags Core turns OFF: it verifies with the
-/// complement (`transaction_tests.cpp:224`).
+/// complement (`transaction_tests.cpp`).
 fn tx_valid_flags(names: &str) -> Result<VerifyFlags, String> {
     let parsed = VerifyFlags::from_core_names(names).map_err(|e| e.to_string())?;
     let effective = VerifyFlags::from_bits_retain(FULL_FLAGS.bits() & !parsed.bits());
@@ -236,7 +236,7 @@ fn tx_valid_flags(names: &str) -> Result<VerifyFlags, String> {
 
 /// `tx_invalid.json` names the flags Core turns ON, unfilled and unedited, so
 /// an invalid combination is detected rather than repaired
-/// (`transaction_tests.cpp:310-315`).
+/// (`transaction_tests.cpp`).
 fn tx_invalid_flags(names: &str) -> Result<VerifyFlags, String> {
     let parsed = VerifyFlags::from_core_names(names).map_err(|e| e.to_string())?;
     if parsed != parsed.filled() {

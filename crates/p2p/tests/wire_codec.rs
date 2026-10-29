@@ -217,8 +217,8 @@ fn decoded_getblocktxn(deltas: &[u64]) -> Result<Vec<u64>, PeerError> {
 /// and each later one is a delta from the previous absolute index, so a `0`
 /// delta names the next transaction rather than repeating one. The decoder
 /// yields increasing `u64` indexes and refuses an overflowing tail. Core 31.1
-/// guarantees differential order over `uint16_t` indexes (`blockencodings.h:23-54`,
-/// `net_processing.cpp:4333-4340`), so this is not decoder-range parity. Both decode
+/// guarantees differential order over `uint16_t` indexes (`blockencodings.h`,
+/// `net_processing.cpp`), so this is not decoder-range parity. Both decode
 /// an empty list; rejecting it in native dispatch is stricter than Core policy.
 #[test]
 fn getblocktxn_differential_indexes_decode_to_absolute_order() -> Result<(), PeerError> {

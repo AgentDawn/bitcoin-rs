@@ -24,8 +24,7 @@ pub struct ChainTxData {
 ///
 /// Core generates these from its memory analysis of an attacked sync; the
 /// values here are those generated numbers, copied from
-/// `bitcoin-core/src/kernel/chainparams.cpp` (mainnet `:229-232`, testnet3
-/// `:337-340`, testnet4 `:450-453`, signet `:572-574`, regtest `:677-679`).
+/// `bitcoin-core/src/kernel/chainparams.cpp` for each supported network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadersSyncParams {
     /// Headers between two salted commitment bits (`commitment_period`).

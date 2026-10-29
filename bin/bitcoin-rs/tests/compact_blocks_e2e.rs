@@ -306,7 +306,7 @@ fn ok_count(value: &serde_json::Value) -> Option<u64> {
 /// `cmpctblock` that prefills the coinbase at index zero; one block deeper is
 /// answered with the whole witness-bearing `block`, not `notfound` and not a
 /// compact reply a peer cannot fill from its own mempool.
-/// Core 31.1 `net_processing.cpp:2705-2721`.
+/// Core 31.1 `net_processing.cpp`.
 #[test]
 fn serves_compact_by_depth_on_the_wire() -> Result<(), Error> {
     let (mut node, mut peer, chain) = synced_peer("depth")?;
@@ -378,7 +378,7 @@ fn serves_compact_by_depth_on_the_wire() -> Result<(), Error> {
 
 /// A `getblocktxn` within 10 blocks of the tip is answered with a `blocktxn`;
 /// one block deeper is answered with the whole witness-bearing `block`
-/// (Core 31.1 `net_processing.cpp:4590-4624`).
+/// (Core 31.1 `net_processing.cpp`).
 #[test]
 fn serves_blocktxn_by_depth_on_the_wire() -> Result<(), Error> {
     let (mut node, mut peer, chain) = synced_peer("blocktxn")?;
@@ -436,7 +436,7 @@ fn serves_blocktxn_by_depth_on_the_wire() -> Result<(), Error> {
 }
 
 /// An empty `getblocktxn` index list ends the connection at the inbound
-/// boundary (Core 31.1 `net_processing.cpp:4560-4574`). A ping/pong proves
+/// boundary (Core 31.1 `net_processing.cpp`). A ping/pong proves
 /// the socket was alive immediately before the request, so the drop is
 /// attributed to the malformed message and not to an idle timeout.
 #[test]
@@ -486,7 +486,7 @@ fn empty_getblocktxn_disconnects_on_the_wire() -> Result<(), Error> {
 /// A `cmpctblock` whose prefilled body does not hash to its own header is
 /// never delivered as a block: the node asks this same peer for the full
 /// witness body and applies the block only once the real body arrives
-/// (Core 31.1 `blockencodings.cpp:207-219`, `net_processing.cpp:3734-3754`).
+/// (Core 31.1 `blockencodings.cpp`, `net_processing.cpp`).
 #[test]
 fn wrong_root_compact_block_falls_back_to_same_peer() -> Result<(), Error> {
     let (mut node, mut peer, chain) = synced_peer("wrong-root")?;
@@ -555,7 +555,7 @@ fn wrong_root_compact_block_falls_back_to_same_peer() -> Result<(), Error> {
 
 /// Hold a compact-block reconstruction across a real chain switch. Core v31.1
 /// GETBLOCKTXN resolves stored bodies by hash even after they leave the chain
-/// (9be056a8a72b624dae9623b2f7bded92c2a21c91, net_processing.cpp:4333-4391).
+/// (9be056a8a72b624dae9623b2f7bded92c2a21c91, net_processing.cpp).
 #[test]
 fn stale_compact_block_finishes_reconstruction_after_reorg() -> Result<(), Error> {
     use NetworkMessage::{BlockTxn, NotFound};

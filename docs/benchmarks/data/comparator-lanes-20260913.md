@@ -103,7 +103,7 @@ nodes. None of these can be started from the current tree:
 - `gettxoutsetinfo` is implemented and can answer `muhash` for the
   current in-memory UTXO view
   (`crates/rpc/src/handlers/chain.rs`), but it refuses
-  specific-height queries (`:1053-1056`) and there is no shipped offline
+  specific-height queries and there is no shipped offline
   path to place the node at the frozen tip with certified state.
 - The P2P lane's product form (live loopback IBD between real nodes) is
   not shipped: `tools/benchmark-campaign/p2p_loopback.py` is a fixture

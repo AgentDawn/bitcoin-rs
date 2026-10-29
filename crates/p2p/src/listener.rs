@@ -85,7 +85,7 @@ pub struct ListenerExtras {
     /// configured consensus network. `None` means transaction relay is open
     /// (callers without a chain, and tests). While `Some` and active,
     /// tx-typed `inv` vectors are not requested and `tx` bodies are dropped
-    /// before ingress (Core 31.1 `net_processing.cpp`, `:4716`). The
+    /// before ingress (Core 31.1 `net_processing.cpp`). The
     /// network travels with the latch because the wire magic is not an
     /// identity: a `--p2p-magic` override can carry another network's bytes.
     pub ibd: Option<(Arc<bitcoin_rs_chain::InitialBlockDownload>, Network)>,
