@@ -77,7 +77,7 @@ impl DerivedIndexQueryEngine {
                 continue;
             }
             let hash = self.resolve_hash_at_height(height, prefix)?;
-            let Some(positions) = Self::validated_positions(&row.value) else {
+            let Some(positions) = Self::validated_positions(&row.value)? else {
                 let block = self.resolve_block(budget, height, hash)?;
                 for transaction in &block.txs {
                     Self::collect_funding_outputs(transaction, height, scripthash, &mut outputs)?;
@@ -131,7 +131,7 @@ impl DerivedIndexQueryEngine {
                 continue;
             }
             let hash = self.resolve_hash_at_height(height, prefix)?;
-            if let Some(positions) = Self::validated_positions(&row.value) {
+            if let Some(positions) = Self::validated_positions(&row.value)? {
                 for &position in positions {
                     let Some(transaction) =
                         self.resolve_positioned_transaction(budget, height, hash, position)?

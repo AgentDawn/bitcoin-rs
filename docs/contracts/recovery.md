@@ -658,9 +658,16 @@ persists branch state.
   the executed frontier — one past the highest row a committed pass deleted —
   written in the same durable batch as its deletions, so a restart
   reconstructs exactly the committed boundary and refuses a lease over
-  deleted history. A legacy datadir reconstructs the bound from its lowest
-  surviving rows; only a legacy datadir with no rows surviving in either
-  family falls back to the requested `node:pruneheight`, which is intent.
+  deleted history. Before the first committed pass all three prune records
+  are absent; ordinary unpruned stores use an empty frontier. Every pass,
+  including an empty one, atomically writes the frontier, requested
+  `node:pruneheight` and batch receipt with its deletions. A failed first
+  commit leaves them all absent; a committed or ambiguous-applied pass
+  leaves them all present. A missing frontier alongside either other prune
+  record, or a malformed frontier, refuses recovery without inferring a
+  boundary from surviving rows. Simultaneous loss of all three records is
+  not detectable from this metadata; arbitrary deletion of all metadata is
+  outside the atomic-write recovery guarantee.
   `RetentionRegistry::reserve` is the single prune/retention
   linearization point, and `PruneReservation::commit` is the only path that
   moves the executed line. `crates/storage/tests/prune_then_reorg.rs` proves
@@ -668,8 +675,10 @@ persists branch state.
   restart law (`executed_frontier_survives_restart_and_refuses_deleted_heights`),
   monotonicity across passes and reorg-reintroduced rows
   (`executed_frontier_is_monotonic_across_passes_and_reintroduced_rows`), and
-  the legacy migration (`legacy_datadir_reconstructs_from_surviving_rows_not_the_requested_line`,
-  `legacy_datadir_with_no_rows_falls_back_to_the_requested_line`).
+  missing/corrupt marker refusal (`missing_executed_frontier_after_prune_fails_closed`,
+  `corrupt_prune_metadata_never_becomes_an_empty_frontier`), the empty-pass
+  lifecycle (`unpruned_store_has_no_executed_frontier`), and interrupted
+  commit outcomes (the `ambiguous_durability_*` tests).
 - Checkpoint publication and recovery:
   `crates/chainstate/src/checkpoint/tests/` covers consensus-valid active-chain
   replay, applied-ancestry selection, heavier-fork exclusion, and
