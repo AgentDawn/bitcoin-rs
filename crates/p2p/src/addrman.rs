@@ -53,17 +53,6 @@ fn deserialize_endpoint<'de, D: serde::Deserializer<'de>>(
     let text = String::deserialize(deserializer)?;
     crate::parse_endpoint(&text).ok_or_else(|| serde::de::Error::custom("invalid endpoint"))
 }
-fn endpoint_group(groups: &NetGroups, endpoint: PeerEndpoint) -> Vec<u8> {
-    match endpoint {
-        PeerEndpoint::Ip(socket) => groups.group(socket.ip()),
-        PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => {
-            crate::endpoint::overlay_netgroup(endpoint.host()).unwrap_or_else(|| vec![0])
-        }
-    }
-}
-fn endpoint_ip(endpoint: PeerEndpoint) -> Option<IpAddr> {
-    endpoint.as_ip().map(|socket| socket.ip())
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -781,7 +770,10 @@ pub(crate) fn canonical(addr: PeerEndpoint) -> PeerEndpoint {
 }
 
 fn routable(addr: PeerEndpoint, allow_local: bool) -> bool {
-    if addr.port() == 0 && !matches!(addr.address(), crate::PeerAddress::I2p(_)) || addr.address().is_unspecified() || addr.address().is_multicast() {
+    if addr.port() == 0 && !matches!(addr.address(), crate::PeerAddress::I2p(_))
+        || addr.address().is_unspecified()
+        || addr.address().is_multicast()
+    {
         return false;
     }
     match addr.address() {
@@ -1704,7 +1696,6 @@ fn read_anchors<'de, D: serde::Deserializer<'de>>(
     }
     deserializer.deserialize_seq(Anchors)
 }
-
 
 fn validate_anchors(stored: &Stored) -> io::Result<()> {
     let mut anchors = HashSet::new();

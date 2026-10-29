@@ -45,16 +45,20 @@
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::Cell;
 use std::fmt::Write as _;
+#[cfg(test)]
 use std::fs::OpenOptions;
 #[cfg(test)]
 use std::io::BufReader;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(test)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use bitcoin::secp256k1::rand::{Rng, RngCore, thread_rng};
+#[cfg(test)]
+use bitcoin::secp256k1::rand::Rng;
+use bitcoin::secp256k1::rand::{RngCore, thread_rng};
 use bitcoin_rs_primitives::endpoint::base32_encode;
 use sha2::{Digest, Sha256};
 
@@ -80,6 +84,7 @@ pub(crate) const ROOT_READINESS_BUDGET: Duration =
 /// waits past it while the bridge has never accepted. Only a bridge that
 /// connects is given [`ROOT_READINESS_BUDGET`], and once one has connected
 /// the window no longer applies.
+#[cfg(test)]
 const UNREACHABLE_WINDOW: Duration = Duration::from_secs(20);
 
 /// Longest wait before a blocked root read or write notices cancellation. It
@@ -89,14 +94,12 @@ const UNREACHABLE_WINDOW: Duration = Duration::from_secs(20);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// Retry pause growth per failed startup step, in milliseconds.
+#[cfg(test)]
 const PAUSE_STEP_MS: u64 = 250;
 
 /// Failed startup steps after which the retry pause stops growing.
+#[cfg(test)]
 const PAUSE_STEPS_MAX: u64 = 10;
-
-/// Longest single pause between startup steps: the grown base plus full jitter.
-pub(crate) const MAX_RETRY_PAUSE: Duration =
-    Duration::from_millis(PAUSE_STEP_MS * PAUSE_STEPS_MAX + PAUSE_STEP_MS);
 
 /// Remaining budget before `deadline`.
 ///
@@ -1026,6 +1029,7 @@ impl SamSession {
     /// at most [`EXCHANGE_BUDGET`]. A bridge that has never accepted a
     /// connection is given up on after [`UNREACHABLE_WINDOW`], which also
     /// clips its connect waits, instead of the whole owner deadline.
+    #[cfg(test)]
     pub(crate) fn establish_startup(
         sam: SocketAddr,
         key_path: Option<&Path>,
@@ -1069,6 +1073,7 @@ impl SamSession {
     /// itself. The first accepted connection sets `reached` for good; nothing
     /// here clears it, so later attempts connect, and fail, under their root
     /// deadline alone.
+    #[cfg(test)]
     fn retry_establish(
         sam: SocketAddr,
         private: &str,
@@ -1540,6 +1545,7 @@ impl SamSession {
 /// that failure instead of spending a doomed attempt. Any other failure
 /// pauses and retries. When the deadline ends the loop, the last failure is
 /// reported.
+#[cfg(test)]
 fn retry_until<T>(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
@@ -1591,6 +1597,7 @@ fn retry_until<T>(
 /// `cancelled` every [`CANCEL_POLL`], so shutdown never waits out a pause.
 /// Reaching the deadline is not an error here: the caller's next deadline
 /// check reports it with the last failure.
+#[cfg(test)]
 fn startup_pause(failures: u64, deadline: Instant, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
     let base = Duration::from_millis(failures.min(PAUSE_STEPS_MAX) * PAUSE_STEP_MS);
     let jitter = Duration::from_millis(thread_rng().gen_range(0..=PAUSE_STEP_MS));
@@ -1621,6 +1628,7 @@ fn startup_pause(failures: u64, deadline: Instant, cancelled: &dyn Fn() -> bool)
 /// the key pair is authoritative and still passes full validation. Any other
 /// `RESULT` is a failure status, refused before a key field is read even
 /// beside keys; only the sanitized result name reaches the error.
+#[cfg(test)]
 pub(crate) fn generate_destination(
     sam: SocketAddr,
     timeout: Duration,
@@ -1672,7 +1680,7 @@ pub(crate) fn generate_destination(
 /// Symbolic links in parent directories are still followed.
 ///
 /// Elsewhere: a plain read-only open with no permission or link policy.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn open_key_file(path: &Path) -> io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
@@ -1696,7 +1704,7 @@ fn open_key_file(path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Open a persisted key file (non-unix): no link or mode policy applies.
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn open_key_file(path: &Path) -> io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
@@ -1709,6 +1717,7 @@ fn open_key_file(path: &Path) -> io::Result<std::fs::File> {
 /// repaired to `0600` before its content is read. A symbolic link at
 /// `key_path` (unix), dangling or not, or any non-regular file is an
 /// error and never selects generation: only an absent path does.
+#[cfg(test)]
 pub(crate) fn load_or_create_private_destination(
     sam: SocketAddr,
     key_path: &Path,
@@ -1821,8 +1830,10 @@ fn validate_private_destination(text: &str) -> io::Result<String> {
     Ok(text.to_owned())
 }
 
+#[cfg(test)]
 struct TempCleanup<'a>(&'a Path);
 
+#[cfg(test)]
 impl Drop for TempCleanup<'_> {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(self.0);
@@ -1830,6 +1841,7 @@ impl Drop for TempCleanup<'_> {
 }
 
 /// Write `contents` as a new mode-`0600` file; refuse to replace.
+#[cfg(test)]
 pub(crate) fn write_key_file(path: &Path, contents: &str) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut nonce = [0u8; 8];
@@ -1876,6 +1888,7 @@ pub(crate) fn write_key_file(path: &Path, contents: &str) -> io::Result<()> {
 /// be a regular file, has its mode repaired to `0600` through that handle,
 /// and is read through the same handle (see `open_key_file`). Callers treat
 /// only `NotFound` as an absent key; every other error is refused.
+#[cfg(test)]
 pub(crate) fn read_key_file(path: &Path) -> io::Result<String> {
     let mut file = open_key_file(path)?;
     let mut text = String::new();
