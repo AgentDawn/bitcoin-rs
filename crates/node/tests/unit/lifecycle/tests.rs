@@ -1056,12 +1056,50 @@ fn bind_test_rpc(state: &NodeState) -> anyhow::Result<RpcServer> {
         state.chainstate(),
         state.stable_read(),
         state.chain_followers(),
-        state.config().mining.payout_script.clone(),
+        super::final_payout_script(state.config()),
     ));
     let mining_control: Arc<dyn bitcoin_rs_mining::MiningControl> = coordinator;
     let mut bindings = bind_rpc(state, &mining_control, state.block_body_source()?)?;
     assert_eq!(bindings.listeners.len(), 1);
     Ok(bindings.listeners.remove(0).0)
+}
+/// The one final payout-script owner: pool and ordinary `getblocktemplate`
+/// share the coordinator's `coinbase_script`, so differing configuration must
+/// resolve to one script for both paths. The pool reward wins while a pool is
+/// configured; otherwise the ordinary mining payout wins.
+#[cfg(feature = "pool")]
+#[test]
+fn final_payout_script_prefers_pool_when_values_differ() {
+    use crate::config::PoolConfig;
+
+    let mut config = NodeConfig::default_for_network(crate::Network::Regtest);
+    config.mining.payout_script = vec![0x51];
+    let pool = PoolConfig {
+        datadir: std::path::PathBuf::from("/tmp/btcrs-pool-regression"),
+        v1_bind: None,
+        sv2_bind: None,
+        sv2_authority_key: None,
+        allow_non_loopback: false,
+        max_connections: 1,
+        max_connections_per_ip: 1,
+        share_difficulty: String::from("1"),
+        share_target: bitcoin_rs_mining::pool::ShareTarget::from_pool_difficulty_decimal("1")
+            .expect("fixed test difficulty parses"),
+        window_work: 1,
+        fee_bps: 0,
+        reward_script: vec![0x52],
+        maturity: 100,
+        payout_confirmations: 1,
+        reorg_watch_depth: 100,
+        min_payout_sat: 546,
+        max_payout_outputs: 1,
+    };
+    config.pool = Some(pool);
+    // Differing values resolve to the pool reward for both the pool template
+    // fetch and the ordinary GBT candidate, which share this owner.
+    assert_eq!(super::final_payout_script(&config), vec![0x52]);
+    config.pool = None;
+    assert_eq!(super::final_payout_script(&config), vec![0x51]);
 }
 
 #[test]

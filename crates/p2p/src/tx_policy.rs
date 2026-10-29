@@ -1719,6 +1719,10 @@ mod tests {
         );
     }
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Single end-to-end retirement scenario drives request, arrival, and resend phases"
+    )]
     fn known_state_and_external_arrival_retire_requests_before_another_send() {
         use std::sync::{
             Arc,
@@ -2778,8 +2782,7 @@ mod tests {
         // The connection ends with its body queued: nothing is re-requested.
         table.transaction_peer_disconnected(a, &inventory);
         assert!(b_rx.try_recv().is_err());
-        let replacement =
-            PeerSource::for_test(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
+        let replacement = PeerSource::for_test(std::net::SocketAddr::from(([127, 0, 0, 1], 8333)));
         assert!(!table.begin_package_resolution(replacement, subject, combined, &sequence));
         assert!(!table.release_package_claim(replacement, subject, &inventory));
         assert!(!table.begin_package_resolution(a, subject, combined, &sequence));

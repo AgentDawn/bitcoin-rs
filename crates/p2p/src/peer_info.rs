@@ -144,6 +144,7 @@ impl PeerInfo {
     }
 
     /// Constructs a `PeerInfo` for an outbound peer from the captured remote `VersionMessage`.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn outbound_from_version(
         addr: impl Into<PeerRemote>,
@@ -362,10 +363,7 @@ mod tests {
         let infos = table.infos();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].endpoint, peer.endpoint());
-        assert_eq!(
-            infos[0].addr_bind,
-            crate::TransportRemote::new(bind_socket)
-        );
+        assert_eq!(infos[0].addr_bind, crate::TransportRemote::new(bind_socket));
         assert_ne!(
             infos[0].endpoint,
             Some(crate::PeerEndpoint::Ip(infos[0].addr_bind.socket_addr()))

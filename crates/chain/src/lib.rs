@@ -43,7 +43,7 @@ pub use deployment::{
 };
 pub use header_sync::{
     AcceptHeaders, HeaderAdmission, HeaderValidationMode, accept_headers, block_work,
-    compact_is_met_by, current_unix_seconds, permitted_difficulty_transition,
+    compact_is_met_by, compact_to_target, current_unix_seconds, permitted_difficulty_transition,
     validate_contextual_header, validate_pow,
 };
 pub use ibd::InitialBlockDownload;

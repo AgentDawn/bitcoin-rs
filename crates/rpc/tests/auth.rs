@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bitcoin_rs_rpc::auth::constant_time_eq;
 use bitcoin_rs_rpc::context::Context;
-use bitcoin_rs_rpc::{Auth, Handler, RpcServer};
+use bitcoin_rs_rpc::{Auth, Handler, RpcServer, RpcSurface};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
 #[test]
@@ -406,6 +406,118 @@ fn authorized_request_with_a_truncated_body_is_a_framing_error()
         "{response}"
     );
     Ok(())
+}
+
+/// POOL-08: pool management stays on the authenticated management surface.
+///
+/// `getpoolinfo` is a shipped pool-registry method (management-only per the
+/// registry notes). An authorized JSON-RPC request on the management
+/// listener reaches the pool handler — which refuses without an enabled
+/// ledger (`MethodDisabled`, or `MethodNotFound` when the pool feature is
+/// not compiled in) — while missing or wrong credentials get Core's 401 and
+/// the same body on the public listener gets 404 before authentication.
+#[test]
+fn pool_management_requires_authentication_and_management_surface()
+-> Result<(), Box<dyn std::error::Error>> {
+    let body = r#"{"jsonrpc":"2.0","method":"getpoolinfo","params":[],"id":1}"#;
+
+    // `getpoolinfo` must be the shipped pool-registered method in every
+    // build, so the refusal legs below target pool management specifically
+    // even when the pool dispatch arm is not compiled in.
+    let row = bitcoin_rs_rpc::manifest::MANIFEST
+        .iter()
+        .find(|entry| entry.name == "getpoolinfo")
+        .ok_or("getpoolinfo must be a registered method")?;
+    assert_eq!(
+        row.feature, "pool",
+        "getpoolinfo must stay a pool-gated method"
+    );
+
+    let management = spawn_on_surface(Auth::basic("alice", "secret"), RpcSurface::Management)?;
+    let authorized = request(management, "YWxpY2U6c2VjcmV0", body)?;
+    assert!(
+        authorized.starts_with("HTTP/1.1 200 OK"),
+        "authorized management request must reach the pool handler: {authorized}"
+    );
+    let payload = authorized.split_once("\r\n\r\n").ok_or("missing body")?.1;
+    let value: sonic_rs::Value = sonic_rs::from_str(payload)?;
+    assert_eq!(value.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+    let error = value
+        .get("error")
+        .ok_or("pool refusal without a ledger must be an error")?;
+    #[cfg(feature = "pool")]
+    {
+        assert_eq!(
+            error.get("code").and_then(sonic_rs::JsonValueTrait::as_i64),
+            Some(-32_603),
+            "disabled pool must answer MethodDisabled: {payload}"
+        );
+        assert!(
+            error
+                .get("message")
+                .and_then(|message| message.as_str())
+                .is_some_and(|message| message.contains("Pool service is disabled")),
+            "disabled pool must not fabricate status: {payload}"
+        );
+    }
+    #[cfg(not(feature = "pool"))]
+    {
+        assert_eq!(
+            error.get("code").and_then(sonic_rs::JsonValueTrait::as_i64),
+            Some(-32_601),
+            "unshipped pool method must answer MethodNotFound: {payload}"
+        );
+        assert!(
+            error
+                .get("message")
+                .and_then(|message| message.as_str())
+                .is_some_and(|message| message.contains("getpoolinfo")),
+            "unshipped pool method must name the method: {payload}"
+        );
+    }
+    assert!(value.get("result").is_none());
+
+    let missing = request_post(management, body, None, "close")?;
+    assert!(
+        missing.starts_with("HTTP/1.1 401 Unauthorized"),
+        "management surface must refuse unauthenticated pool access: {missing}"
+    );
+    let wrong = request_post(management, body, Some("YWxpY2U6YmFk"), "close")?;
+    assert!(
+        wrong.starts_with("HTTP/1.1 401 Unauthorized"),
+        "management surface must refuse wrong credentials: {wrong}"
+    );
+
+    let public = spawn_on_surface(Auth::basic("alice", "secret"), RpcSurface::Public)?;
+    let refused = request(public, "YWxpY2U6c2VjcmV0", body)?;
+    assert!(
+        refused.starts_with("HTTP/1.1 404 Not Found"),
+        "public surface must not route pool JSON-RPC even with valid credentials: {refused}"
+    );
+    Ok(())
+}
+
+fn spawn_on_surface(
+    auth: Auth,
+    surface: RpcSurface,
+) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let ctx = Arc::new(Context::new());
+    let handler = Arc::new(Handler::new(ctx));
+    let server = RpcServer {
+        listener,
+        auth: Arc::new(auth),
+        handler,
+        max_connections: 8,
+        idle_timeout: Duration::from_secs(2),
+        rest_enabled: false,
+    };
+    let shutdown = Arc::new(AtomicBool::new(false));
+    thread::spawn(move || {
+        let _ignored = server.serve_surface_with_shutdown(shutdown, surface);
+    });
+    Ok(address)
 }
 
 fn spawn(auth: Auth) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {

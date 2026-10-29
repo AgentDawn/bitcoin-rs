@@ -97,7 +97,6 @@ fn optional_u64(params: &Value, index: usize, default: u64) -> Result<u64, RpcEr
         .ok_or_else(|| RpcError::InvalidParameter("value is out of range".to_owned()))
 }
 
-
 pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let peers = ctx.network.peer_table.infos();
@@ -802,8 +801,7 @@ mod tests {
                     ),
                     onlynet: vec![bitcoin_rs_p2p::PeerNetwork::Onion],
                     ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
-                }
-                .into(),
+                },
                 ..bitcoin_rs_p2p::P2pServiceConfig::default()
             },
             bitcoin_rs_chain::LatchReader::fixture_never(),
@@ -871,8 +869,7 @@ mod tests {
                     i2p_sam: Some("127.0.0.1:2".parse()?),
                     randomize_credentials: true,
                     ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
-                }
-                .into(),
+                },
                 ..bitcoin_rs_p2p::P2pServiceConfig::default()
             },
             bitcoin_rs_chain::LatchReader::fixture_never(),
@@ -948,8 +945,7 @@ mod tests {
                 overlay: bitcoin_rs_p2p::overlay::OverlayConfig {
                     tor_control: Some("127.0.0.1:9051".parse()?),
                     ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
-                }
-                .into(),
+                },
                 ..bitcoin_rs_p2p::P2pServiceConfig::default()
             },
             bitcoin_rs_chain::LatchReader::fixture_never(),
@@ -1030,7 +1026,7 @@ mod tests {
             let mut ctx = Context::new();
             let p2p = Arc::new(bitcoin_rs_p2p::P2pService::new(
                 bitcoin_rs_p2p::P2pServiceConfig {
-                    overlay: overlay.into(),
+                    overlay,
                     ..bitcoin_rs_p2p::P2pServiceConfig::default()
                 },
                 bitcoin_rs_chain::LatchReader::fixture_never(),
@@ -1144,8 +1140,7 @@ mod tests {
                     randomize_credentials: false,
                     onlynet: vec![bitcoin_rs_p2p::PeerNetwork::Onion],
                     ..bitcoin_rs_p2p::overlay::OverlayConfig::default()
-                }
-                .into(),
+                },
                 ..bitcoin_rs_p2p::P2pServiceConfig::default()
             },
             bitcoin_rs_chain::LatchReader::fixture_never(),
@@ -1312,10 +1307,7 @@ mod addnode_validation_tests {
         let persisted = bitcoin_rs_p2p::PeerEndpoint::Ip(SocketAddr::from(([127, 0, 0, 1], 8333)));
         let result = addnode(&ctx, &json!(["127.0.0.1:8333", "add"]));
         assert!(result.is_ok());
-        assert_eq!(
-            ctx.network.p2p.added_nodes().as_slice(),
-            &[persisted.into()]
-        );
+        assert_eq!(ctx.network.p2p.added_nodes().as_slice(), &[persisted]);
 
         ctx.network.p2p.set_network_active(true);
         let result = addnode(&ctx, &json!(["127.0.0.2:8333", "onetry"]));

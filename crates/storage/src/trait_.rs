@@ -343,6 +343,19 @@ pub trait KvSnapshot: Send + Sync {
         prefix: &[u8],
     ) -> Result<KvIter<'a>, StorageError>;
 
+    /// Returns the greatest snapshot row with the given prefix, if any.
+    ///
+    /// The default walks the forward iterator retaining one row and keeps no
+    /// result collection of its own. Backends override it with a native
+    /// reverse seek that reads a single row.
+    fn last_prefix(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<Option<KvPair>, StorageError> {
+        let mut last = None;
+        for item in self.iter_prefix(cf, prefix)? {
+            last = Some(item?);
+        }
+        Ok(last)
+    }
+
     /// Collects matching snapshot rows within `limit`.
     fn scan_prefix_bounded(
         &self,

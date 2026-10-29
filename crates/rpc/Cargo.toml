@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 default = []
+pool = ["bitcoin-rs-mining/pool"]
 silent-payments = ["bitcoin-rs-index/silent-payments"]
 # Synthetic capability worlds for tests, not production composition.
 test-seam = ["bitcoin-rs-index/test-seam"]
@@ -48,6 +49,7 @@ bytes.workspace = true
 zmq = { workspace = true, optional = true }
 
 [dev-dependencies]
+bitcoin-rs-storage = { workspace = true, default-features = false, features = ["fjall"] }
 bitcoin-rs-rpc = { workspace = true, features = ["test-seam"] }
 bitcoin-rs-p2p = { workspace = true, features = ["test-seam"] }
 toml.workspace = true

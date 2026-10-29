@@ -1,8 +1,8 @@
 use bitcoin_rs_consensus::MAX_TIMEWARP;
 use bitcoin_rs_primitives::{CompactTarget, Hash256, Network};
 
-pub use pow::compact_is_met_by;
-use pow::{compact_to_target, target_to_compact};
+use pow::target_to_compact;
+pub use pow::{compact_is_met_by, compact_to_target};
 
 use crate::{
     ChainError,
@@ -518,7 +518,7 @@ pub fn permitted_difficulty_transition(
 /// overflowing shift folds to `ChainWork::ZERO` instead of surfacing
 /// `pfOverflow`, and a sign-flagged encoding decodes to `ChainWork::ZERO`
 /// instead of being rejected by name.
-pub(crate) mod pow {
+pub mod pow {
     use bitcoin_rs_primitives::{CompactTarget, Hash256};
 
     use crate::node::ChainWork;
@@ -549,7 +549,7 @@ pub(crate) mod pow {
 
     /// Decodes a compact target, returning zero for negative encodings.
     #[must_use]
-    pub(crate) fn compact_to_target(bits: CompactTarget) -> ChainWork {
+    pub fn compact_to_target(bits: CompactTarget) -> ChainWork {
         let decoded = decode_compact(bits.to_consensus());
         if decoded.negative {
             ChainWork::ZERO

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rust_rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
-    Options, ReadOptions, WriteBatch as RocksWriteBatch, WriteOptions,
+    Options, PrefixRange, ReadOptions, WriteBatch as RocksWriteBatch, WriteOptions,
 };
 
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteCondition};
@@ -386,6 +386,34 @@ impl KvSnapshot for RocksDbSnapshot<'_> {
                     Err(_) => true,
                 }),
         ))
+    }
+
+    fn last_prefix(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<Option<crate::KvPair>, StorageError> {
+        let handle = self.db.cf_handle(cf)?;
+        let prefix = prefix.to_vec();
+        // The iterate range holds exactly the prefixed rows (`PrefixRange`
+        // maps empty and all-`0xFF` prefixes to unbounded sides), so one
+        // `seek_to_last` lands directly on the tail. The prefix check below
+        // only guards against bound-enforcement subtleties.
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_range(PrefixRange(prefix.as_slice()));
+        let mut iterator = self
+            .snapshot
+            .iterator_cf_opt(handle, read_opts, IteratorMode::End);
+        for item in &mut iterator {
+            let (key, value) = item.map_err(StorageError::backend)?;
+            let key_slice: &[u8] = &key;
+            let prefix_slice: &[u8] = &prefix;
+            if key_slice.starts_with(prefix_slice) {
+                return Ok(Some((key.to_vec(), value.to_vec())));
+            }
+            return Ok(None);
+        }
+        Ok(None)
     }
 
     fn scan_prefix_from_bounded(

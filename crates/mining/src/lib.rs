@@ -20,7 +20,9 @@ mod policy;
 /// Transport-neutral candidate assembly.
 mod template;
 
-pub use bip22::{chain_reject_reason, consensus_reject_reason, header_reject_reason};
+pub use bip22::{
+    STALE_PARENT_REASON, chain_reject_reason, consensus_reject_reason, header_reject_reason,
+};
 pub use coinbase::{
     MiningError, WITNESS_RESERVED_VALUE, needs_witness_reserved_value,
     update_uncommitted_block_structures, witness_commitment_script,
@@ -46,3 +48,7 @@ pub use template::{
     TemplateId, assemble_candidate, assemble_ordered_candidate, select_template_body,
     select_template_body_after, solve_block,
 };
+
+/// Optional native mining pool protocols and accounting.
+#[cfg(feature = "pool")]
+pub mod pool;

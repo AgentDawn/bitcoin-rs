@@ -80,6 +80,9 @@ pub(crate) const MAX_CUMULATIVE_BODY_BYTES: usize = MAX_RETAINED_BODY_BYTES * 2;
 /// Cancellation is polled once per this many codec inputs.
 const CANCELLATION_POLL_INPUTS: usize = 256;
 
+type FlatLookup = Option<Result<Option<u32>, LookupError>>;
+type LocatedPrevoutLookup = Option<Result<Option<(OutPoint, ResolvedPrevout)>, LookupError>>;
+
 /// Caller-selected compression behaviour.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CompressOptions {
@@ -907,15 +910,15 @@ fn resolve_flats_grouped(
     resolver: &mut dyn PrevoutResolver,
     order: &[u32],
     members: &HashMap<u32, Vec<usize>>,
-) -> Result<Vec<Option<Result<Option<u32>, LookupError>>>, CodecError> {
-    let mut results: Vec<Option<Result<Option<u32>, LookupError>>> = vec![None; tx.inputs.len()];
+) -> Result<Vec<FlatLookup>, CodecError> {
+    let mut results: Vec<FlatLookup> = vec![None; tx.inputs.len()];
     let mut polls = 0_usize;
     for &height in order {
         let Some(indices) = members.get(&height) else {
             continue;
         };
         for &index in indices {
-            if polls % CANCELLATION_POLL_INPUTS == 0 && resolver.cancelled() {
+            if polls.is_multiple_of(CANCELLATION_POLL_INPUTS) && resolver.cancelled() {
                 return Err(CodecError::Cancelled);
             }
             polls += 1;
@@ -1029,12 +1032,12 @@ pub(crate) fn compress_transaction(
     // order. Results are cached per input; the plan pass below still runs in
     // input order, so warnings keep their `UTXO(i)` order and content, and
     // proved-absent inputs still degrade rather than fail.
-    let mut flat_results: Vec<Option<Result<Option<u32>, LookupError>>> =
-        vec![None; tx.inputs.len()];
-    if options.compress_outpoints {
+    let flat_results = if options.compress_outpoints {
         let (order, members) = flat_lookup_groups(tx, &resolved, &degraded);
-        flat_results = resolve_flats_grouped(tx, resolver, &order, &members)?;
-    }
+        resolve_flats_grouped(tx, resolver, &order, &members)?
+    } else {
+        vec![None; tx.inputs.len()]
+    };
 
     // Per-input encoding plan.
     let mut plans: Vec<Plan> = Vec::with_capacity(tx.inputs.len());
@@ -1347,7 +1350,7 @@ fn recover_pubkey(cache: &SighashCache<'_>, request: &Recovery<'_>) -> Result<Ve
 fn resolve_outpoints_grouped(
     parsed: &[ParsedInput],
     resolver: &mut dyn PrevoutResolver,
-) -> Result<Vec<Option<Result<Option<(OutPoint, ResolvedPrevout)>, LookupError>>>, CodecError> {
+) -> Result<Vec<LocatedPrevoutLookup>, CodecError> {
     let mut order: Vec<u32> = Vec::new();
     let mut members: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, part) in parsed.iter().enumerate() {
@@ -1358,15 +1361,14 @@ fn resolve_outpoints_grouped(
             members.entry(height).or_default().push(index);
         }
     }
-    let mut located: Vec<Option<Result<Option<(OutPoint, ResolvedPrevout)>, LookupError>>> =
-        vec![None; parsed.len()];
+    let mut located: Vec<LocatedPrevoutLookup> = vec![None; parsed.len()];
     let mut polls = 0_usize;
     for &height in &order {
         let Some(indices) = members.get(&height) else {
             continue;
         };
         for &index in indices {
-            if polls % CANCELLATION_POLL_INPUTS == 0 && resolver.cancelled() {
+            if polls.is_multiple_of(CANCELLATION_POLL_INPUTS) && resolver.cancelled() {
                 return Err(CodecError::Cancelled);
             }
             polls += 1;
@@ -1579,11 +1581,10 @@ pub(crate) fn decompress_prepare(
         let (outpoint, resolved) = match height_flat {
             Some((height, _)) => match located[index].take() {
                 Some(Ok(Some(found))) => (found.0, Some(found.1)),
-                Some(Ok(None)) => return Err(CodecError::BodyMissing(height)),
+                Some(Ok(None)) | None => return Err(CodecError::BodyMissing(height)),
                 Some(Err(error)) => {
                     return Err(lookup_failure(error, CodecError::BodyMissing(height)));
                 }
-                None => return Err(CodecError::BodyMissing(height)),
             },
             None => match raw_outpoint {
                 Some(outpoint) => (outpoint, None),

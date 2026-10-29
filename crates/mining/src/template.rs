@@ -70,6 +70,10 @@ pub struct CoinbaseBudget {
 }
 
 impl CoinbaseBudget {
+    /// Consensus limit on a coinbase scriptSig length (`bad-cb-length`).
+    pub const MAX_SCRIPT_SIG_LEN: usize = 100;
+    /// Smallest scriptSig the node builds (`bad-cb-length` lower bound).
+    pub const MIN_SCRIPT_SIG_LEN: usize = 2;
     /// Splits a template identity into its ordinary part and the budget
     /// qualifier [`TemplateId::qualified`] appends, if any.
     ///
@@ -574,8 +578,6 @@ fn reserve(
     })
 }
 
-/// Consensus limit on a coinbase scriptSig length (`bad-cb-length`).
-const MAX_COINBASE_SCRIPT_SIG_LEN: usize = 100;
 /// Smallest serialized `TxOut`: an 8-byte value and a one-byte empty-script length.
 const MIN_TXOUT_SIZE: u32 = 9;
 
@@ -596,7 +598,7 @@ fn coinbase_growth(coinbase: &Tx, budget: CoinbaseBudget) -> Result<FixedReserva
         .inputs
         .first()
         .map_or(0, |input| input.script_sig.len());
-    let script_growth = widen(MAX_COINBASE_SCRIPT_SIG_LEN.saturating_sub(script_sig_len));
+    let script_growth = widen(CoinbaseBudget::MAX_SCRIPT_SIG_LEN.saturating_sub(script_sig_len));
     let outputs = widen(coinbase.outputs.len());
     let added_outputs = u64::from(budget.additional_size / MIN_TXOUT_SIZE);
     let count_growth = widen(

@@ -627,7 +627,7 @@ impl Node {
                 },
                 trip: start.cancel_on_body_read.then(|| Arc::clone(&shutdown)),
                 witness: start.witness,
-                loads: start.body_loads.clone(),
+                loads: start.body_loads,
             })),
         };
         let chain_events: Arc<dyn ChainCursorSource> = probe.clone();

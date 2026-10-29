@@ -9,6 +9,7 @@
 //! re-derives every field from the bodies themselves.
 
 #![expect(
+    clippy::expect_used,
     clippy::unwrap_used,
     reason = "test assertions fail with the checked value in the message"
 )]
@@ -1500,7 +1501,16 @@ fn mainnet_bodies_truth() {
     }
 }
 
+fn compact_of(der_plus_hashtype: &[u8]) -> [u8; 64] {
+    let parsed = bitcoin::secp256k1::ecdsa::Signature::from_der(
+        &der_plus_hashtype[..der_plus_hashtype.len() - 1],
+    )
+    .unwrap();
+    parsed.serialize_compact()
+}
+
 #[test]
+#[expect(clippy::too_many_lines)]
 fn shared_sighash_cache_recovers_every_input() {
     // One cache over the immutable skeleton must serve every compressed
     // input: the legacy input and the segwit input below share the same
@@ -1568,24 +1578,17 @@ fn shared_sighash_cache_recovers_every_input() {
     // transaction carries DER signatures plus a sighash byte; recovery
     // needs the 64-byte compact form, so strip the trailing byte and
     // parse the DER prefix.
-    fn compact_of(der_plus_hashtype: &[u8]) -> [u8; 64] {
-        let parsed = bitcoin::secp256k1::ecdsa::Signature::from_der(
-            &der_plus_hashtype[..der_plus_hashtype.len() - 1],
-        )
-        .unwrap();
-        parsed.serialize_compact()
-    }
     let cache = SighashCache::new(&tx);
     let compact_a = compact_of(&sig_item_a);
     let compact_b = compact_of(&tx.inputs[1].witness[0]);
     let kind_a = super::prevout_kind(prevout_a.script_pubkey.as_bytes());
     let kind_b = super::prevout_kind(prevout_b.script_pubkey.as_bytes());
     let resolved_a = ResolvedPrevout {
-        txout: prevout_a.clone(),
+        txout: prevout_a,
         confirmed_height: Some(100),
     };
     let resolved_b = ResolvedPrevout {
-        txout: prevout_b.clone(),
+        txout: prevout_b,
         confirmed_height: Some(101),
     };
     let recovered_a = super::recover_pubkey(
@@ -1640,6 +1643,7 @@ fn shared_sighash_cache_recovers_every_input() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines)]
 fn production_resolver_clones_only_the_requested_output() {
     use std::sync::Arc;
 

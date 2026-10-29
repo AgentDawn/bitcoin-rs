@@ -4,7 +4,7 @@ use bitcoin_rs_primitives::PeerAddress;
 use std::collections::VecDeque;
 use std::net::IpAddr;
 
-use bitcoin_rs_primitives::{EndpointHost, PeerEndpoint};
+use bitcoin_rs_primitives::PeerEndpoint;
 use std::time::{Duration, Instant, SystemTime};
 
 use hashbrown::{HashMap, HashSet};
@@ -104,20 +104,10 @@ impl AutomaticPeerPolicy {
                         .contains(&PeerAddress::from(crate::EndpointHost::Ip(ip)))
                         || self.protected.iter().any(|subnet| subnet.contains(ip)))
             }
-            PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => {
-                !self
-                    .discouraged
-                    .contains(&PeerAddress::from(endpoint.host()))
-            }
+            PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => !self
+                .discouraged
+                .contains(&PeerAddress::from(endpoint.host())),
         }
-    }
-}
-
-/// Whether an endpoint is local; overlay endpoints are never local.
-pub(crate) fn is_local_endpoint(endpoint: PeerEndpoint) -> bool {
-    match endpoint {
-        PeerEndpoint::Ip(socket) => is_local(socket.ip()),
-        PeerEndpoint::TorV3 { .. } | PeerEndpoint::I2p { .. } => false,
     }
 }
 
