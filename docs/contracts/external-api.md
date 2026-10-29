@@ -166,6 +166,14 @@ scanning and wallet interoperability remain unverified.
   `getrawtransaction` verbosity 2 includes both fees and prevouts, pairing
   the requested transaction with its row in the authenticated block for
   explicit-block and txindex lookups. Mempool and coinbase replies omit both.
+- Explicit-block `getrawtransaction` verbosity 2 authenticates the entire
+  block/input view before selecting the transaction, including a requested
+  coinbase. An expected missing or corrupt undo record therefore fails that
+  coinbase lookup too; verbosity 1/boolean true and implicit txindex coinbase
+  lookups do not require undo. This is a conservative availability deviation
+  from Core's coinbase shortcut; the existing certified reader stays authoritative.
+  The explicit-coinbase RPC regression covers this refusal with a readable
+  block body containing a spend.
 - This remains a declared deviation: after a later branch receipt replaces
   the retained undo extent, older stale rows lack current certification and
   their undo fields are omitted even if raw rows remain. Snapshot history
@@ -188,6 +196,14 @@ scanning and wallet interoperability remain unverified.
   captures at most 2,000,000 ancestor IDs (at most 8 MB); missing bodies do not
   trigger deployment work. Both budget failures are explicit resource limits;
   these bounds are not throughput or global-RSS claims.
+- A txindex hit for a non-coinbase `getrawtransaction` verbosity 2 request
+  still decodes the complete authenticated body and retained undo, then
+  searches the block for its transaction row under a shared render permit.
+  Future performance qualification should measure body/undo bytes, decode
+  cost, latency and permit refusals for single requests and concurrent load
+  across representative block sizes and input counts. No measurement or
+  throughput claim is established here; follow the benchmark evidence rules
+  in [docs/benchmarks/README.md](../benchmarks/README.md).
 - Existing storage boundaries provide bounded reads with safe unsupported
   defaults, never an unbounded fallback. Fjall checks its value, redb its
   read guard, and RocksDB its pinned value before the owned copy; backend

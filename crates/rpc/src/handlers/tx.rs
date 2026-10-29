@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn getrawtransaction_detailed_read_preserves_undo_failures_and_render_budget() {
+    fn getrawtransaction_explicit_coinbase_preserves_undo_failures_and_render_budget() {
         use bitcoin_rs_utxo::contract::{BlockSpends, BlockSpendsError, BlockUndoSource};
 
         struct FailingSource(fn() -> BlockSpendsError);
@@ -1433,7 +1433,12 @@ mod tests {
                 Err((self.0)())
             }
         }
-        let block = fixture_genesis();
+        let mut block = fixture_genesis();
+        let mut spend = block.txs[0].clone();
+        spend.inputs[0].previous_output = OutPoint::new(block.txs[0].txid(), 0);
+        block.txs.push(spend);
+        block.header.merkle_root =
+            bitcoin_rs_chain::regtest_fixture::merkle_root(&block.txs).expect("merkle root");
         let context = |failure| {
             let mut ctx = Context::new();
             ctx.chain
@@ -1467,9 +1472,33 @@ mod tests {
                 -32603,
             ),
         ] {
+            let mut ctx = context(failure);
             assert_eq!(
-                getrawtransaction(&context(failure), &args)
+                getrawtransaction(&ctx, &args)
                     .expect_err("read failure")
+                    .code(),
+                code
+            );
+            // The requested coinbase needs no prevouts, but explicit v2
+            // authenticates the entire block/undo. Even with its body
+            // readable, an undo failure for the block must remain visible.
+            attach_body_for_block(Arc::get_mut(&mut ctx).expect("unique context"), &block, 0);
+            for verbosity in [json!(1), json!(true)] {
+                let value = getrawtransaction(
+                    &ctx,
+                    &json!([
+                        block.txs[0].txid().to_string(),
+                        verbosity,
+                        block.block_hash().to_string()
+                    ]),
+                )
+                .expect("coinbase body is readable without undo");
+                assert!(value.get("fee").is_none());
+                assert!(value["vin"][0].get("prevout").is_none());
+            }
+            assert_eq!(
+                getrawtransaction(&ctx, &args)
+                    .expect_err("v2 still requires undo")
                     .code(),
                 code
             );
