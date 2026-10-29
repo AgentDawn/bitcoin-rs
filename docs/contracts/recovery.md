@@ -21,7 +21,7 @@ Owners:
 - Authoritative durable root and ordered commit protocol:
   `crates/chainstate/src/connect.rs`, `disconnect.rs`, and `durable.rs`
 - Recovery and schema admission: `crates/chainstate/src/recovery.rs`;
-  process-composition tests remain in `crates/node/tests/unit/state/tests/`
+  process-composition tests remain in `crates/node/src/state/tests/`
 - Persistent coin transition boundary: `crates/utxo/src/set.rs`
   (transition types); durable form in
   `crates/storage/src/durable_head.rs`
@@ -151,9 +151,9 @@ committed `Finalized` head. Cleanup failures are warnings, not recovery failures
 ordinary checkpoints and unknown files are preserved.
 
 Snapshot recovery is exercised by
-`crates/chainstate/tests/unit/assumeutxo_tests.rs` (commitment verification,
+`crates/chainstate/src/assumeutxo/tests.rs` (commitment verification,
 isolated replay, terminal-write failures and role guards) and
-`crates/chainstate/tests/unit/assumeutxo_recovery_tests.rs` (real-storage
+`crates/chainstate/src/assumeutxo/tests/recovery.rs` (real-storage
 restart, process-kill boundaries, lost failure receipts, root-preserving
 archive replay, checkpoint pin binding, pruning and below-base reorg restart).
 

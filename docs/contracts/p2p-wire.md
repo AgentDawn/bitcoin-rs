@@ -97,7 +97,7 @@ This page assigns ownership and cites proof under the
 
 For the process comparison, set `BITCOIN_RS_NODE` to a binary built from the
 tested commit and `BITCOIN_RS_REFERENCE_BITCOIND` to the pinned Core binary.
-`cargo test -p bitcoin-rs-e2e --test peer_discouragement` runs
+`cargo test -p bitcoin-rs-e2e --test suite peer_discouragement::` runs
 `e2e/tests/peer_discouragement.rs` against pinned Core 31.1 and the candidate on
 loopback: protected oversized-headers senders remain connected, unprotected
 local senders disconnect and can reconnect, RPC reflects `noban`, and no manual

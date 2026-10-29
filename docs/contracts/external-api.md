@@ -40,7 +40,7 @@ scanning and wallet interoperability remain unverified.
   `crates/rpc/tests/manifest_coverage.rs` enforces set equality between
   the registry and the live dispatch table in both directions and
   regenerates the reference. Regenerate with:
-  `REGEN_RPC_REFERENCE=1 cargo test -p bitcoin-rs-rpc --test manifest_coverage -- --ignored regenerate_reference`
+  `REGEN_RPC_REFERENCE=1 cargo test -p bitcoin-rs-rpc --test suite manifest_coverage::regenerate_reference -- --ignored`
 
 ### `API-02`: JSON-RPC mechanics and the wallet-free surface
 
