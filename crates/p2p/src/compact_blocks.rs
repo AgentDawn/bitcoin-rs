@@ -1,26 +1,12 @@
-//! BIP152 compact-block reconstruction.
+//! BIP152 reconstruction, owned by each connection's message loop.
+//! Completed bodies enter the ordinary validation/apply sink. Ambiguous or
+//! missing hints and bound misses fall back to same-peer full-block `getdata`;
+//! expired entries drop silently, leaving recovery to connection stall handling.
+//! Completion, replacement, timeout, and owner drop release retained state.
 //!
-//! One [`Reconstruction`] lives per peer message loop: it owns the bounded
-//! pending-reconstruction state for that connection and hands finished
-//! blocks to the caller, which delivers them through the ordinary block
-//! sink — the same validation and apply path as a `block` message, with no
-//! bypass. Short IDs are hints only: any ambiguity, missing piece, or bound
-//! miss degrades to a full-block `getdata` fallback on the same connection,
-//! so a wrong guess costs round trips, never a wrong block; an entry whose
-//! deadline passes is dropped silently — liveness then rests on the
-//! connection's separate stall handling.
-//!
-//! BIP152 identity direction: a peer serializes the compact blocks it sends
-//! us with the version we advertised in our own `sendcmpct`
-//! ([`crate::peer::COMPACT_BLOCK_VERSION`], v2 = wtxid identity, witness-bearing
-//! prefills). Conversely, we serve peers at the version they recorded with
-//! us (`CompactBlockNegotiation::servable_version`, used by the chain
-//! query). The two directions are independent; decoding incoming compact
-//! blocks never reads their preference.
-//!
-//! State is released by completion, by the deadline, by a replacement, and
-//! by dropping the owner at disconnect or session cancel — a chain change
-//! cannot strand memory beyond the deadline.
+//! Incoming identity uses our advertised `COMPACT_BLOCK_VERSION` (v2 wtxids
+//! and witness-bearing prefills); serving uses the peer's `servable_version`.
+//! These directions are independent.
 
 use crate::inv::{native_block_hash, wire_block_hash};
 
@@ -288,10 +274,10 @@ impl Reconstruction {
 /// `[a, b, c, c]` hash to the same root, so the reduction also rejects a
 /// mutated tree and the caller answers with the same-peer full-block
 /// fallback (Core 31.1 `READ_STATUS_FAILED` before delivery,
-/// `blockencodings.cpp:207-219`). A 64-byte transaction in a body without a
+/// `blockencodings.cpp`). A 64-byte transaction in a body without a
 /// coinbase can pose as an inner tree node and reach the header's root with
 /// fabricated leaves (CVE-2017-12842), so that body takes the same fallback
-/// (Core `IsBlockMutated`, `validation.cpp:4035-4061`).
+/// (Core `IsBlockMutated`, `validation.cpp`).
 fn complete_block(header: Header, filled: Vec<Option<Tx>>) -> Result<Block, ()> {
     if filled.iter().any(Option::is_none) {
         return Err(());
@@ -314,7 +300,7 @@ fn complete_block(header: Header, filled: Vec<Option<Tx>>) -> Result<Block, ()> 
 /// map would silently misplace bodies. Two distinct hint identities that
 /// collide on one short ID retire only that slot, which the `getblocktxn`
 /// request then carries; a later candidate never refills it (Core 31.1
-/// clears only the colliding slot, `blockencodings.cpp:116-166`).
+/// clears only the colliding slot, `blockencodings.cpp`).
 ///
 /// PRE: `filled` holds one body per prefill and `None` per short-ID slot;
 /// `retained_bytes` counts the short IDs and the prefilled bodies.

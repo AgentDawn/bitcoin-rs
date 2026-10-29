@@ -257,7 +257,6 @@ impl PeerTable {
     /// Live inbound connections, including handshakes that have not
     /// published metadata yet.
     ///
-    /// PRE: none.
     /// POST: returns the number of uncancelled leases whose identity is
     ///   inbound.
     /// INVARIANT: the count is always derived from the live entry set; no
@@ -382,7 +381,7 @@ impl PeerTable {
     }
 
     /// Makes room for an inbound newcomer at `addr` by removing the
-    /// connection Core's `SelectNodeToEvict` chooses (`net.cpp:1819-1826`).
+    /// connection Core's `SelectNodeToEvict` chooses (`net.cpp`).
     /// Returns whether one was removed.
     fn evict_inbound_locked(
         entries: &mut TableView,
@@ -761,7 +760,7 @@ impl PeerTable {
     }
 
     /// Records that the mempool accepted a transaction the current connection
-    /// delivered (Core `m_last_tx_time`, `net_processing.cpp:4538-4541`). The
+    /// delivered (Core `m_last_tx_time`, `net_processing.cpp`). The
     /// sequence orders inbound eviction protection.
     pub fn note_useful_transaction(&self, source: PeerSource) -> bool {
         let mut entries = self.entries.write();
@@ -885,24 +884,11 @@ impl PeerTable {
         self.remove_if(addr.into(), |current| current.connection_id() == id)
     }
 
-    /// Removes and cancels exactly the handshake-complete connection whose
-    /// process-unique node id is `node_id` — [`PeerLease::node_id`], the value
-    /// Core calls `nodeid` and publishes as `getpeerinfo.id`.
-    ///
-    /// Identity resolution and removal are one table write operation, so a
-    /// same-address replacement cannot move the target in between: this can
-    /// never disconnect a connection the caller did not name. Because the
-    /// scan is over session keys rather than addresses, an anonymous inbound
-    /// session — which has no logical endpoint at all — is selectable too.
-    /// Only sessions that published metadata are selectable, the same set
-    /// `getpeerinfo` reports ids for.
-    ///
-    /// PRE: none.
-    /// POST: returns `false` and changes nothing when no handshake-complete
-    ///   entry carries that node id; otherwise removes and cancels exactly
-    ///   that entry and returns `true`.
-    /// INVARIANT: address sessions are not consulted for identity, so the
-    ///   endpoint-keyed replacement rule plays no part here.
+    /// Atomically removes and cancels the handshake-complete session named by
+    /// `PeerLease::node_id` (`getpeerinfo.id`), including anonymous inbound sessions.
+    /// Resolution and removal share one table write guard, so same-address
+    /// replacement cannot redirect the target. Returns false without mutation
+    /// when that exact ready session is absent.
     pub fn disconnect_ready_node_id(&self, node_id: u64) -> bool {
         let mut entries = self.entries.write();
         let Some(key) = entries
@@ -925,7 +911,6 @@ impl PeerTable {
     /// replacement fails the identity check instead of being disconnected in
     /// the stale connection's place.
     ///
-    /// PRE: none.
     /// POST: `false` with no mutation when `addr` is vacant, its session has
     ///   published no [`PeerInfo`], or it holds a connection with a different
     ///   node id.
@@ -1115,7 +1100,6 @@ impl PeerTable {
 
     /// Identity of every live, uncancelled connection.
     ///
-    /// PRE: none.
     /// POST: returns one `PeerSource` per live, uncancelled table entry.
     /// INVARIANT: every returned source passes `is_current` at snapshot time.
     #[must_use]
@@ -1225,7 +1209,6 @@ impl PeerTable {
     /// Counts automatic outbound connections by relay role, including those
     /// still handshaking.
     ///
-    /// PRE: none.
     /// POST: `(full_relay, block_relay)` counts of automatic outbound
     ///   connections; inbound connections are never counted.
     /// INVARIANT: inbound, manual, and cancelled leases hold no automatic

@@ -1,24 +1,9 @@
-//! Portable, versioned index bundles: export and restore of the `TxLookup`
-//! family.
+//! Versioned `TxLookup` bundle export and restore on the derived-index worker.
+//! `artifact` owns the wire layout, `export` coherent reads and publication,
+//! and `restore` validation and fenced import through `IndexWriter`.
 //!
-//! A bundle is a directory holding `txlookup-v1.dat` and, published last,
-//! `manifest.json`. Export reads one coherent index snapshot at the applied
-//! tip. Restore validates the whole bundle, including every locator against
-//! the receiver's own block bodies, before it mutates anything, then imports
-//! through the existing fenced [`crate::IndexWriter`] path. Both run on the
-//! existing derived-index worker inside `open_and_run`; there is no second
-//! store opener, writer, or RPC surface.
-//!
-//! `ScriptHistory` is not carried: its occurrence layout is not qualified,
-//! so the manifest refuses it and `ScriptLive` is never a bundle capability
-//! (it is always reseeded from the UTXO set).
-//!
-//! Remaining interface for the `ScriptHistory` artifact: a
-//! `TxIndexFamily::HistoryOccurrence` variant with its streaming method arm,
-//! a fixed 51-byte record codec beside `TxLookup` in `artifact.rs`, a manifest
-//! family entry, and an import row variant committed through the same
-//! fenced stream with the script-history watermark stamped only in the final
-//! commit. None exists until the v6 schema is qualified.
+//! `ScriptHistory` is refused until its occurrence layout is qualified;
+//! `ScriptLive` is always reseeded from the UTXO set, never a bundle capability.
 
 mod artifact;
 mod chain;

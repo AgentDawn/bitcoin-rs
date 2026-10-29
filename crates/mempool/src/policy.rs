@@ -56,7 +56,7 @@ pub enum PolicyError {
 /// in sat/kvB. The selected rate is 1,000 sat/kvB; Core 31.1's default is 100.
 pub(crate) const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 1_000;
 /// Half-life of the rolling minimum fee's exponential decay, in seconds (Core
-/// `ROLLING_FEE_HALFLIFE`, `txmempool.h:213`).
+/// `ROLLING_FEE_HALFLIFE`, `txmempool.h`).
 pub(crate) const ROLLING_FEE_HALFLIFE_SECS: u64 = 12 * 60 * 60;
 
 /// Maximum resident age before expiry also removes an entry's descendants.

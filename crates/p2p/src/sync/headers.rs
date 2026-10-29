@@ -254,7 +254,7 @@ impl BlockSync {
 
     /// Applies every queued `MSG_BLOCK` announcement to the announcing
     /// connection's header-sync state, as Core does in
-    /// `net_processing.cpp:4370-4410`.
+    /// `net_processing.cpp`.
     ///
     /// PRE: entries were queued by [`BlockSync::announce_block`].
     /// POST: a hash already in the tree credits its connection with that tip
@@ -316,7 +316,7 @@ impl BlockSync {
     /// Requests the body of a freshly announced near-tip header from the
     /// connection that proved it, without waiting for the next scheduler
     /// tick. Core direct-fetches in the same situation
-    /// (`HeadersDirectFetchBlocks`, `net_processing.cpp:3098-3158`, gated by
+    /// (`HeadersDirectFetchBlocks`, `net_processing.cpp`, gated by
     /// `CanDirectFetch` at `:1450-1453`).
     ///
     /// PRE: `source` is the connection that delivered `announced_tip`.
@@ -503,25 +503,14 @@ impl BlockSync {
             .is_none_or(|tip| tip.chainwork < minimum_work)
     }
 
-    /// Resolves deferred owned-fetch marks now that this drain may have
-    /// admitted the ancestry their tips were waiting on.
+    /// Resolves deferred fetches after header admission. Call on the sync thread
+    /// outside locks. Unknown headers and capacity refusals keep their marks;
+    /// departed connections lose theirs. Snapshot tree/peer reads outside scheduler.
     ///
-    /// PRE: runs on the sync thread, outside every lock.
-    /// POST: a mark whose header is in the tree and whose connection is
-    ///   current becomes a window pending (or stays a mark when the window
-    ///   refuses it, or another connection already owns the hash); a mark
-    ///   whose connection left is dropped; a mark whose header is unknown
-    ///   stays.
-    /// INVARIANT: a mark is the proof of a matched outstanding request, so
-    ///   it never leaves the scheduler while it resolves. The tree and peer
-    ///   table reads run on a snapshot outside the scheduler lock. Each
-    ///   install holds exact-source peer authority across the scheduler lock
-    ///   and rechecks its mark under the same lock hold that installs it:
-    ///   a mark released since the snapshot (the exact owner's `notfound`, a
-    ///   session sweep, an eviction) installs nothing, so a stale snapshot
-    ///   can never re-create a request the owner already declined. A
-    ///   `notfound` that lands anywhere in the resolve therefore finds the
-    ///   mark or, after the install, the window pending it became.
+    /// Hold exact-source peer authority across the scheduler lock and recheck the
+    /// mark before installation. Conversion to pending never removes ownership
+    /// between states: a concurrent `notfound` must find the mark or its pending,
+    /// and a released mark must not be resurrected from the snapshot.
     pub(super) fn resolve_owned_body_fetches(&self) {
         let snapshot = {
             let scheduler = self.scheduler.lock();
@@ -1128,7 +1117,7 @@ impl BlockSync {
         };
         // Only a genuine wire `headers` message opens or feeds the
         // download-twice state: Core feeds the sync state only from
-        // processed `headers` messages (`net_processing.cpp:2915-2924`).
+        // processed `headers` messages (`net_processing.cpp`).
         // A header carried by a delivered body — a staged-body retry or a
         // drain-forwarded tip — arrives as a one-header page, and feeding
         // it to a live state would finalize the wire sync's progress (a
@@ -1365,7 +1354,6 @@ impl BlockSync {
     /// The fork point a batch builds from, when that fork is not yet worth
     /// admitting directly.
     ///
-    /// PRE: none.
     /// POST: return the anchor for the batch's first header's parent when
     ///   this node holds that parent, it is not already `Invalid` (the
     ///   admission path owns that refusal), and its cumulative chainwork
@@ -1373,7 +1361,7 @@ impl BlockSync {
     ///   return `None` when the parent is unknown (the admission path
     ///   reports the missing ancestry) or the floor is already met
     ///   (Core's `TryLowWorkHeadersSync` fast path,
-    ///   `net_processing.cpp:3010-3018`).
+    ///   `net_processing.cpp`).
     /// INVARIANT: the tree read closes before any scheduler or transition
     ///   lock is taken.
     fn presync_anchor(&self, headers: &[Header]) -> Option<HeaderAnchor> {
@@ -1392,7 +1380,7 @@ impl BlockSync {
         }
         // Core's `TryLowWorkHeadersSync` fast path counts the work the batch
         // itself claims (`chain_start->nChainWork +
-        // CalculateClaimedHeadersWork`, `net_processing.cpp:3010-3018`): a
+        // CalculateClaimedHeadersWork`, `net_processing.cpp`): a
         // batch that crosses the floor on its own admits directly instead
         // of opening a presync that re-requests the same page after the
         // crossing.
@@ -1516,9 +1504,8 @@ fn headers_target_height(horizon: Option<u32>, info: Option<&PeerInfo>) -> i32 {
 }
 
 /// Fresh unpredictable key material for one sync's commitment hash
-/// (`headerssync.cpp:24` draws the same from a fast RNG).
+/// (`headerssync.cpp` draws the same from a fast RNG).
 ///
-/// PRE: none.
 /// POST: return a salt from OS-seeded randomness; anything predictable
 ///   (clock, PID, peer address) would let a peer precompute which mutated
 ///   headers keep their one-bit commitments.

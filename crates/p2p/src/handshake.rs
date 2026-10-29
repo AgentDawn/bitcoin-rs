@@ -21,10 +21,10 @@ use bitcoin::p2p::message_compact_blocks::SendCmpct;
 ///   and `local_services` contains the services this node can provide.
 /// POST: the message advertises transaction relay only for a full-relay
 ///   connection; a block-relay-only connection advertises `relay = false`,
-///   as Core's `PushNodeVersion` does (`net_processing.cpp:1651-1689`).
+///   as Core's `PushNodeVersion` does (`net_processing.cpp`).
 ///   Prune mode never advertises `NODE_NETWORK`; non-prune mode advertises
 ///   `NODE_NETWORK`; `WITNESS` remains advertised in both modes (Core
-///   `init.cpp:2022-2026`).
+///   `init.cpp`).
 /// INVARIANT: services, height, and nonce do not vary with the role; both
 ///   inbound and outbound handshakes use the same service set.
 pub fn version_message(
@@ -57,21 +57,10 @@ pub const fn feature_messages() -> [Message; 3] {
     ]
 }
 
-/// BIP434 feature announcements sent after [`feature_messages`] and before our
-/// `verack`, once the peer's `version` has arrived.
-///
-/// PRE: `remote_version` is the protocol version the peer announced in its
-///   `version`; `peer` carries this connection's offers
-///   ([`Peer::offer_stale_tip_relay`]).
-/// POST: empty for a peer below [`FEATURE_VERSION`]: BIP434 forbids sending it
-///   a `feature`, so its handshake bytes are those of a pre-BIP434 session.
-///   Otherwise the announcements this node was told to make, in send order:
-///   BIP332 when offered, nothing by default. BIP330 and BIP331 negotiate on
-///   their own messages and never appear here.
-/// INVARIANT: `dispatch_inbound_full`'s `version` reply is the only caller.
-///   Both roles negotiate through it, because only there is the peer's
-///   version known, and it runs before `verack`, the last point at which
-///   BIP434 permits a `feature`.
+/// Sends offered BIP434 features after `feature_messages`, before `verack`,
+/// using the remote version already received by `dispatch_inbound_full`.
+/// Below `FEATURE_VERSION` send none. Otherwise send offered BIP332 only;
+/// BIP330/331 use their own negotiation messages. Both roles use this call site.
 pub(crate) fn negotiated_features<S>(
     peer: &Peer<S>,
     remote_version: u32,
@@ -160,31 +149,12 @@ pub fn start<S>(
     messages
 }
 
-/// Drive a Bitcoin v1 handshake from the inbound listener side.
-///
-/// The caller has already accepted the TCP connection and constructed a
-/// `Peer<S>` whose `magic` matches the network. This reads the remote
-/// `Version`, sends our `Version` followed by feature-negotiation messages and
-/// `Verack`, then dispatches inbound messages until the peer is ready.
-///
-/// Reads tolerate transient `WouldBlock`/`TimedOut` errors so the caller can
-/// poll a short stream timeout: the handshake fails with a timeout error once
-/// `deadline` passes and with a lease-revoked protocol error as soon as the
-/// connection is cancelled, leaving connection teardown to the caller.
-///
-/// # Errors
-///
-/// Returns [`PeerError`] if reading or writing the wire stream fails, if the
-/// finite-state machine rejects any inbound message, if `deadline` passes
-/// before the peer reaches the ready state, or if the connection's lease is
-/// revoked mid-handshake.
-///
-/// PRE: `peer` wraps an accepted connection, `lease` belongs to it, and
-///   `local_services` are the services this node provides.
-/// POST: `peer` is `Ready`, the post-verack messages are sent, and our
-///   `Version` advertised `local_services`.
-/// INVARIANT: This function counts no bytes; the stream that `peer` wraps
-/// owns byte accounting.
+/// Handshakes an accepted peer with matching network magic and its own lease.
+/// Sends our version/services, negotiation, and verack; success leaves `Ready`
+/// and sends post-verack messages. Transient read timeouts permit polling until
+/// the absolute deadline; cancellation reports lease revocation immediately.
+/// Wire/FSM errors and deadline expiry propagate as `PeerError`; the caller
+/// owns teardown and the wrapped stream owns byte accounting.
 pub fn run_inbound_handshake<S: Read + Write>(
     peer: &mut Peer<S>,
     our_nonce: u64,

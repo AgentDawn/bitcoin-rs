@@ -434,7 +434,7 @@ impl NodeState {
                 inbound_block_queue_limit: INBOUND_BLOCK_CHANNEL_LIMIT,
                 // A pruned node cannot serve the full block history, so it
                 // advertises `NODE_NETWORK_LIMITED` instead of
-                // `NODE_NETWORK` (Core `init.cpp:2022-2026`); witness relay
+                // `NODE_NETWORK` (Core `init.cpp`); witness relay
                 // is unaffected.
                 local_services: {
                     let history = if config.storage.prune_target_mb > 0 {

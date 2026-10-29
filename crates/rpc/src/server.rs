@@ -24,7 +24,7 @@ const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 
 /// How long a wrong-credential answer waits before it is written, Core's
-/// brute-force deterrent (`httprpc.cpp:215-225`).
+/// brute-force deterrent (`httprpc.cpp`).
 const WRONG_CREDENTIALS_DELAY: Duration = Duration::from_millis(250);
 
 /// Most declared body bytes the unauthorized path reads after its answer.
@@ -540,7 +540,7 @@ fn reject_unauthenticated_json_rpc(
     head: &RequestHead,
 ) -> io::Result<()> {
     // Present but wrong credentials are slowed before the answer, Core's
-    // brute-force deterrent (`httprpc.cpp:215-225`). Absent credentials
+    // brute-force deterrent (`httprpc.cpp`). Absent credentials
     // answer at once: there is no secret to slow down.
     if head.authorization.is_some() {
         thread::sleep(WRONG_CREDENTIALS_DELAY);
@@ -892,7 +892,7 @@ enum JsonRpcVersion {
 
 impl JsonRpcVersion {
     /// Classifies the envelope exactly as the pinned Core 31.1 parser does
-    /// (`src/rpc/request.cpp:206-224`).
+    /// (`src/rpc/request.cpp`).
     ///
     /// PRE: `request` is one decoded JSON-RPC request object.
     /// POST: `V2` for `"jsonrpc":"2.0"`, `Legacy` for an absent field or the
@@ -906,7 +906,7 @@ impl JsonRpcVersion {
             return Ok(Self::Legacy);
         };
         // Core treats an absent field like `null`; only explicit non-strings
-        // are refused (`request.cpp:213-216`).
+        // are refused (`request.cpp`).
         if version.is_null() {
             return Ok(Self::Legacy);
         }
@@ -915,7 +915,7 @@ impl JsonRpcVersion {
         };
         match version {
             // Core keeps the historical `{"jsonrpc":"1.0"}` request form as
-            // legacy for backwards compatibility (`request.cpp:216-222`).
+            // legacy for backwards compatibility (`request.cpp`).
             "1.0" => Ok(Self::Legacy),
             "2.0" => Ok(Self::V2),
             _ => Err(RpcError::InvalidRequest("JSON-RPC version not supported")),
@@ -947,7 +947,7 @@ impl JsonRpcVersion {
     /// HTTP status for a failing call in this dialect.
     ///
     /// Core answers legacy errors with an HTTP error status and v2 errors
-    /// with HTTP 200 (`src/httprpc.cpp:41-56`). Within the legacy dialect,
+    /// with HTTP 200 (`src/httprpc.cpp`). Within the legacy dialect,
     /// `RPC_INVALID_REQUEST` maps to 400 and `RPC_METHOD_NOT_FOUND` to 404;
     /// every other code keeps 500.
     const fn error_status_for(self, error: &RpcError) -> u16 {
@@ -960,7 +960,7 @@ impl JsonRpcVersion {
     /// For a v2 request only *dispatch* errors stay inside HTTP 200; an
     /// envelope violation reaches Core's outer error path, which maps
     /// `-32600` to HTTP 400 regardless of the version the parser had
-    /// already assigned (`src/httprpc.cpp:41-56`, `src/rpc/request.cpp:206-260`).
+    /// already assigned (`src/httprpc.cpp`, `src/rpc/request.cpp`).
     const fn error_status_for_code(self, code: i64) -> u16 {
         match self {
             Self::Legacy => match code {
@@ -1093,7 +1093,7 @@ fn handle_decoded_json(handler: &Handler, request: &Value) -> JsonResponse {
             };
         }
         // Core: "Batches never throw HTTP errors, they are always just
-        // included in HTTP OK responses" (`httprpc.cpp:200-201`). A
+        // included in HTTP OK responses" (`httprpc.cpp`). A
         // per-member envelope or dispatch error stays inside the 200 batch.
         return JsonResponse {
             close,
@@ -1141,10 +1141,10 @@ fn handle_decoded_json(handler: &Handler, request: &Value) -> JsonResponse {
 ///   the pinned Core 31.1 rules: the `jsonrpc` field, when present, must be
 ///   a string and must be `"1.0"` or `"2.0"`; `method` must be present and
 ///   a string; `params`, when present, must be an array, an object, or
-///   `null` (`src/rpc/request.cpp:206-260`). A violation while classifying
+///   `null` (`src/rpc/request.cpp`). A violation while classifying
 ///   `jsonrpc` answers in the legacy dialect; a later violation keeps the
 ///   already-assigned dialect's envelope but still takes the legacy HTTP
-///   status, matching Core's outer error path (`src/httprpc.cpp:189-194`).
+///   status, matching Core's outer error path (`src/httprpc.cpp`).
 /// INVARIANT: an envelope error never executes the method, and a
 ///   notification is only silent when its envelope was valid.
 fn handle_single_json(handler: &Handler, request: &Value) -> CallResponse {
@@ -1159,8 +1159,8 @@ fn handle_single_json(handler: &Handler, request: &Value) -> CallResponse {
         Err(error) => {
             // Core raises -32600 from `JSONRPCRequest::parse`, before the
             // claimed version is trusted, so the reply uses the legacy
-            // envelope (`request.cpp:206-224`) while the HTTP status stays
-            // the 400 every envelope refusal takes (`httprpc.cpp:41-56`).
+            // envelope (`request.cpp`) while the HTTP status stays
+            // the 400 every envelope refusal takes (`httprpc.cpp`).
             // The error envelope still carries the request's `id`.
             let version = JsonRpcVersion::Legacy;
             return CallResponse::envelope_error(
@@ -1170,7 +1170,7 @@ fn handle_single_json(handler: &Handler, request: &Value) -> CallResponse {
             );
         }
     };
-    // Core checks `isNull()` before `isStr()` (`request.cpp:228-232`), so
+    // Core checks `isNull()` before `isStr()` (`request.cpp`), so
     // an explicit `"method": null` is "Missing method".
     let Some(method) = request.get("method").filter(|method| !method.is_null()) else {
         let error = RpcError::InvalidRequest("Missing method");
@@ -1189,7 +1189,7 @@ fn handle_single_json(handler: &Handler, request: &Value) -> CallResponse {
         return CallResponse::envelope_error(version.error_response(&error, &id), version, &error);
     }
     // Core canonicalizes absent or explicit-null params to an empty array
-    // before dispatch, so method defaults apply (`src/rpc/request.cpp:243-248`).
+    // before dispatch, so method defaults apply (`src/rpc/request.cpp`).
     let empty_params = json!([]);
     let params = if params.is_null() {
         &empty_params

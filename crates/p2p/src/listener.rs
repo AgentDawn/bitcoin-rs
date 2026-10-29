@@ -464,25 +464,11 @@ impl ConnectionShared {
         }
     }
 
-    /// Enqueues a decoded block body into ingress, then forwards its carried
-    /// header to header admission.
-    ///
-    /// The body is queued first so the header can never reach `headers_tx`
-    /// while the body is still unsent: request scheduling runs after both
-    /// drains, so the staged-or-received body suppresses a duplicate
-    /// `getdata` for a tip learned only by delivery.
-    ///
-    /// PRE: `lease` belongs to the connection that delivered `block`.
-    /// POST: when [`crate::PeerLease::admit_block_forward`] admits the body,
-    ///   the body reaches the shared inbound block channel and then its
-    ///   header reaches the headers sink; a refused body drops both with a
-    ///   counter record, so a peer over its unsolicited bound cannot grow
-    ///   the header queue either.
-    /// INVARIANT: one connection holds at most
-    ///   [`crate::connection::MAX_UNSOLICITED_BLOCK_FORWARDS`] unsolicited
-    ///   bodies in the shared channel at once, and a body the download
-    ///   window owns is never dropped for that bound, so requested sync
-    ///   traffic always arrives.
+    /// Queues a body before its carried header to suppress duplicate scheduling.
+    /// `lease` must identify the delivering connection. The unsolicited per-source
+    /// bound drops both body and header on refusal; requested window-owned bodies
+    /// are exempt. The header is not a wire `headers` response and must not consume
+    /// an outstanding `getheaders` request.
     fn send_block(
         &self,
         lease: &crate::PeerLease,
@@ -491,23 +477,8 @@ impl ConnectionShared {
     ) {
         let peer_addr = peer_addr.into();
         let source = lease.source(peer_addr.endpoint());
-        // Every body carries its own header; route it through the headers
-        // sink too so tips learned only by body delivery (`inv` getdata,
-        // compact reconstruction, or an unsolicited push) reach header
-        // admission. Without a tree node the body can never become the
-        // apply frontier's expected block, and no announced-tip credit
-        // reaches the delivering peer. The headers drain runs before the
-        // blocks drain each tick, so the body lands already expected. The
-        // forward is not a `headers` response: it must not consume an
-        // outstanding `getheaders` request's pending state.
-        //
-        // The body goes on its channel before the header goes on its own on
-        // purpose: a tip learned only by body delivery arrives untracked
-        // (the `inv` getdata is never marked pending), so if the header
-        // reached the tree while the body still sat outside `received`, the
-        // same tick would schedule a duplicate fetch for it. Queueing the
-        // body first means the tick that admits the header always marks the
-        // body received first.
+        // Queue before forwarding the carried header; `send_block` owns that ordering.
+        // The header makes body-only discoveries eligible for ordinary admission.
         let header = payload.block().header;
         let hash = bitcoin_rs_primitives::Hash256::from(header.compute_hash());
         let requested = self
@@ -730,38 +701,13 @@ pub fn bind_listener(addr: std::net::SocketAddr) -> Result<TcpListener, Listener
     Ok(listener)
 }
 
-/// Run the accept loop on a bound listener.
-///
-/// On each accepted connection, spawns a thread that runs the inbound
-/// handshake followed by a message-dispatch loop. Socket flags come from
-/// `configure_peer_stream`. The handshake uses
-/// `HANDSHAKE_TIMEOUT`; after handshake, the message loop
-/// polls inbound reads every `STREAM_POLL_INTERVAL`, probing
-/// a quiet peer with one `ping` per `PING_INTERVAL` and ending the
-/// connection once a direction is silent past `TIMEOUT_INTERVAL`.
-/// The thread terminates on:
-///   - successful handshake then inactivity (no send or receive for
-///     `TIMEOUT_INTERVAL`)
-///   - wire / FSM error
-///   - explicit FSM disconnect transition
-///
-/// Transient `accept` errors (ECONNABORTED, EMFILE/ENFILE under fd
-/// pressure, etc.) are logged at warn and the loop continues after a
-/// bounded backoff, matching Bitcoin Core's tolerant accept loop so inbound
-/// P2P stays alive through temporary resource exhaustion.
-///
-/// Per-connection threads are NOT joined by the outer shutdown — they
-/// outlive the listener by up to the timeout. On exit (clean or error),
-/// the peer is removed from the authoritative peer table.
-///
-/// PRE: The listener is bound and nonblocking. Wiring is complete.
-/// POST: Return when `shutdown` or `shared.session_cancel` is set.
-/// INVARIANT: Apply the ban and activity checks to each accepted socket.
-///
-/// # Errors
-///
-/// Returns [`ListenerError::Accept`] when the listener cannot report its
-/// local address.
+/// Accepts on a bound nonblocking listener with complete wiring until shutdown
+/// or session cancellation. Each socket passes ban/activity checks and uses
+/// `configure_peer_stream` plus the handshake/message-loop timeout owners.
+/// Transient accept failures back off and retry. Connection threads are not
+/// joined here and can outlive the listener until their timeout; each removes
+/// its peer-table entry on exit. `ListenerError::Accept` reports failure to
+/// read the listener's local address.
 #[expect(clippy::needless_pass_by_value)]
 pub fn serve(
     listener: TcpListener,
@@ -1633,24 +1579,12 @@ fn run_connected_session(
     loop_result
 }
 
-/// Applies a connection's relay role to one inbound message.
-///
-/// PRE: `role` is the connection's role and `message` arrived on it.
-/// POST: return the message for dispatch, `None` to drop it unheard, or the
-///   protocol error that ends the connection.
-/// INVARIANT: a block-relay-only connection carries blocks and headers and
-///   nothing else. A `tx` message or a transaction `inv` is a protocol
-///   violation and ends the connection, as Core's `RejectIncomingTxs`
-///   requires (`net_processing.cpp`, and the `inv` branch at
-///   `net_processing.cpp`). A `getdata` from such a connection is
-///   answered with block inventory alone: transaction inventory is stripped
-///   before dispatch, and a request that asked for nothing else is dropped
-///   unheard, so the role cannot obtain a transaction body through
-///   `getdata`. `addr` and `addrv2` are dropped
-///   without punishment, because Core declines address relay for such a
-///   peer rather than faulting it (`SetupAddressRelay`,
-///   `net_processing.cpp`). A full-relay connection is never
-///   restricted.
+/// Enforces the connection's relay role before dispatch.
+/// Block-relay-only peers sending `tx` or transaction `inv` are disconnected
+/// (Core's `RejectIncomingTxs`). Strip transaction `getdata` items and drop an
+/// empty remainder; drop `addr`/`addrv2` without punishment (`SetupAddressRelay`).
+/// Full-relay messages are unrestricted. Returns the message, a silent drop,
+/// or the protocol error ending the connection.
 fn enforce_relay_role(
     role: crate::peer_info::PeerRole,
     message: crate::Message,
@@ -2010,21 +1944,11 @@ mod keepalive_tests {
     }
 }
 
-/// Pays for one pass's outbound messages out of reservations taken before
-/// the messages exist, so a body is loaded, and a reply is built, only while
-/// the queue space it will occupy is already owned.
-///
-/// The sink holds at most one production credit (a worst-case frame,
-/// reserved by [`ProductionSink::headroom`]) and at most one reply credit
-/// (reserved by the loop before it dispatched a request-scoped message).
-/// [`ProductionSink::send`] spends the production credit first, then the
-/// reply credit; the spent credit shrinks to the exact wire length and
-/// travels with the queued frame. A credit the pass never spends (a lookup
-/// that found nothing, a request that needed no reply) is returned when the
-/// sink drops.
-///
-/// INVARIANT: `headroom` is idempotent: a held production credit is reused,
-/// never replaced, so a run of misses charges the aggregate once.
+/// Reserves before materializing outbound data. Holds at most one worst-case
+/// production credit and one request-scoped reply credit; sends spend production
+/// first, shrink to exact length, and transfer the credit to the queued frame.
+/// Drop returns unused credit. `headroom` reuses held credit, so repeated lookup
+/// misses cannot charge the aggregate twice.
 struct ProductionSink<'a> {
     lease: &'a crate::PeerLease,
     /// At most one live production credit.
@@ -3129,22 +3053,10 @@ fn process_compact_wire_message(
     }
 }
 
-/// Applies one BIP152 receive-side outcome: a finished block enters the
-/// ordinary block sink exactly like a `block` message; a missing list or an
-/// unrecoverable reconstruction becomes a `Some((hash, message))` follow-up
-/// the caller sends exactly once inside `enqueue_owned_body_fetch` —
-/// the node's download window resolves both by hash on arrival, so no
-/// request ownership is lost or duplicated.
-///
-/// PRE: `outcome` came from a message of the connection `sink`'s lease
-/// identifies, and `sink` holds the reply reservation taken for it.
-/// POST: A finished block reaches `shared`'s block sink and the answer is
-/// `None`; a follow-up is returned unsent for the single enqueue site and
-/// `Idle` returns `None`.
-/// INVARIANT: This function never sends the follow-up itself; the caller
-/// owns the one send inside the enqueue closure. Linearizability
-/// (exact-source peer-table guard across the scheduler lock, send, and
-/// publication) lives in `enqueue_owned_body_fetch`, not here.
+/// Maps a BIP152 outcome from the sink's leased connection, under its reply
+/// reservation. Completed bodies enter the ordinary sink; Idle does nothing.
+/// Return compact/fallback follow-ups unsent for the single send/publication
+/// site in `enqueue_owned_body_fetch`, which owns exact-source linearizability.
 fn handle_compact_outcome(
     outcome: crate::compact_blocks::Outcome,
     sink: &ProductionSink<'_>,

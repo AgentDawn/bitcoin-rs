@@ -27,10 +27,10 @@ mod pinned;
 
 use crate::listener::ListenerError;
 
-/// Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS` (`net.h:69`).
+/// Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS` (`net.h`).
 const DEFAULT_OUTBOUND_FULL_RELAY_SLOTS: usize = 8;
 
-/// Core's `MAX_OUTBOUND_BLOCK_RELAY_CONNECTIONS` (`net.h:73`).
+/// Core's `MAX_OUTBOUND_BLOCK_RELAY_CONNECTIONS` (`net.h`).
 const DEFAULT_OUTBOUND_BLOCK_RELAY_SLOTS: usize = 2;
 
 const DEFAULT_OUTBOUND_QUEUE_LIMIT: usize = DEFAULT_OUTBOUND_FULL_RELAY_SLOTS;
@@ -59,7 +59,7 @@ fn feeler_delay(uniform: u64) -> Duration {
 const DEFAULT_INBOUND_BLOCK_QUEUE_LIMIT: usize = 256;
 
 /// Core's automatic-connection maximum, `-maxconnections`
-/// (`DEFAULT_MAX_PEER_CONNECTIONS`, `net.h:81`).
+/// (`DEFAULT_MAX_PEER_CONNECTIONS`, `net.h`).
 const DEFAULT_MAX_PEER_CONNECTIONS: usize = 200;
 
 /// How many capacity-blocked automatic dials the drain worker holds for
@@ -97,7 +97,7 @@ pub struct P2pServiceConfig {
     /// Total automatic peer connections, the Core maximum inbound and
     /// outbound admission is derived from.
     ///
-    /// Core: `m_max_automatic_connections` (`net.h:1091`).
+    /// Core: `m_max_automatic_connections` (`net.h`).
     pub max_peer_connections: usize,
     /// Outbound full-relay connection slots (transaction, address, block relay,
     /// and announcements).
@@ -157,7 +157,6 @@ impl Default for P2pServiceConfig {
 impl P2pServiceConfig {
     /// Total outbound connection slots.
     ///
-    /// PRE: none.
     /// POST: returns the sum of the full-relay and block-relay slot counts,
     ///   which bounds the live automatic-outbound target and simultaneous
     ///   automatic attempts.
@@ -172,7 +171,6 @@ impl P2pServiceConfig {
     /// Inbound connection capacity: what the automatic-connection maximum
     /// leaves after the outbound slot counts.
     ///
-    /// PRE: none.
     /// POST: returns `max_peer_connections` minus both outbound slot counts,
     ///   clamped at zero.
     /// INVARIANT: this is the only inbound capacity derivation; at the result
@@ -335,12 +333,11 @@ impl Workers {
 /// One queued request to dial an outbound address, with the origin that
 /// asked for it.
 ///
-/// PRE: none.
 /// POST: `manual` records whether the operator named this address.
 /// INVARIANT: the origin travels with the request to the lease. Core's
 ///   `ConnectionType::MANUAL` is exempt from the chain-sync timeout and the
-///   extra-peer retirement (`net_processing.cpp:5502`,
-///   `net_processing.cpp:5558-5604`), and the queue is the only place that
+///   extra-peer retirement (`net_processing.cpp`,
+///   `net_processing.cpp`), and the queue is the only place that
 ///   still knows which dials were asked for by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutboundDial {
@@ -1667,9 +1664,9 @@ fn spawn_outbound_dial(
 ///   The table and pending dials share one snapshot, so registration during a
 ///   census cannot drop a dial from both groups. Manual peers and dials never
 ///   consume automatic slots. Full-relay slots fill first, then block-relay
-///   slots, as Core orders its dial priorities (`net.cpp:2780-2799`). A stale
+///   slots, as Core orders its dial priorities (`net.cpp`). A stale
 ///   tip raises the full-relay target by one, as Core's
-///   `GetTryNewOutboundPeer` (`net.cpp:2471-2480`). When both classes are
+///   `GetTryNewOutboundPeer` (`net.cpp`). When both classes are
 ///   satisfied the automatic dial is served as full relay. A pinned dial is
 ///   assigned full relay by the caller and never reaches this chooser.
 fn next_outbound_role(
@@ -1744,7 +1741,7 @@ fn next_outbound_role(
 ///   candidate is too young or mid-download.
 /// INVARIANT: the extra connection exists to find a better chain, so it leaves
 ///   as soon as the chain moves. Core retires one per check
-///   (`EvictExtraOutboundPeers`, `net_processing.cpp:5604-5668`) and passes
+///   (`EvictExtraOutboundPeers`, `net_processing.cpp`) and passes
 ///   over a peer with blocks in flight or a peer below the minimum age.
 fn retire_extra_full_relay_connection(
     peer_table: &crate::PeerTable,
@@ -1786,11 +1783,11 @@ fn retire_extra_full_relay_connection(
 /// INVARIANT: the census and the victim set hold automatic connections only:
 ///   a hand-pinned full-relay connection counts in neither, as Core's
 ///   `IsFullOutboundConn()` excludes `ConnectionType::MANUAL`
-///   (`net_processing.cpp:5558-5604`). An operator's peer therefore never
+///   (`net_processing.cpp`). An operator's peer therefore never
 ///   forces the retirement of an automatic one. A connection that never
 ///   finished its handshake still holds a slot, so it counts, while a
 ///   candidate with blocks in flight is passed over, as Core's rule does
-///   (`net_processing.cpp:5604-5668`).
+///   (`net_processing.cpp`).
 ///   `PeerTable::sessions` is ordered by connection identity, which is dial
 ///   order, so the newest is last and the excess is taken from the tail.
 fn newest_excess_full_relay(
@@ -1801,7 +1798,7 @@ fn newest_excess_full_relay(
 ) -> Option<crate::peer_table::PeerSession> {
     // A hand-pinned full-relay connection is outside the census, as Core's
     // `IsFullOutboundConn()` excludes `ConnectionType::MANUAL`
-    // (`net_processing.cpp:5558-5604`): it creates no excess and the victim
+    // (`net_processing.cpp`): it creates no excess and the victim
     // selection below only ever sees automatic connections.
     let sessions: Vec<crate::peer_table::PeerSession> = peer_table
         .sessions()

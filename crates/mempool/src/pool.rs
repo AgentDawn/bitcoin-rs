@@ -638,22 +638,11 @@ impl Mempool {
         }
     }
 
-    /// Removes all entries from the pool, clears every index and the
-    /// persistent prioritisation overlay, and resets the fee history. Every
-    /// cleared entry commits as one `Removed(Clear)` change — in entry-id
-    /// order — each taking the next mempool sequence value. A clear of an
-    /// already-empty pool commits nothing and moves no sequence.
-    ///
-    /// The fee-history reset is intentional and specific to this wholesale
-    /// action: the estimator returns to the empty, insufficient-data state
-    /// because every observation it held described transactions this pool no
-    /// longer tracks. A reorg never routes through `clear` — disconnected
-    /// transactions return through reconsideration (re-admission), which
-    /// keeps the recorded confirmations and re-arms only the re-admitted
-    /// entries — so chain recovery cannot silently discard fee history.
-    ///
-    /// This is an explicit wholesale reset for standalone pools and fixtures.
-    /// Ordinary block, reorg, and snapshot paths preserve fee history.
+    /// Explicit wholesale reset for standalone pools and fixtures: clear entries,
+    /// indexes, prioritisation, and fee history. Entries emit `Removed(Clear)` in
+    /// entry-id order with consecutive sequences; an empty clear advances none.
+    /// Block, reorg, and snapshot paths must not use this reset: their fee history
+    /// survives, and disconnected transactions return through reconsideration.
     pub fn clear(&mut self) -> MutationResult {
         // Every entry leaves the pool here, so this is the same retire funnel
         // Core walks during a bulk clear: fire `mempool:removed` per entry
@@ -1427,21 +1416,11 @@ impl Mempool {
         self.estimator = history;
     }
 
-    /// Copies the pool's mining state into one immutable snapshot.
-    /// Everything block-template selection needs is read in this single
-    /// coherent pass — shared transaction payloads, per-entry fee, sigop,
-    /// weight, and size metadata, the signed overlay, ancestor-package
-    /// aggregates, ancestor topology, and both sequence counters — so
-    /// the caller's read critical section ends when this returns and
-    /// selection works on the owned copy with the lock released. Entries
-    /// appear in maintained chunk order (the order `chunks_by_feerate`
-    /// yields), and `ancestors` positions refer to this vector, so a consumer
-    /// can walk packages without re-consulting the pool.
-    ///
-    /// Selection that only needs the top chunks should read
-    /// [`Self::chunks_by_feerate`] under the guard instead: this copy exists
-    /// for consumers that need every entry with the lock released
-    /// (`assemble_ordered_candidate` and the RPC mining handler).
+    /// Copies all mining inputs and both sequences under one read guard, allowing
+    /// selection after releasing it. Entries follow maintained chunk order;
+    /// ancestor positions refer to the returned vector, never a later pool view.
+    /// Consumers needing only top chunks should use `Self::chunks_by_feerate`
+    /// instead of copying the whole pool.
     #[must_use]
     pub fn mining_snapshot(&self) -> MempoolMiningSnapshot {
         let order: Vec<EntryId> = self

@@ -515,45 +515,19 @@ impl Drop for BlockForwardCredit {
     }
 }
 
-/// Item and full-framed-wire-byte accounting for one outbound queue.
+/// Per-connection item and full-frame byte accounting.
+/// `OutboundCredit` charges local bounds then the node aggregate before enqueue,
+/// travels in `QueuedFrame`, and releases on any drop path. Testing local
+/// high-water marks before addition admits one oversized message to an empty queue.
+/// Local refusal cancels the lease; aggregate refusal preserves it and the
+/// caller's intent. Bulk production reserves before loading a body.
 ///
-/// Every queued message is owned by an [`OutboundCredit`]: a charge taken
-/// here, against the local bounds first and then against the node aggregate,
-/// before the message is queued. A message is charged when both local
-/// counters were below their high-water marks immediately before its
-/// addition, which admits one oversized message to an empty local queue. The
-/// credit travels with the message as a [`QueuedFrame`] and releases both
-/// halves when dropped, whether the writer wrote it, the writer's error path
-/// dropped it, or the channel discarded it.
-///
-/// # Refusal policy
-///
-/// A local refusal ([`Refusal::Local`]: item cap, byte cap, dead writer)
-/// disconnects only this peer: [`PeerLease::send`] cancels the lease and
-/// returns the refused message. An aggregate refusal ([`Refusal::Shared`])
-/// never does: the lease stays live and the caller keeps its intent. Bulk
-/// production reserves a worst-case frame ([`OutboundBudget::try_reserve_production`])
-/// before it loads a body, so a queue that is full by item count or by bytes
-/// parks the session instead of reaching a refusal.
-///
-/// # Waiting
-///
-/// A paused session sleeps on a condvar guarded by a lock that protects no
-/// data. The predicate it waits for reads atomics only, and every decrease of
-/// those atomics (`release`, `shrink`, `mark_writer_dead`) updates the
-/// counter, then takes the lock, then notifies. A waiter therefore either
-/// sees the new state in its predicate check, or is already parked when the
-/// notification fires, so no wake is lost. While an aggregate is attached the
-/// wait parks on the aggregate condvar, so another connection's drain wakes
-/// it too.
-///
-/// # Lock order
-///
-/// Caller locks (peer table, scheduler, relay state), then this budget's
-/// `drained_lock`, then the aggregate's. No path holds the two budget locks
-/// at once (the aggregate is charged and released with atomics under the
-/// local lock, and notified only after the local lock is dropped), and no
-/// send ever blocks.
+/// Wait predicates read atomics. Each decrease updates counters, takes the
+/// condvar lock, then notifies, so the check/park boundary loses no wake.
+/// With an aggregate attached, any connection's drain wakes shared waiters.
+/// Caller locks precede budget locks; local and aggregate locks are never held
+/// together. Aggregate accounting uses atomics under the local lock, but its
+/// notification follows local unlock. Sending never blocks.
 #[derive(Debug)]
 pub(crate) struct OutboundBudget {
     max_messages: usize,
@@ -615,7 +589,7 @@ impl OutboundBudget {
 
     /// Charges `wire_len` bytes and one message.
     ///
-    /// PRE: none. POST: `Ok` carries the credit that owns the charge on both
+    /// `Ok` carries the credit that owns the charge on both
     /// halves; `Err(Local)` means the writer is gone or a local cap is at its
     /// high-water mark; `Err(Shared)` means the aggregate cap would be
     /// exceeded. A refusal charges nothing.
@@ -645,7 +619,7 @@ impl OutboundBudget {
 
     /// Reserves one worst-case frame before a body is loaded.
     ///
-    /// PRE: none. POST: `Ok` carries a credit of the block-production
+    /// `Ok` carries a credit of the block-production
     /// reserve. The local rule is the production headroom (a free item slot
     /// and room for the reserve behind everything pending, or an empty
     /// queue); the aggregate rule is that the reserve fits under the bulk
@@ -936,7 +910,6 @@ impl PeerLease {
 
     /// Creates an outbound lease the operator asked for by name.
     ///
-    /// PRE: none.
     /// POST: the lease is outbound, carries `role`, and is manual.
     /// INVARIANT: Core's `ConnectionType::MANUAL` is exempt from the
     ///   chain-sync timeout and the extra-peer retirement
@@ -1098,7 +1071,6 @@ impl PeerLease {
 
     /// Whether the operator pinned this connection by hand.
     ///
-    /// PRE: none.
     /// POST: true exactly for a dial asked for by `--connect` or `addnode`.
     /// INVARIANT: never changes, like the role: the exemption the flag
     ///   carries is Core's `ConnectionType::MANUAL`
@@ -1111,7 +1083,6 @@ impl PeerLease {
 
     /// When this connection was created, on the monotonic clock.
     ///
-    /// PRE: none.
     /// POST: the instant never moves, and it is never in the future
     ///   relative to a later read.
     /// INVARIANT: this holds the role Core's `nTimeConnected` holds
@@ -1198,22 +1169,11 @@ impl PeerLease {
         self.source(Some(crate::accepted_ip_identity(addr)))
     }
 
-    /// Queues a message for this connection's writer.
-    ///
-    /// PRE: none. POST: `Ok` means the message is queued with its charge.
-    /// `Closed` means the lease is cancelled, or this call cancelled it for
-    /// the connection's own state (an unencodable message, a local item or
-    /// byte cap, a dead writer, a full or closed channel). `Saturated` means
-    /// the node's aggregate budget is full: the lease is live, nothing was
-    /// cancelled, and the caller keeps its intent. The refused message is
-    /// returned either way.
-    /// INVARIANT: never blocks.
-    ///
-    /// Exactness of the accounting does not depend on the channel flavor:
-    /// each frame's credit drops when the frame drops, wherever that
-    /// happens (after the writer wrote it, when a refused enqueue returns
-    /// it, when the writer drains the channel on exit, or when the channel
-    /// discards it).
+    /// Nonblocking enqueue with a frame-owned charge. `Ok` means queued.
+    /// `Closed` returns the message and cancels this lease for local failure
+    /// (including encoding, budget, writer, or channel refusal). `Saturated` returns
+    /// the message while preserving the live lease and caller's intent.
+    /// `OutboundCredit` releases accounting wherever the frame is dropped.
     #[expect(clippy::result_large_err)]
     pub fn send(&self, message: crate::Message) -> Result<(), OutboundRefusal> {
         if self.is_cancelled() {
@@ -1300,7 +1260,7 @@ impl PeerLease {
 
     /// Reserves one worst-case bulk frame before a body is loaded.
     ///
-    /// PRE: none. POST: `Ok` carries the credit, spent with
+    /// `Ok` carries the credit, spent with
     /// [`Self::send_with`] or dropped to return the bytes. Refusal charges
     /// nothing and cancels nothing; the caller decides what a local or a
     /// shared refusal means.

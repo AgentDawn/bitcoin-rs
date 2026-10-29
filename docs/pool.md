@@ -95,7 +95,7 @@ Both protocols share the connection, job, and accounting owners. Their
 bounded queues are independent limits, not a total-process memory bound;
 [POOL-03](contracts/pool.md#pool-03-shared-admission-and-bounded-deferred-work) owns the
 enforcing symbols and [POOL-05](contracts/pool.md#pool-05-one-mining-owner-and-acknowledgement-boundaries) owns durable success.
-A queue-pressure rejection is not an accepted share. SV1 retains failed writes in its bounded in-memory outbox but withholds success until the required share record and, for a found block, block record complete. Each SV1 session permits only one pending accounting response; additional submissions are rejected before validation with a retryable accounting error. Process failure can lose queued work before completion, but that work has not received a success response. SV2 likewise holds success until the host confirms the ledger record. Operators MUST NOT equate queued work with committed accounting.
+A queue-pressure rejection is not an accepted share. Success requires completed durable accounting. Process failure may lose queued work before success is acknowledged; operators MUST NOT equate queued work with committed accounting.
  Once the node accepts a found block, the current job is retired at once: new and different shares on the old job are refused as stale (SV1 error 21, SV2 `stale-share`), while resending the exact accepted share reports a duplicate (SV1 error 22, SV2 `duplicate-share`) without extra credit. A block the backend answers with `inconclusive-not-best-prevblk` is still recorded, then refused as a nonfatal stale share; other node rejections are never answered as stale. The [pool contract](contracts/pool.md) states the authoritative rule.
 
 ## Evidence and operational limits

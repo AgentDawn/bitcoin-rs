@@ -198,23 +198,11 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
 /// the clocks agree, but because too few samples is not a measurement.
 const MIN_TIME_OFFSET_SAMPLES: usize = 5;
 
-/// The node's clock offset, as the median of what its outbound peers claim.
-///
-/// Bitcoin Core samples each peer's declared time at handshake and reports the
-/// median of those samples. The figure exists to warn an operator that their
-/// own clock is wrong, so what matters is that no one else can produce that
-/// warning: hence outbound peers only, and hence a floor below which there is
-/// no answer at all.
-///
-/// With too few samples the offset is zero, which is also what Core answers.
-/// The zero is "not measured", not "the clocks agree" -- the two are
-/// indistinguishable in this field, in Core as here.
-///
-/// One difference from Core worth naming: Core medians over a rolling deque of
-/// the last 50 offsets it sampled, which outlives the connections that produced
-/// them. This medians over the peers connected now. The two agree while the
-/// peer set is stable and diverge after churn, where Core still remembers a
-/// departed peer's sample and this does not.
+/// Median offset from current outbound peers, zero below the sample floor.
+/// Outbound-only sampling prevents inbound peers from inducing a clock warning;
+/// zero cannot distinguish insufficient data from agreement.
+/// Core retains its last 50 samples across disconnects; this projection uses
+/// currently connected peers and can differ after churn.
 fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
     // **Outbound peers only.** Core's reason, in its own words at the call
     // site in `net_processing.cpp`: "Don't use timedata samples from inbound
@@ -240,27 +228,10 @@ fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
     offsets.get(offsets.len() / 2).copied().unwrap_or(0)
 }
 
-/// Renders every handshake-complete connection, including anonymous inbound
-/// overlay sessions.
-///
-/// `id` is the connection's own process-unique identity
-/// ([`bitcoin_rs_p2p::PeerLease::node_id`]) — Core's `nodeid`, not a position
-/// in this array. The distinction is observable: a positional index shifts
-/// for every peer behind a departed one and is reused by the next connection
-/// to register, so a caller that read an index and then acted on it could
-/// reach a different connection than the one it described. A connection
-/// identity names one connection for exactly as long as that connection is
-/// live, and it is the value `disconnectnode`'s `nodeid` selects. Sessions
-/// are still ordered by it, so the array keeps connection order.
-///
-/// The id is serialized at its full unsigned 64-bit width. The pinned
-/// `corepc_types::v31::PeerInfo::id` is a `u32`, but connection identities
-/// come from a counter that only rises and is never reused, so on a
-/// long-running node every id past the 2^32nd connection would fail the whole
-/// query, and narrowing or clamping it would alias two live connections.
-/// Rows are therefore rendered through [`PeerInfoWire`], which differs from
-/// the pinned type in the width of `id` alone. `disconnectnode` selects by
-/// the same 64-bit value.
+/// Renders all handshake-complete sessions, including anonymous overlays,
+/// in connection order. `PeerInfoWire` preserves the full u64 `PeerLease::node_id`
+/// for `disconnectnode`; the pinned corepc type's u32 would fail or alias after
+/// counter growth. Array positions are never connection identities.
 pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     // `sessions` carries the lease — role and manual flag — that `infos`
@@ -619,31 +590,12 @@ fn control_error_to_rpc_error(error: bitcoin_rs_p2p::P2pControlError) -> RpcErro
     }
 }
 
-/// `disconnectnode ( "address" nodeid )`
-///
-/// Three selectors, one per way a caller can name a connection:
-///
-/// - `address` alone disconnects whatever connection is live there.
-/// - `nodeid` alone — or with an empty `address`, Core's spelling
-///   (`src/rpc/net.cpp`) — disconnects exactly that connection.
-/// - `address` and `nodeid` together disconnect the connection only when the
-///   live one at that address *is* the one `nodeid` names. Core rejects this
-///   combination; bitcoin-rs has always accepted it, so it stays a
-///   conjunction rather than becoming an error.
-///
-/// Every form targets a *connected* node: one that has completed its
-/// handshake and so appears in `getpeerinfo`. A vacant address, and a session
-/// still handshaking, both answer `NotFound`.
-///
-/// Readiness and selection are checked and applied under the peer table's own
-/// write lock ([`bitcoin_rs_p2p::PeerTable::disconnect_ready`],
-/// [`bitcoin_rs_p2p::PeerTable::disconnect_ready_node_id`] and
-/// [`bitcoin_rs_p2p::PeerTable::disconnect_ready_node_id_at`]). Reading a peer
-/// list here and then disconnecting by address would let a same-address
-/// replacement register in between, and the operator would lose a connection
-/// the call never named. Because the identity names a connection rather than
-/// a position, an anonymous inbound overlay session — which has no logical
-/// endpoint to name — is selectable by `nodeid` too.
+/// Disconnects a ready session by address, nodeid, or their conjunction.
+/// An empty address with nodeid selects by id (Core spelling); a nonempty
+/// address plus nodeid is a bitcoin-rs extension Core rejects. Absent or still
+/// handshaking sessions return NotFound. PeerTable checks readiness and removes
+/// the exact target under one write guard, excluding same-address replacement
+/// races. Nodeid also selects anonymous sessions without an endpoint.
 pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let bound = super::bind_named_params(params, &["address", "nodeid"])?;
     let array = params_array(&bound)?;

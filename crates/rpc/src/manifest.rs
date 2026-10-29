@@ -1,40 +1,13 @@
-//! Machine-readable compatibility manifest for every external surface this
-//! node exposes, declared against Bitcoin Core 31.x.
+//! Compatibility projection of `registry::REGISTRY`, the dispatcher authority.
+//! `Status` owns row semantics; `core-compat.toml` owns the pinned reference and
+//! comparison requirements. The manifest-coverage gate checks registry/manifest
+//! set equality and generates `docs/rpc-reference.md`.
 //!
-//! [`manifest::MANIFEST`] projects the single `crate::registry::REGISTRY` table,
-//! which is the source of truth for the dispatcher: a JSON-RPC method
-//! answers only when a non-`Unimplemented` RPC row carries its name, so the
-//! manifest cannot drift from what actually dispatches. The coverage gate
-//! (`crates/rpc/tests/manifest_coverage.rs`) proves the other direction — it
-//! asserts set equality between the dispatcher's live registry and the
-//! shipped rows in both directions — and regenerates `docs/rpc-reference.md`
-//! from this table.
-//!
-//! Row semantics:
-//! - `status`: [`manifest::Status::Supported`] is differentially verified against the
-//!   pinned reference and requires `reference.differential_harness` in
-//!   `crates/rpc/core-compat.toml`; [`manifest::Status::Deviation`] ships with a
-//!   recorded difference (the `notes` field cites the source file carrying
-//!   it); [`manifest::Status::ImplementedUnverified`] ships without a comparison
-//!   against the pinned reference; [`manifest::Status::Extension`] has no Core
-//!   counterpart; [`manifest::Status::Disabled`] is reserved for parameter-level
-//!   refusal with a stable error (no row uses it); [`manifest::Status::Unimplemented`]
-//!   is Core surface this node does not expose.
-//! - `feature`: cargo feature that must be active for the surface to exist
-//!   (empty for always-compiled surfaces).
-//! - `core_version`: the Core contract version the row is declared against.
-//! - `since`: the bitcoin-rs version whose surface the row describes;
-//!   `pending` marks rows whose implementation lands in a later change.
-//!
-//! The `Unimplemented` JSON-RPC set was audited against Bitcoin Core v31.0
-//! source command tables (`src/rpc/*.cpp`, `src/wallet/rpc/*.cpp`,
-//! `src/rest.cpp` `StartREST`, `src/zmq/zmqpublishnotifier.cpp`) — the same
-//! registrations Core's `help` output prints. Hidden test/administration
-//! commands (`echo*`, `setmocktime`, `mockscheduler`, `addconnection`,
-//! `addpeeraddress`, `sendmsgtopeer`, `getrawaddrman`,
-//! `syncwithvalidationinterfacequeue`, `generate` (removed in Core),
-//! `generatetodescriptor`, `getorphantxs`, `getmempoolfeeratediagram`) are
-//! intentionally absent from the table.
+//! The Core v31.0 command-table comparison covers RPC, wallet, REST, and ZMQ
+//! registrations. Hidden test/administration commands remain outside the manifest:
+//! `echo*`, `setmocktime`, `mockscheduler`, `addconnection`, `addpeeraddress`,
+//! `sendmsgtopeer`, `getrawaddrman`, `syncwithvalidationinterfacequeue`, removed
+//! `generate`, `generatetodescriptor`, `getorphantxs`, and `getmempoolfeeratediagram`.
 
 use std::format;
 use std::string::String;

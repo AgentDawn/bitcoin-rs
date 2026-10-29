@@ -72,7 +72,7 @@ pub struct Frame {
 /// Whether one protocol role is implemented by this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoleStatus {
-    /// Implemented and covered by `tests/protocol.rs`.
+    /// Implemented and covered by `crates/mining/tests/pool_sv2.rs`.
     Implemented,
     /// Not implemented; never advertised.
     NotImplemented,

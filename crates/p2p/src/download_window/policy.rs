@@ -22,7 +22,7 @@ use crate::PeerInfo;
 // ---------------------------------------------------------------------------
 
 /// Core's `BLOCK_DOWNLOAD_TIMEOUT_BASE` in half-target-spacing units
-/// (`net_processing.cpp:153-168`): an owner with no other validated-block
+/// (`net_processing.cpp`): an owner with no other validated-block
 /// downloaders gets one full proof-of-work target spacing of queue age
 /// before its oldest request is considered stuck.
 pub(super) const BLOCK_DOWNLOAD_TIMEOUT_BASE: u32 = 2;
@@ -31,13 +31,13 @@ pub(super) const BLOCK_DOWNLOAD_TIMEOUT_BASE: u32 = 2;
 pub(super) const BLOCK_DOWNLOAD_TIMEOUT_PER_PEER: u32 = 1;
 /// How far below a pruned peer's own tip this node may still ask it for
 /// blocks: Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`
-/// (`net_processing.cpp:159`), the 288 blocks a `NODE_NETWORK_LIMITED` peer
+/// (`net_processing.cpp`), the 288 blocks a `NODE_NETWORK_LIMITED` peer
 /// keeps past its pruning horizon. Core holds a two-block race buffer at
 /// `:1637`; the handshake clause keeps the plain 288, and the
 /// demonstrated-height clause ([`peer_can_serve_height`]) applies the
 /// buffer.
 pub(super) const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
-/// Core's limited-service race buffer (`net_processing.cpp:1637`): a peer
+/// Core's limited-service race buffer (`net_processing.cpp`): a peer
 /// that keeps only the retained window may have pruned two of its newest
 /// blocks by the time the request lands.
 const NODE_NETWORK_LIMITED_RACE_BUFFER: u32 = 2;
@@ -115,7 +115,7 @@ pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 pub(crate) const MIN_PEERS_FOR_FANOUT: usize = 8;
 
 /// How young a connection may be before policy may hold its silence against
-/// it. Core's `MINIMUM_CONNECT_TIME` (`net_processing.cpp:115`).
+/// it. Core's `MINIMUM_CONNECT_TIME` (`net_processing.cpp`).
 pub(crate) const MINIMUM_CONNECT_TIME: Duration = Duration::from_secs(30);
 
 /// Fast-sync per-peer stripe floor. Half the Core cap so the window spreads
@@ -248,22 +248,11 @@ pub(crate) struct BlockDownloadPolicy {
     pub network: Network,
 }
 
-/// Whether a peer's advertised services can serve the policy's height.
-///
-/// This is the one block-body service clause: the request, fan-out, probe,
-/// and hedge paths all read it, and none re-derives a witness-only rule. It
-/// runs before the window's dynamic clauses (KTD6).
-///
-/// PRE: `policy` names the requested height and the node's sync phase.
-/// POST: true only for a witness peer whose advertised services cover that
-///   height. During initial block download the peer must advertise
-///   `NODE_NETWORK`, so a pruned peer is never asked for old blocks (Core
-///   `net_processing.cpp:6521`). Afterwards a peer without `NODE_NETWORK`
-///   serves only the last [`NODE_NETWORK_LIMITED_MIN_BLOCKS`] blocks of its
-///   own demonstrated chain (`net_processing.cpp:1637`); one below the
-///   requested height is ineligible.
-/// INVARIANT: every body-selection path applies this clause; a peer that
-///   cannot serve the range is never asked for it.
+/// Shared service/range gate for all body-selection paths, before dynamic rules.
+/// Requires witness service. During IBD also requires `NODE_NETWORK`;
+/// a limited peer afterwards can serve only the last
+/// `NODE_NETWORK_LIMITED_MIN_BLOCKS` of its demonstrated chain and never a
+/// height above it (Core `net_processing.cpp`).
 pub(crate) fn serves_requested_height(peer: &PeerInfo, policy: &BlockDownloadPolicy) -> bool {
     let network = ServiceFlags::NETWORK.to_u64();
     let witness = ServiceFlags::WITNESS.to_u64();
@@ -274,7 +263,7 @@ pub(crate) fn serves_requested_height(peer: &PeerInfo, policy: &BlockDownloadPol
         return true;
     }
     // Core applies the retained window only to `NODE_NETWORK_LIMITED`
-    // (`net_processing.cpp:1637`): a peer without it serves no blocks.
+    // (`net_processing.cpp`): a peer without it serves no blocks.
     if peer.services & ServiceFlags::NETWORK_LIMITED.to_u64() == 0 {
         return false;
     }
@@ -296,7 +285,7 @@ pub(crate) fn serves_requested_height(peer: &PeerInfo, policy: &BlockDownloadPol
 /// `0` for a `NODE_NETWORK` peer or while initial block download already
 /// excludes limited peers outright, else the retained-window floor of the
 /// peer's demonstrated chain (`NODE_NETWORK_LIMITED_MIN_BLOCKS`,
-/// `net_processing.cpp:159-161`). Request schedulers clamp batches to
+/// `net_processing.cpp`). Request schedulers clamp batches to
 /// `floor..=best` so a limited peer is never sent a height outside the
 /// window [`serves_requested_height`] certified at selection time.
 #[must_use]
@@ -341,7 +330,7 @@ fn peer_advertises_block_service(peer: &PeerInfo) -> bool {
 /// Whether a peer advertising block service can serve one required body height.
 ///
 /// Core leaves two blocks of race buffer inside the 288-block limited-service
-/// window (`net_processing.cpp:1636-1638`).
+/// window (`net_processing.cpp`).
 pub(crate) fn peer_can_serve_height(
     peer: &PeerInfo,
     peer_height: u32,

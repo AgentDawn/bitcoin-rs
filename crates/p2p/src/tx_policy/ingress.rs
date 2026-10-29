@@ -1,35 +1,14 @@
-//! Bounded ingress for BIP331 `pkgtxns` bodies, contained in the transaction
-//! policy owner.
+//! Bounded BIP331 ingress under the transaction-policy owner.
+//! Before peer-controlled allocation: `plan_package_charge` validates count and
+//! weight, scans wtxids and decoded sizes; `begin_package_resolution` checks the
+//! exact-source request claim; `PackageCapacity` reserves frame plus decoded
+//! bytes; then queue the encoded frame on the bounded ingress channel.
 //!
-//! A `pkgtxns` body is accepted for admission in one fixed order, and every
-//! step before the last allocates nothing a peer controls:
-//!
-//! 1. [`plan_package_charge`] scans the still-encoded payload without
-//!    allocating. It rejects a count above the mempool's package bound from
-//!    the `CompactSize` prefix, accumulates each member's exact
-//!    [`Tx::weight`] against the package weight bound, and yields the member
-//!    wtxids and the decoded-heap lower bound in the same pass.
-//! 2. [`PeerTable::begin_package_resolution`] compares the plan against the
-//!    sent `getpkgtxns` claim of the exact [`PeerSource`].
-//! 3. [`PackageCapacity`] reserves the frame bytes and the planned decoded
-//!    bytes with one compare-and-add against a process-wide cap.
-//! 4. The still-encoded frame is queued on the node's one bounded ingress
-//!    channel as [`InboundBody::Package`].
-//!
-//! The single ingress consumer then takes the package by value and
-//! [`InboundPackage::open`] re-plans the frame (plan equality is exact),
-//! decodes it with `try_reserve_exact` at the planned sizes as the one
-//! decode-or-admit window, and reconciles the measured heap against the
-//! plan. The consumer ends in exactly one of
-//! [`PeerTable::package_response_rejected`] (the package never reached
-//! admission) or [`PeerTable::package_response_completed`] (the gateway
-//! answered, `Ok` or `Err`); each returns the capacity and releases the
-//! request claim through the one claim owner.
-//!
-//! The charge is a lower bound of the heap a decoded package owns, taken at
-//! the exact capacities the decoder requests. It is not a physical heap
-//! ceiling: allocator rounding is outside it, and no process allocator is
-//! made to refuse.
+//! The single consumer's `InboundPackage::open` rechecks exact plan equality,
+//! uses `try_reserve_exact`, and reconciles measured heap. Rejection before
+//! admission or completion after the gateway answers returns capacity and the
+//! request claim through its owner. The charge bounds requested decoded capacity,
+//! not allocator rounding; it is not a physical-heap ceiling.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

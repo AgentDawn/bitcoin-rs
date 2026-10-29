@@ -747,26 +747,12 @@ impl LedgerHost {
                 Err(error) => break Some(error),
             }
         };
-        // Bounded reconciliation units without a chain-transition fence: each
-        // financial commit observes at most `RECONCILE_*_BATCH_LIMIT` items
-        // lock-free via `RawChainView` (never re-locks `StableRead`) and
-        // validates the generation inside its write transaction, so a reorg
-        // cannot slip between validation and commit to permanently fail a
-        // payout. No `StableRead` is held across observations, signed-transaction
-        // scans, body decodes, or durable writes, so a growing payout or round
-        // history cannot stall block application. Batches loop with an offset
-        // until no more remains, so the tail converges instead of starving
-        // behind the head; a moving tip retries once and otherwise converges
-        // on the next tick. Snapshot
-        // isolation holds per commit: a commit only applies observations taken
-        // under one generation. Callers stay idempotent, so a deferred
-        // reconcile is retried.
-        // Bounded cursor pagination: each commit seeks from the last key via
-        // `page_after` (`limit + 1` rows) instead of re-scanning the head to
-        // skip `offset` rows. Linearizable seeks; snapshot isolation per
-        // commit; idempotent retry from cursors. Sheds no work; bulkheaded by
-        // `RECONCILE_*_BATCH_LIMIT` per commit with at most one retry on
-        // generation change, then defers to the next 250ms tick (monotonic).
+        // Reconcile bounded `RECONCILE_*_BATCH_LIMIT` pages through `RawChainView`.
+        // Validate the observed generation inside each durable write; no `StableRead`
+        // spans observations, body decoding, transaction scans, or storage I/O.
+        // Seek after the last key (`page_after`, limit + 1) so later history cannot
+        // starve behind the head. One generation-race retry is allowed; otherwise the
+        // next tick resumes idempotently. Snapshot isolation is per commit.
         let mut round_after: Option<u64> = None;
         let mut payout_after: Option<u64> = None;
         let mut attempts = 0;

@@ -223,7 +223,7 @@ pub(super) fn apply_block_admitted<'b>(
     // BIP325: a committed signet block must carry a valid solution. The check
     // follows Merkle and witness binding because the solution lives in the
     // coinbase commitment, and a proposal skips it as Core does when
-    // `fCheckPOW` is false (`validation.cpp:3939`). Keeping it out of
+    // `fCheckPOW` is false (`validation.cpp`). Keeping it out of
     // `verify_block_rules_precomputed`, which has no intent, is what makes
     // that skip possible.
     if intent == ApplyIntent::Commit

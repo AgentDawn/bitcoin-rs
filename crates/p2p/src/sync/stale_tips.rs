@@ -220,24 +220,12 @@ impl StaleTipRetainer {
         }
     }
 
-    /// Records `hash`, a stale tip the caller just learned of, and returns
-    /// whether it newly entered the retained set.
-    ///
-    /// Callers: header admission (the last header of an accepted branch, and
-    /// the tip it displaced), a failed connect's displaced tip, and an
-    /// invalidation's displaced tip.
-    ///
-    /// PRE: `hash` names the newest header of its branch in `tree` at call
-    ///   time; `from` is the peer that announced it as a header chain, if one
-    ///   did (a `staletip` announcer arrives through [`Self::note_heard`]).
-    /// POST: `true` iff `hash` is a stale candidate in `tree` that was not
-    ///   already held, no retained tip descends from it, and it outranked the
-    ///   weakest tip when the set was full. Held ancestors of `hash` are
-    ///   removed, and `from` plus every peer that was heard announcing `hash`
-    ///   is recorded as knowing it. `false` for replays, active, invalid,
-    ///   unknown, out-of-window, superseded, and outranked tips; the announcers
-    ///   are still recorded when `hash` is already held, so a second announcer
-    ///   is not echoed either.
+    /// Learns a branch's newest stale tip from admission or invalidation.
+    /// `from` is its header announcer; `staletip` announcers use `note_heard`.
+    /// Return true only for a newly retained, eligible tip that has no held descendant
+    /// and outranks the weakest at capacity. Remove held ancestors and remember all
+    /// announcers. Replays and ineligible/superseded tips return false; an already-held
+    /// tip still records new announcers to prevent echoes.
     pub(crate) fn learn(&self, tree: &BlockTree, hash: Hash256, from: Option<PeerSource>) -> bool {
         let mut state = self.state.lock();
         state.prune(tree);
@@ -324,27 +312,13 @@ impl StaleTipRetainer {
         self.state.lock().prune(tree);
     }
 
-    /// The retained tips to announce to `peer` now, best first.
-    ///
-    /// The first call for a peer opens relay with it: it offers at most
-    /// [`MAX_ADVERTISED_STALETIPS`] of the tips already held, greatest
-    /// chainwork first. Every later call offers only tips learned since plus
-    /// the selected earlier tips the peer has not acknowledged, so a peer is
-    /// never sent the backlog twice nor the part of it beyond the cap.
-    ///
-    /// PRE: call first for a peer once it has demonstrated a tip, so
-    ///   `relayable` can choose a fork point it knows; opening is one-shot.
-    /// POST: none of the returned tips is recorded as known by `peer`, and each
-    ///   was accepted by `relayable`. `relayable` runs in rank order, outside
-    ///   the mutex, and on opening only until the cap is met, so the work is
-    ///   bounded by the cap plus the tips it rejects. A tip `relayable`
-    ///   refuses stays offerable (a body still being fetched for a
-    ///   `prefers_blocks` peer, say) until it is marked known or retired,
-    ///   and so does a tip that was offered but never marked: the caller
-    ///   marks each tip with [`Self::mark_known`] after its send returned
-    ///   `Ok`, and a saturated send that breaks the batch marks nothing, so
-    ///   the next call offers the unacked tips again. Nothing is marked
-    ///   known here.
+    /// Offers retained tips best-first without marking them known. First call,
+    /// after the peer demonstrates a usable fork point, selects at most
+    /// `MAX_ADVERTISED_STALETIPS` from the backlog; later calls offer new tips and
+    /// unacknowledged selections, never the unselected old backlog.
+    /// `relayable` runs outside the mutex in rank order until the cap is met.
+    /// Refused or unsent tips remain offerable until retired or marked known;
+    /// the caller uses `mark_known` only after a successful send.
     pub(crate) fn pending_for(
         &self,
         peer: PeerSource,

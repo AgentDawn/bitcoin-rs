@@ -44,7 +44,7 @@ impl BlockSync {
     /// INVARIANT: body-binding (`BodyMutated`) and operational failures never
     ///   reach this path, and the punishment follows the exact connection, so
     ///   a same-address replacement is never blamed for its predecessor
-    ///   (Core 31.1 `net_processing.cpp:2031-2068`).
+    ///   (Core 31.1 `net_processing.cpp`).
     fn punish_permanent_block_delivery(&self, blocker: &DrainedBlock) {
         self.punish_permanent_delivery_source(blocker.source(), blocker.hash);
     }

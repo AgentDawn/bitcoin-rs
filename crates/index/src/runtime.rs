@@ -1,21 +1,9 @@
-//! Asynchronous, durable, node-owned transaction index runtime.
-//!
-//! The node creates and owns exactly one `DerivedIndexRuntime` when Core txindex or
-//! `ScriptIndex` enables an index capability.
-//!
-//! The runtime holds a process-local revision counter and a bounded
-//! nonblocking wake channel; `Chainstate` clones it and wakes the worker
-//! after every committed `applied_tip.store`. The worker is a process-local
-//! reconciliation loop; storage-level CAS conditions on exact reset state,
-//! optional revision, and all capability watermarks linearize every ordinary mutation
-//! across coexisting current-process and cross-process writers. A lost CAS
-//! with an unchanged reset is transient (`StaleIndexState`): the worker
-//! discards pending derived work and re-derives from durable state. Exact
-//! query gating refuses that temporary lag and the next worker pass repairs
-//! it. Independent durable capability watermarks let aligned row families
-//! share one parse and commit while divergent families backfill separately.
-//! A snapshot-gated query engine serves `crate::query_api::DerivedIndexQuery`
-//! and the generic [`ScriptIndexQuery`] without raw index mutex paths.
+//! Node-owned derived-index runtime and reconciliation worker.
+//! A bounded wake channel follows committed applied-tip publication. Exact
+//! reset, revision, and capability-watermark CAS conditions fence every write;
+//! a transient `StaleIndexState` discards pending work and re-derives it.
+//! Queries refuse temporary lag. Aligned families share a parse and commit;
+//! divergent families backfill independently. See `docs/contracts/indexing.md`.
 
 use arc_swap::ArcSwap;
 

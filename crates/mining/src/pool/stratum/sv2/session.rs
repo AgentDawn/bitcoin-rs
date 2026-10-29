@@ -1,37 +1,12 @@
-//! Stratum V2 mining-protocol server state machine.
+//! SV2 plaintext-frame state machine above the Noise transport.
+//! `ProtocolSession` owns channel identity, layouts, and share targets;
+//! `JobBook` owns job projection, extranonces, and share verdicts.
 //!
-//! [`ProtocolSession`] is one pool connection above the Noise transport: it
-//! consumes plaintext [`Frame`]s and produces plaintext [`Frame`]s, so the
-//! state machine is testable without a socket and the transport can be
-//! swapped without touching it.
-//!
-//! The session is a *wire* adapter. It owns channel identity, the message
-//! layouts, and the per-channel share target. Everything else is delegated to
-//! the one owner, [`crate::pool::JobBook`]:
-//!
-//! - job projection (coinbase split, merkle branch, header facts) comes from
-//!   [`crate::pool::Job`];
-//! - extranonce uniqueness and session identity come from
-//!   [`JobBook::open_session`] / [`JobBook::close_session`];
-//! - every share verdict (stale, duplicate, version mask, time window, target,
-//!   network target) comes from [`JobBook::validate`], whose rejection is only
-//!   *mapped* here to an official SV2 error code;
-//! - a block candidate is handed to the host as the owner's
-//!   [`crate::pool::FoundBlock`]; the node's authoritative submit path is
-//!   called by the host through [`FoundBlock::submit`], never from here.
-//!
-//! One wire rule is checked here before delegating, because it is a rule about
-//! the SV2 messages this session itself sent: §5.3.11 requires a share's
-//! `ntime` to be at least the `ntime_start` the job announced, and the
-//! announced value is `Job::ntime()`.
-//!
-//! Financial effects are not decided here. An accepted share becomes an
-//! [`Event::ShareAccepted`] carrying the owner's accepted-share identity (its
-//! header hash is the ledger's idempotency key). A network-target result is
-//! instead emitted as [`Event::BlockFound`] and remains pending until the host
-//! submits it through [`MiningControl`], records the receipt, and calls
-//! [`ProtocolSession::confirm_block`]. `SubmitShares.Success` is held until
-//! those host-owned durable steps complete.
+//! The wire-specific ntime check enforces SV2 section 5.3.11 against the announced
+//! `Job::ntime()`. Accepted shares emit `ShareAccepted` with the header hash as
+//! ledger idempotency key. `BlockFound` stays pending until the host submits
+//! through `MiningControl`, records the receipt, and calls `confirm_block`;
+//! `SubmitShares.Success` cannot precede those durable steps.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;

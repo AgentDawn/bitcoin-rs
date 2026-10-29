@@ -612,7 +612,7 @@ impl ChainQuery for ActiveChainQuery {
     /// servable BIP152 profile.
     /// POST: the held most-recent early-announced body answers its indexed
     /// transactions first, before any depth or eligibility check (Core 31.1
-    /// `net_processing.cpp:4342-4351` serves its most-recent block the same
+    /// `net_processing.cpp` serves its most-recent block the same
     /// way). Disk-backed and deep requests use the fallback instead: the
     /// `blocktxn` reply for a block within `MAX_BLOCKTXN_DEPTH` of the
     /// active tip, encoded for `compact_version` (v1 strips witnesses, any
@@ -622,7 +622,7 @@ impl ChainQuery for ActiveChainQuery {
     /// of the body.
     /// INVARIANT: deep requests use full-block inventory policy, including
     /// stale-block age/validation restrictions; shallow stored stale blocks
-    /// remain reconstructible (Core 31.1 `net_processing.cpp:4333-4391`).
+    /// remain reconstructible (Core 31.1 `net_processing.cpp`).
     /// `headroom` is evaluated immediately before loading, so a saturated
     /// gate materializes no body.
     fn block_transactions(

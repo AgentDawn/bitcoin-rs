@@ -71,7 +71,7 @@ impl MiningChainContext {
         // The chain owns the boundary predicate and its floor: the template
         // reads the same [`header_sync::minimum_candidate_time`] that
         // admission enforces (Core's `GetMinimumTime`,
-        // `src/node/miner.cpp:42-49`), so a locally built template cannot
+        // `src/node/miner.cpp`), so a locally built template cannot
         // start under the floor that admission would reject.
         if let Some(timewarp_floor) =
             header_sync::minimum_candidate_time(parent.header.time, height, network)

@@ -31,7 +31,7 @@ const MERKLE_NODE_SERIALIZED_SIZE: usize = 64;
 
 /// Whether `txs` is a body whose first transaction is not a coinbase and any
 /// transaction is exactly 64 witness-stripped bytes: Core `IsBlockMutated`
-/// (`validation.cpp:4035-4061`, CVE-2017-12842).
+/// (`validation.cpp`, CVE-2017-12842).
 ///
 /// Such a body can hash to a valid header's Merkle root with fabricated
 /// "transactions" standing in for inner nodes, so the header is not at fault

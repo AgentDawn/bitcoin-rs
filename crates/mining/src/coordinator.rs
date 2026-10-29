@@ -370,35 +370,12 @@ pub trait ChainContextSource: Send + Sync {
     fn signalling_rules(&self, tip: &TipSnapshot, height: u32) -> Vec<AvailableMiningRule>;
 }
 
-/// Mining-domain candidate lifecycle service driven by capability sources.
-///
-/// Owns the template cache, single-flight assembly, long-poll publication
-/// state, and the staged-template preparation worker. The node facade
-/// constructs it with adapters over the applied tip, the mempool, and the
-/// block tree, and keeps proposal validation and solved-block submission on
-/// the authoritative apply path.
-///
-/// Consistency: pool selection runs under one read guard (snapshot
-/// isolation); accepted-generation and cache publication are linearizable
-/// under the coordinator mutex. Repeated identical stage and publication
-/// notifications are idempotent.
-///
-/// Budgeted templates ([`CoinbaseBudget`]) follow the same rules with one
-/// addition, finite owner admission: at most one budgeted selection walks the
-/// pool at a time, beside the ordinary single-flight assembly, which neither
-/// waits for it nor displaces it. Publication drops cached budgeted candidates
-/// of the old generation but never frees the slot while its assembler runs;
-/// the assembler's guard releases it, and an install for a generation that is
-/// no longer live is refused under the coordinator mutex. A caller behind
-/// the slot waits at most one `LONG_POLL_SLICE` (one second) per attempt and
-/// at most `CANDIDATE_GENERATION_RETRIES` attempts, then fails with a
-/// retryable error.
-/// Nothing promises liveness under endless churn or contention: a caller can
-/// exhaust its attempts and the next one starts afresh.
-///
-/// The cache bounds entries, not memory: the `Arc`s handed to callers (and
-/// the ordinary candidate a budgeted request may reuse) stay alive after
-/// eviction for as long as their holders keep them.
+/// Owns template caching, single-flight assembly, long-poll publication, and
+/// staged preparation. Pool selection uses one read guard; generation/cache
+/// publication is serialized by the coordinator mutex. Identical notifications
+/// are idempotent. `budgeted_candidate` owns finite admission and retry bounds.
+/// Proposal validation and block submission remain on the node's authoritative
+/// apply path. Cache entry limits do not bound caller-held `Arc` lifetimes.
 pub struct MiningService {
     /// Network whose genesis anchors an empty applied chain.
     network: Network,

@@ -252,7 +252,7 @@ inventory in `net_processing.cpp`: TXR-01–07 are the per-peer request-tracker
 duties Core 31.1 owns in `node::TxDownloadManager` (`src/node/txdownloadman.h`),
 issued through `GetRequestsToSend` in `SendMessages` (`net_processing.cpp`);
 TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
-`net_processing.cpp` under the `INVENTORY_BROADCAST_*` delays at `:163-166`):
+`net_processing.cpp` under the `INVENTORY_BROADCAST_*` delays in that file):
 
 1. **BIP324 v2 transport**: on by default, as in Core 31. A live run against an unmodified Core 31.1 recorded v2 in both connection directions with matching session ids, ping answers and a full header and block sync over each, plus a v2-off node syncing over v1 from v2 Core (https://github.com/gosuda/bitcoin-rs/pull/1612; CORE-06). No deviation from Core is known; the v1 retry after an unanswered v2 dial, decoy packets and rekeying rest on in-tree tests only. `--v2transport=false` keeps every connection on v1 and stops advertising `NODE_P2P_V2`. BIP324 does not authenticate peers, so it does not stop an active MITM or eclipsing peer.
 2. **BIP330 `sendtxrcncl`**: not implemented; it is the one Core 31 command missing from our 42-command table. Decoded as `Unknown`: ignored from a ready peer (Core ignores unknown commands too), disconnected before readiness. Core whitelists it during handshake, so the only affected topology is a Core peer *dialing* bitcoin-rs with `-txreconciliation=1`. The supported topology — bitcoin-rs dials Core, Core sees an inbound peer — never receives it, because Core sends `sendtxrcncl` to outbound peers only.
@@ -591,126 +591,29 @@ TXR-09 is the trickled inventory schedule, `m_next_inv_send_time` at
 
 ## 8. Verification
 
-- **BIP434 negotiation and BIP332 relay**: `crates/p2p/src/handshake.rs` test `announcements_go_only_to_peers_at_the_feature_version` pins the default-off, opt-in, and `70017` gates (empty without an offer, one `BIP332` announcement when offered, nothing below the threshold), with `inbound_handshake_announces_an_offered_bip332_between_feature_messages_and_verack` and `inbound_handshake_never_announces_bip332_to_a_pre_bip434_peer` pinning the handshake slot; the feature codec, FSM, BIP324 and wire-codec tests and `core_compat` cover the remainder, which rest on in-tree tests only. The Core leg is blocked, because the pinned Core 31.1 does not support BIP434 (§7, item 18). No external-consumer result exists for this command.
-- **Deterministic fixtures**: `crates/p2p/tests/core_compat.rs` pins the command inventory against rust-bitcoin's v1 envelope (`RawNetworkMessage`), the handshake fields and service bits, the per-role `relay` advertisement and the block-relay-only prohibition on transaction traffic, per-network magic/ports and framing, getheaders/headers semantics and bounds, inv/getdata relay round-trips with `notfound`, the reject-or-ignore matrix of §6, and the peer-visible behavior across a chain switch (reorg) and a restart at the `ChainQuery` seam: a rebuilt query serves byte-identical answers, a switched active branch serves the new branch from the fork point while recently validated stale bodies remain available by hash. Run with `cargo test -p bitcoin-rs-p2p --test core_compat`.
-- **Transaction consumers**: `crates/p2p/src/dispatch.rs` test
-  `gateway_inventory_filters_and_serves_txid_and_wtxid` exercises lookup,
-  requested serialization, and retained-body immutability over the gateway.
-  `announced_transactions_request_witness_without_changing_hashes` covers
-  ordinary inventory requests with and without the inventory filter.
-  Node's `tx_ingress_e2e` suite requires witness requests from its
-  `NODE_WITNESS` dialers before delivering transactions. `crates/p2p/src/inv.rs` tests
-  `missing_parents_use_txids_and_deduplicate_repeated_inputs`,
-  `missing_parents_request_witness_by_service_not_announcement_preference`,
-  `stale_missing_parent_source_cannot_send_to_or_cancel_replacement`,
-  `cancelled_missing_parent_source_does_not_enqueue_a_request`, and
-  `missing_parent_request_keeps_outbound_saturation_policy` cover txid parent
-  requests and live-connection identity. `crates/p2p/src/tx_relay.rs` tests
-  `peer_relay_reaches_replacement_and_cancels_only_saturated_peer` and
-  `disconnected_relay_worker_does_not_count_queue_saturation` cover relay
-  delivery and saturation ownership.
-  `relay_waits_for_handshake_and_selects_the_peers_inventory_type` and
-  `local_tx_relay_uses_committed_wtxid_and_ignores_peer_and_removed_entries`
-  cover negotiated announcements and actual retained witness identity.
-  Run with `cargo test -p bitcoin-rs-p2p --lib`.
-- **Paused `getdata`**: `crates/p2p/src/dispatch.rs` tests
-  `headroom_false_before_first_load_parks_without_loading`,
-  `hostile_50000_item_getdata_parks_the_tail`,
-  `halted_mixed_getdata_parks_ordered_tail_and_unsent_misses`, and
-  `gate_closed_at_the_trailing_report_parks_the_misses` cover the park and
-  the request order it keeps. `crates/p2p/src/listener/getdata_pause_tests.rs`
-  drives `run_message_loop` over loopback sockets:
-  `saturated_getdata_parks_tail_and_serves_it_after_drain` pins the wire order
-  across a byte-saturated drain with the immediate `notfound`,
-  `tiny_item_flood_pauses_at_the_item_cap_and_drains_in_order` the same for an
-  item-cap-saturated queue where the `notfound` must wait,
-  `a_getdata_that_fills_the_last_slot_parks_its_trailing_notfound_and_the_next_pong`
-  the last-slot boundary (trailing `notfound` and the following `ping`),
-  `a_drained_getdata_holds_reads_until_the_queue_can_take_a_reply` the read
-  hold, `a_full_queue_keeps_the_misses_and_sends_nothing` the no-send-when-full
-  invariant, `paused_peer_that_never_reads_ends_on_write_timeout` and
-  `production_writer_marks_the_budget_dead_when_a_write_fails` the writer-death
-  wake, and `lease_cancel_ends_a_parked_session` the cancel exit.
-  `crates/p2p/src/connection.rs` tests cover the headroom and capacity
-  predicates and the budget's wake protocol, and `keepalive_tests` cover the
-  receive-silence exemption.
-- **Aggregate outbound budget**: `crates/p2p/src/connection.rs` tests
-  `strict_cap_no_empty_queue_bypass`, `reservation_is_the_admission`,
-  `concurrent_reservations_never_exceed_cap`, `shrink_and_drop_wake_waiters`,
-  `credit_drop_exactly_once`, `bulk_margin_keeps_control_flowing`,
-  `send_with_fails_closed_and_releases_the_credit`,
-  `dead_writer_refuses_charges_and_reclaims_nothing`,
-  `healthy_peer_progresses_beside_a_locally_saturated_peer`, and
-  `aggregate_waiter_resumes_on_another_connections_drain` pin the strict cap,
-  the reservation as the admission, exactly-once release and the wake
-  protocol. `crates/p2p/src/listener.rs` tests
-  `queued_frames_release_on_writer_exit` and `writer_releases_budget_after_write`
-  pin release on every writer exit path.
-  `crates/p2p/src/listener/aggregate_budget_tests.rs` tests
-  `headroom_retains_one_credit`, `parked_misses_reserved_before_build`,
-  `reply_bound_covers_actual_replies`, `request_deferred_not_reply`,
-  `deferred_request_retries_and_keeps_the_existing_local_rules`,
-  `stall_exclusion_removes_only_shared_refusals`, and
-  `a_bulk_tail_parked_on_the_aggregate_leaves_the_margin_for_control` cover
-  deferral, the exact reservations and the stall rule over loopback sockets.
-  `crates/p2p/src/peer.rs` test `filter_deadline_excludes_only_shared`,
-  `crates/p2p/src/dispatch.rs` test
-  `filter_remainder_is_the_parked_requests_only_cursor`, and
-  `crates/p2p/src/chain_query.rs` tests
-  `filter_backpressure_defers_unsent_responses_and_parks_the_remainder_of_a_partial_stream`
-  and `compact_filter_interruptions_that_are_not_backpressure_stay_errors`
-  cover the filter remainder and its deadline.
-  `crates/p2p/src/sync/tests/aggregate_saturation.rs`,
-  `crates/p2p/src/sync/tests.rs`
-  `cold_front_hedge_skips_a_saturated_candidate_without_cancelling_it`,
-  `crates/p2p/src/tx_policy/preferred_tests.rs` `tx_getdata_saturated_unclaims`,
-  `crates/p2p/src/tx_policy/relay.rs` `feefilter_saturated_restores` and
-  `relay_inv_saturated_requeues`, and `crates/p2p/src/block_announce.rs`
-  `announcement_saturated_retried` and
-  `demotion_saturated_keeps_the_selection_and_retries` cover the producers
-  that keep their intent.
-- **Compact receive admission**: three tests in
-  `crates/p2p/src/sync/tests/head_sync.rs` together cover each branch of
-  `BlockSync::compact_reconstruction_admissible`.
-  - `compact_reconstruction_admission_follows_cores_header_gate` covers a
-    target other than the required one and the case with nothing applied yet.
-  - `compact_reconstruction_admission_reads_admitted_tree_state` covers an
-    admitted header past the live clock ceiling, and a block or a parent
-    marked invalid.
-  - `compact_reconstruction_admission_stays_near_the_applied_tip` covers
-    held headers one and two blocks above the applied tip, which earn the
-    scan, three and five blocks above, which do not, and an owned fetch
-    beyond that distance.
+Run owner-local P2P behavior with `cargo test -p bitcoin-rs-p2p --lib` and
+consumer compatibility with
+`cargo test -p bitcoin-rs-p2p --test suite core_compat::`.
+The following boundaries describe what that evidence can establish; test
+registration and individual case names remain with their owning modules.
 
-  `crates/p2p/src/listener.rs` test
-  `compact_reconstruction_requires_an_earning_header` covers the message path
-  through the listener. Run with `cargo test -p bitcoin-rs-p2p --lib`.
-  - A header without proof of work, one with an unknown parent, and a
-    replayed applied block are only announced, with no mempool scan.
-  - Ownership counts only for the exact connection.
-  - An extending or owned block reconstructs, and a repeat does not rescan.
+| Boundary | Evidence and limits |
+| --- | --- |
+| Handshake and command surface | Handshake/FSM/codec tests and `core_compat` cover offers, version gates, message order, services, framing, relay roles, and the reject/ignore matrix. BIP434/BIP332 have in-tree evidence only: Core 31.1 does not support BIP434, so no external-consumer result is claimed. |
+| Transaction consumers | Dispatch, inventory, relay, and node ingress tests cover txid/wtxid requests and serialization, retained witness identity, live-session ownership, replacement, and saturation. |
+| Parked `getdata` | Dispatch and listener loopback tests cover ordered tails/misses, item and byte pressure, trailing `notfound`, read holds, writer death, cancellation, and receive-silence exemptions. |
+| Shared outbound accounting | Connection and listener tests cover strict aggregate bounds, admission reservations, exactly-once credit release, wakeups across peers, deferred replies, and stall exclusion. Filter and producer tests cover deadlines, retained cursors, and retryable intent under saturation. |
+| Compact receive admission | Sync and listener tests distinguish valid/contextually valid headers, exact-source owned fetches, near-applied work, invalid/unknown/replayed headers, and scan deduplication through the deadline. These exercise the listener path as well as the gate. |
+| Compact serving | Chain-query/dispatcher tests cover negotiated versions in both orders, independently decoded serialized replies, retained-body immutability, unavailable bodies, empty lists, and invalid indexes. |
+| Stale serving and reorgs | Chain-query tests cover same-height identities, I/O-time changes, age/work/depth limits, and headroom. The binary compact-block process lane holds reconstruction across an actual regtest reorg and fetches both bodies; `core_compat` covers branch switches and restart answers at the `ChainQuery` seam. |
+| Decoder reachability | `fuzz/fuzz_targets/p2p_message.rs` drives the payload decoders registered by `COMMANDS`; this is not an external interoperability result. |
 
-  `compact_blocks::tests::replay_dedup_spans_more_than_sixty_four_blocks_until_the_deadline`
-  holds deduplication across more than 64 hashes until the deadline.
-- **Compact serving**: `crates/p2p/src/chain_query.rs` test
-  `compact_exchange_keeps_the_mutually_supported_version` drives the
-  production dispatcher through negotiation in both orders and checks
-  serialized replies with rust-bitcoin and retained body immutability (BIP152).
-  `getblocktxn_versions_preserve_missing_body_and_invalid_index_outcomes`
-  covers unavailable blocks, empty index lists, and out-of-range indexes
-  for the same profiles.
-- **Stale-block serving**: `chain_query` tests cover same-height stale/winner
-  identity, I/O-time reorg/invalidation/age changes, the strict 30-day time and
-  proof-work bounds, applied-tip depth with headers ahead, and headroom before
-  I/O. `bin/bitcoin-rs/tests/compact_blocks_e2e.rs` test
-  `stale_compact_block_finishes_reconstruction_after_reorg` holds a compact
-  response across an actual regtest process reorg, fetches its missing
-  transaction, verifies reconstruction, and fetches both same-height bodies.
-- **Fuzz**: `fuzz/fuzz_targets/p2p_message.rs` drives every payload decoder named by `COMMANDS` (a missing inventory row is a decoder no fuzz input can reach).
-- **Live lane (cut)**: owned by [`CORE-01` / `CORE-02` / `CORE-03` / `CORE-05` / `CORE-06`](../contracts/core-differential.md). `CORE-05` compares outbound `inv`, `headers`, and high-bandwidth `cmpctblock` frames from equivalent peers on pinned Core and bitcoin-rs, including a live reorg. `CORE-06` runs BIP324 v2 against Core in both connection directions. This policy does not restate the Core version, RPC set, or CI job.
-- Node-level reorg effects are coordinated in `crates/node/src/reorg.rs` (`switch_to_branch`, `invalidate_block`), which moves the applied tip off a losing branch; the node's P2P-chain adapter calls `switch_to_branch` when a higher-work header branch wins. The reorg fixture pins the peer-visible part of this at the `ChainQuery` seam — the exact surface `ActiveChainQuery` implements — via `reorg_switches_which_chain_a_peer_sees` (`crates/p2p/tests/core_compat.rs`).
-
-See also [docs/contracts/p2p-wire.md](../contracts/p2p-wire.md) for the contracts index and precedence rule.
+The live Core comparison is owned by
+[CORE-01/02/03/05/06](../contracts/core-differential.md): equivalent peers,
+outbound block announcements including reorg, and BIP324 in both directions.
+See [the P2P wire contract](../contracts/p2p-wire.md) for precedence and the
+cross-module requirements. Node's reorg owner coordinates applied-chain
+effects; the `ChainQuery` fixtures certify only their peer-visible projection.
 
 ## Overlay transports
 

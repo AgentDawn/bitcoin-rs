@@ -1,20 +1,8 @@
-//! The node option table: every operator option declared once.
-//!
-//! [`option_rows!`] holds one row per operator-settable node option. Each row
-//! names its configuration slot, its text value grammar, and its spelling on
-//! every process-input surface: the command line, the environment, the TOML
-//! configuration file, and Bitcoin Core's `bitcoin.conf`. Consumer macros
-//! derive each surface from the same rows, so an option is written once and
-//! appears everywhere with one grammar.
-//!
-//! PRE: each row names a [`UserConfig`] slot that is `None` until a surface
-//! sets it.
-//! POST: every surface a row lists parses its own spelling of that option
-//! into the slot with the row's grammar.
-//! INVARIANT: a surface column absent from a row means the option does not
-//! exist on that surface. The chainstate-journal bounds are environment-only
-//! (their TOML spellings live inside the `chainstate_journal` table group),
-//! and the notification adapters are a TOML-only whole-value option.
+//! Canonical operator-option rows consumed by CLI, environment, TOML, and
+//! `bitcoin.conf` parsers. Each names an initially unset `UserConfig` slot and
+//! one value grammar; an absent surface column means unsupported there.
+//! Journal bounds use environment rows or the grouped TOML table; notification
+//! adapters are a TOML-only whole-value option. `option_rows!` owns the grammar.
 
 use std::convert::Infallible;
 use std::ffi::OsStr;

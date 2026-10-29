@@ -1,29 +1,8 @@
-//! Per-connection SV1 session state machine, the shared pool core, and the
-//! bounded TCP server.
-//!
-//! # Sharing model and lock order
-//!
-//! [`crate::JobBook`] is single-owner (`&mut`, not `Sync`). Many connection
-//! threads reach it through [`PoolCore`], which wraps it in one `Mutex`:
-//!
-//! 1. `PoolCore.book` (the `JobBook`): held for `open_session`, `close_session`,
-//!    `install`, `invalidate_active`, and `validate`. Never across a socket
-//!    read or write, a ledger call, or a node call.
-//! 2. `PoolCore.published` (latest job, sequence numbers): held for a clone of
-//!    the latest `Arc<Job>`. Taken while holding `book` only by `install` and
-//!    `invalidate_active`, in that order; no code takes `book` while holding
-//!    `published`.
-//!
-//! A panicking connection thread poisons nothing it cannot afford to: lock
-//! guards recover from poison, and the thread's `Lease` closes its book
-//! session while unwinding.
-//!
-//! # Ownership of verdicts
-//!
-//! Stale, duplicate, version, `ntime`, network-target and share-target
-//! decisions are `JobBook::validate`'s. This module only maps its
-//! `ShareError` onto SV1 error codes, picks the session's share target
-//! (difficulty policy), and hands accepted shares to the [`ShareLedger`].
+//! SV1 connection state and bounded TCP server.
+//! `PoolCore` owns shared locking/publication; `JobBook::validate` owns share
+//! verdicts. This adapter maps errors, chooses session difficulty, and hands
+//! accepted shares to `ShareLedger`. A session's `Lease` closes it on unwind;
+//! shared locks recover from poison.
 
 use std::collections::HashMap;
 use std::error::Error;

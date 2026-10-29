@@ -26,7 +26,7 @@ pub fn consensus_reject_reason(error: &ConsensusError) -> CompactString {
         ConsensusError::InputsLessThanOutputs { .. } => "bad-txns-in-belowout",
         ConsensusError::SigopsLimit { .. } => SIGOPS_LIMIT_REASON,
         // A 64-byte mutation is a coinbase-less body, so `submitblock` still
-        // reports Core's first-transaction rule (`validation.cpp:3960`).
+        // reports Core's first-transaction rule (`validation.cpp`).
         ConsensusError::EmptyBlock
         | ConsensusError::MissingCoinbase
         | ConsensusError::SixtyFourByteMutation => "bad-cb-missing",
@@ -81,7 +81,7 @@ pub fn chain_reject_reason(error: &ChainError) -> CompactString {
         ChainError::KnownInvalidHeader { .. } => "duplicate-invalid",
         ChainError::DuplicateHeader { .. } => "duplicate",
         // Core prints `bad-version(0x%08x)` with the rejected version's
-        // unsigned bit pattern (`src/validation.cpp:4112-4126`).
+        // unsigned bit pattern (`src/validation.cpp`).
         ChainError::BadVersion { version, .. } => {
             return CompactString::from(format!(
                 "bad-version(0x{:08x})",

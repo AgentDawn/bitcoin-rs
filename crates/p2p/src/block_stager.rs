@@ -204,7 +204,6 @@ impl BlockStager {
         Some(received_len)
     }
 
-    /// PRE: none.
     /// POST: yields the identity of every currently staged body, in map
     ///       order.
     /// INVARIANT: yields no heights; the block tree is the only height

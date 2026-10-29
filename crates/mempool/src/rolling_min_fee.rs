@@ -1,18 +1,8 @@
-//! Core rolling minimum fee.
-//!
-//! Port of Core `CTxMemPool::GetMinFee`, `CTxMemPool::trackPackageRemoved`,
-//! and the rolling-fee lines of `CTxMemPool::removeForBlock`
-//! (`bitcoin-core/src/txmempool.cpp:423-424,877-924`): one state machine over
-//! `rate` (Core `rollingMinimumFeeRate`), `last_update` (Core
-//! `lastRollingFeeUpdate`), and `block_since_bump` (Core
-//! `blockSinceLastRollingFeeBump`). The pool owns it behind a mutex and reads
-//! it through [`crate::Mempool::min_fee_sat_per_kvb`]; a capacity eviction or
-//! replacement trim raises it, and every committed block connection stamps
-//! it for decay.
-//!
-//! Core measures capacity as allocator usage against the byte limit; btcrs
-//! measures total virtual size against `max_total_bytes` — the floor rises
-//! in larger steps (recorded in `CONCEPTS.md`, "Rolling minimum fee").
+//! Core rolling minimum fee (`CTxMemPool::GetMinFee`, `trackPackageRemoved`,
+//! and `removeForBlock` in `txmempool.cpp`). Capacity eviction raises the floor;
+//! committed block connection permits decay. The pool owns synchronization.
+//! Capacity uses virtual size against `max_total_bytes`, whereas Core uses
+//! allocator usage; see "Rolling minimum fee" in `CONCEPTS.md`.
 
 use crate::policy::ROLLING_FEE_HALFLIFE_SECS;
 

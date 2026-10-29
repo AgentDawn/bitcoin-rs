@@ -366,8 +366,7 @@ pub(crate) struct DownloadWindow {
     next_request_height: u32,
     request_tip: Option<(Hash256, u32)>,
     /// Per-owner block-download queue start: the local equivalent of
-    /// Core's per-peer `m_downloading_since` (`net_processing.cpp,
-    /// 1363-1368`). Keyed by the exact `PeerSource`; an entry exists exactly
+    /// Core's per-peer `m_downloading_since` (`net_processing.cpp`, Core 31.1 `m_downloading_since`). Keyed by the exact `PeerSource`; an entry exists exactly
     /// while that owner has validated in-flight blocks.
     owner_downloading_since: HashMap<PeerSource, Instant>,
     /// Eligible outbound witness peers available for new block assignments.
@@ -474,8 +473,7 @@ impl DownloadWindow {
     }
 
     /// Records the eligible population and updates engagement with one-peer
-    /// hysteresis. Dynamic stripe sizing prevents the old whole-window
-    /// re-concentration when the count dips.
+    /// hysteresis. Dynamic stripe sizing keeps requests distributed when the count dips.
     ///
     /// Bounded prefix-race-before-fanout handoff: when the eligible count
     /// reaches the fanout threshold while a prefix probe is active and
@@ -499,8 +497,7 @@ impl DownloadWindow {
         // `Instant::now()`. The bound is a strict less-than: at an elapsed
         // time exactly equal to `stall_timeout_initial` the probe is no
         // longer fresh (the race had its full budget), so fanout engages at
-        // the deadline — `<` rather than `<=`. The boundary is pinned by
-        // tests that cross at exactly `stall_timeout_initial`.
+        // the deadline — `<` rather than `<=`.
         let probe_young = self.prefix_probe.as_ref().is_some_and(|probe| {
             now.duration_since(probe.started_at) < self.budget.stall_timeout_initial
         });
@@ -568,16 +565,9 @@ impl DownloadWindow {
             && self.staged_count_headroom(stager, 0) > 0
     }
 
-    /// Staged-byte backpressure: once the blocks already received and waiting
-    /// to apply have consumed the staging byte budget, stop issuing new block
-    /// requests — arrivals would only be refused by the stager and
-    /// re-requested, churning bandwidth. Capacity returns as staged blocks are
-    /// applied (or expire) and their bytes are released.
-    ///
-    /// PRE: `stager` is the staging set coupled to this window.
-    /// POST: `true` while the stager's staged bytes have exhausted the
-    ///      staging byte budget.
-    /// INVARIANT: the byte total is read from `stager`.
+    /// Whether the coupled stager has exhausted its byte budget. Refusing new
+    /// requests avoids arrivals that would be dropped and requested again;
+    /// applying or expiring staged blocks releases the capacity.
     fn staged_bytes_exhausted(&self, stager: &BlockStager) -> bool {
         stager.received_bytes() >= self.budget.max_received_bytes
     }
@@ -636,7 +626,7 @@ impl DownloadWindow {
         // Expired bytes are credited back to pending capacity (they will be
         // re-requested) but not to staging byte headroom: a late arrival of
         // the original request still stages. The count headroom does credit
-        // them — see `staged_count_headroom` for why the wedge needs it.
+        // them so a stalled front can be retried while the staging count is full.
         let byte_capacity = self
             .budget
             .max_pending_bytes
@@ -683,26 +673,12 @@ impl DownloadWindow {
         self.owner_download_expired(source, self.active_downloading_peers(), now)
     }
 
-    /// Advances every blockage observation once and returns at most one
-    /// action for this tick.
-    ///
-    /// The order is fixed: the measurement intervals; the apply-side bound;
-    /// the no-blame guard; the cold-front timer and the stall predicate;
-    /// staller blame; the pending timeout (also at the chain tip); pending
-    /// blame; the cold-front hedge.
-    ///
-    /// PRE: `ctx` describes the canonical frontier after this tick's apply
-    ///      drain; `stager` is the coupled staging set and `tree` resolves
-    ///      staged hashes to heights; `now` is injected by the caller.
-    /// POST: the no-blame guard is evaluated once; the return value is the
-    ///      single action the caller owes: disconnect the blamed exact
-    ///      owner, evict the stuck staged body without blame, send the
-    ///      cold-front duplicate request, or nothing.
-    /// INVARIANT: a same-address replacement never inherits blame, because
-    ///      every observation keys on the exact [`PeerSource`].
-    /// INVARIANT: while `ctx.apply_side_busy` holds, no stall, timeout, or
-    ///      hedge action returns; only the apply-side bound can return
-    ///      [`BlockedDecision::EvictStaged`].
+    /// Returns at most one action after the canonical apply drain, using injected
+    /// `now`, the coupled stager, and tree-resolved heights. Evaluate intervals,
+    /// apply-side bound, no-blame guard, cold-front/stall, pending timeout, then hedge.
+    /// Blame always names the exact `PeerSource`, never a same-address replacement.
+    /// While apply is busy only the apply-side bound may return `EvictStaged`;
+    /// otherwise return the owed disconnect, unblamed eviction, hedge, or no action.
     pub(crate) fn observe_blocked(
         &mut self,
         ctx: BlockedContext,
@@ -760,26 +736,12 @@ impl DownloadWindow {
         })
     }
 
-    /// Observes the lowest expired request and convicts only on a second
-    /// idle tick.
-    ///
-    /// A block may arrive while synchronous apply is running and wait in the
-    /// inbound channel after its request timestamp expires. The first
-    /// observation records suspicion only; delivery from the observed owner
-    /// clears it at once, and any path that releases the observed hash
-    /// without a delivery (the retarget and purge paths) leaves a suspicion
-    /// that no longer measures anything. The second tick therefore
-    /// re-verifies the observation against the live window before it
-    /// converts suspicion into blame.
-    ///
-    /// PRE: the apply side is not busy this tick.
-    /// POST: `Some(owner)` exactly when the previous observation named
-    ///      `owner`, that owner still owns the observed hash in `pending`,
-    ///      and that owner is still expired this tick; the owner's address
-    ///      then enters the staller cooldown. Every other outcome clears
-    ///      the observation and blames nobody.
-    /// INVARIANT: the observation names the exact owning connection, and a
-    ///      conviction never outlives the queue age it measured.
+    /// Convicts an expired request owner only on a second idle tick.
+    /// Inbound delivery may wait behind synchronous apply: the first observation
+    /// records suspicion, and delivery clears it. On the next tick the exact
+    /// connection must still own the same pending hash and remain expired;
+    /// otherwise clear suspicion without blame. Conviction adds its address to
+    /// cooldown. Call only when the apply side is not busy.
     fn advance_pending_timeout(
         &mut self,
         now: Instant,
@@ -819,39 +781,14 @@ impl DownloadWindow {
         None
     }
 
-    /// Time-bounds the apply-side no-blame suppression.
-    ///
-    /// While the stager holds the next expected block, `apply_side_busy`
-    /// suppresses stall conviction, pending-timeout conviction, and the
-    /// cold-front hedge — our own slowness is never a peer's fault. Left
-    /// unbounded, a well-formed body that is staged but never applied wedges
-    /// the window in silence: the 60s staged-body prune expires it, the
-    /// re-request re-delivers it, the fresh insert re-stamps its
-    /// `received_at`, and the suppression re-arms — a sawtooth that never
-    /// lets any recovery path mature (observed live as 13h frozen at
-    /// `gap=1`).
-    ///
-    /// This observation advances the stuck clock: an episode keyed by the
-    /// apply-front `(height, frontier_hash)`. It accumulates across the
-    /// brief unbusy seams of that sawtooth, and any frontier change — the
-    /// apply side actually progressing, or a same-height branch replacement
-    /// swapping the expected body — resets it. An idle frontier (no body
-    /// staged yet) starts no clock, so a frontier that simply took longer
-    /// than the bound to deliver does not have its first normal delivery
-    /// evicted on arrival. Once one continuous stuck interval reaches
-    /// twice `SyncBudget::received_timeout` (one full staged-body expiry
-    /// plus one full refetch window have both failed to unblock the
-    /// frontier), it fires: the caller must escalate WITHOUT peer blame, by
-    /// evicting the stuck staged body for refetch so either the fresh
-    /// delivery applies or the normal unsuppressed stall path engages.
-    /// Firing re-arms the clock, so a persistently stuck frontier escalates
-    /// at most once per bound.
-    ///
-    /// PRE: `frontier_hash` is `None` when no next-expected block exists
-    ///      (the applied tip sits at the chain tip).
-    /// POST: `Some((frontier_hash, suppressed_for))` exactly on fire; a
-    ///      missing frontier drops any leftover episode.
-    /// INVARIANT: the clock runs only while `apply_side_busy` holds.
+    /// Bounds apply-side suppression without blaming a peer for local slowness.
+    /// Start the clock only after a body stages at `(height, frontier_hash)`;
+    /// retain elapsed busy time across expiry/refetch seams. A frontier change or
+    /// missing frontier resets it, so a late first delivery is not evicted.
+    /// At twice `SyncBudget::received_timeout`, return the body and elapsed time
+    /// for unblamed eviction/refetch, then re-arm. This allows one complete expiry
+    /// and refetch attempt while preventing repeated arrivals from resetting
+    /// recovery indefinitely. The clock accrues only while `apply_side_busy`.
     fn advance_apply_side_stuck(
         &mut self,
         next_apply_height: u32,
@@ -922,31 +859,14 @@ impl DownloadWindow {
         }
     }
 
-    /// Advances the window-blocked stall state machine one observation (R8).
-    ///
-    /// `next_apply_height` is `applied_tip.height + 1`, the apply frontier.
-    ///
-    /// Deliberately *not* an input: a chain-tail arm ("nothing above the
-    /// window left to request"). At the tip, one >2s block from a caught-up
-    /// peer is the normal regime, not a stall — Core's stalling logic does
-    /// not engage there either, and the last <window blocks of IBD stay
-    /// covered by the pending-timeout machinery.
-    ///
-    /// An unseeded front-cadence EWMA (cold start) does not suppress
-    /// conviction: the threshold is then the stored adaptive value, whose
-    /// floor is `stall_timeout_initial` — Core's `BLOCK_STALLING_TIMEOUT_DEFAULT`.
-    ///
-    /// PRE: the apply side is not busy this tick.
-    /// POST: `Some(owner)` exactly when the stall threshold fires: the
-    ///      caller must disconnect that exact owner (its pendings then
-    ///      re-queue through [`Self::retain_owned_by`]). On fire the
-    ///      adaptive threshold doubles (capped at `stall_timeout_max`) and
-    ///      the owner's address enters the staller cooldown.
-    /// INVARIANT: when any predicate term stops holding — including any
-    ///      delivery from the blamed peer ([`Self::record_delivery_progress`])
-    ///      — the episode is cleared, more forgiving than freezing the clock
-    ///      and Core-shaped (`m_stalling_since` is likewise re-derived,
-    ///      never frozen).
+    /// Advances the blocked-window stall observation when apply is not busy.
+    /// `next_apply_height` is the apply frontier. No chain-tail arm is used: ordinary
+    /// tip latency and the IBD tail remain covered by pending timeouts.
+    /// Cold starts use the initial floor; `stall_decay_floor` owns cadence bounds.
+    /// On fire, return the exact owner to disconnect, add its address to cooldown,
+    /// and double the threshold up to `stall_timeout_max`. Any failed predicate
+    /// or delivery from that connection clears the episode rather than freezing it
+    /// (Core's `m_stalling_since`).
     fn advance_stall(
         &mut self,
         next_apply_height: u32,
@@ -981,13 +901,9 @@ impl DownloadWindow {
                 episode
             }
         };
-        // Phase 0 observability: one INFO line per episode, once it survives
-        // STALL_EPISODE_LOG_AGE — visible below the WARN fire line so episode
-        // dynamics (and the EWMA the threshold tracks, the design falsifier)
-        // appear in run logs.
-        //
+        // Log a surviving episode after STALL_EPISODE_LOG_AGE.
         // The fire threshold is the stored adaptive value, never below the
-        // ADV-DRIP-1 decay floor: on a network whose demonstrated front
+        // cadence-based decay floor: on a network whose demonstrated front
         // cadence exceeds `stall_timeout_initial`, an episode younger than
         // twice that cadence is the uniform-slow steady state, not a stall.
         let effective_timeout = self.stall_timeout.max(self.stall_decay_floor());
@@ -1051,32 +967,10 @@ impl DownloadWindow {
         )
     }
 
-    /// Lower bound for the adaptive threshold's x0.85 decay (and for the
-    /// fire check itself): twice the network's demonstrated front cadence
-    /// ([`Self::front_interval_ewma_ms`]), never below
-    /// `stall_timeout_initial` and never above `stall_timeout_max`.
-    ///
-    /// The ADV-DRIP-1 fix. Consequences, pinned by tests:
-    /// - Fast network (front cadence well under 1s): the EWMA term stays
-    ///   below `stall_timeout_initial`, the floor is the static 2s, and
-    ///   conviction speed matches Core.
-    /// - Slow network (uniform honest gap g = 3s): the floor lands at ~6s
-    ///   (> g), so the decay limit cycle that fired one honest peer per ~5g
-    ///   cannot re-cross g — zero false fires — while a true staller
-    ///   (silent while others stream) still convicts at ~6s, far inside the
-    ///   60s pending-timeout fallback. That zero-false-fires guarantee
-    ///   holds only because same-chunk batch arrivals are filtered out of
-    ///   the EWMA (sub-[`EWMA_MIN_SAMPLE_MS`] samples share one chunk
-    ///   timestamp and would otherwise deflate the floor back to the static
-    ///   2s). A cold-start window (no sample yet) convicts at the
-    ///   `stall_timeout_initial` floor: an unproven cadence is never an
-    ///   exemption, matching Core's `BLOCK_STALLING_TIMEOUT_DEFAULT`
-    ///   behavior for a fresh connection.
-    ///
-    /// The 2x multiplier is deliberately hardcoded (no `SyncBudget` knob):
-    /// it is the audit finding's refuted-equilibrium margin — the floor must
-    /// clear the cadence itself (1x fires on jitter) and stay well under the
-    /// fallback machinery; nothing tunes it per deployment.
+    /// Clamps decay and conviction to twice the demonstrated front cadence,
+    /// between `stall_timeout_initial` and `stall_timeout_max`. Cold starts
+    /// use the initial floor. The 2x margin tolerates honest cadence jitter;
+    /// same-chunk arrivals below `EWMA_MIN_SAMPLE_MS` cannot lower the EWMA.
     fn stall_decay_floor(&self) -> Duration {
         self.front_interval_ewma_ms
             .map_or(Duration::ZERO, |ewma_ms| {
@@ -1120,7 +1014,7 @@ impl DownloadWindow {
     }
 
     /// Current stall observation, if one is running: the blamed peer and when
-    /// the episode started. The R10 slow-trickle observability surface — a
+    /// the episode started. A
     /// peer delivering each front block just under the adaptive threshold is
     /// never disconnected (same exposure as Core) but is visible here and on
     /// the `node.sync.stall_seconds` gauge.
@@ -1380,7 +1274,6 @@ impl DownloadWindow {
 
     /// Whether `owner` holds one of the per-owner download slots.
     ///
-    /// PRE: none.
     /// POST: true exactly while `owner` is in the population that
     ///   `active_downloading_peers` counts.
     /// INVARIANT: the answer is the same fact the fan-out budget reads, so a
@@ -1431,23 +1324,12 @@ impl DownloadWindow {
             })
     }
 
-    /// Re-derives one owner's queue start after a removal from `pending`.
-    ///
-    /// PRE: the entry is already out of `pending`; `removed_requested_at`
-    ///      is its request time; `now` is the caller's injected clock.
-    /// POST: the owner keeps no entry once it owns nothing; the entry moves
-    ///      to `now` exactly when the removed entry was strictly older
-    ///      than every survivor (the true queue head left); when a
-    ///      survivor carries the removed entry's own stamp, the clock
-    ///      adopts that stamp without ever regressing; otherwise the
-    ///      entry is untouched.
-    /// INVARIANT: the local equivalent of Core's `m_downloading_since`
-    ///      start-and-oldest-removal reset (`net_processing.cpp,
-    ///      1363-1368`); `requested_at` stays the ordering and diagnostic
-    ///      record, never the sole source of the queue age. One batched
-    ///      `mark_requested` stamps every entry with one `requested_at`,
-    ///      so only that batch's front advances the clock: a peer cannot
-    ///      postpone its timeout by dripping non-front deliveries.
+    /// Updates one owner's queue start after removing its pending entry.
+    /// Drop the clock when no entries remain. If the removed request was strictly
+    /// oldest, reset to injected `now`; equal-stamped survivors adopt that stamp
+    /// without regression; otherwise leave the clock unchanged.
+    /// This mirrors Core 31.1 `m_downloading_since` in `net_processing.cpp`:
+    /// batched requests share a stamp, so non-front trickles cannot delay timeout.
     fn reset_owner_queue_start(
         &mut self,
         owner: PeerSource,
@@ -2146,31 +2028,14 @@ impl DownloadWindow {
         }
     }
 
-    /// Delivery progress for the stall state machine, charged per peer
-    /// (Core's `RemoveBlockRequest`: "this peer delivered, so it's not
-    /// stalling"). Called after `hash` was removed from `pending`.
+    /// Records delivery after removing `hash` from pending. Any requested body
+    /// from the exact blamed connection clears its stall; other connections,
+    /// including same-address replacements, do not. Front-only credit would falsely
+    /// blame slow peers still streaming into a saturated window.
     ///
-    /// Any requested block arriving from the episode *connection* clears the
-    /// running episode, so blame accumulates only against a connection that
-    /// delivers *nothing* while owning the front and others stream past it.
-    /// A same-address replacement's deliveries never clear its predecessor's
-    /// clock. In the
-    /// saturated fan-out steady state (the staged backlog sits at the count
-    /// budget, so the staged-fraction arming term holds almost always),
-    /// charging only front arrivals would serially false-blame
-    /// every slow-but-streaming peer — the self-eclipse cascade. Deliveries
-    /// from *other* peers do not clear it: they are the discriminator that
-    /// convicts a true staller.
-    ///
-    /// A window-front arrival additionally samples the inter-front-advance
-    /// interval into [`Self::front_interval_ewma_ms`] (unless the sample is
-    /// a same-chunk batch artifact under [`EWMA_MIN_SAMPLE_MS`]) and decays
-    /// the adaptive threshold by x0.85 toward [`Self::stall_decay_floor`]
-    /// (an adaptive floor) instead
-    /// of snapping it to the floor: after a real fire the elevated threshold
-    /// must survive the peer rotation, so the next front owner is judged
-    /// against the doubled value while it gradually relaxes with front
-    /// progress.
+    /// A front advance samples cadence, excluding same-chunk `EWMA_MIN_SAMPLE_MS`
+    /// artifacts, and decays the threshold by 0.85 toward `stall_decay_floor`.
+    /// Gradual decay preserves the raised threshold across peer rotation after fire.
     fn record_delivery_progress(
         &mut self,
         source: PeerSource,
@@ -2221,9 +2086,7 @@ impl DownloadWindow {
     /// Test-only cold-start disarm: installs a front-cadence estimate as if
     /// the network had demonstrated `ewma_ms` with its last front advance at
     /// `now`. Sync-layer tests whose fixtures never advance the window front
-    /// (the recorded wedge constructions) use this instead of replaying two
-    /// real front deliveries; the real sampling path is pinned by the window
-    /// tests.
+    /// use this instead of replaying two real front deliveries.
     #[cfg(test)]
     pub(crate) const fn seed_front_cadence_for_test(&mut self, ewma_ms: u64, now: Instant) {
         self.front_interval_ewma_ms = Some(ewma_ms);
@@ -2328,24 +2191,12 @@ impl DownloadWindow {
         entries
     }
 
-    /// Records a body fetch the window does not own — a compact
-    /// `getblocktxn` or fallback `getdata` already issued on `owner` —
-    /// as pending so `next_peer_request` does not schedule a duplicate
-    /// request for a freshly admitted tip. Delivery resolves it like any
-    /// window request; expiry or peer disconnect hands it back to normal
-    /// scheduling, so a silently dropped compact fetch still re-requests.
-    /// The window owns no frontier for the entry: `next_request_height`
-    /// must not advance past heights it never scanned.
-    ///
-    /// The mark still consumes window budgets, so the same gates a real
-    /// request would face apply: no mark when the window has no request
-    /// capacity (its `pending` would overflow), when `owner` already holds
-    /// its per-peer inflight share, or when `height` sits below the
-    /// request frontier — a below-frontier entry could never be scheduled
-    /// anyway, and its expiry would drag `next_request_height` back down
-    /// into a re-request sweep of heights already applied.
-    /// `false` when capacity refused the mark: the caller keeps the deferred
-    /// ownership record so a fast delivery still counts as requested.
+    /// Tracks an already-issued compact/fallback fetch without advancing the
+    /// window's request frontier. Delivery resolves it; expiry/disconnect returns
+    /// it to normal scheduling. Apply ordinary window/per-peer capacity bounds and
+    /// refuse below-frontier heights so expiry cannot rewind over applied work.
+    /// On refusal the caller retains deferred ownership, ensuring fast delivery
+    /// still counts as requested.
     pub(crate) fn mark_owned_fetch(
         &mut self,
         stager: &mut BlockStager,

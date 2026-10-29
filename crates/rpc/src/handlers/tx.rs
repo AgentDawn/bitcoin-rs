@@ -333,28 +333,12 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     proof_from_block_log(ctx, &wanted)
 }
 
-/// Answers `gettxoutproof` from the txindex, or `None` when it cannot.
-///
-/// Probes the wanted txids until one resolves to a confirming height, then tries
-/// to build the proof from that block alone. Probing *every* txid rather than an
-/// arbitrary one matters: `wanted` is a `HashSet`, so "the first" is whichever
-/// the hasher happens to yield, and one unresolvable txid would otherwise drop
-/// the call into the full chain scan non-deterministically — the very cost this
-/// path exists to avoid.
-///
-/// Every miss returns `None` so the caller falls back to that scan: no index,
-/// no row, a stale row, a pruned body, or a block that does not hold *all* the
-/// wanted txids. The last of those is not belt-and-braces — BIP30's duplicate
-/// coinbase txids mean a txid can confirm in more than one block, so a block
-/// chosen from a single txid is a candidate, never a verdict.
-///
-/// An index that returns an error is a miss too, logged rather than propagated.
-/// Before this path existed a broken txindex could not fail this call, and the
-/// scan can still answer it; an optimization must not turn a working call into
-/// an error. `TxQueryError::Retry` makes that concrete rather than defensive:
-/// the index reconciles asynchronously, so it reports `Retry` while it is
-/// catching up, and a call the scan can answer today must not be refused
-/// because the index is behind.
+/// Tries every wanted txid for a confirming block, avoiding HashSet-order
+/// fallback when only some have usable index rows. The chosen block must contain
+/// all wanted txids: BIP30 permits one coinbase txid in multiple blocks.
+/// Missing/stale rows, pruned bodies, mismatched candidates, and logged index
+/// errors (including temporary Retry) return None for the full scan; index
+/// availability must not turn a scan-answerable request into an error.
 fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Option<Value> {
     let derived_index = ctx.indexes.derived_index.as_ref()?;
     for probe in wanted {

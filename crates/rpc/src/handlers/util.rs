@@ -372,25 +372,10 @@ enum ChecksumRequirement {
     Required,
 }
 
-/// Verifies a descriptor's checksum and returns the body plus the computed sum.
-///
-/// Bitcoin Core's `CheckChecksum` in `script/descriptor.cpp`, rule for rule.
-/// Callers parse the returned payload. `combo(` / `addr(` / `raw(` look for a
-/// trailing `)`, so the original `desc#checksum` string is not a descriptor
-/// body.
-///
-/// The previous implementation split the text on its last `#` and threw the
-/// supplied checksum away, which meant a *wrong* checksum was accepted and
-/// silently replaced with the right one in the response. The checksum exists to
-/// catch a mistyped descriptor; discarding it defeats the entire mechanism, and
-/// the caller is told their typo is fine.
-///
-/// The three refusals, in Core's order:
-///
-/// - more than one `#`, which is a malformed descriptor rather than a
-///   descriptor with an odd checksum;
-/// - a checksum that is present but not exactly eight characters;
-/// - a checksum that does not match the one the payload computes.
+/// Core's `CheckChecksum` (`script/descriptor.cpp`): reject multiple `#`,
+/// then a present checksum of the wrong length, then a mismatch. Return only
+/// the body and computed checksum; descriptor parsers must not receive the
+/// `#checksum` suffix or silently replace a supplied wrong checksum.
 fn checked_checksum(
     descriptor: &str,
     requirement: ChecksumRequirement,
@@ -1175,24 +1160,10 @@ fn descriptor_address(
         })
 }
 
-/// Refuses a descriptor whose extended keys belong to another network.
-///
-/// Bitcoin Core never reaches this check because it cannot: `DecodeExtPubKey`
-/// resolves the version bytes against the running chain's Base58 prefix, so a
-/// `tpub` on mainnet fails to decode and the descriptor never parses.
-/// rust-bitcoin decodes both prefixes into the same type and keeps the network
-/// as a field, so the descriptor parses fine and the mismatch survives to
-/// derivation -- where `address(network)` re-encodes the key with *this*
-/// network's prefix and hands back a `bc1...` address for a testnet key.
-///
-/// That address is well-formed, and nobody holds its private key. Someone
-/// checking the descriptor by eye sees mainnet addresses and has no way to tell.
-/// So the check is here rather than absent, and it runs before any derivation.
-///
-/// `NetworkKind` is the right granularity: BIP32 has two prefix sets, one for
-/// mainnet and one shared by every test network, so a signet key and a testnet
-/// key are genuinely indistinguishable and refusing between them would refuse
-/// something valid.
+/// Checks extended-key `NetworkKind` before address derivation. Unlike Core's
+/// chain-specific `DecodeExtPubKey`, rust-bitcoin parses both prefixes into one
+/// type and can re-encode for another network without rejecting the mismatch.
+/// Test networks share the BIP32 prefix set; only mainnet versus test matters.
 fn ensure_keys_match_network(
     descriptor: &MiniscriptDescriptor<DescriptorPublicKey>,
     network: bitcoin::Network,

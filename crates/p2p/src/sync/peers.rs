@@ -159,15 +159,15 @@ pub(super) fn active_demonstrated_height(
 
 /// How long a full-relay outbound connection may sit below our tip before it
 /// is probed, and then retired: `CHAIN_SYNC_TIMEOUT` is 20 * 60 seconds, as
-/// Core sets it (`net_processing.cpp:109`).
+/// Core sets it (`net_processing.cpp`).
 const CHAIN_SYNC_TIMEOUT: Duration = Duration::from_mins(20);
 
 /// How long the answer to that probe is awaited: `HEADERS_RESPONSE_TIME` is
-/// 2 * 60 seconds, as Core sets it (`net_processing.cpp:103`).
+/// 2 * 60 seconds, as Core sets it (`net_processing.cpp`).
 pub(super) const HEADERS_RESPONSE_TIME: Duration = Duration::from_mins(2);
 
 /// How many tip-reaching outbound connections are never retired. Core's
-/// `MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT` (`net_processing.cpp:107`).
+/// `MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT` (`net_processing.cpp`).
 const MAX_OUTBOUND_PEERS_TO_PROTECT: usize = 4;
 
 /// What the chain-sync rule owes one connection.
@@ -211,7 +211,7 @@ impl ChainSyncState {
     }
 
     /// Starts a fresh window against the current tip, as Core's `m_work_header
-    /// = tip` arm does (`net_processing.cpp:5519-5527`).
+    /// = tip` arm does (`net_processing.cpp`).
     fn arm(&mut self, tip_height: u32, now: Instant) {
         self.timeout_start = Some(now);
         self.benchmark = Some(tip_height);
@@ -313,24 +313,11 @@ impl BlockSync {
             .with_live_sessions(|live| self.scheduler.lock().release_unowned(live));
     }
 
-    /// Advances the window's blockage observations against the canonical
-    /// frontier and performs the single action the unified decision names:
-    /// convict one owner, evict one stuck staged body, or fire one bounded
-    /// cold-front hedge.
-    ///
-    /// R8: window-blocked staller detection, the apply-side
-    /// suppression bound, and the pending-timeout fallback all read the
-    /// same `next_required` body the scheduler requests — the frontier
-    /// cannot disagree with itself about which block is required next.
-    ///
-    /// Convictions are identity-exact: `disconnect_source` removes only the
-    /// connection that owns the stalled work, so a same-address replacement
-    /// survives and never inherits the blame.
-    ///
-    /// While the apply path has latched a fatal settlement no recovery fires:
-    /// deliveries cannot apply, so non-delivery is not a peer fault, and a
-    /// staged body stays queued for the re-created apply path rather than
-    /// being evicted past the suppression bound.
+    /// Executes the window's single recovery decision against the canonical
+    /// `next_required` body: exact-owner conviction, unblamed staged eviction, or
+    /// bounded hedge. Same-address replacement cannot inherit blame.
+    /// Fatal settlement suppresses all recovery: delivery cannot apply, so retain
+    /// staged bodies for the re-created apply path and blame no peer.
     pub(super) fn reconcile_window_recovery(&self, chain: &ChainFrontier, now: Instant) {
         if chain.apply_halted {
             return;
@@ -417,21 +404,10 @@ impl BlockSync {
         }
     }
 
-    /// Evict the stuck staged body for
-    /// refetch, without blaming any peer.
-    ///
-    /// Fired on [`BlockedDecision::EvictStaged`] after the apply-side
-    /// suppression held for two full `received_timeout` windows.
-    /// `frontier_hash` is the snapshot the window observation fired on; the
-    /// final equality check against the live frontier ensures a same-height
-    /// branch replacement between observation and eviction cannot drain a
-    /// body that never stalled. The eviction reuses the staged-body prune's
-    /// requeue flow — stager removal first, then the tree-height re-evaluation,
-    /// then the window drop-for-retry — so the request path re-requests the
-    /// body: either the fresh delivery applies, or, while the body is
-    /// absent, the normal unsuppressed stall path engages. If a peer then
-    /// fails to re-deliver, THAT is a peer fault and the existing conviction
-    /// machinery handles it; the eviction itself carries no blame.
+    /// Evicts a stuck staged body without peer blame. Recheck the observed
+    /// frontier hash before removal so branch replacement cannot evict unrelated
+    /// work. Remove from stager, resolve height, then drop-for-retry in the window;
+    /// normal scheduling owns refetch and any later non-delivery conviction.
     fn escalate_stuck_staged_body(
         &self,
         next_apply_height: u32,
@@ -521,21 +497,11 @@ impl BlockSync {
 
     /// Collects the fan-out candidates from the frontier's usable peers.
     fn fanout_candidates(&self, frontier: &SyncFrontier) -> Vec<FanoutCandidate> {
-        // Height clause of the fan-out eligibility predicate (KTD6) and
-        // the pre-existing candidate filter: the peer's demonstrated chain
-        // must cover the canonical next-required body — on a reorg whose
-        // first connect node sits below the applied tip, that is lower
-        // than the applied height, so gating on the applied height would
-        // declare the body requestable yet never pick a peer for it.
-        // Like Core's `pindexBestKnownBlock`, eligibility reads the
-        // demonstrated best-known height (handshake snapshot, raised as
-        // the peer hands us accepted headers) rather than the handshake
-        // value alone — a long-lived at-tip peer would otherwise become
-        // ineligible for every newly announced block. Per-request
-        // truncation by `peer_best_height` still bounds the damage of a
-        // stale value. `peer_can_serve_height` also keeps a limited-service
-        // peer inside its retained range. With nothing required the clause
-        // reduces to the applied tip's successor, as before.
+        // Eligibility covers the canonical next-required body, which may be below
+        // applied height during reorg. Use the peer's demonstrated height (raised by
+        // accepted headers), not its initial handshake; per-request truncation and
+        // service-range checks still bound stale claims. With no required body,
+        // use the applied tip's successor.
         let required_height = frontier.chain.next_required.map_or_else(
             || {
                 frontier

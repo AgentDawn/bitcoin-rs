@@ -1,21 +1,13 @@
-//! Durable PPLNS accounting with an external wallet signer boundary.
+//! Durable PPLNS accounting over a host-supplied `KvStore`; no keys, wallet RPC,
+//! engine opening, or transaction broadcast. Each mutation is one revision-guarded
+//! durable batch: a revision conflict changes nothing, but durability errors
+//! are ambiguous and require reconciliation by the operation's idempotent identity.
+//! Creation requires an empty namespace; opening verifies immutable configuration.
+//! No implicit migration from the experimental ledger format is supported.
 //!
-//! The node supplies an `Arc<dyn bitcoin_rs_storage::KvStore>`. The ledger never opens an engine,
-//! holds private keys, calls a wallet RPC, or broadcasts transactions. All mutations use one
-//! revision-guarded durable batch; a revision conflict applies nothing, while a backend durability
-//! error is ambiguous and must be reconciled through the operation's idempotent identity.
-//! Creation requires an empty ledger namespace; opening verifies the immutable configuration.
-//! There is no implicit migration from the standalone experimental ledger format.
-//!
-//! Layout:
-//! - this file: identifiers, money/work arithmetic (checked integers only), PPLNS window and
-//!   reward split, transaction parsing and payout verification, canonical request/receipt codecs,
-//!   the chain-observation and signer seams, and the error type;
-//! - [`store`]: durable accounting transitions ([`Ledger`]);
-//! - `kv`: coherent logical-table views and the conditional durable commit boundary.
-//!
-//! Conventions: every `Hash32` is in internal byte order (the order used by transaction
-//! serialization), money is `u64` satoshis, work is `u128`, and no floating point is used.
+//! `store` owns transitions, `kv` owns coherent views/commits, and this module
+//! owns arithmetic and signer codecs. Hashes use internal byte order, money is
+//! `u64` satoshis, work is `u128`; arithmetic is checked and never floating point.
 
 #![forbid(unsafe_code)]
 

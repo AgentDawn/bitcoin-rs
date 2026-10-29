@@ -855,16 +855,9 @@ impl Context {
         })
     }
 
-    /// Composes one context from a complete [`ContextHandles`] value.
-    ///
-    /// This is the single production composition point. PRE: `handles` names
-    /// every capability the context will use, including the authoritative
-    /// chain-transition barrier supplied by the chain owner. POST: the
-    /// context carries that full set; the groups' `pub` fields still permit
-    /// post-hoc attachment, which only test fixtures use.
-    /// INVARIANT: production wiring supplies the chain owner's barrier
-    /// (e.g. `chainstate.transition_barrier()`); the synthetic
-    /// `ContextHandles::default` path builds a private barrier for tests.
+    /// Composes the complete production capability set. Supply the chain owner's
+    /// transition barrier; `ContextHandles::default` mints a private fixture barrier.
+    /// Production attaches nothing afterwards, though public fields allow fixtures to.
     #[must_use]
     pub fn from_handles(handles: ContextHandles) -> Self {
         let ContextHandles {
@@ -945,14 +938,8 @@ impl Context {
         self
     }
 
-    /// Attaches the transition-exclusion role composition minted for this node.
-    ///
-    /// PRE: `chain_transition` is the read role over the same
-    ///   [`bitcoin_rs_chain::TransitionDomain`] chainstate's mutation role uses.
-    /// POST: exclusive chainstate reads use it; see
-    ///   `ChainHandles::with_stable_chainstate`.
-    /// INVARIANT: published status reads do not acquire it, so a block
-    ///   transition cannot stall `getblockchaininfo` or `getchaintxstats`.
+    /// Attaches the read role of chainstate's own `TransitionDomain` for exclusive
+    /// reads. Published status uses `AppliedView` and never waits on this barrier.
     #[must_use]
     pub fn with_chain_transition(mut self, chain_transition: bitcoin_rs_chain::StableRead) -> Self {
         self.chain.chain_transition = chain_transition;
@@ -1021,23 +1008,13 @@ fn retained_tx_bytes(txs: &[Tx]) -> usize {
         .sum()
 }
 
-/// Production [`PrevoutResolver`] for the BIP337 codec.
-///
-/// Consistency: snapshot isolation. Handlers construct and run the
-/// resolver inside `ChainHandles::with_stable_chainstate`, so the
-/// captured `applied_view()`, UTXO entries, txindex heights, and bodies
-/// all come from one transition-excluded chainstate read; a tip that
-/// moves mid-call cancels the call instead of mixing branches. It holds one
-/// block-render permit for the whole call, retains materialized
-/// transactions plus cumulative-output prefix rows per height, and parses
-/// each retained body once in a scope that drops the parsed block before
-/// the next body is read. Retained materialized transactions are charged
-/// against the body and combined budgets and evicted with their body, so
-/// the cache lifetime stays bounded. Cumulative loads and bytes bound the
-/// total read/parse/materialize/txid work under the exclusion and fail
-/// closed; codecs group height-known lookups so each body loads once.
-/// Missing, corrupt, and unreadable bodies stay distinct ([`LookupError`])
-/// because the codec degrades them differently.
+/// BIP337 resolver run under `ChainHandles::with_stable_chainstate` with one
+/// block-render permit. Tip, coins, index heights, and bodies must share the
+/// captured chainstate; tip movement cancels rather than mixing branches.
+/// Retain materialized transactions/output prefixes per height, charge them to
+/// body and combined budgets, and evict with the body. Drop each parsed view
+/// before the next read. Cumulative load/byte limits bound work under exclusion;
+/// missing, corrupt, and unreadable bodies keep distinct `LookupError` results.
 pub(crate) struct RpcPrevoutResolver<'ctx> {
     ctx: &'ctx Context,
     view: AppliedView,
@@ -1379,7 +1356,6 @@ impl ChainHandles {
     /// Typed synchronization progress: the `getblockchaininfo` facts without
     /// RPC JSON. Chainwork is the applied tip's when one exists.
     ///
-    /// PRE: none.
     /// POST: progress projected from one applied publication captured here.
     /// INVARIANT: neither capture nor projection acquires `chain_transition`,
     ///   so a block transition in progress cannot stall this response.
@@ -1389,14 +1365,9 @@ impl ChainHandles {
         self.sync_progress_at(&applied)
     }
 
-    /// Synchronization progress projected from a retained applied publication.
-    ///
-    /// PRE: `applied` is the view this response is built from.
-    /// POST: the chain facts are Chainstate's [`bitcoin_rs_chain::ChainProgress`]
-    ///   at that view; this adds Core's difficulty rendering and the storage
-    ///   facts. The header height is sampled separately, so best-header may
-    ///   lead applied.
-    /// INVARIANT: the projection never reloads the applied publication.
+    /// Projects Chainstate progress from this response's retained `AppliedView`,
+    /// adding difficulty and storage facts without reloading applied state.
+    /// Header height is sampled separately and may lead applied height.
     #[must_use]
     pub(crate) fn sync_progress_at(&self, applied: &AppliedView) -> SyncProgress {
         let chain = self
@@ -1520,14 +1491,8 @@ impl ChainHandles {
         self.block_hash_at_height_in_view(&self.applied_view(), height)
     }
 
-    /// Returns the applied-chain hash at `height` within a retained view.
-    ///
-    /// PRE: `view` is the response's retained applied publication.
-    /// POST: that branch's hash at `height`; with no applied tip yet, the
-    ///   genesis hash at height 0 or the block-log record's hash, which is the
-    ///   cache-only fallback such contexts use.
-    /// INVARIANT: reads the tree and the log as necessary but never reloads
-    ///   `applied_tip`, so one response cannot straddle two applied branches.
+    /// Reads this retained branch's hash without reloading applied state.
+    /// With no applied tip, height zero uses genesis and other heights use the log.
     #[must_use]
     pub(crate) fn block_hash_at_height_in_view(
         &self,
@@ -1592,13 +1557,8 @@ impl ChainHandles {
         self.block_by_height_in_view(&self.applied_view(), height)
     }
 
-    /// Returns the applied block at `height` within a retained view.
-    ///
-    /// PRE: `view` is the response's retained applied publication.
-    /// POST: that branch's record at `height`; with no applied tip yet, the
-    ///   block-log record, which is the cache-only fallback such contexts use.
-    /// INVARIANT: reads the log as necessary but never reloads `applied_tip`,
-    ///   so one response cannot straddle two applied branches.
+    /// Reads this retained branch's record without reloading applied state;
+    /// with no applied tip, falls back to the block log.
     #[must_use]
     pub(crate) fn block_by_height_in_view(
         &self,
@@ -1670,30 +1630,17 @@ impl ChainHandles {
     }
 }
 
-/// One retained applied-tip publication.
-///
-/// A response that reports several applied facts builds them from a single
-/// value of this type, so height, hash, work, and count cannot come from
-/// different blocks.
-///
-/// PRE: the publisher stores complete immutable [`TipSnapshot`] values.
-/// POST: the view retains the result of exactly one `applied_tip` load; no
-///   transition exclusion, tree lock, UTXO lock, count-register read, or retry
-///   loop occurs in capture.
-/// INVARIANT: the facts projected from this view describe the same
-///   publication even if the publisher advances afterward.
+/// One immutable applied publication shared by every fact in a response.
+/// Capture is exactly one tip load: no transition/tree/UTXO lock, separate
+/// count register, or retry. Height, hash, work, and count stay coherent even
+/// after the publisher advances.
 pub(crate) struct AppliedView {
     tip: Option<Arc<TipSnapshot>>,
 }
 
 impl ChainHandles {
-    /// Captures the applied publication the response is built from.
-    ///
-    /// PRE: none; this reads the published tip cell.
-    /// POST: a view holding exactly one `applied_tip` load result, empty
-    ///   before the first publication.
-    /// INVARIANT: capture never acquires `chain_transition`, so a response
-    ///   that reports only applied facts does not wait on a block transition.
+    /// Captures one immutable applied publication, empty before the first tip.
+    /// See `AppliedView` for the nonblocking capture guarantee.
     #[must_use]
     pub(crate) fn applied_view(&self) -> AppliedView {
         AppliedView {
@@ -1701,13 +1648,8 @@ impl ChainHandles {
         }
     }
 
-    /// Returns the applied-chain hash at `height` within a retained view.
-    ///
-    /// PRE: `view` is the response's retained applied publication.
-    /// POST: that tip's ancestor hash at `height`, or `None` for no tip, a
-    ///   height above the tip, or missing ancestry.
-    /// INVARIANT: reads the block tree as necessary but never reloads
-    ///   `applied_tip`, so the answer cannot describe a newer branch.
+    /// Reads an ancestor of the retained tip without reloading the publisher.
+    /// Returns None for no tip, a height above it, or missing ancestry.
     #[must_use]
     pub(crate) fn active_hash_in_view(&self, view: &AppliedView, height: u32) -> Option<Hash256> {
         let tip = view.tip()?;
@@ -1716,32 +1658,19 @@ impl ChainHandles {
 }
 
 impl AppliedView {
-    /// The captured snapshot, or `None` before the first publication.
-    ///
-    /// PRE: use a captured view.
-    /// POST: the retained snapshot.
-    /// INVARIANT: does not reload a publisher.
+    /// The retained snapshot, or None before the first publication.
     #[must_use]
     pub(crate) fn tip(&self) -> Option<&TipSnapshot> {
         self.tip.as_deref()
     }
 
-    /// The applied height, `0` with no tip.
-    ///
-    /// PRE: use a captured view.
-    /// POST: the captured tip's height, or the empty-tip default `0`.
-    /// INVARIANT: does not reload a publisher.
+    /// The retained applied height, or zero with no tip.
     #[must_use]
     pub(crate) fn height(&self) -> u32 {
         self.tip.as_ref().map_or(0, |tip| tip.height)
     }
 
-    /// The applied block hash, genesis with no tip.
-    ///
-    /// PRE: use a captured view and the network the response describes.
-    /// POST: the captured tip's hash, or that network's genesis hash when the
-    ///   view is empty.
-    /// INVARIANT: does not reload a publisher.
+    /// The retained applied hash, or the supplied network's genesis with no tip.
     #[must_use]
     pub(crate) fn hash(&self, network: Network) -> Hash256 {
         self.tip
@@ -1749,13 +1678,7 @@ impl AppliedView {
             .map_or_else(|| network.genesis_block_hash(), |tip| tip.hash)
     }
 
-    /// The applied-chain transaction count, `None` when unknown.
-    ///
-    /// PRE: use a captured view.
-    /// POST: the captured tip's count, or `None` for an empty view or a tip
-    ///   whose count is not yet known. A present tip with an unknown count is
-    ///   not guessed as zero.
-    /// INVARIANT: does not reload a publisher or read a count register.
+    /// The retained transaction count; absent or unknown stays None, never guessed zero.
     #[must_use]
     pub(crate) fn chain_tx_count(&self) -> Option<u64> {
         self.tip.as_ref().and_then(|tip| tip.chain_tx_count.get())

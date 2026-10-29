@@ -6,7 +6,7 @@
 pub use bitcoin_rs_script::MAX_SCRIPT_SIZE;
 /// Maximum distance a BIP94 candidate timestamp may fall below its parent
 /// block's timestamp at a difficulty-adjustment boundary (`MAX_TIMEWARP`, Core
-/// `src/consensus/consensus.h:30-37`).
+/// `src/consensus/consensus.h`).
 pub const MAX_TIMEWARP: u32 = 600;
 
 /// BIP30 duplicate-transaction checks.

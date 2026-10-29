@@ -40,7 +40,7 @@ pub struct BufferedWriteBatch {
 impl BufferedWriteBatch {
     /// Inserts or replaces `key` with `value` in `cf`.
     ///
-    /// PRE: none. POST: the batch records one `BatchOp::Put` after its
+    /// the batch records one `BatchOp::Put` after its
     /// recorded operations. INVARIANT: append order equals commit order.
     pub fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
         self.put_value(cf, key, Bytes::copy_from_slice(value));
@@ -48,7 +48,7 @@ impl BufferedWriteBatch {
 
     /// Inserts or replaces `key` with an owned `value` in `cf`.
     ///
-    /// PRE: none. POST: the batch records one `BatchOp::Put` after its
+    /// the batch records one `BatchOp::Put` after its
     /// recorded operations. INVARIANT: append order equals commit order.
     pub fn put_value(&mut self, cf: ColumnFamily, key: &[u8], value: Bytes) {
         self.encoded_bytes = self.encoded_bytes.saturating_add(key.len() + value.len());
@@ -61,7 +61,7 @@ impl BufferedWriteBatch {
 
     /// Deletes `key` from `cf`.
     ///
-    /// PRE: none. POST: the batch records one `BatchOp::Delete` after its
+    /// the batch records one `BatchOp::Delete` after its
     /// recorded operations. INVARIANT: append order equals commit order.
     pub fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
         self.encoded_bytes = self.encoded_bytes.saturating_add(key.len());
@@ -73,7 +73,7 @@ impl BufferedWriteBatch {
 
     /// Deletes keys in `[start, end)` from `cf`.
     ///
-    /// PRE: none. POST: the batch records one `BatchOp::DeleteRange` after
+    /// the batch records one `BatchOp::DeleteRange` after
     /// its recorded operations. INVARIANT: append order equals commit order.
     pub fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
         self.encoded_bytes = self
@@ -89,7 +89,7 @@ impl BufferedWriteBatch {
 
     /// Consumes the batch and returns its recorded operations.
     ///
-    /// PRE: none. POST: returns every recorded [`BatchOp`] in the order the
+    /// returns every recorded [`BatchOp`] in the order the
     /// backend applies it. INVARIANT: consuming it leaves no batch from
     /// which those operations can be read again.
     #[must_use]

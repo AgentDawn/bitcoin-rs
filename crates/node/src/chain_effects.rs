@@ -206,24 +206,12 @@ impl ChainFollowers {
         Ok(())
     }
 
-    /// Dispatches a committed connect: RPC log, ZMQ, index wake, sequence `C`,
-    /// mining wake, and orphan re-evaluation, in that order.
-    ///
-    /// PRE: `outcome` is committed and the mempool fence, when present, is
-    /// held.
-    ///
-    /// POST: block-log record, hash/raw ZMQ, derived-index wake plus sequence
-    /// `C`, mining wake, and mempool orphan re-evaluation run once in that
-    /// order. The block-inclusion removals are committed before sequence
-    /// `C`; a `sequence` subscriber sees no `R` event for them, because the
-    /// block event already covers the departures. The committed removal
-    /// receipt travels with the mining wake so a staged preparation can
-    /// install against exactly these removals.
-    ///
-    /// INVARIANT: consumer failure cannot invalidate chainstate.
+    /// Dispatches committed connect effects under the held mempool fence:
+    /// RPC log, hash/raw ZMQ, index wake plus sequence `C`, mining wake, then orphan
+    /// re-evaluation. Block removals commit before `C` and emit no separate `R`;
+    /// the mining wake carries their receipt for staged preparation installation.
+    /// Consumer failure cannot invalidate chainstate.
     pub(crate) fn on_connect(&self, block: &Block, outcome: &ConnectOutcome) {
-        // Step-21 block-to-template baseline: debug-only on-connect span, same
-        // mechanism as the chainstate publish profile; no behavior change.
         let on_connect_started = quanta::Instant::now();
         // A follower set without an admission gate removed nothing, so its
         // receipt is truthfully empty: every committed connect publishes one,

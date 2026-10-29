@@ -224,7 +224,7 @@ pub trait KvStore: Send + Sync + 'static {
 
     /// Returns an empty buffered batch for this or any other store.
     ///
-    /// PRE: none. POST: the batch records operations but touches no engine
+    /// the batch records operations but touches no engine
     /// state until one write method consumes it.
     fn new_batch(&self) -> BufferedWriteBatch;
 

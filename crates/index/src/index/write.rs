@@ -93,29 +93,16 @@ impl<S: KvStore> IndexWriter<S> {
         resume_capability_reset(store, generation, IndexCapabilities::ALL.to_mask())
     }
 
-    /// Seeds the live view from a producer of compact locators.
+    /// Seeds every live `(outpoint, scripthash)` at `seed_tip` through fenced writes
+    /// (IDX-07 in `docs/contracts/indexing.md`). Reset state, ordinary revision, and
+    /// all capability watermarks must match each batch and the final watermark.
+    /// A lost fence returns `StaleIndexState`/`ResetInProgress`; storage errors propagate.
     ///
-    /// `produce` emits every live `(outpoint, scripthash)` at `seed_tip`.
-    /// Each bounded batch, and the watermark stamp, is an ordinary fenced
-    /// write: reset state, ordinary revision, and every capability watermark
-    /// must still match the capture. A lost fence is [`IndexError::StaleIndexState`]
-    /// or [`IndexError::ResetInProgress`]; a storage failure is
-    /// [`IndexError::Storage`]. The caller resets this capability before
-    /// retrying. See `IDX-07` in `docs/contracts/indexing.md`.
-    ///
-    /// The live watermark is written only with the last batch, so an
-    /// interrupted seed stays unqueryable. Refuses to run over an existing
-    /// live watermark ([`IndexError::LiveAlreadySeeded`]).
-    ///
-    /// A missing live watermark with leftover rows is treated as an
-    /// interrupted seed: `ScriptLive` is reset before any new row is
-    /// written so a later watermark cannot advertise a stale view.
-    ///
-    /// `cancelled` is polled at entry, every 4,096 emitted rows, and before
-    /// the final watermark commit; a trip returns
-    /// [`IndexError::Cancelled`] with no watermark stamped. A cancelled
-    /// prefix is cleared by the retry's opening reset, and the caller keeps
-    /// its artifact and lease for that retry.
+    /// Refuses an existing watermark (`LiveAlreadySeeded`). Un-watermarked leftovers
+    /// are reset first; only the last batch publishes the watermark, so interrupted
+    /// prefixes remain unqueryable. Polls cancellation at entry, every 4,096 rows,
+    /// and before publication. A cancelled caller retains its artifact and lease
+    /// for retry, whose opening reset clears the prefix.
     pub(crate) fn seed_script_live_stream<F>(
         &self,
         mut produce: F,
@@ -248,24 +235,13 @@ impl<S: KvStore> IndexWriter<S> {
         )
     }
 
-    /// Imports verified `TxLookup` rows and block identities for a portable
-    /// bundle restore.
+    /// Imports verified `TxLookup` rows through the ordinary reset/revision/watermark
+    /// fence. A lost fence returns `StaleIndexState` or `ResetInProgress`.
+    /// The final commit stamps the watermark and coverage floor only after `produce`
+    /// returns; earlier failures leave partial rows unqueryable.
     ///
-    /// `produce` emits every row of the bundle. Each bounded batch is an
-    /// ordinary fenced write: reset state, ordinary revision, and every
-    /// capability watermark must still match the capture, so a lost fence is
-    /// [`IndexError::StaleIndexState`] or [`IndexError::ResetInProgress`]. The
-    /// `TxLookup` watermark and coverage floor are written only in the final
-    /// commit, after `produce` has returned, so an error, crash, or aborted
-    /// source leaves the capability un-watermarked (and therefore
-    /// `Unavailable`) with partial rows the caller resets.
-    ///
-    /// An existing `TxLookup` watermark is never reset or overwritten:
-    /// the import refuses with [`IndexError::WatermarkMismatch`] naming it.
-    /// Leftover rows without a watermark are an interrupted earlier attempt
-    /// and are cleared through the capability reset before any row is written.
-    ///
-    /// Returns the number of `TxLookup` rows written.
+    /// An existing watermark is refused with `WatermarkMismatch`. Un-watermarked
+    /// leftovers are reset before writing. Returns the number of rows imported.
     pub(crate) fn import_tx_lookup_stream<F>(
         &self,
         mut produce: F,
@@ -375,24 +351,13 @@ impl<S: KvStore> IndexWriter<S> {
         )
     }
 
-    /// Stamps `watermark` on the selected capabilities without deriving rows.
+    /// Anchors history-derived capabilities before the first surviving body height.
+    /// `floor` must be `anchor.height + 1`; queries below it cannot prove absence.
+    /// The next prepared block must be the anchor's child. Ordinary reset/revision
+    /// fences still apply (`ResetInProgress`/`StaleIndexState`).
     ///
-    /// A rebuild from a pruned prefix needs the durable cursor to start at
-    /// the first surviving height, not at genesis: the pruning authority has
-    /// already deleted the bodies below it, so no commit can ever produce
-    /// them. The anchor names the chain identity at that boundary — the
-    /// block tree keeps headers for pruned heights, so the identity is
-    /// always available — and the next prepared block must be its child.
-    ///
-    /// The write is fenced like every ordinary commit, so a reset in flight
-    /// or a moved revision reports `ResetInProgress`/`StaleIndexState`.
-    ///
-    /// `floor` is the first covered height (`anchor.height + 1`): queries that
-    /// cannot prove absence below it answer `Unavailable` rather than `None`.
-    ///
-    /// `capabilities` must name only history-derived indexes: `ScriptLive`
-    /// reseeds from an immutable artifact or retained history, so anchoring it would
-    /// publish a live watermark with no rows behind it.
+    /// Never anchor `ScriptLive`: it needs rows reseeded from an immutable artifact
+    /// or retained history before its watermark can be published.
     pub(crate) fn anchor_watermark(
         &self,
         capabilities: IndexCapabilities,

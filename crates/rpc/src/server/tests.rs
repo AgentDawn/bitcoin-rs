@@ -680,8 +680,8 @@ fn unsupported_method_is_404_at_listener() -> std::io::Result<()> {
 }
 
 // CONTRACT: docs/contracts/external-api.md#API-02 — the envelope rules
-// follow the pinned Core 31.1 parser (`src/rpc/request.cpp:206-260`) and
-// its legacy HTTP mapping (`src/httprpc.cpp:41-56`).
+// follow the pinned Core 31.1 parser (`src/rpc/request.cpp`) and
+// its legacy HTTP mapping (`src/httprpc.cpp`).
 #[test]
 fn non_string_jsonrpc_version_is_an_invalid_request() {
     let handler = Handler::new(Arc::new(Context::new()));
@@ -747,7 +747,7 @@ fn unsupported_jsonrpc_version_is_an_invalid_request() {
 #[test]
 fn json_rpc_1_0_remains_accepted_as_legacy() {
     // Core keeps the historical `{"jsonrpc":"1.0"}` form as legacy
-    // (`request.cpp:216-224`); it must not become an invalid request.
+    // (`request.cpp`); it must not become an invalid request.
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(
         &handler,
@@ -926,7 +926,7 @@ fn json_rpc_2_method_and_params_envelope_errors_answer_400() {
 #[test]
 fn an_all_notification_batch_answers_204() {
     // A non-empty batch whose members are all valid v2 notifications has
-    // no reply rows, so Core answers HTTP 204 (`httprpc.cpp:219-227`).
+    // no reply rows, so Core answers HTTP 204 (`httprpc.cpp`).
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(
         &handler,
@@ -943,7 +943,7 @@ fn an_all_notification_batch_answers_204() {
 #[test]
 fn legacy_invalid_request_maps_to_http_400() {
     // A legacy request whose method is not a string is a -32600, which
-    // Core answers with HTTP 400 (`httprpc.cpp:47-53`).
+    // Core answers with HTTP 400 (`httprpc.cpp`).
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(&handler, br#"{"id":1,"method":7,"params":[]}"#);
     assert_eq!(response.status, 400, "legacy -32600 maps to HTTP 400");
@@ -952,7 +952,7 @@ fn legacy_invalid_request_maps_to_http_400() {
 #[test]
 fn legacy_method_not_found_maps_to_http_404() {
     // Core maps RPC_METHOD_NOT_FOUND to HTTP 404 for legacy requests
-    // (`httprpc.cpp:51-53`); this previously answered 500.
+    // (`httprpc.cpp`); this previously answered 500.
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(&handler, br#"{"id":1,"method":"missing","params":[]}"#);
     assert_eq!(response.status, 404, "legacy -32601 maps to HTTP 404");
@@ -969,7 +969,7 @@ fn legacy_other_errors_keep_http_500() {
 #[test]
 fn json_rpc_2_dispatch_errors_still_answer_http_200() {
     // Core keeps *dispatch* errors inside HTTP 200 for a v2 request
-    // (`httprpc.cpp:118-124`); only envelope failures, which happen
+    // (`httprpc.cpp`); only envelope failures, which happen
     // before the version is trusted, take the legacy HTTP status.
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(
@@ -992,7 +992,7 @@ fn json_rpc_2_dispatch_errors_still_answer_http_200() {
 fn json_rpc_2_envelope_error_uses_the_legacy_status() {
     // A malformed envelope is refused while classifying `jsonrpc`, before
     // the claimed version is trusted, so it takes the legacy HTTP mapping
-    // and envelope shape (`request.cpp:206-224`, `httprpc.cpp:41-56`).
+    // and envelope shape (`request.cpp`, `httprpc.cpp`).
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(
         &handler,
@@ -1007,9 +1007,9 @@ fn json_rpc_2_envelope_error_uses_the_legacy_status() {
 #[test]
 fn json_rpc_2_post_classification_error_keeps_the_v2_envelope() {
     // Core's parser assigns the version before checking method/params
-    // (`request.cpp:211-231`), so a v2 request rejected later still
+    // (`request.cpp`), so a v2 request rejected later still
     // replies in the v2 envelope — but the outer error path answers
-    // HTTP 400, not the dialect's 200 (`httprpc.cpp:189-194`).
+    // HTTP 400, not the dialect's 200 (`httprpc.cpp`).
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(
         &handler,
@@ -1035,7 +1035,7 @@ fn json_rpc_2_post_classification_error_keeps_the_v2_envelope() {
 #[test]
 fn an_explicit_null_method_is_missing() {
     // Core checks `valMethod.isNull()` before its string check
-    // (`request.cpp:226-229`), so `"method":null` is "Missing method",
+    // (`request.cpp`), so `"method":null` is "Missing method",
     // not "Method must be a string".
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(
@@ -1056,7 +1056,7 @@ fn an_explicit_null_method_is_missing() {
 #[test]
 fn absent_and_null_params_dispatch_as_an_empty_array() {
     // Core canonicalizes absent and explicit-null params to `[]` before
-    // dispatch (`request.cpp:243-248`), so no-argument methods apply
+    // dispatch (`request.cpp`), so no-argument methods apply
     // their defaults instead of failing on the null.
     let handler = Handler::new(Arc::new(Context::new()));
     for request in [
@@ -1076,7 +1076,7 @@ fn absent_and_null_params_dispatch_as_an_empty_array() {
 #[test]
 fn batch_members_keep_per_member_envelope_dialect() {
     // Batch members are parsed independently by Core
-    // (`httprpc.cpp:200-215`), so a v2 member and a legacy member in one
+    // (`httprpc.cpp`), so a v2 member and a legacy member in one
     // batch keep their own envelopes even when a sibling is malformed.
     let handler = Handler::new(Arc::new(Context::new()));
     let response = handle_json(

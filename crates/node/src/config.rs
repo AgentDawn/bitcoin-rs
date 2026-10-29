@@ -724,7 +724,7 @@ impl NodeConfig {
 
     /// Validates chainstate journal retention bounds.
     ///
-    /// PRE: none; this reads only resolved fields and opens no path.
+    /// Reads only resolved fields and opens no path.
     /// POST: journal retention counters are internally consistent and positive
     /// where rotation depends on them.
     fn validate_chainstate_journal(&self) -> Result<()> {
@@ -848,7 +848,7 @@ impl NodeConfig {
 
     /// Validates the portable index bundle request.
     ///
-    /// PRE: none; this reads only resolved fields and opens no path.
+    /// Reads only resolved fields and opens no path.
     /// POST: at most one nonempty bundle directory is set, and it is set only
     /// when the transaction index it moves is enabled.
     /// INVARIANT: the bundle is an explicit one-shot operator request, so a

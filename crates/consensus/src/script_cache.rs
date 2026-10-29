@@ -1,27 +1,13 @@
-//! Bounded script-execution cache for natively verified transactions.
+//! Bounded script-execution cache keyed by wtxid and exact script flags.
+//! Mempool admission fills it; block connect consumes it (Core's
+//! `CheckInputsFromMempoolAndCache` and `ConnectBlock` in `validation.cpp`).
 //!
-//! The mempool fills this cache after admitting a transaction under the next
-//! block's script flags, and block connect consults it before building a
-//! transaction's script checks: a hit skips re-execution of scripts the
-//! admission path already verified. This mirrors Core's script-execution
-//! cache (filling in `CheckInputsFromMempoolAndCache`, consulting in
-//! `ConnectBlock`, `validation.cpp`), keyed by witness transaction id and
-//! the exact flag bits.
+//! An outpoint's script and value are immutable, so a reorg changes spendability,
+//! not script inputs. Finality, amounts, BIP68, and sigop limits always re-run;
+//! a flag mismatch is a cache miss.
 //!
-//! Soundness rests on two properties. First, script execution is a pure
-//! function of the transaction, its prevouts, and the flags: an outpoint's
-//! script and value are immutable once created, so a reorg can change which
-//! outpoints are spendable but never what they contain; finality, amounts,
-//! BIP68 locks, and sigop limits are NOT cached and always re-run. Second,
-//! the key carries the exact flag bits, so any flag divergence between fill
-//! and connect is a miss, never an unsound skip.
-//!
-//! Memory bound: at most [`SCRIPT_EXECUTION_CACHE_ENTRIES`] live keys in the
-//! map, and the FIFO queue never exceeds twice that (a compaction retains
-//! only live entries whenever the queue reaches the bound). Taken keys leave
-//! one stale queue node each; the stale nodes are skipped during eviction and
-//! reclaimed by compaction, so repeated insert/take/reinsert cycles cannot
-//! grow either structure without bound.
+//! The map holds at most `SCRIPT_EXECUTION_CACHE_ENTRIES` keys. Compaction at
+//! twice that queue length removes stale nodes left by take/reinsert cycles.
 
 use std::collections::{HashMap, VecDeque};
 

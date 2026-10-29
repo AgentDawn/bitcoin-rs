@@ -1,23 +1,7 @@
-//! Outbound block announcement owner: headers-first, high-bandwidth compact block,
-//! and `inv` fallback.
-//!
-//! # Architecture
-//!
-//! [`BlockAnnounceQueue`] is the non-blocking producer: a one-slot wake channel
-//! that coalesces notifications under backpressure. Chainstate remains the
-//! authoritative owner of the committed tip.
-//!
-//! [`BlockAnnouncer`] is the P2P-owned decision engine:
-//! - Tracks peer known-header/block state.
-//! - Tracks peer `sendheaders` preference (BIP130).
-//! - Maintains a bounded set of up to 3 peers promoted to BIP152 high-bandwidth mode.
-//! - Selects the best announcement mechanism for each peer:
-//!   1. BIP152 high-bandwidth compact block (`cmpctblock`) if selected, previous block is known, and not blocksonly.
-//!   2. BIP130 `headers` sequence (up to 8 headers) if `sendheaders` was negotiated and anchored to active chain.
-//!   3. Compatibility fallback `inv` (`MSG_BLOCK`) announcing the current active tip.
-//! - Discards stale announcements across reorgs.
-//! - Coalesces wakeups under queue saturation and rereads the committed tip from chainstate.
-//! - Disconnect cleanly removes peer announcement state.
+//! Outbound header, compact-block, and inventory announcements.
+//! `BlockAnnounceQueue` coalesces wakes; `BlockAnnouncer` rereads the committed
+//! tip and peer preferences so reorgs cannot publish stale work. Selection
+//! bounds and announcement priority live in the enforcing methods below.
 
 #[cfg(test)]
 use std::net::SocketAddr;
@@ -42,10 +26,10 @@ use crate::peer::COMPACT_BLOCK_VERSION;
 use crate::peer_info::PeerInfo;
 use crate::wire::Message;
 
-/// Core's `MAX_BLOCKS_TO_ANNOUNCE` (`net_processing.cpp:111`).
+/// Core's `MAX_BLOCKS_TO_ANNOUNCE` (`net_processing.cpp`).
 pub const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
 
-/// Core's `MAX_PEERS_FOR_HIGH_BANDWIDTH_CMPCT` (`net_processing.cpp:142`).
+/// Core's `MAX_PEERS_FOR_HIGH_BANDWIDTH_CMPCT` (`net_processing.cpp`).
 pub const MAX_HIGH_BANDWIDTH_PEERS: usize = 3;
 
 /// Drain poll interval when the block announce queue is empty.
@@ -764,7 +748,6 @@ impl BlockAnnouncer {
     /// Replans the committed tip after aggregate-budget refusal, all sends
     /// failing, or processing with no ready peers.
     ///
-    /// PRE: none.
     /// POST: with a retry pending, the pending flag clears and the tip is
     /// processed again as if it had not been seen. Continued refusal or no
     /// ready peers rearms the retry. Peers that already know it are skipped
@@ -790,7 +773,6 @@ impl BlockAnnouncer {
     /// Synchronously drains the queue, coalesces to the latest tip, and processes it.
     /// Relays recent stale tips to ready peers that negotiated BIP332.
     ///
-    /// PRE: none.
     /// POST: sends at most [`crate::staletip::MAX_ADVERTISED_STALETIPS`] stale-tip announcements
     ///   per peer, respecting peer `prefers_blocks`, rate bounds, and repeat/echo
     ///   suppression. Sent tips are marked known via [`crate::sync::StaleTipRetainer::mark_known`]

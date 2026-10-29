@@ -23,23 +23,11 @@ pub fn block_undo_key(height: u32, hash: Hash256) -> [u8; KEY_LEN] {
     key
 }
 
-/// Storage for per-block UTXO undo records.
-///
-/// Records survive an orderly restart. They are not crash-safe: see
-/// [`KvUndoStore::persist_undo`] for why no fsync sits here.
-///
-/// Undo records are consensus state, not an optional index: without the record
-/// for a block the node cannot disconnect it, so it can advance `applied_tip`
-/// into a chain it is unable to leave. The handle is therefore mandatory rather
-/// than `Option`, and every construction path must supply a real
-/// implementation. [`InMemoryUndoStore`] is a real one — it round-trips — and
-/// is the correct choice for tests that need no durability. A no-op
-/// implementation would recreate exactly the silent failure this type exists to
-/// prevent, so do not add one.
-///
-/// Records are keyed by height AND block hash. Keying by height alone would let
-/// a stale record from an abandoned branch be replayed against a different
-/// block at the same height.
+/// Required per-block undo storage, keyed by height and block hash so a stale
+/// branch's record cannot undo a different block. Missing undo strands an
+/// applied chain; implementations must round-trip, never silently discard.
+/// `InMemoryUndoStore` serves nondurable callers. See `KvUndoStore::persist_undo`
+/// for the deferred-write/durable-head boundary.
 pub trait UndoStore: Send + Sync {
     /// Writes the undo record for one block.
     fn persist_undo(&self, height: u32, hash: Hash256, record: &[u8]) -> Result<(), StorageError>;
@@ -288,21 +276,10 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
         )
     }
 
-    /// Deferred, matching the rest of the apply path.
-    ///
-    /// `put` is what this used to call, and on redb `put` commits an
-    /// immediately durable transaction, so every connected block paid an fsync
-    /// on that backend — the same per-block durability cost the deferred
-    /// block-body write path exists to avoid. `write_deferred` leaves the row
-    /// visible to later reads in this process and lets the checkpoint flush
-    /// make it durable, which is what `disconnect_block` needs and all it needs.
-    ///
-    /// Deferred is correct because the durable-head commit is the receipt
-    /// that makes this row authoritative: the apply path flushes it together
-    /// with the head row in one atomic batch (`RCV-02`), and the head's
-    /// `undo_extent` names it only from that receipt on. Writing it earlier
-    /// keeps it readable for planning; it is an orphan tail, safely
-    /// discarded, until the head names it.
+    /// Makes undo readable for planning through a deferred write. RCV-02's
+    /// atomic durable-head commit makes the row authoritative and names it in
+    /// `undo_extent`; before that receipt it is a discardable orphan tail.
+    /// Durability belongs to that commit, not a per-block fsync here.
     fn persist_undo(&self, height: u32, hash: Hash256, record: &[u8]) -> Result<(), StorageError> {
         let mut batch = self.store.new_batch();
         batch.put(

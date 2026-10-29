@@ -1,28 +1,12 @@
-//! Running UTXO-set statistics over the live set.
+//! Derived statistics over the live set owned by `crate::set`.
+//! `MuHash3072` owns the Core-compatible accumulator; `CoinStats` owns scalar
+//! folds and its byte codec. `CoinStatsListener` applies committed events and
+//! explicit disconnect rewinds; `CoinStatsAccumulator` serves checkpoints with
+//! ordered parallel MuHash partials or hashing disabled. `scan_coin_stats`
+//! recomputes from a stable view. See "Owed derived state" in `CONCEPTS.md`.
 //!
-//! This is derived computation over the authoritative UTXO state that
-//! [`crate::set`] owns. It reads the live set and folds it; it never decides
-//! what the live set contains. The rewind accounts for
-//! [`owed derived state`](../../../CONCEPTS.md#owed-derived-state) when a block
-//! disconnects.
-//!
-//! [`stats::MuHash3072`] is Bitcoin Core's 3072-bit `MuHash` as a running
-//! numerator/denominator (`insert`, `remove`, `combine`, `finalize_hash`
-//! yielding the Core-compatible `uint256`). [`stats::CoinStats`] folds the live set --
-//! `insert_utxo` and `remove_utxo` feed the accumulator and the scalar tallies
-//! -- and serializes to a stable byte layout (`to_bytes`/`from_bytes`).
-//! [`stats::CoinStatsListener`] keeps stats behind a lock, applies the block-level
-//! delta in `finish_block`, and exposes `rewind_block` as the explicit inverse
-//! for disconnects. [`stats::CoinStatsAccumulator`] serves checkpoint traversals:
-//! `with_parallel_muhash` buffers exact coin preimages and combines ordered
-//! insert-only partial `MuHash` values, while `without_muhash` skips hashing
-//! entirely. [`stats::scan_coin_stats`] recomputes stats on demand from a
-//! [`crate::UtxoSetView`] (Core's on-demand model, no rolling listener
-//! required).
-//!
-//! The checkpoint manifest records this component under the current codec
-//! identifier `"bitcoin-rs-coinstats-v1"`. It is an on-disk value and changes
-//! to it require a datadir schema epoch bump.
+//! The durable codec id `bitcoin-rs-coinstats-v1` requires a datadir schema epoch
+//! bump if changed.
 
 /// Running UTXO statistics.
 pub mod coin_stats;

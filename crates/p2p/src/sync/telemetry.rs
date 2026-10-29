@@ -50,7 +50,6 @@ impl BlockSync {
 
     /// The initial-block-download fact reported by sync progress.
     ///
-    /// PRE: none.
     /// POST: answers with the node's shared chain-owned
     ///   [`bitcoin_rs_chain::InitialBlockDownload`] latch at the current
     ///   second — the same answer RPC and the listener see.

@@ -135,24 +135,12 @@ fn not_found_block_hash(item: &Inventory) -> Option<Hash256> {
     }
 }
 
-/// Releases the body fetch `source` owns for `hash`, if it owns one, and
-/// remembers that `source` cannot serve it.
-///
-/// PRE: the caller holds the scheduler lock inside the peer table's
-///   `with_current(source)` authority, so `source` is the live connection.
-/// POST: `true` when `source` owned a window request for `hash` (released
-///   through the owner-only delivery rejection, which also ends a timeout
-///   observation or cold-front episode naming it and lowers the request
-///   cursor) or a deferred owned-fetch mark for it (dropped); `false` and no
-///   release otherwise. A `notfound` from a connection that owns nothing for
-///   a tracked (pending) hash — a prefix-probe racer or cold-front hedge
-///   alternate answering for the owner's prefix — is still remembered, so
-///   the probe and request paths stop offering it that hash, but the
-///   owner's request is left untouched.
-/// INVARIANT: only the exact owning connection releases. A different
-///   connection's `notfound` never releases the owner; one for a hash
-///   nobody tracks changes nothing at all. Nothing here blames or
-///   disconnects the owner.
+/// Releases only `source`'s matching request, under scheduler lock inside
+/// `PeerTable::with_current(source)`. Ordinary window release also clears its
+/// timeout/cold-front observation and rewinds the cursor; a deferred mark drops.
+/// Remember a tracked probe/hedge alternate's refusal without releasing the
+/// owner. An untracked hash changes nothing. Return whether ownership released;
+/// this path never blames or disconnects a peer.
 fn release_unavailable_body(
     scheduler: &mut SchedulerState,
     source: PeerSource,
@@ -186,27 +174,12 @@ fn release_unavailable_body(
 }
 
 impl BlockSync {
-    /// Routes the block vectors of one inbound `notfound` to the body fetch
-    /// each answers.
-    ///
-    /// PRE: `source` is the connection that sent `items`.
-    /// POST: every block vector that `source` is the exact owner of (a
-    ///   foreground window request, a deferred owned fetch, or a historical
-    ///   window request) releases that request without blame, and the next
-    ///   tick replans it through the ordinary scheduler, which no longer
-    ///   offers it to `source` until [`BODY_UNAVAILABLE_RETRY`] passes — the
-    ///   one record in `SchedulerState::body_unavailable` serves all three
-    ///   paths. Returns whether anything was released, so the caller can
-    ///   wake the sync loop. A vector for a hash `source` was never asked
-    ///   for — not its request, and neither a probe nor a hedge offer — is
-    ///   ignored entirely: it neither releases nor is remembered, so a
-    ///   racing alternate or a replacement cannot poison the owner's or its
-    ///   own retry record.
-    /// INVARIANT: the peer table's `with_current` authority is held across
-    ///   the scheduler mutation, so a stale connection or a same-address
-    ///   replacement can neither release its predecessor's request nor be
-    ///   remembered for it. Vectors that are not block vectors, and block
-    ///   vectors nobody asked `source` for, are left to their own owners.
+    /// Routes block `notfound` vectors under exact-source peer authority.
+    /// Release this connection's foreground, deferred, or historical request without
+    /// blame and suppress its retry for `BODY_UNAVAILABLE_RETRY`. Return whether
+    /// anything released so the caller can wake sync. Ignore unasked vectors;
+    /// a stale source or same-address replacement cannot release or poison another
+    /// connection's request. Non-block vectors belong to their respective owners.
     pub(crate) fn block_not_found(&self, source: PeerSource, items: &[Inventory]) -> bool {
         if !items
             .iter()
@@ -405,7 +378,7 @@ impl BlockSync {
         // The service clause that gates tick-time selection applies here
         // too: header-drain fetches and stripe retries reach this function
         // without passing the selector, so the gate is enforced at the one
-        // path every body request takes (net_processing.cpp:6521-6525).
+        // path every body request takes (net_processing.cpp).
         let Some(info) = self.peer_table.info_of_source(source) else {
             return GetdataRequestOutcome::default();
         };

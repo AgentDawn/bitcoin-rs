@@ -300,22 +300,11 @@ pub(super) fn is_top_level_span(position: TxPosition, start: u32, len: u32) -> b
     position.offset() == start && position.byte_len() == len
 }
 
-/// Reads single transactions through the existing body source, with a small
-/// bounded LRU of parsed bodies keyed by block identity. The strict span rule
-/// needs the whole body, so each entry keeps the body together with its
-/// parsed top-level transaction spans: a block is read and parsed once per
-/// cache fill, and each lookup is a binary search plus one transaction
-/// decode.
-///
-/// Stored locator order is transaction-id order, so consecutive records
-/// usually name different heights and a one-body memo reloads and reparses a
-/// block per record. The window keeps recently used bodies resident across
-/// those interleaved lookups.
-///
-/// How many parsed block bodies are kept resident. The bound is on body
-/// count, not bytes: each body is at most `MAX_SERIALIZED_BLOCK_BYTES`
-/// (4 MiB), so eight bodies pin at most ~32 MiB transiently on the bundle
-/// worker.
+/// Parsed-body LRU bound for transaction-id-ordered locator reads.
+/// Interleaved heights need more than a one-body memo; each entry retains the
+/// body and top-level transaction spans for strict boundary validation.
+/// Each body is bounded by `MAX_SERIALIZED_BLOCK_BYTES`, so this count also
+/// bounds transient body memory.
 const BODY_CACHE_BLOCKS: usize = 8;
 
 pub(super) struct BodyReader<'a> {

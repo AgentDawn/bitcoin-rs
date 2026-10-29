@@ -1,21 +1,6 @@
-//! Read-only verification of the newest applied blocks.
-//!
-//! One owner serves the `verifychain` RPC and the startup check. The walk
-//! follows parent links from the applied tip, never mutates chain state, and
-//! holds a history lease for the whole walk so a concurrent prune pass cannot
-//! delete rows it is about to read. The lease is a bounded optional pin, not
-//! an atomic exclusion around IO: its liveness is re-checked at every
-//! progress boundary, and a withdrawn pin ends the walk as
-//! [`VerifyOutcome::SkippedNoBlockData`] even when the rows are still
-//! readable. A cancelled request ends as [`VerifyError::Interrupted`]; a
-//! chainstate closed for recovery is fail-closed as
-//! [`VerifyError::ClosedForRecovery`], including an empty or genesis-only
-//! chain. Data the node never kept or intentionally no longer keeps ends the
-//! walk as [`VerifyOutcome::SkippedNoBlockData`]; data that should exist and
-//! does not, or does not check out, is a typed [`VerifyError`]. The RPC level
-//! mapping stops at [`CheckLevel::CheckUndo`] with Core's context-free scope;
-//! startup selects [`CheckLevel::CheckUndoAndCommitments`], which additionally
-//! enforces header-body binding on data at rest.
+//! Read-only verification shared by startup and `verifychain`.
+//! `verify_recent_blocks` owns cancellation, retention, and failure semantics.
+//! RPC checks stop at `CheckUndo`; startup also verifies header-body commitments.
 
 use core::num::NonZeroU32;
 use std::sync::Arc;

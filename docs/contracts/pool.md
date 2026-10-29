@@ -6,16 +6,17 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, 
 
 ## Owners
 
-| Boundary | Authoritative owner | Responsibility |
+| Boundary | Authoritative owner | Responsibility and evidence boundary |
 | --- | --- | --- |
-| Operator options | `crates/node/src/options.rs`, `config.rs` | Feature/runtime gating, explicit configuration, and validation. |
-| Composition and shutdown | `crates/node/src/lifecycle.rs`, `pool.rs` | Ledger construction, RPC handle publication, listeners, reconciliation, and draining. |
-| Jobs and SV1 | `crates/mining/src/pool/job.rs`, `pool/core.rs`, `pool/stratum/sv1.rs` | MiningControl-backed jobs, share validation, bounded admission, and SV1 protocol handling. |
-| SV2 protocol | `crates/mining/src/pool/stratum/sv2.rs` | Noise responder, mining channels, job/share frames, and deferred acknowledgements. |
-| Node SV2 adapter | `crates/node/src/pool/sv2.rs`, `authority.rs` | Socket lifecycle, account mapping, found-block handling, and authority-file security. |
-| Accounting | `crates/mining/src/pool/ledger.rs`, `ledger/store.rs`, `ledger/kv.rs` | PPLNS work, round/batch transitions, balance conservation, audit records, and versioned payout codecs over `KvStore`. |
-| Applied-chain observations | `crates/node/src/pool/ledger.rs` | Hash-keyed canonicality, coinbase bodies, payout transaction/spend observations, and stable reconciliation. |
-| Management API | `crates/rpc/src/handlers/pool.rs` | Authenticated key-free accounting operations through the composed pool handle. |
+| Operator options | `crates/node/src/options.rs`, `config.rs::resolve_pool`, `PoolConfig::validate` | Explicit enablement and validation; not deployment approval. |
+| Composition and shutdown | `crates/node/src/lifecycle.rs`, `pool.rs::LedgerComposer`, `PoolService::prepare`, `PoolService::start`; `crates/mining/src/pool/ledger.rs::try_reserve_block_slot` | Ledger/RPC/listener ordering, persistence budgets, reconciliation, and draining; no operator-data cutover. |
+| Jobs, share records, and SV1 | `crates/mining/src/pool/job.rs`, `core.rs::PoolCore::submit`, `Completion`, `stratum/sv1/session.rs::on_submit`, `poll` | MiningControl-backed jobs, share validation, bounded admission, and deferred durable success. |
+| SV2 protocol | `crates/mining/src/pool/stratum/sv2.rs` | Noise responder, mining channels, job/share frames, and deferred acknowledgements; not external miner interoperability. |
+| Node SV2 adapter and key security | `crates/node/src/pool/sv2.rs::handle_events`, `authority.rs::load`, `open_private_file`; `crates/mining/src/pool/stratum/sv2.rs::AuthorityKeypair` | Socket lifecycle, account mapping, found-block handling, descriptor checks, and explicitly owned zeroizing buffers. |
+| Accounting and reward reversal | `crates/mining/src/pool/ledger.rs`, `ledger/store.rs::reconcile_rounds`, `apply_round_observation`, `fix_reward`, `reverse_round_credits`; `ledger/kv.rs` | PPLNS work, round/batch transitions, balance conservation, and audit records over `KvStore`. |
+| Applied-chain observations | `crates/node/src/pool/ledger.rs::record_submitted_block`, `RawChainView` | Submission ordering and hash-keyed canonicality within the watch horizon; coinbase and payout transaction/spend observations. |
+| External signer codecs | `crates/mining/src/pool/ledger.rs::PayoutRequest`, `PayoutReceipt`, `verify_payout_transaction`; `ledger/store.rs::record_signed` | Versioned codecs and exact output/txid checks; no in-process wallet or signature-verification claim. |
+| Management API | `crates/rpc/src/handlers/pool.rs` | Authenticated key-free operations at the durable-ledger boundary; no deployment certification. |
 
 ## Clauses
 
@@ -107,19 +108,9 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, 
 - Custom jobs/work selection, Job Declaration, a Template Distribution server, extranonce-prefix changes, and extensions negotiation MUST NOT be advertised as implemented. The in-process template source MUST NOT be confused with a Template Distribution server.
 - Verification gap: no test starts pool listeners or shuts the pool down — that needs a pool-enabled `start_node` (hand-built `PoolConfig` with matching share target and mining payout, free ports, plus a template-serving mining control for the initial template), and deadline-miss plus worker-panic surfacing have no injection seam. The prepare-then-RPC-bind-then-`start` sequencing itself remains structural in `crates/node/src/lifecycle.rs`.
 
-## Evidence boundary and source map
+## Evidence boundary
 
 Verification results belong to the corresponding CI run or PR. No external
 miner interoperability is claimed; the clause-local gaps above remain open.
-
-| Contract area | Source anchor | Evidence boundary |
-| --- | --- | --- |
-| Options and validation | `crates/node/src/options.rs`, `config.rs::resolve_pool`, `PoolConfig::validate` | Implemented configuration, not deployment approval. |
-| Persistence and budgets | `crates/node/src/pool.rs::LedgerComposer`, `PoolService::prepare`, `PoolService::start`; `pool/ledger.rs::try_reserve_block_slot` | Additive storage and runtime bounds; no operator-data cutover. |
-| Key security | `crates/node/src/pool/authority.rs::load`, `open_private_file`; `crates/mining/src/pool/stratum/sv2.rs::AuthorityKeypair` | Descriptor checks and explicitly owned zeroizing buffers. |
-| Block and share records | `crates/node/src/pool/ledger.rs::record_submitted_block`; `crates/node/src/pool/sv2.rs::handle_events`; `crates/mining/src/pool/core.rs::Completion`, `PoolCore::submit`; `pool/stratum/sv1/session.rs::on_submit`, `poll` | Submission ordering and deferred durable success in both protocols; not miner interoperability. |
-| Canonicality and reward reversal | `crates/mining/src/pool/ledger/store.rs::reconcile_rounds`, `apply_round_observation`, `fix_reward`, `reverse_round_credits`; node `RawChainView` | Hash-keyed observations within the watch horizon. |
-| Signer codecs and receipt checks | `crates/mining/src/pool/ledger.rs::PayoutRequest`, `PayoutReceipt`, `verify_payout_transaction`; `ledger/store.rs::record_signed` | Exact output/txid checks; no in-process wallet or signature-verification claim. |
-| Operator API | `crates/rpc/src/handlers/pool.rs` | RPC behavior at the durable-ledger boundary; no deployment certification. |
 
 For operator configuration and the external signing sequence, read [Native pool operation](../pool.md). Existing operator databases MUST remain untouched by this work. Deployment and existing-data cutover require separate approval.

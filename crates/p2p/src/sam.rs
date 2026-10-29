@@ -1,46 +1,15 @@
-//! I2P SAM v3 client (pinned IVNP bridge) for typed I2P transports.
+//! I2P SAM v3 client for the pinned IVNP bridge. One persistent streaming root
+//! serves fresh connect/accept bridges. Resolve names only through SAM; never
+//! fall back to direct TCP or log private destination material.
 //!
-//! One persistent `SESSION CREATE STYLE=STREAM` root is held per session;
-//! every dial opens a fresh SAM bridge connection with `STREAM CONNECT`,
-//! and inbound streams arrive through fresh `STREAM ACCEPT` bridges.
-//! Names resolve only through `NAMING LOOKUP` on the bridge — never
-//! through the system resolver — and no failure falls back to direct TCP.
-//! Private destination material is never logged.
-//!
-//! Each installed root carries a generation. A stream request is issued
-//! against the root that was live when the caller started, so a stale
-//! `INVALID_ID` retires only that root and never one recovered meanwhile.
-//! The generation rises only when a root is installed.
-//!
-//! # Root readiness
-//!
-//! The pinned bridge answers `SESSION CREATE` only once its destination is
-//! ready, which can take its whole readiness wait ([`READINESS_WAIT`]).
-//! A root under construction is therefore one resumable [`PendingRoot`]
-//! owned by the `recovery` state: its socket, one absolute readiness
-//! deadline fixed once per root, before its socket connects, so the budget
-//! covers the TCP connect, `HELLO`, the readiness wait, and `NAMING LOOKUP`
-//! together, an explicit [`RootPhase`], the count of command bytes the socket
-//! already accepted, and the bounded partial reply line. A connect or accept
-//! caller advances it only while it holds `recovery`, bounded by the earlier
-//! of its own deadline and the root's deadline. A caller deadline pauses the
-//! exchange and reports `TimedOut`; the next caller resumes the same
-//! exchange, so each command reaches the bridge exactly once. Only a hard
-//! protocol or I/O failure, the root deadline, or [`SamSession::close`]
-//! discards it. A TCP connect that cannot finish inside a caller's deadline
-//! is abandoned: nothing was sent, so nothing can be duplicated. The
-//! readiness budget is separate from the per-stream [`EXCHANGE_BUDGET`].
-//!
-//! [`SamSession::close`] wakes a connected root at once. Before the socket
-//! exists there is nothing to wake, so `close` waits for at most the one
-//! connect attempt in flight (at most [`EXCHANGE_BUDGET`]) and never for the
-//! root's budget.
-//!
-//! # Lock order
-//!
-//! `recovery` then `control`, never the reverse. `wake` is a leaf: no other
-//! lock is taken while it is held, and `close` releases it before taking
-//! `recovery`.
+//! A root's generation rises only on installation; stale `INVALID_ID` retires
+//! only the generation the caller used. `PendingRoot` resumes exchanges after
+//! caller timeouts, retaining accepted command bytes so commands are not resent.
+//! Only hard protocol/I/O failure, root deadline, or close discards it;
+//! a timed-out TCP connect has sent nothing and may be abandoned.
+//! `establish_within` owns absolute readiness/connect deadlines; `close` owns
+//! wake/drain behavior. Lock order is `recovery` then `control`; `wake` is a
+//! leaf released before acquiring either.
 
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::Cell;
@@ -1500,21 +1469,11 @@ impl SamSession {
         Ok((conn.into_stream(), destination_hash(&bytes), port))
     }
 
-    /// Close the session root; later dials fail closed.
-    ///
-    /// Order: store `closed`; wake root I/O in progress through `wake`
-    /// (released before anything else is taken); then take `recovery` and
-    /// drain the pending root and, under `control`, the installed one. No
-    /// root can be installed after the drain: every install holds `recovery`
-    /// and re-checks `closed`.
-    ///
-    /// Waiting for `recovery` ends in one of two ways. Once the holder's root
-    /// socket exists, the wake interrupts its read or write at once and the
-    /// holder reports the close. Before the socket exists there is nothing to
-    /// wake: the holder is inside a TCP connect attempt, which cannot be
-    /// interrupted, so `close` waits for that one attempt, at most
-    /// [`EXCHANGE_BUDGET`], after which the holder sees `closed` before it
-    /// starts another. Either way `close` never waits out a readiness budget.
+    /// Closes future dials and wakes in-flight root I/O, then drains pending and
+    /// installed roots under `recovery` then `control`. Installation holds recovery
+    /// and rechecks `closed`, so none can follow the drain. Release the leaf `wake`
+    /// lock before taking either. Before a socket exists, close waits for at most
+    /// one uninterruptible TCP attempt (`EXCHANGE_BUDGET`), never the readiness budget.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         {

@@ -109,7 +109,6 @@ pub trait SyncChain: Send + Sync {
     /// Cumulative chain work a peer's header chain must demonstrate before
     /// this node stores its headers (`Network::minimum_chain_work`).
     ///
-    /// PRE: none.
     /// POST: return the network's anti-DoS work threshold, the value that
     ///   decides whether an inbound batch enters the download-twice presync
     ///   or the direct admission path.

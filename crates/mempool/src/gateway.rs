@@ -596,11 +596,11 @@ impl MempoolObserver for CompositeObserver {
 }
 
 /// Transactions kept beyond pool residency for BIP152 reconstruction: Core's
-/// `DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN` (`net_processing.h:47-48`).
+/// `DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN` (`net_processing.h`).
 pub(crate) const BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
 /// A policy-rejected transaction whose retained heap reaches this bound is
 /// not kept for reconstruction; Core's `RecursiveDynamicUsage(*ptx) < 100000`
-/// gate (`net_processing.cpp:3139`), measured here with the pool's own
+/// gate (`net_processing.cpp`), measured here with the pool's own
 /// `transaction_heap_usage` accounting rather than the consensus
 /// serialization.
 pub(crate) const EXTRA_TXN_MAX_MEMORY_BYTES: usize = 100_000;
@@ -612,21 +612,13 @@ struct ExtraTxn {
     tx: Arc<Tx>,
 }
 
-/// Bounded FIFO of transactions a compact block may still name after the pool
-/// dropped or never admitted them: replaced bodies, peer orphans and peer
-/// policy rejects (Core's `vExtraTxnForCompact`).
-///
-/// Identity is the witness hash, so two witness variants of one txid are two
-/// entries. Re-inserting a resident wtxid changes nothing: the entry keeps its
-/// place, so a repeated body can neither grow the ring nor postpone its own
-/// eviction. A coinbase is never retained. Entry count is bounded by
-/// [`BLOCK_RECONSTRUCTION_EXTRA_TXN`]. Bodies that reached the ring through
-/// the pool or the orphan pool are already bounded by the standardness rules
-/// that admitted them there; a policy reject is additionally bounded by the
-/// [`EXTRA_TXN_MAX_MEMORY_BYTES`] retained-memory gate.
-///
-/// The ring is reconstruction-hint state only. It is never consulted for
-/// inventory, `getdata`, relay, admission or any pool query.
+/// Bounded reconstruction-only FIFO (Core's `vExtraTxnForCompact`).
+/// Replaced bodies, peer orphans, and policy rejects are keyed by wtxid;
+/// reinsertion neither grows the ring nor refreshes eviction order. Coinbase
+/// transactions are refused. `BLOCK_RECONSTRUCTION_EXTRA_TXN` bounds entries;
+/// standardness bounds admitted/orphan bodies, and `EXTRA_TXN_MAX_MEMORY_BYTES`
+/// also bounds policy rejects. Inventory, relay, admission, and pool queries
+/// never consult this hint state.
 #[derive(Default)]
 pub(crate) struct ExtraTxnRing {
     entries: VecDeque<ExtraTxn>,
@@ -687,35 +679,11 @@ struct PublishState {
     draining: bool,
 }
 
-/// Owns the mempool's write lock and publishes ordered mutation events.
-///
-/// # Ordering invariant
-///
-/// Every mutating method flows through exactly one path, `Self::commit`,
-/// which runs, in this exact order:
-///
-/// 1. take the commit-ordering lock, then the pool write lock,
-/// 2. mutate and assign per-change mempool sequences,
-/// 3. release the write lock, join accepted bodies to the committed changes,
-///    then enqueue the non-empty envelope on the publish state's FIFO queue
-///    and elect a drainer if none exists,
-/// 4. release the ordering lock and the publish-state lock,
-/// 5. the elected drainer pops batches one at a time — releasing the
-///    publish-state lock before every observer call — and returns the
-///    publish state to idle only once the queue is empty.
-///
-/// Commits serialize under the ordering lock and step 3 enqueues under that
-/// same ownership, so the queue order is the commit order and the sequence
-/// order: every committed, non-empty batch is published exactly once, in
-/// order, even across nested and concurrent callers. Publication is
-/// eventual, not synchronous: a nested or concurrent mutation enqueues
-/// and returns while a drainer exists, and its callback may run after
-/// that call has returned. No gateway lock is ever held across an
-/// observer call, so observers may re-enter the gateway freely. An
-/// observer panic is caught and recorded; the drainer continues with
-/// the remaining queue and only then returns to idle. Empty results and
-/// an absent observer enqueue nothing, allocate nothing, and spawn no
-/// thread.
+/// Serializes mempool mutations and ordered publication through `Self::commit`.
+/// The commit-ordering lock spans mutation and FIFO enqueue; the pool write
+/// lock is released before joining accepted bodies. No gateway lock spans an
+/// observer call, so reentrant publication can enqueue without deadlocking.
+/// See MPL-01 in `docs/contracts/mempool-mutations.md` for publication guarantees.
 pub struct MempoolGateway {
     pub(crate) pool: Arc<RwLock<Mempool>>,
     /// Pool guards precede this lock. Never held during observer calls,
@@ -1556,8 +1524,9 @@ impl MempoolGateway {
     /// through. A failed `mutate` returns before the publish mutex is taken
     /// and means nothing was committed. A successful mutation publishes
     /// every accepted/removed change from its prevalidated plan.
-    /// Successful mutations acquire the publish mutex before releasing the
-    /// pool guard, then call observers only after releasing the pool guard.
+    /// The ordering guard spans mutation and enqueue; the pool guard drops
+    /// before joining bodies and taking the publish mutex. Observers run
+    /// only after all gateway guards are released.
     pub(crate) fn commit<T, E>(
         &self,
         origin: AdmissionOrigin,

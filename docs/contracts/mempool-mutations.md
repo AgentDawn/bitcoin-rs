@@ -16,27 +16,18 @@ state (`crates/mempool/src/orphan.rs`).
 - Every production mempool mutation routes through `MempoolGateway`. No
   production code outside the gateway takes the mempool write lock; lookups
   go through `MempoolGateway::read`.
-- Every publishing mutation flows through `commit`, in this exact order:
-  1. take the pool write lock,
-  2. mutate and assign per-change `mempool_sequence` values, then update
-     the gateway's orphan state and mark waiting children ready for parents
-     that remain in the committed pool,
-  3. while still holding the write lock, enqueue a non-empty
-     `MutationEnvelope` on the publish FIFO and elect a drainer if none
-     exists,
-  4. release the write lock and the publish-state lock,
-  5. the elected drainer pops batches one at a time — releasing the
-     publish-state lock before every observer call — and returns the
-     publish state to idle only once the queue is empty.
-- Commits serialize under the write lock and step 3 enqueues under that
-  same ownership, so the queue order is the commit order and the sequence
-  order. An observer never sees a later-committed batch before, or
-  interleaved with, an earlier one.
+- `MempoolGateway::commit` serializes mutation, sequence assignment, admission
+  lifecycle updates, and FIFO enqueue under the commit-ordering lock. The
+  pool write lock is released before joining accepted bodies and enqueueing;
+  the ordering lock keeps queue order equal to commit and sequence order.
+  Observers never see a later batch ahead of, or interleaved with, an earlier
+  batch. The elected drainer releases the publish lock before callbacks and
+  returns to idle only when the queue is empty.
 - Publication is eventual, not synchronous. A nested or concurrent
   mutation enqueues and returns while a drainer exists; its callback may
   run after that call has returned. A slow observer delays later
   publications, not the caller. It can never roll anything back or reorder
-  the stream. Sequences were assigned in step 2, so a lagging observer
+  the stream. Sequences are assigned at commit, so a lagging observer
   still sees a gap-free, ordered stream.
 - The observer receives a `&MutationEnvelope` — the committed
   `MutationResult` paired with the `AdmissionOrigin` that identifies how
@@ -46,6 +37,9 @@ state (`crates/mempool/src/orphan.rs`).
   replay saved sequences or blanket relay notifications. The existing P2P
   relay worker separately resumes saved pending initial broadcasts for
   successfully re-admitted entries.
+- Publication of empty results or with an absent observer enqueues nothing,
+  allocates nothing, and spawns no thread. Internal admission-state updates
+  do not depend on an observer being present or making progress.
 - Observers are best-effort mirrors. Observer errors and panics never
   affect the committed mutation. No gateway lock is held across an
   observer call, so an observer may re-enter the gateway: a nested call

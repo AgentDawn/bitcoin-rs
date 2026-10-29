@@ -167,7 +167,7 @@ Owners, prerequisites, commands, and scope limitations are listed in each sectio
 ## 5. libbitcoinkernel oracle and scoped native parity
 
 - **Tier**: In-tree oracle & differential evidence.
-- **Related contract**: [`docs/contracts/validation-default.md`](contracts/validation-default.md) (`Proven by` evidence; no `VAL-02` clause is defined).
+- **Related contract**: [`docs/contracts/validation-default.md`](contracts/validation-default.md) (scope and verification limits).
 - **Owner suites**:
   - `crates/consensus/tests/kernel_vector_parity.rs`: Core transaction vectors
     evaluated through `libbitcoinkernel`'s `verify_tx_scripts` against expected

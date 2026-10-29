@@ -143,23 +143,11 @@ impl ChainProgressReader {
     }
 }
 
-/// Bitcoin Core's `GuessVerificationProgress`, as a fraction in `[0, 1]`.
-///
-/// The quantity is **transactions verified over transactions believed to
-/// exist** — not a ratio of heights. Early blocks are nearly empty, so a height
-/// ratio reports the chain as most of the way done while most of the work is
-/// still ahead; Core moved off height for that reason.
-///
-/// The denominator cannot be known, so it is extrapolated from the network's
-/// pinned [`bitcoin_rs_primitives::ChainTxData`] observation at `tx_rate`
-/// transactions per second. When the node is already past that observation its
-/// own count is used as the baseline instead, which keeps the fraction from
-/// sticking at 1.0 forever.
-///
-/// `tip_time` is the applied tip's block timestamp. When the tip is within two
-/// hours of `now`, Core stops trusting that miner-set timestamp and estimates
-/// the tip's age from how many blocks the header chain is ahead instead — which
-/// also quantizes the answer near 1.0, where people expect to see it settle.
+/// Core's `GuessVerificationProgress`: verified transactions divided by an
+/// estimate from the network's `ChainTxData`, clamped to `[0, 1]`.
+/// Past the pinned observation, use the node's own count as the baseline.
+/// For tips within two hours of `now`, estimate age from the header-height gap
+/// rather than trusting the miner-set timestamp.
 fn verification_progress(
     network: Network,
     chain_tx_count: u64,

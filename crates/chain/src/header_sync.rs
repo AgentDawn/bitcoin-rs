@@ -76,22 +76,10 @@ impl AcceptHeaders {
     }
 }
 
-/// Demoted tip when a batch [`accept_headers`] rejected still displaced the tip.
-///
-/// [`accept_headers`] inserts each valid prefix header before validating the
-/// next, so a batch whose prefix carries more work than the active tip moves
-/// the tip and marks the old tip `Stale` even when a later header fails and
-/// the call returns `Err`. The `Err` itself reports no displacement (see
-/// [`AcceptHeaders::demoted_tip`); the old tip stays a stale leaf and must
-/// still enter stale-tip relay.
-///
-/// Call after an `Err` return with `pre_tip` captured before the call and the
-/// same `tree`. Returns `pre_tip` when the tip moved onto a branch that does
-/// not contain it, else `None` (no movement, linear extension, or unknown
-/// tips). The tree stays the authority; this only reads it.
-///
-/// Single ownership: header admission owns tip mutation; this helper and the
-/// stale-tip retainer only read the displacement it left behind.
+/// Returns the old tip displaced by a partially accepted, then rejected header batch.
+/// Capture `pre_tip` before `accept_headers` and pass the same tree after `Err`.
+/// The accepted prefix may have demoted that tip even though the error cannot
+/// report it. Linear extension, unchanged tips, and unknown tips return `None`.
 #[must_use]
 pub fn demoted_tip_after_rejection(tree: &BlockTree, pre_tip: Option<Hash256>) -> Option<Hash256> {
     let pre_hash = pre_tip?;
@@ -183,7 +171,7 @@ fn unix_seconds_at(now: std::time::SystemTime) -> u32 {
 /// Validates the contextual rules for a header extending `parent_id`.
 ///
 /// Contextual nBits, median-time-past, BIP94 timewarp, future-time, and
-/// version floors, in Core's order (`src/validation.cpp:4092-4126`). Header
+/// version floors, in Core's order (`src/validation.cpp`). Header
 /// admission and direct block connection both route through here; no caller
 /// implements a second version, timewarp, or nBits predicate.
 pub fn validate_contextual_header(
@@ -215,7 +203,7 @@ pub fn validate_contextual_header(
 
     // BIP94 timewarp floor at a difficulty-adjustment boundary: the
     // candidate may not fall more than `MAX_TIMEWARP` below its parent
-    // (`src/validation.cpp:4100-4110`). Consensus applies it only where the
+    // (`src/validation.cpp`). Consensus applies it only where the
     // BIP94 deployment is active; the mining floor in
     // [`minimum_candidate_time`] applies it on every network as policy.
     if network.enforce_bip94()
@@ -244,7 +232,7 @@ pub fn validate_contextual_header(
     }
 
     // Version floors for the buried deployments, in Core's order
-    // (`src/validation.cpp:4112-4126`).
+    // (`src/validation.cpp`).
     for (required, active) in [
         (2, network.is_bip34_active(height)),
         (3, network.is_bip66_active(height)),
@@ -265,7 +253,7 @@ pub fn validate_contextual_header(
 ///
 /// At a difficulty-adjustment boundary, the floor is `parent_time` minus
 /// [`MAX_TIMEWARP`]; off one there is no floor. This is the one boundary
-/// predicate and floor. Core's `GetMinimumTime` (`src/node/miner.cpp:42-49`)
+/// predicate and floor. Core's `GetMinimumTime` (`src/node/miner.cpp`)
 /// applies it on every network as mining policy; consensus rejection
 /// additionally requires the BIP94 deployment, which
 /// [`validate_contextual_header`] gates on `network.enforce_bip94()`.
@@ -475,7 +463,7 @@ pub fn block_work(header: &BlockHeader) -> ChainWork {
 /// Whether a difficulty transition from `old_bits` to `new_bits` at `height`
 /// is permitted without consulting a stored chain.
 ///
-/// Core's `PermittedDifficultyTransition` (`bitcoin-core/src/pow.cpp:89-136`),
+/// Core's `PermittedDifficultyTransition` (`bitcoin-core/src/pow.cpp`),
 /// which header presync runs while it holds no tree; the contextual check in
 /// [`validate_header_nbits`] remains the full-consensus rule.
 #[must_use]

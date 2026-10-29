@@ -219,31 +219,13 @@ impl BlockSync {
         );
     }
 
-    /// Retries header admission for staged bodies whose headers are still
-    /// absent from the tree, and re-gates the staged bodies that staged
-    /// before their headers were tree-known.
-    ///
-    /// The listener forwards every inbound body's embedded header through
-    /// the headers drain, but a refused batch or a source-less delivery
-    /// leaves the body staged without a tree node — and
-    /// `apply_buffered_blocks` only drains hashes the tree knows, so the
-    /// body would otherwise sit until its staged timeout despite being
-    /// complete. `MissingParent` keeps the body staged and asks an eligible
-    /// peer for the missing ancestry; `TimestampTooFarAhead` retries
-    /// naturally each drain and admits once the header enters the allowed
-    /// window; a permanently inadmissible header (a peer-fault rejection)
-    /// means the body can never apply, so it is discarded instead of paying
-    /// the same admission retry every drain — and its delivering peer
-    /// carries the fault, exactly as a rejected `headers` batch would.
-    ///
-    /// A body that staged while its header was unknown passed the arrival
-    /// gate's missing-header arm without facing the unrequested-admission
-    /// clauses — the stager flags it `gate_pending`. The header can resolve
-    /// anywhere: the retry loop here, or the ordinary headers drain the
-    /// listener forwards into. `recheck_staged_gates` then faces it with
-    /// the same clauses a resolved arrival faced, unless request evidence
-    /// exists — a live pending mark, or an owned fetch resolved by
-    /// `resolve_owned_body_fetches` (which settles the flag directly).
+    /// Retries staged headers missing from the tree: MissingParent requests
+    /// ancestry, future timestamps retry each drain, and permanent peer faults
+    /// discard the body and fault its delivering peer.
+    /// Unknown-header arrivals carry `gate_pending`; once any path resolves their
+    /// headers, `recheck_staged_gates` applies ordinary unrequested admission unless
+    /// live pending/owned-fetch evidence authorizes them. `resolve_owned_body_fetches`
+    /// settles that flag directly for matched requests.
     fn admit_staged_headers(&self) {
         let unadmitted: Vec<(Hash256, Header, Option<crate::PeerSource>)> = {
             let tree = self.chain.block_tree();
@@ -430,21 +412,11 @@ impl BlockSync {
             });
         }
 
-        // Already-staged precheck: skip the expensive body-binding hashes for
-        // blocks whose hash is already in the stager. A correct body already
-        // staged must not be displaced by a late malformed duplicate (P2-3).
-        //
-        // The same pass gates unrequested bodies: a body that no connection
-        // has in flight (Core's `fRequested` is false) stages only when
-        // Core's `AcceptBlock` would process it, and it additionally needs a
-        // genuinely free staging slot at insert time — an insert at the
-        // count budget would count-evict already-downloaded work, possibly
-        // requested, for a delivery nobody asked for. The slot is charged at
-        // insert rather than here so a body that never stages (failed
-        // binding, byte-budget refusal, a same-chunk duplicate) cannot burn
-        // a reservation a later admissible body could have used. A
-        // discarded body leaves no staged state and queues no retry.
-        // Lock order: tree, then scheduler.
+        // Do not replace an already-staged body with a late malformed duplicate.
+        // Unrequested admission uses `unrequested_body_admissible`; charge its free
+        // slot at insertion, so failed binding, byte refusal, and duplicates do not
+        // consume another body's capacity. Discards leave no retry. Lock order: tree,
+        // then scheduler.
         let admission_plan: Vec<BodyAdmission> = {
             let chain_tip = self.chain.chain_tip();
             let applied_tip = self.chain.applied_tip();
@@ -760,36 +732,17 @@ impl BlockSync {
     }
 }
 
-/// Whether a body that no connection has in flight may stage: Core's
-/// `AcceptBlock` acceptance for `fRequested == false`
-/// (validation.cpp:4327-4353), plus an active-branch clause.
+/// Gate for bodies with no live pending request (Core's `AcceptBlock`,
+/// `fRequested == false`, in `validation.cpp`, plus active-branch membership).
+/// An unknown header may stage with `gate_pending`; after resolution require:
+/// 1. membership on the header-tip branch;
+/// 2. at least the applied tip's chainwork;
+/// 3. the network minimum chainwork;
+/// 4. at most `CORE_REORG_SAFETY_MARGIN` blocks ahead of the applied tip.
 ///
-/// PRE: `hash` names a body with no live pending request — a fresh arrival
-///   that is neither staged nor pending, or a staged body still flagged
-///   `gate_pending` whose header has since resolved (the callers in
-///   `buffer_received_block_chunk` and `admit_staged_headers`).
-/// POST: `true` when the tree cannot resolve `hash` (the missing-header
-///   path: the body stages flagged `gate_pending` and faces the four
-///   clauses once its header lands); otherwise `true` only when all four
-///   admission clauses below hold.
-/// INVARIANT: reads only the tree and the two tip snapshots.
-///
-/// The admission clauses:
-/// 1. The node lies on the header tip's branch.
-/// 2. The node's chainwork is at least the applied tip's
-///    (`fHasMoreOrSameWork`).
-/// 3. The node's chainwork meets the network's minimum chain work.
-/// 4. The node is at most `CORE_REORG_SAFETY_MARGIN` blocks above the
-///    applied tip (`fTooFarAhead`).
-///
-/// Core checks the minimum-work floor on the body itself for
-/// `fRequested == false`. The requested path is the caller's: a hash with a
-/// recorded pending request never reaches this function, so a late delivery
-/// is admitted on the pending's recorded request alone. Once the window has
-/// released a request (expiry, rejection, purge), a later delivery of that
-/// hash is never-requested for this gate: the four clauses apply with the
-/// body's own chainwork, including the floor. Clause 1 keeps a low-work
-/// side chain out on its own.
+/// Read only the tree and tip snapshots. Live requested arrivals bypass this
+/// gate; after expiry, rejection, or purge they must pass it again using the
+/// body's own work. Staged `gate_pending` bodies use the same rule.
 pub(super) fn unrequested_body_admissible(
     tree: &BlockTree,
     hash: Hash256,

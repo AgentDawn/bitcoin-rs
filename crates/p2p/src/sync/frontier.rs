@@ -90,26 +90,10 @@ pub(crate) struct UsablePeer {
     pub connected_at: Instant,
 }
 
-/// The height a connection may be asked to serve bodies up to.
-///
-/// `claimed` is the best-known height the peer advertises and this node
-/// raises as it accepts that peer's headers; `active_height` is what the
-/// peer's demonstrated tips resolve to on the active chain.
-///
-/// PRE: both heights are heights this node derived from the peer itself,
-///   never from a third party.
-/// POST: the greater of the two, `None` only when the peer offered neither:
-///   an unusable advertised height and no tip that resolves.
-/// INVARIANT: branch evidence never LOWERS the height a peer is trusted at.
-///   A tip that resolves off the active chain says the peer's best chain is
-///   elsewhere; it does not retract the height the peer claimed, and a
-///   connection that cannot serve what it claimed is judged by the request
-///   that times out — `expired_release` convicts it — not by being skipped
-///   without ever being asked. Without that floor, one fork answer pins a
-///   connection below the frontier for its whole life: its later
-///   `getheaders` replies follow the same losing branch, so the probe meant
-///   to restore capability replays headers this node already holds, and the
-///   frontier starves on peers it never asks.
+/// Maximum of the peer's own claimed and active-chain demonstrated heights;
+/// None only if neither is usable. Off-branch evidence must not lower the claim:
+/// otherwise repeated fork replies strand a peer below the request frontier.
+/// Ask at the claimed height and let `expired_release` judge non-delivery.
 #[must_use]
 pub(crate) fn body_capability(claimed: i32, active_height: Option<u32>) -> Option<u32> {
     match (u32::try_from(claimed).ok(), active_height) {
@@ -131,7 +115,7 @@ impl UsablePeer {
     /// that entered the block tree. `None` while it has announced nothing we
     /// accepted, whatever its handshake claimed: Core's eviction rule reads
     /// `pindexBestKnownBlock`, a tip the peer actually sent, and never the
-    /// version height (`net_processing.cpp:3203-3210`). Where `capability`
+    /// version height (`net_processing.cpp`). Where `capability`
     /// falls back to the claimed height to choose whom to ask for a body,
     /// this one has no fallback, because the rule that reads it decides
     /// whether to keep the connection.

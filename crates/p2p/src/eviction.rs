@@ -1,5 +1,5 @@
 //! Inbound eviction selection, ported from Bitcoin Core's `SelectNodeToEvict`
-//! (`node/eviction.cpp:178-240`).
+//! (`node/eviction.cpp`).
 //!
 //! Three Core steps are absent. Core protects the eight inbound peers with the
 //! lowest minimum ping time, and bitcoin-rs measures no ping round trip. Core

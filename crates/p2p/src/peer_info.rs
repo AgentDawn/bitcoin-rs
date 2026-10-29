@@ -29,7 +29,6 @@ pub enum PeerRole {
 impl PeerRole {
     /// Whether this role may carry transaction and address relay.
     ///
-    /// PRE: none.
     /// POST: `true` only for `FullRelay`.
     /// INVARIANT: block and header relay is never restricted by role.
     #[must_use]

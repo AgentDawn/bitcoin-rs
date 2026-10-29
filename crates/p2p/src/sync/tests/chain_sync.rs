@@ -48,7 +48,7 @@ fn claiming(port: u16, height: u32, at: Instant) -> UsablePeer {
 }
 
 /// An outbound connection to an address the operator named, which Core marks
-/// `MANUAL` (`net_processing.cpp:5502`).
+/// `MANUAL` (`net_processing.cpp`).
 fn pinned(port: u16, height: u32, at: Instant) -> UsablePeer {
     let mut peer = outbound(port, height, PeerRole::FullRelay, at);
     peer.manual = true;

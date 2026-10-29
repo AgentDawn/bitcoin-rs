@@ -8,28 +8,11 @@ use bitcoin_rs_primitives::Hash256;
 use std::time::Instant;
 
 impl BlockSync {
-    /// Moves the applied chain onto the header tip's branch when it has been
-    /// outweighed.
-    ///
-    /// `chain_tip` tracks the heaviest headers and `applied_tip` the validated
-    /// chain; the two diverge exactly when a competing branch wins. Forward
-    /// application cannot close that gap, because the blocks it wants to apply
-    /// do not build on the applied tip.
-    ///
-    /// Availability is left to the implementation's switch. It may commit the
-    /// contiguous winning prefix already present in bounded staging, then
-    /// report `MissingBody` for the first absent suffix block. Only a
-    /// zero-length available connect prefix guarantees no mutation. Keeping
-    /// this as one authority avoids a pre-check that can disagree with the
-    /// transition witness.
-    ///
-    /// Returns the valid header tip a failed connect's invalidation moved
-    /// onto another branch (`ReorgError::ConnectFailed::demoted_tip`), the
-    /// chain-owned fact a stale-tip retainer records. `None` when no switch
-    /// ran, the switch committed, or the failure displaced no valid tip.
-    /// Header admission reports its own displacement through
-    /// `HeaderAdmission::Accepted::demoted_tip`, so a committed switch has
-    /// nothing further to report.
+    /// Switches an outweighed applied chain through `SyncChain`'s authority.
+    /// The switch may commit an available winning prefix before `MissingBody`;
+    /// only a zero-length connect prefix guarantees no mutation. Do not pre-check
+    /// availability outside that transition. Returns a failed connect's displaced
+    /// valid tip for stale-tip retention; a committed/no-op switch reports none.
     pub(super) fn switch_branch_if_outweighed(&self) -> Option<Hash256> {
         let target = self.outweighed_branch_target()?;
         let outcome = self.chain.switch_to_branch(

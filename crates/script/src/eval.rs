@@ -254,7 +254,7 @@ pub(crate) fn eval_script(
         let opcode_byte = match instruction {
             Instruction::PushBytes(data) => {
                 let opcode_byte = script[instruction_start];
-                // Core checks push size unconditionally (interpreter.cpp:457),
+                // Core checks push size unconditionally (interpreter.cpp),
                 // before testing fExec — a >520-byte push in a non-executed
                 // branch is still PUSH_SIZE.
                 if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
@@ -264,7 +264,7 @@ pub(crate) fn eval_script(
                 }
                 if conditions.all_true() {
                     // Core checks MINIMALDATA only in executed branches
-                    // (interpreter.cpp:489, inside `if (fExec && ... <= OP_PUSHDATA4)`).
+                    // (interpreter.cpp, inside `if (fExec && ... <= OP_PUSHDATA4)`).
                     if flags.contains(VerifyFlags::MINIMALDATA) && !minimal_push(data, opcode_byte)
                     {
                         return Err(ScriptError::Invalid {

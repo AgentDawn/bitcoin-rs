@@ -1,25 +1,9 @@
-//! Process-exclusive data-directory lock.
-//!
-//! A node owns its data directory for as long as any handle that can write it
-//! lives: the `.lock` file is acquired before the directory's schema check and
-//! process epoch, so a second process — or a second open inside this one —
-//! fails before it can touch any datadir state, instead of failing later on a
-//! backend store lock with a backend-specific message. The posture follows the
-//! epoch lock in `crates/chainstate/src/events.rs`: capability-scoped open, no
-//! symlink following, regular files only. Core's contract is `LockDirectory`
-//! (`bitcoin-core/src/init.cpp:1254-1269`).
-//!
-//! The lock has no owner of its own. [`crate::storage_backend`] hands a clone
-//! to every store it opens (chainstate store, block files, txindex store) as a
-//! `StoreGuard`, and each store drops it after its engine or file handle has
-//! closed. Every consumer of a store therefore keeps the directory locked
-//! until its last use: a detached RPC connection thread holding the chainstate,
-//! an index worker, or an embedder's retained clone. A field on `NodeState` or
-//! `Node` could not give that, since a handle can outlive both.
-//!
-//! The name has one owner: [`DATA_DIR_LOCK_FILE`] lives in
-//! `bitcoin_rs_storage::checkpoint::fs` because the schema classifier there
-//! must exempt the lock file from its fresh-directory scan.
+//! Process-exclusive datadir lock, acquired before schema/epoch inspection.
+//! Capability-scoped open rejects symlinks and nonregular files (Core's
+//! `LockDirectory` in `init.cpp`). Every writable store retains a `StoreGuard`
+//! clone and drops it after its engine/file handles, so detached consumers
+//! cannot outlive lock ownership. `DATA_DIR_LOCK_FILE` belongs to storage's
+//! checkpoint classifier, which exempts it from fresh-directory checks.
 
 use bitcoin_rs_storage::checkpoint::fs::DATA_DIR_LOCK_FILE;
 use cap_fs_ext::FollowSymlinks;

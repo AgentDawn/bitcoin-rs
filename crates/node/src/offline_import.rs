@@ -1,40 +1,17 @@
-//! Foreground offline import for the strict full-validation comparator.
+//! Foreground, full-validation import of one pinned Core-framed archive.
+//! `docs/contracts/reference-set.md` owns corpus custody; this path never accepts
+//! the multi-file `sources` directory. Core's counterpart is `-loadblock` through
+//! `ImportBlocks`/`LoadExternalBlockFile` in `init.cpp` and `validation.cpp`.
 //!
-//! Consistency: chain mutation holds the exclusive chain-transition lock
-//! (linearizable single-writer per transition); certified reads use the
-//! stable whole-set view (snapshot isolation over the UTXO set, blocking
-//! commits for the scan); the manifest plus archive pin is bound by hash
-//! (a transactional outbox is unnecessary here because publication is a
-//! single atomic `create_new` state file after the checkpoint, and reruns
-//! either resume by tip comparison under a matching full-validation
-//! provenance record or are refused, so no exactly-once delivery is
-//! assumed).
-//!
-//! Consumes the single regular Core-framed archive file bound by
-//! `{corpus_path}` (the custody archive pin, parity-bound to the indexed
-//! logical stream), the manifest at `{manifest_path}`, and the output state
-//! path at `{state_path}`, all alongside the resolved [`NodeConfig`].
-//!
-//! Asymmetry is explicit: Bitcoin Core consumes the same file through its
-//! checked-in `-loadblock` family (`bitcoin-core/src/init.cpp:529`,
-//! `2128-2136` into `ImportBlocks`, `bitcoin-core/src/node/blockstorage.cpp:1270`,
-//! `bitcoin-core/src/validation.cpp:4975` `LoadExternalBlockFile`); this
-//! module is the bitcoin-rs counterpart. It never takes the custody
-//! `sources` directory: that directory holds multiple `blkNNNNN.dat` files
-//! while the timed command expects one regular corpus file.
-//!
-//! Guarantees: exact bytes (framing walk plus per-record manifest binding
-//! plus archive digest, verified for skipped prefix records and on reopen
-//! too), full validation (`--assume-valid-height 0` with the validation mode
-//! pinned to `Full` instead of any inherited live mode, indexes off, no
-//! stale persisted derived-index namespace, and no resumed prefix without a
-//! matching full-validation provenance record), durable bodies plus undo
-//! (authoritative commit path), production clean checkpoint (nonzero when
-//! publication fails), foreground only (no fork, no daemonize, no spawned
-//! descendants), and an eight-field certified state. Reopen against the same
-//! data directory resumes the applied prefix only when the provenance record
-//! this importer wrote at certification matches the applied tip; otherwise
-//! the rerun is refused and the operator revalidates from a fresh directory.
+//! Mutation uses the chain-transition exclusion; certified reads use a stable
+//! whole-set UTXO view. Framing, per-record binding, and archive digest also cover
+//! skipped prefixes and reopened files. Import forces full validation with
+//! assume-valid disabled and indexes off, refusing stale derived-index state.
+//! Bodies/undo commit through chainstate; checkpoint publication precedes atomic
+//! `create_new` certification and publication failure returns nonzero.
+//! A rerun resumes only when the importer's full-validation provenance matches
+//! the applied tip; otherwise use a fresh directory and revalidate. No daemon or
+//! descendant process is spawned.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -342,24 +319,12 @@ fn read_record(
     Ok(FramedRecord { framed, payload })
 }
 
-/// Connects one batch of archive blocks, relieving journal retention pressure
-/// inline.
-///
-/// The foreground import runs no maintenance worker, so a retention-limit
-/// refusal would otherwise abort the whole import even though the refused
-/// block committed nothing and the tip is unchanged. On a
-/// [`bitcoin_rs_chainstate::ApplyError::JournalBackpressure`] refusal
-/// carrying a retention limit, this publishes one synchronous clean
-/// checkpoint — the same foreground publication the import performs at the
-/// end, which compacts the journal — and retries the uncommitted block
-/// exactly once. Any other failure, a skipped publication (no applied tip to
-/// checkpoint), or a second refusal propagates.
-///
-/// Neither the refused attempt nor the checkpoint moves the applied tip, so
-/// the inline retry resumes from the same durable state. A cross-process
-/// rerun over the same data directory resumes by tip comparison only under
-/// a matching provenance record; without one it is refused, so the operator
-/// wipes the data directory and revalidates from genesis.
+/// Connects an archive batch without a maintenance worker. A retention-limit
+/// `JournalBackpressure` refusal commits nothing: publish one synchronous clean
+/// checkpoint, then retry that block exactly once. Other errors, skipped
+/// publication, or a second refusal propagate. Neither the refused attempt nor
+/// the checkpoint advances the tip; cross-process resume still requires the
+/// matching full-validation provenance described by this module.
 fn connect_batch(
     node: &crate::state::NodeState,
     batch: &mut Vec<bitcoin_rs_primitives::BlockPayload>,

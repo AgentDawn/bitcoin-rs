@@ -1,45 +1,13 @@
-//! Maintained chunk order over the live pool.
+//! Maintained chunk order over the live pool; `fee_diagram` owns linearization.
+//! Call `relinearize` for each changed component and `forget` when its id is freed.
 //!
-//! One owner of every cluster's exact linearization. `ChunkIndex` keeps, per
-//! component, the members in linearization order and the chunk boundaries,
-//! plus one global `BTreeSet` of [`ChunkKey`]s that orders every chunk of
-//! every component the way Core's block builder walks them. The exact min-cut
-//! solver in `fee_diagram` stays the only linearization engine; this module
-//! stores its output and orders it. The pool calls [`ChunkIndex::relinearize`]
-//! once per changed component and [`ChunkIndex::forget`] for every component
-//! id it frees, so the index never holds a stale or absorbed component.
-//!
-//! # Order of chunks
-//!
-//! Chunks sort by, in this order:
-//!
-//! 1. higher feerate first, compared exactly by cross-multiplication;
-//! 2. the equal-feerate chunk prefix weight, ascending;
-//! 3. the greatest member txid of the chunk, ascending;
-//! 4. component id, then ordinal inside the component.
-//!
-//! The prefix weight is Core's `m_main_equal_feerate_chunk_prefix_size`
-//! (`txgraph.cpp:502-519,1075-1128`): the summed charged weight of the
-//! component's chunks that share this chunk's feerate, from the first of
-//! them up to and including this chunk, in linearization order. Weighing the
-//! chunk alone is not enough. A linearization may emit a parent chunk and its
-//! child chunk at exactly the same feerate (parent 2000 sat over 800 WU, child
-//! 1000 sat over 400 WU); the lighter child would then sort before its parent
-//! and break dependency order for every consumer that walks the index. The
-//! prefix grows strictly along such a run, so within one component the key
-//! order is the linearization order, whatever the weights are. Chunks of
-//! different components that tie on feerate and prefix fall to the txid rule,
-//! Core's fallback order (`txmempool.cpp:183-186` orders by txid and
-//! `m_main_max_chunk_fallback` is the maximal member).
-//!
-//! The order is a total order: every comparison is lexicographic over exact
-//! orders (a total preorder on rationals, then `u64`, then txid, then ids),
-//! so it is transitive, and no two live chunks compare equal because the last
-//! two fields name the chunk.
-//!
-//! Equal-feerate chunks stay separate. Merging a run into one chunk would
-//! change what fits: selection and eviction keep skipping or taking whole
-//! chunks, as Core's builder does.
+//! `ChunkKey` sorts by descending exact feerate, then ascending equal-feerate
+//! prefix weight, greatest member txid, component id, and chunk ordinal.
+//! The prefix is cumulative within a same-rate run (Core's
+//! `m_main_equal_feerate_chunk_prefix_size` in `txgraph.cpp`): weighing a lighter
+//! child alone would place it before its parent. Cross-component ties use Core's
+//! `m_main_max_chunk_fallback` txid order; the final ids make the order total.
+//! Equal-feerate chunks remain separate because merging changes what fits.
 
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;

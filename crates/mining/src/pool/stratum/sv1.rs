@@ -1,26 +1,8 @@
-//! Native Stratum V1 pool adapter.
-//!
-//! Two layers:
-//!
-//! * this module: the SV1 wire. Bounded line framing ([`LineBuffer`]), JSON-RPC
-//!   decode ([`decode_line`], [`ClientRequest`]), exact response and
-//!   notification encoders, the prevhash word swap, BIP310 parameter parsing,
-//!   decimal difficulty ([`Difficulty`]), explicit account resolution
-//!   ([`AccountResolver`]) and the accounting boundary ([`ShareLedger`]);
-//! * [`session`]: the per-connection state machine, the shared [`PoolCore`]
-//!   over [`crate::JobBook`], and the bounded TCP [`Server`].
-//!
-//! Division of ownership. The parent crate owns job projection, the coinbase
-//! split, extranonce allocation, the share predicate, stale and duplicate state,
-//! and block assembly. This adapter never hashes a header, never builds a
-//! coinbase, never compares a hash with a target. It owns what only SV1 has:
-//! framing, dialect, handshake order, BIP310 negotiation, per-session
-//! difficulty policy, deadlines, and connection bounds. It holds no keys, no
-//! wallet, no signer, and no money: payouts are the ledger's business.
-//!
-//! JSON goes through `sonic-rs`. Untrusted frames are bounded three ways before
-//! any value exists: line length ([`LineBuffer`]), nesting depth
-//! ([`MAX_JSON_DEPTH`]), and parameter count ([`MAX_PARAMS`]).
+//! SV1 framing, dialect, handshake, difficulty policy, and connection bounds.
+//! `session` owns per-connection state; `PoolCore` and `JobBook` own shared work
+//! and verdicts. The adapter performs no independent coinbase, hash, or target
+//! validation and holds no keys or wallet. Before JSON decoding, `LineBuffer`,
+//! `MAX_JSON_DEPTH`, and `MAX_PARAMS` bound untrusted frames.
 #![forbid(unsafe_code)]
 
 mod session;

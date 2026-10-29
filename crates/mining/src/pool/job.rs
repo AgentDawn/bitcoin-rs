@@ -1,20 +1,11 @@
-//! Job projection, extranonce allocation, and the single share predicate.
+//! Job projection, extranonce allocation, and share validation for SV1/SV2.
+//! `MiningControl` builds templates and validates blocks; `JobBook` owns the
+//! bounded job/session state. Money, keys, and difficulty policy are inputs.
 //!
-//! One [`JobBook`] owns every fact a Stratum V1 or V2 adapter needs about
-//! work it handed to miners: the coinbase split around the extranonce, the
-//! merkle branch, the header template, bounded job retention, bounded session
-//! identity, stale state, and duplicate state. The template itself is built by
-//! `MiningControl`; a block is validated by `MiningControl`. Money, keys, and
-//! difficulty policy are inputs, never state, here.
-//!
-//! Invariants:
-//! - `coinbase_prefix || session || rolled || coinbase_suffix` is the exact
-//!   non-witness (txid) serialization of the coinbase the block will carry.
-//! - A job never grows its candidate's coinbase beyond the declared
-//!   [`CoinbaseBudget`]: scriptSig growth stays under the 100-byte consensus
-//!   limit, extra outputs stay inside the budget's size and sigop allowance,
-//!   and `Candidate::admits` (the owner's rule) passes for the budget.
-//! - A stale job is never revived.
+//! `coinbase_prefix || session || rolled || coinbase_suffix` must be the exact
+//! non-witness coinbase encoding. Growth must satisfy `CoinbaseBudget`, its size
+//! and sigop allowance, the 100-byte scriptSig limit, and `Candidate::admits`.
+//! A stale job is never revived.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

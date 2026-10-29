@@ -1,34 +1,9 @@
-//! Deletion of historical block bodies and undo records, once the active
-//! chain no longer needs them.
-//!
-//! [`crate::pruning::stage_block_and_undo_prune`] is the main entry point. It stages
-//! block-body and undo-row deletion together with prune-height metadata into
-//! one caller-owned atomic batch, so node wiring commits them in a single
-//! backend commit. Both kinds of data are pruned against the durable tip
-//! rather than the in-memory tip: a crash restores to the last durable
-//! checkpoint, and bodies between that base and the crash-recovery sidecar tip
-//! are evidence needed for local replay while undo records are needed to
-//! disconnect back through the restored chain. After the index rows commit,
-//! [`crate::pruning::reclaim_staged_flat_block_files`] deletes the staged flat block files,
-//! and [`crate::pruning::PruneOutcome`] reports the bytes and row counts freed.
-//!
-//! Rows pinned by a live [`RetentionLease`] are never staged: the pass
-//! reserves its deletion line through [`RetentionRegistry::reserve`], which
-//! folds every live lease floor into that line before any deletion is
-//! selected, so a reader holding a lease keeps exactly its required
-//! history.
-//!
-//! Three prune meanings stay separate. The *requested* height is operator
-//! intent (`node:pruneheight`). The *effective* line is that intent folded
-//! with reorg safety, live retention, and the byte target. The
-//! [`crate::pruning::ExecutedFrontier`] (`node:prune_executed`) is the durable, monotonic
-//! fact of what a committed pass deleted, written in the same batch as its
-//! deletions: it is what a restart reconstructs and what refuses a lease,
-//! and no consumer infers it from the intent line.
-//!
-//! [`PrunePolicy`] converts the configured mebibyte target to bytes and applies the
-//! reorg-safety retention floor. The node supplies the policy; the pruning
-//! pass selects and stages deletions.
+//! Stages body/undo deletion and metadata in one atomic batch, then reclaims
+//! flat files after row commit. `stage_block_and_undo_prune` owns the durable-tip
+//! and retention constraints; `PrunePolicy` owns byte/reorg limits.
+//! `ExecutedFrontier` is committed deletion evidence, distinct from requested
+//! operator height and the retention/target-adjusted effective line. Restart
+//! and lease refusal use that evidence, never operator intent.
 
 use alloc::sync::Arc;
 use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
@@ -140,24 +115,10 @@ pub fn load_executed_frontier<S: crate::KvStore>(
     Ok(height.map(ExecutedFrontier::new))
 }
 
-/// The durable, monotonic executed prune frontier: one past the highest
-/// block-body or undo row a committed prune pass deleted.
-///
-/// This is the one authoritative answer to "what history is permanently
-/// gone?". Three meanings stay distinct: the *requested* prune height is
-/// operator intent (`node:pruneheight`); the *effective* prune line is that
-/// intent folded with reorg safety, active retention, and the byte target;
-/// the frontier names only deletions that committed.
-///
-/// PRE: [`Self::NONE`] is the state of a store that has deleted nothing.
-///
-/// POST: a pass writes its frontier inside the same batch as its row
-/// deletions, so the record and the deletion commit together or not at all,
-/// and a restart reconstructs exactly the committed boundary.
-///
-/// INVARIANT: the frontier never moves backwards, every height below it is
-/// gone, and no lease is granted below it, so no reader can pin rows the
-/// frontier names as deleted.
+/// One past the highest row deleted by a committed prune; `NONE` means none.
+/// Stored in the same atomic batch as body/undo deletions, it is monotonic and
+/// reconstructible after restart. No lease may pin below it. Requested operator
+/// height and the effective policy line cannot substitute for this evidence.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ExecutedFrontier(u32);
 

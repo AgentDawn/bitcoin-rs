@@ -179,9 +179,8 @@ pub trait ChainQuery: Send + Sync {
 
     /// Header time of the active tip, `None` when no active tip is known.
     ///
-    /// PRE: none.
     /// POST: returns UNIX seconds of the tip header Core would read as
-    ///   `m_best_block_time` (`net_processing.cpp:1445-1448`); `None` means
+    ///   `m_best_block_time` (`net_processing.cpp`); `None` means
     ///   nothing is applied, which the outbound service policy reads as the
     ///   deepest possible local chain.
     /// INVARIANT: the only local tip-age source for peer admission; no
@@ -338,37 +337,19 @@ pub fn dispatch_inbound<S>(
     Ok(responses.into_inner())
 }
 
-/// Dispatch with an active-chain view and a transaction-inventory filter.
+/// Dispatches against the chain view and optional transaction inventory.
+/// Responses preserve order; send errors abort and propagate. `headroom`
+/// reserves before each body load, and the next send spends that reservation.
 ///
-/// Every response is emitted through `send` in the identical order the
-/// former batch form produced (I8); `send` errors abort emission and
-/// propagate. `headroom` gates block-body materialization (I7) and is
-/// evaluated before each load. It reserves the outbound bytes of one
-/// worst-case frame (or reuses a reservation already held) and returns
-/// `false` when the connection or the node cannot take them; the next `send`
-/// spends that reservation, so a body is loaded only while its queue space is
-/// already owned.
+/// Inventory suppresses requests for held/orphan/rejected transactions and
+/// serves held bodies, reporting misses as `notfound`. Inventory type selects
+/// txid/wtxid independently of outbound preference. The node-owned relay gate
+/// is read lazily for `inv`; a closed gate requests no transactions.
 ///
-/// When `tx_inventory` is `Some`, the `inv` arm suppresses `getdata` for
-/// transactions the node already holds (mempool, orphan map, or
-/// recent-rejects) and the `getdata` arm serves tx bodies for tx-typed
-/// items the node has, reporting the rest as `notfound`. Inventory types
-/// identify txids or wtxids independently of the peer's outbound preference.
-///
-/// `tx_relay_open` reports whether the node accepts transaction relay from
-/// peers (it is not in initial block download). While it returns `false`,
-/// the `inv` arm requests no transaction-typed vector and every other arm
-/// is unchanged. The gate is evaluated lazily per `inv` message.
-///
-/// `announce_tx` receives missing transaction vectors for the shared request
-/// owner; dispatch never chooses a download source.
-///
-/// `announce_block` receives the hash of every `MSG_BLOCK` and
-/// `MSG_WITNESS_BLOCK` vector of an `inv`.
-/// PRE: `announce_block` belongs to the connection that `peer` wraps.
-/// POST: block inventory reaches `announce_block` and never a `getdata`.
-/// INVARIANT: block bodies are requested only by header sync and the
-/// download window (Core 31.1 `net_processing.cpp:4370-4410`).
+/// Missing transaction vectors go to `announce_tx`, which owns source selection.
+/// Block vectors go to this connection's `announce_block`, never directly to
+/// `getdata`: header sync and the window own body requests (Core 31.1
+/// `net_processing.cpp`).
 #[expect(clippy::too_many_arguments, reason = "independent protocol sinks")]
 pub fn dispatch_inbound_full<S>(
     peer: &mut Peer<S>,
@@ -983,7 +964,7 @@ fn serve_block_txn(
 /// PRE: the request carries decoded absolute indexes. POST: a rejected list
 /// returns `PeerError::Misbehavior` before any chain query, even without a chain.
 /// Core 31.1 establishes increasing wire indexes during deserialization
-/// (`blockencodings.h:23-54`, `net_processing.cpp:4333-4340`); the order check here
+/// (`blockencodings.h`, `net_processing.cpp`); the order check here
 /// also defends in-process requests. Empty-list rejection is stricter native
 /// policy: Core accepts an empty decoded list.
 fn ensure_block_txn_indexes_valid(request: &BlockTransactionsRequest) -> Result<(), PeerError> {

@@ -735,7 +735,7 @@ fn micros(elapsed: Duration) -> u64 {
 }
 
 // Core v31.1 keeps m_from_snapshot_blockhash after marking the snapshot
-// validated (validation.cpp:6104-6111). A failure likewise does not erase an
+// validated (validation.cpp). A failure likewise does not erase an
 // active assumed role's origin merely because the disk status is Failed.
 fn active_snapshot_base(
     role: ChainstateRole,

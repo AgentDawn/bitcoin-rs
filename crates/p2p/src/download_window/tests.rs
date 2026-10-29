@@ -626,7 +626,7 @@ fn receiving_the_oldest_pending_resets_the_owner_queue_start() {
 
 /// BLK-05: the block-download budget is Core's per-owner queue-age rule —
 /// one target spacing plus half a spacing per other active owner
-/// (`net_processing.cpp:153-168`) — not a fixed 60 seconds.
+/// (`net_processing.cpp`) — not a fixed 60 seconds.
 #[test]
 fn slow_peer_timeout_uses_spacing_and_other_downloaders() {
     let spacing = Duration::from_secs(10);

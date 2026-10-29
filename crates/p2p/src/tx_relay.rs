@@ -214,7 +214,7 @@ pub trait RelaySink: Send + Sync {
 /// queue `MSG_TX` for a connection that later requests `MSG_WTX`. A
 /// block-relay-only lease receives none either: transaction relay is
 /// prohibited on such a connection, as Core restricts `RelayTransaction` to
-/// full-relay peers (`net_processing.cpp:5186-5260`).
+/// full-relay peers (`net_processing.cpp`).
 pub struct PeerRelaySink {
     peers: Arc<crate::PeerTable>,
     ibd: Option<(
@@ -356,22 +356,11 @@ pub(crate) fn drain_relay_queue(
     processed
 }
 
-/// Spawns the single tx-relay worker thread.
-///
-/// The thread drains [`RelayRequest`]s from `rx` and announces each through
-/// `sink`, excluding the source connection, while its transaction is still
-/// in `gateway`. It exits when `shutdown` is set or the queue sender is
-/// dropped.
-///
-/// PRE: `gateway` is a weak handle to the shared gateway for the node's live
-/// mempool; it remains upgradeable while the node is running.
-/// POST: each request is announced exactly when its transaction is resident
-/// with its queued wtxid at the send; a request for a removed or
-/// witness-mutated transaction is consumed with no announcement. The
-/// thread ends on `shutdown` or queue close.
-/// INVARIANT: no mempool guard is held while `sink` sends to peers. The
-/// worker applies the same send-time rule as `drain_relay_queue` and never
-/// retains a strong gateway reference while it waits for queue input.
+/// Runs the single relay worker against a weak live gateway. At send time the
+/// queued wtxid must still be resident; removed or witness-replaced transactions
+/// are consumed silently. Exclude the source connection and release mempool
+/// guards before sending. Hold no strong gateway reference while waiting;
+/// exit on shutdown or queue close. `drain_relay_queue` uses the same rule.
 pub fn spawn_tx_relay_worker<S: RelaySink + 'static>(
     sink: S,
     rx: Receiver<RelayRequest>,

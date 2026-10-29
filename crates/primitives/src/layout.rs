@@ -1,26 +1,9 @@
-//! Checked borrowed wire layout for blocks and transactions.
-//!
-//! This module is the sole owner of block and transaction wire parsing. Every
-//! byte range it hands out is a [`layout::ByteSpan`] that was bounds-checked against
-//! one immutable byte image at parse time, and the `'a` borrow on
-//! [`layout::ParsedBlock`] and [`layout::ParsedTransaction`] ties every offset to that image,
-//! so a span can never outlive the bytes it indexes. Positions inside the
-//! parsed metadata vectors use the distinct [`layout::MetadataRange`] type, so byte
-//! offsets and metadata indices can never be confused.
-//!
-//! Parsing establishes wire *shape* only: BIP144 marker/flag rules, canonical
-//! compact-size lengths, and counts that could still fit in the remaining
-//! bytes. Consensus acceptance (amounts, maturity, script validity, weight
-//! limits) is deliberately not evaluated here; [`layout::ParsedTransaction::materialize`]
-//! hands the owned form to the callers that own those rules. Record counts
-//! whose minimal serialized footprint already exceeds the remaining bytes are
-//! rejected up front, so a malformed length can never drive an oversized
-//! allocation or an out-of-bounds access.
-//!
-//! Span offsets are `u32` relative to the parsed image.
-//! Lengths outside the representable span domain surface as an impossible
-//! [`DecodeError::EndOfData`] requirement, following `read_script`'s
-//! convention for lengths beyond `usize`.
+//! Bounds-checked borrowed block/transaction wire layout.
+//! `ByteSpan` offsets belong to one immutable borrowed image; `MetadataRange`
+//! indexes parsed vectors instead. Parsing establishes BIP144/CompactSize shape
+//! and rejects counts that cannot fit remaining bytes before allocation.
+//! Consensus amounts, maturity, scripts, and weight belong to materialization's
+//! callers. Offsets are u32; unrepresentable lengths report `EndOfData`.
 
 use std::ops::Range;
 

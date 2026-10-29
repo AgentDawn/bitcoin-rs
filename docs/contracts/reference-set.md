@@ -2,13 +2,13 @@
 
 A readable projection of the `[reference]` record in
 `crates/rpc/core-compat.toml` and its typed validation in
-`bin/bitcoin-rs/tests/support/reference_set.rs`. `ReferenceSet` is the parsed
-identity record used by the test and formal gates. It is not a separate
-registry and not a new public type.
+`e2e/src/reference_set.rs`. `ReferenceSet` is the parsed
+identity record shared by the existing e2e harness and fixture/formal gates.
+It is not a separate registry.
 
 This page is a readable projection only. On conflict,
 `crates/rpc/core-compat.toml` governs the reference values and
-`bin/bitcoin-rs/tests/support/reference_set.rs` governs their typed validation.
+`e2e/src/reference_set.rs` governs their typed validation.
 A version label alone is never custody.
 
 ## Clauses
@@ -17,12 +17,11 @@ A version label alone is never custody.
 
 - The `[reference]` record in `crates/rpc/core-compat.toml` is the
   machine-readable authority for reference identity values.
-- `bin/bitcoin-rs/tests/support/reference_set.rs` is the typed parser that
+- `e2e/src/reference_set.rs` is the typed parser that
   enforces required identities, complete source commits, digest formats,
   corpus presence, product versus kernel-tree separation, and audited
   fingerprints of each complete source-and-artifact identity tuple. The RPC
-  corpus gate compiles this same test support module to validate its capture
-  provenance.
+  corpus gate calls the same e2e-harness parser to validate capture provenance.
 - `docs/contracts/reference-set.md` is a readable projection. It does not
   override the manifest values or parser validation on conflict.
 - A version label alone is never custody. A reference must carry source and
@@ -115,7 +114,7 @@ The product corpora are defined in
 
 `manifest_sha256` is optional until the archive exists. C150 (exported
 2026-09-07) and Cmodern (exported 2026-09-09) carry their exported digests.
-`corpus_custody()` in `bin/bitcoin-rs/tests/support/reference_set.rs` reports
+`corpus_custody()` in `e2e/src/reference_set.rs` reports
 a corpus without one as `Blocked { missing: "manifest_sha256" }` rather than
 inventing a digest.
 
@@ -144,7 +143,7 @@ This is an evidence tool pin. No checker run is claimed by this page.
 - Missing identities, malformed commits or digests, unbound custody tuples,
   and confused product identities are rejected with a typed `ReferenceError`
   from
-  `bin/bitcoin-rs/tests/support/reference_set.rs`. The fixture gate rejects
+  `e2e/src/reference_set.rs`. The fixture gate rejects
   stale capture provenance, and the process harness rejects missing binaries
   or executable hashes that differ from the selected reference.
 - The 31.1 product reference and the 31.99.0 kernel tree are distinct. No

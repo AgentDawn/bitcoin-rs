@@ -1,45 +1,13 @@
-//! Retention authority for required readers of prunable chain history.
+//! Retention authority for prunable bodies and undo (RCV-08).
+//! The lowest live floor binds pruning. `reserve` is the linearization point:
+//! earlier leases constrain deletion; later requests below the reserved or
+//! executed line fail with `RetentionError`. Only committed deletion advances
+//! the executed frontier.
 //!
-//! Pruning deletes historical block bodies and undo records once the active
-//! chain no longer needs them. The active chain is not the only reader: a
-//! reorg transition re-reads old-branch bodies it is about to disconnect,
-//! boot replay reads the bodies the durable head names, and a derived-index
-//! catch-up may read bodies older than the current prune line. Such a
-//! reader holds a [`RetentionLease`]: a registered floor height that every
-//! pruning pass folds into its prune line, so deletion can never cross it.
-//!
-//! The binding constraint is the *lowest* active floor. Each lease requires
-//! rows at heights at or above its floor to survive, so the union of the
-//! constraints keeps exactly the rows the deepest lease needs; rows below
-//! every floor remain prunable.
-//!
-//! Leases are bounded by what still exists. A floor at or below the highest
-//! prune line already executed is refused with
-//! [`RetentionError`] — the defined required-history-is-gone
-//! result (`RCV-08`: optional consumer lag cannot retain unlimited
-//! segments, and missing required history is an unavailable result, never a
-//! partial success). An optional consumer that falls that far behind must
-//! rebuild to follow again; it can never pin rows it already lost, and
-//! releasing its lease always returns pruning to exactly the policy line.
-//!
-//! One prune pass claims the rows it means to delete through
-//! [`RetentionRegistry::reserve`]. That reservation is the protocol's
-//! single linearization point: a lease request that arrives before it is
-//! folded into the reserved line, and a request that arrives after it and
-//! below that line is refused. The pass then commits the line it actually
-//! deleted through. No consumer rechecks after the deletion, and no
-//! request can cross a deletion inconsistently.
-//!
-//! Two retention policies share this one registry and differ only in how
-//! long they bind. A [`RetentionLease`] is mandatory: chainstate recovery and
-//! reorg correctness require the rows, so its pin never expires and every
-//! pass folds it into the line. A [`HistoryLease`] is optional: a derived
-//! index or similar consumer asks through [`HistoryAccess`], and a pass
-//! expires that pin once it lags the policy line by more than the granted
-//! [`RetentionBudget`]. An optional consumer therefore cannot retain history
-//! indefinitely, and the answer it receives — granted, pruned, reserved,
-//! missing, or shutting down — is the owner's decision, not its
-//! own guess.
+//! Mandatory `RetentionLease` pins never expire. Optional `HistoryLease` pins
+//! expire when they lag policy beyond their `RetentionBudget`; pruned consumers
+//! must rebuild. `HistoryAccess` owns granted/pruned/reserved/missing/shutdown
+//! outcomes, so consumers cannot infer permanence from a failed byte read.
 
 use crate::pruning::ExecutedFrontier;
 use alloc::sync::Arc;
@@ -492,21 +460,10 @@ impl MandatoryRetention {
     }
 }
 
-/// One prune pass's claim on the rows it is about to delete.
-///
-/// A pass reserves its folded deletion line before it stages rows, holds
-/// the claim across the commit, and then promotes the line it actually
-/// deleted through. While the claim is outstanding, a lease request below
-/// it is refused, so no reader can pin rows the pass has already staged.
-///
-/// PRE: built only by [`RetentionRegistry::reserve`].
-///
-/// POST: exactly one of [`Self::commit`] (the pass deleted through its
-/// line) or `Drop` (the pass failed and grants flow again) settles the
-/// claim.
-///
-/// INVARIANT: the executed prune line never moves backwards, and it never
-/// advances for a deletion that did not commit.
+/// A prune claim minted by `RetentionRegistry::reserve`, held through the
+/// storage commit. Below-line leases are refused while it exists. `commit`
+/// promotes only the line actually deleted; Drop releases an unapplied claim.
+/// The executed frontier never regresses or advances for uncommitted deletion.
 #[derive(Debug)]
 pub struct PruneReservation {
     registry: Arc<RetentionRegistry>,
