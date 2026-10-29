@@ -17,6 +17,11 @@ Declared Cargo ranges are the versions this workspace claims to support. The com
 ### `DEP-03`: One JSON stack and one time stack
 - **Owner**: `deny.toml` `[bans]`.
 - First-party code serializes JSON with `sonic-rs`. `serde_json` is denied with exactly six third-party `wrappers`: `corepc-types` (Bitcoin Core v31 RPC result models), `tracing-subscriber` (the node's JSON log format), `criterion` with `tinytemplate` (the bench harness), and `usdt-impl` with `dof` (the optional USDT probe path). A direct dependent outside that list, including any workspace crate, fails `cargo deny check bans` with `error[banned]`; a new third-party path to `serde_json` therefore needs an explicit edit to this list.
+- The root workspace graph is the ban's scope. The spike workspaces under `tools/ldk`
+  and `tools/stratum-sv2/template-provider` are separate cargo workspaces with their
+  own lockfiles, so `deny.toml` does not cover them; their only `serde_json` edges are
+  third-party (`corepc-types`, `tracing-subscriber`, and `config` in the template
+  provider), and no first-party crate there names the crate.
 - Wall-clock time comes from `std::time`, monotonic timing from `quanta`, and a calendar type would come from `jiff`. `chrono`, `chrono-tz`, and `time` are denied. All three are absent from the resolved graph today, so these entries are forward guards that make a second time stack a deliberate, reviewed change rather than a transitive accident.
 - `sonic-rs` enables `sort_keys` in the root `Cargo.toml`, which keeps serialized output of constructed values in sorted key order, so a digest over serialized value bytes is stable across runs. Durable formats still come from typed structs, never from a mutated value tree.
 ## License and source rules
