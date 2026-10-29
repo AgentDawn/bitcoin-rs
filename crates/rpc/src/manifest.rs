@@ -139,7 +139,7 @@ impl Status {
 /// The compatibility manifest source, embedded so it cannot drift.
 ///
 /// Reference identity parsing and custody validation are owned by
-/// `bin/bitcoin-rs/tests/support/reference_set.rs`; the admission-profile
+/// `e2e/src/reference_set.rs`; the admission-profile
 /// evidence is read from the `[admission_profile]` table.
 ///
 /// PRE: the embedded file parses as TOML and carries the `[reference]` and

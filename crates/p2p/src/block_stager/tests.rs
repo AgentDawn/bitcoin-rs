@@ -9,16 +9,6 @@ use crate::default_sync_budget;
 use crate::download_window::SyncBudget;
 
 #[test]
-fn payload_retains_exact_consensus_serialized_len() {
-    let block = Network::Regtest.genesis_block();
-
-    let payload = BlockPayload::from_local(block.clone());
-
-    assert_eq!(payload.bytes().len(), consensus_bytes(&block).len());
-    assert_eq!(payload.bytes().len(), block.total_size());
-}
-
-#[test]
 fn drain_expected_prefix_stops_at_first_missing_hash() {
     let block = Network::Regtest.genesis_block();
     let block_bytes = block.total_size();

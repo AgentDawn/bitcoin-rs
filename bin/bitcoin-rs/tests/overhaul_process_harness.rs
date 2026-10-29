@@ -11,7 +11,7 @@
     reason = "process custody failures must name the offending identity"
 )]
 
-use crate::support::reference_set;
+use bitcoin_rs_e2e::reference_set;
 
 #[path = "support/script_decode_cases.rs"]
 mod script_decode_cases;

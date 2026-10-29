@@ -25,14 +25,14 @@ const KERNEL_CUSTODY_SHA256: &str =
 /// label alone is never custody: every identity carries its digest, and
 /// [`load_reference_set`] rejects anything less.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReferenceSet {
+pub struct ReferenceSet {
     /// The released Bitcoin Core product: the behavioral reference.
-    pub(crate) release: ReleaseIdentity,
+    pub release: ReleaseIdentity,
     /// The Core development tree the oracle lane links. Oracle evidence only:
     /// not a release, and never a policy pin.
-    pub(crate) kernel: KernelIdentity,
+    pub kernel: KernelIdentity,
     /// Replay corpora with their pinned stop identities.
-    pub(crate) corpora: Vec<CorpusPin>,
+    pub corpora: Vec<CorpusPin>,
 }
 
 impl ReferenceSet {
@@ -42,7 +42,7 @@ impl ReferenceSet {
     /// manifest digests are produced at export time and are legitimately
     /// absent until the archive exists.
     #[must_use]
-    pub(crate) fn corpus_custody(&self) -> Vec<(String, CorpusCustody)> {
+    pub fn corpus_custody(&self) -> Vec<(String, CorpusCustody)> {
         self.corpora
             .iter()
             .map(|corpus| {
@@ -61,15 +61,15 @@ impl ReferenceSet {
 /// One pinned release artifact: a bitcoincore.org archive and the digests
 /// of the tarball and the `bitcoind` binary inside it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReleaseArtifact {
+pub struct ReleaseArtifact {
     /// The archive's platform suffix (e.g. `x86_64-linux-gnu`).
-    pub(crate) target: String,
+    pub target: String,
     /// Release archive the binary digest is taken from.
-    pub(crate) archive: String,
+    pub archive: String,
     /// SHA-256 of the release archive.
-    pub(crate) archive_sha256: [u8; 32],
+    pub archive_sha256: [u8; 32],
     /// SHA-256 of the `bitcoind` binary inside the archive.
-    pub(crate) bitcoind_sha256: [u8; 32],
+    pub bitcoind_sha256: [u8; 32],
 }
 
 /// The released Bitcoin Core product identity.
@@ -79,20 +79,20 @@ pub(crate) struct ReleaseArtifact {
 /// `bitcoind` captured the checked-in fixtures, plus one row per additional
 /// platform a lane may run on.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReleaseIdentity {
+pub struct ReleaseIdentity {
     /// Released product version, `MAJOR.MINOR`.
-    pub(crate) core_version: String,
+    pub core_version: String,
     /// Release tag (e.g. `v31.1`).
-    pub(crate) git_tag: String,
+    pub git_tag: String,
     /// Source commit the release was built from.
-    pub(crate) source_commit: String,
+    pub source_commit: String,
     /// The canonical artifact: the fixture-capture platform's pinning.
-    pub(crate) canonical: ReleaseArtifact,
+    pub canonical: ReleaseArtifact,
     /// Additional runnable artifacts keyed by `target`; no target may repeat
     /// the canonical one or a sibling's.
-    pub(crate) platforms: Vec<ReleaseArtifact>,
+    pub platforms: Vec<ReleaseArtifact>,
     /// The exact `bitcoind -version` line the pinned binary must print.
-    pub(crate) version_output: String,
+    pub version_output: String,
 }
 
 impl ReleaseIdentity {
@@ -100,7 +100,7 @@ impl ReleaseIdentity {
     /// it names the target, else the matching `platforms` row. `None` means
     /// the manifest pins no artifact for the platform — an identity failure,
     /// never a skipped check.
-    pub(crate) fn artifact_for(&self, target: &str) -> Option<&ReleaseArtifact> {
+    pub fn artifact_for(&self, target: &str) -> Option<&ReleaseArtifact> {
         if self.canonical.target == target {
             return Some(&self.canonical);
         }
@@ -110,13 +110,13 @@ impl ReleaseIdentity {
     /// The `bitcoind` digest that captured the checked-in fixtures: always
     /// the canonical artifact's, regardless of the platform running this
     /// suite.
-    pub(crate) fn capture_bitcoind_sha256(&self) -> [u8; 32] {
+    pub fn capture_bitcoind_sha256(&self) -> [u8; 32] {
         self.canonical.bitcoind_sha256
     }
 
     /// The pinned artifact runnable on the host platform, when the manifest
     /// carries one.
-    pub(crate) fn current_artifact(&self) -> Option<&ReleaseArtifact> {
+    pub fn current_artifact(&self) -> Option<&ReleaseArtifact> {
         self.artifact_for(current_platform_target()?)
     }
 }
@@ -124,7 +124,7 @@ impl ReleaseIdentity {
 /// The host platform's release-archive suffix, mirroring the uname mapping in
 /// `scripts/install-bitcoind.sh`. `None` on platforms no pinned artifact can
 /// execute on.
-pub(crate) fn current_platform_target() -> Option<&'static str> {
+pub fn current_platform_target() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("x86_64-linux-gnu"),
         ("linux", "aarch64") => Some("aarch64-linux-gnu"),
@@ -142,43 +142,43 @@ pub(crate) fn current_platform_target() -> Option<&'static str> {
 /// evidence about the oracle lane only and must never be read as the product
 /// reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct KernelIdentity {
+pub struct KernelIdentity {
     /// Core tree version (e.g. `31.99.0`).
-    pub(crate) core_version: String,
+    pub core_version: String,
     /// Safe wrapper crate pinned in the manifest.
-    pub(crate) kernel_crate: String,
+    pub kernel_crate: String,
     /// Locked version of the wrapper crate.
-    pub(crate) kernel_crate_version: String,
+    pub kernel_crate_version: String,
     /// `-sys` crate vendoring the Core source.
-    pub(crate) kernel_sys_crate: String,
+    pub kernel_sys_crate: String,
     /// Locked version of the `-sys` crate.
-    pub(crate) kernel_sys_crate_version: String,
+    pub kernel_sys_crate_version: String,
     /// Published `-sys` crate's `.cargo_vcs_info.json` source revision.
-    pub(crate) kernel_vendor_commit: String,
+    pub kernel_vendor_commit: String,
     /// Bitcoin Core commit imported by that crate's vendored subtree.
-    pub(crate) kernel_source_commit: String,
+    pub kernel_source_commit: String,
     /// Published `-sys` package checksum, checked against `Cargo.lock`.
-    pub(crate) kernel_sys_crate_sha256: [u8; 32],
+    pub kernel_sys_crate_sha256: [u8; 32],
     /// Whether a differential harness compares *values* against a running
     /// reference. `false` means no entry may claim `supported`.
-    pub(crate) differential_harness: bool,
+    pub differential_harness: bool,
 }
 
 /// A replay corpus pinned by its manifest digest. The manifest also
 /// carries the replay stop height and hash; the gate requires their
 /// presence at load but no consumer reads them back.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CorpusPin {
+pub struct CorpusPin {
     /// Corpus identifier (e.g. `C150`).
-    pub(crate) id: String,
+    pub id: String,
     /// SHA-256 of the corpus manifest, produced at export time. Absent until
     /// the archive exists; a placeholder here would be an invented digest.
-    pub(crate) manifest_sha256: Option<[u8; 32]>,
+    pub manifest_sha256: Option<[u8; 32]>,
 }
 
 /// Custody state of a corpus archive.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CorpusCustody {
+pub enum CorpusCustody {
     /// The manifest digest is pinned; the corpus is held end to end.
     Pinned,
     /// A required custody artifact is absent, named by `missing`.
@@ -190,7 +190,7 @@ pub(crate) enum CorpusCustody {
 
 /// Why a reference identity failed to load.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum ReferenceError {
+pub enum ReferenceError {
     /// The manifest does not parse as TOML.
     #[error("the compatibility manifest does not parse: {detail}")]
     ManifestUnreadable {
@@ -249,7 +249,7 @@ pub(crate) enum ReferenceError {
 ///
 /// Every digest is decoded to bytes and every identity is required in full;
 /// this is where "a version label alone" stops being a reference.
-pub(crate) fn load_reference_set(manifest: &str) -> Result<ReferenceSet, ReferenceError> {
+pub fn load_reference_set(manifest: &str) -> Result<ReferenceSet, ReferenceError> {
     let table: toml::Table =
         toml::from_str(manifest).map_err(|err| ReferenceError::ManifestUnreadable {
             detail: err.to_string(),
@@ -407,7 +407,7 @@ fn check_custody_fingerprint(
 }
 
 /// Loads the reference set from the manifest embedded at compile time.
-pub(crate) fn reference_set() -> Result<ReferenceSet, ReferenceError> {
+pub fn reference_set() -> Result<ReferenceSet, ReferenceError> {
     load_reference_set(MANIFEST_TOML)
 }
 
@@ -551,3 +551,6 @@ fn check_identity_confusion(release: &str, kernel: &str) -> Result<(), Reference
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

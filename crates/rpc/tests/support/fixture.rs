@@ -20,14 +20,7 @@ use super::compare::EnvelopeCheck;
 use super::limits::{MAX_CORPUS_BYTES, MAX_FIXTURE_BYTES, MAX_FIXTURE_COUNT, MAX_JSON_DEPTH};
 use super::manifest_check;
 
-// Reuse the process gates' typed identity owner in this test binary; no
-// production crate dependency or second reference parser is introduced.
-#[expect(
-    dead_code,
-    reason = "the RPC fixture gate consumes only the release identity"
-)]
-#[path = "../../../../bin/bitcoin-rs/tests/support/reference_set.rs"]
-mod reference_set;
+use bitcoin_rs_e2e::reference_set;
 
 /// Converts an in-memory byte length to `u64` for ceiling comparisons; a
 /// length that does not fit is above every ceiling and is refused by them.

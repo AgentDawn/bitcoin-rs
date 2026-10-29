@@ -27,6 +27,7 @@ smallvec.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+bitcoin-rs-e2e.workspace = true
 bitcoin.workspace = true
 serde_json.workspace = true
 proptest.workspace = true

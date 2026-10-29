@@ -229,26 +229,12 @@ fn verified_core_binary() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The host platform's release-archive suffix, mirroring the uname mapping in
-/// `scripts/install-bitcoind.sh`. `None` on platforms no pinned artifact can
-/// execute on.
-fn current_platform_target() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Some("x86_64-linux-gnu"),
-        ("linux", "aarch64") => Some("aarch64-linux-gnu"),
-        ("macos", "aarch64") => Some("arm64-apple-darwin"),
-        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
-        ("windows", "x86_64") => Some("win64"),
-        _ => None,
-    }
-}
-
 /// Read the `bitcoind_sha256` the compiled `core-compat.toml` manifest pins
 /// for the platform this suite runs on: the canonical artifact when its
 /// target matches, else the matching `[[reference.release.platforms]]` row —
 /// and a typed failure when the manifest carries no artifact for this platform.
 pub(crate) fn manifest_reference_sha256() -> Result<String> {
-    let target = current_platform_target().ok_or_else(|| {
+    let target = crate::reference_set::current_platform_target().ok_or_else(|| {
         Error::Assertion(format!(
             "no pinned Core artifact for {}-{}",
             std::env::consts::OS,

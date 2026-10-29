@@ -938,7 +938,10 @@ impl std::fmt::Display for NoProgressReason {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// A latch that stays in initial block download: nothing is ever applied
 /// behind it, so [`bitcoin_rs_chain::InitialBlockDownload::is_active`] answers

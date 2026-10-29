@@ -1,8 +1,7 @@
 //! BIP341 wire signature and native witness-program dispatch rules.
 #![expect(clippy::expect_used)]
 
-#[path = "support/taproot_spends.rs"]
-mod fixture;
+use bitcoin_rs_e2e::helpers::taproot as fixture;
 
 use bitcoin::hashes::Hash as _;
 use bitcoin_rs_primitives::{Script, Tx, TxOut};

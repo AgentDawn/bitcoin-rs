@@ -1,6 +1,8 @@
 //! Independently signed BIP341 spends shared by native and process regressions.
 //! Fixed fixture keys never enter production code or a wallet.
 
+#![expect(clippy::expect_used, reason = "fixed-key fixture construction")]
+
 use bitcoin::hashes::Hash as _;
 use bitcoin::key::TapTweak as _;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
@@ -10,10 +12,10 @@ use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute, transaction,
 };
 
-pub(crate) struct Case {
-    pub(crate) name: String,
-    pub(crate) tx: Transaction,
-    pub(crate) accepted: bool,
+pub struct Case {
+    pub name: String,
+    pub tx: Transaction,
+    pub accepted: bool,
 }
 
 fn tree() -> (Keypair, TaprootSpendInfo, ScriptBuf) {
@@ -29,7 +31,7 @@ fn tree() -> (Keypair, TaprootSpendInfo, ScriptBuf) {
     (key, tree, leaf)
 }
 
-pub(crate) fn funding_script() -> ScriptBuf {
+pub fn funding_script() -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(tree().1.output_key())
 }
 
@@ -52,7 +54,7 @@ fn template(outpoint: OutPoint, prevout: &TxOut) -> Transaction {
 
 /// Every signature message, tweak, signature and control block is produced by
 /// rust-bitcoin/secp256k1, independently of bitcoin-rs's native sighash code.
-pub(crate) fn cases(outpoint: OutPoint, prevout: &TxOut) -> Vec<Case> {
+pub fn cases(outpoint: OutPoint, prevout: &TxOut) -> Vec<Case> {
     let secp = Secp256k1::new();
     let (key, tree, leaf) = tree();
     let tweaked = key.tap_tweak(&secp, tree.merkle_root());
@@ -186,11 +188,11 @@ fn success_tree() -> (TaprootSpendInfo, Vec<ScriptBuf>) {
     )
 }
 
-pub(crate) fn success_funding_script() -> ScriptBuf {
+pub fn success_funding_script() -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(success_tree().0.output_key())
 }
 
-pub(crate) fn success_cases(outpoint: OutPoint, prevout: &TxOut) -> Vec<Case> {
+pub fn success_cases(outpoint: OutPoint, prevout: &TxOut) -> Vec<Case> {
     let (tree, scripts) = success_tree();
     let mut cases = Vec::new();
     for annex in [false, true] {

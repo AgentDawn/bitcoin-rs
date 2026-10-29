@@ -13,7 +13,6 @@ mod mempool_restart;
 mod overhaul_external_miner;
 mod overhaul_process_harness;
 mod overhaul_process_p2p;
-mod overhaul_reference_set;
 mod rest_getutxos_process;
 mod silent_payments;
 mod tx_ibd_gate_e2e;

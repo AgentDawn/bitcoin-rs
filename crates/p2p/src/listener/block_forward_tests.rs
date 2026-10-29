@@ -12,9 +12,8 @@ use crate::PeerSource;
 use crate::connection::MAX_UNSOLICITED_BLOCK_FORWARDS;
 use crate::sync::BlockSync;
 use crate::sync::chain::SyncChain;
-use crate::sync::tests::{
-    TestChain, connect_peer, current_source, mined_chain, synthetic_peer, test_addr,
-};
+use crate::sync::test_support::{TestChain, mined_chain};
+use crate::test_support::{connect_peer, current_source, synthetic_peer, test_addr};
 use bitcoin_rs_chain::regtest_fixture;
 
 fn genesis_body() -> bitcoin_rs_primitives::Block {
