@@ -521,9 +521,9 @@ fn hash_serialized_3_stable_inner(
             }
 
             entries.sort_unstable_by(|left, right| {
-                left.txid_le.cmp(&right.txid_le).then_with(|| {
-                    crate::compress::cmp_core_varint_key(left.output.vout, right.output.vout)
-                })
+                left.txid_le
+                    .cmp(&right.txid_le)
+                    .then_with(|| left.output.vout.cmp(&right.output.vout))
             });
 
             for entry in entries {
@@ -537,9 +537,8 @@ fn hash_serialized_3_stable_inner(
 }
 
 /// The single per-coin serialization owner for Core's `HASH_SERIALIZED`
-/// commitment. Callers supply coins in raw-txid order with vouts in Core
-/// VARINT key order (bytewise order of the subtract-one MSB VARINT encodings;
-/// see `crate::compress::cmp_core_varint_key`).
+/// commitment. Callers supply coins in raw-txid order with numeric vout
+/// order, matching Core's `std::map<uint32_t, Coin>` iteration.
 pub(crate) struct SerializedUtxoHasher(Sha256);
 
 impl SerializedUtxoHasher {
