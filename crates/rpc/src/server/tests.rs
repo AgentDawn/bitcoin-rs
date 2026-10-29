@@ -223,22 +223,55 @@ fn prepare_http_socket_disables_nagle() {
 #[test]
 #[expect(clippy::expect_used)]
 fn serve_with_shutdown_exits_on_signal() -> std::io::Result<()> {
-    let auth = Arc::new(Auth::basic("alice", "secret"));
-    let handler = Arc::new(Handler::new(Arc::new(Context::new())));
-    let server = RpcServer::bind(
-        "127.0.0.1:0",
-        auth,
-        handler,
-        4,
-        core::time::Duration::from_millis(500),
-        false,
-    )?;
+    let server = accept_test_server()?;
+    let handler = Arc::clone(&server.handler);
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
-    let handle = std::thread::spawn(move || server.serve_with_shutdown(shutdown_clone));
-    std::thread::sleep(core::time::Duration::from_millis(150));
+    let (parked, ready) = crossbeam_channel::bounded(1);
+    let handle = thread::spawn(move || {
+        server.serve_accept_loop(&shutdown_clone.into(), RpcSurface::Shared, |listener| {
+            let result = listener.accept();
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            {
+                let _ = parked.try_send(());
+            }
+            result
+        })
+    });
+    ready
+        .recv_timeout(Duration::from_secs(3))
+        .expect("idle accept");
+    // Let the listener enter its idle wait, rather than stopping before it parks.
+    thread::sleep(Duration::from_millis(45));
+    let start = Instant::now();
     shutdown.store(true, Ordering::Release);
-    handle.join().expect("join serve thread")
+    handle.join().expect("join serve thread")?;
+    let elapsed = start.elapsed();
+    eprintln!("idle RPC listener shutdown: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(80),
+        "idle shutdown took {elapsed:?}"
+    );
+    assert!(handler.is_stopping());
+    Ok(())
+}
+
+#[test]
+fn shutdown_before_serving_does_not_admit_a_queued_connection() -> io::Result<()> {
+    let server = accept_test_server()?;
+    let handler = Arc::clone(&server.handler);
+    let _queued = TcpStream::connect(server.local_addr()?)?;
+    let shutdown = Arc::new(AtomicBool::new(true));
+    let mut attempts = 0;
+    server.serve_accept_loop(&shutdown.into(), RpcSurface::Shared, |listener| {
+        attempts += 1;
+        listener.accept()
+    })?;
+    assert_eq!(attempts, 0);
+    assert!(handler.is_stopping());
+    Ok(())
 }
 
 #[test]
@@ -1472,6 +1505,61 @@ fn accept_test_server() -> io::Result<RpcServer> {
     )
 }
 
+/// Arrival phases start after a real `WouldBlock`, so the former 100-ms sleep
+/// cannot hide behind a connection queued before the accept thread started.
+#[test]
+fn idle_accept_is_prompt_across_arrival_phases() -> io::Result<()> {
+    let server = accept_test_server()?;
+    let addr = server.local_addr()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&shutdown);
+    let (idle_tx, idle_rx) = crossbeam_channel::bounded(1);
+    let (accepted_tx, accepted_rx) = crossbeam_channel::unbounded();
+    let handle = thread::spawn(move || {
+        server.serve_accept_loop(&stop.into(), RpcSurface::Shared, |listener| {
+            let result = listener.accept();
+            match &result {
+                Ok(_) => {
+                    let _ = accepted_tx.send(Instant::now());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let _ = idle_tx.try_send(());
+                }
+                Err(_) => {}
+            }
+            result
+        })
+    });
+    let result = (|| -> io::Result<Vec<Duration>> {
+        let mut latencies = Vec::new();
+        for phase in [0, 13, 37, 61, 89] {
+            idle_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("idle listener");
+            thread::sleep(Duration::from_millis(phase));
+            let start = Instant::now();
+            let client = TcpStream::connect(addr)?;
+            let accepted = accepted_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("accepted connection");
+            latencies.push(accepted.duration_since(start));
+            drop(client);
+        }
+        Ok(latencies)
+    })();
+    shutdown.store(true, Ordering::Release);
+    handle.join().expect("accept thread")?;
+    let latencies = result?;
+    eprintln!("new-connection accept delays at phases 0/13/37/61/89 ms: {latencies:?}");
+    assert!(
+        latencies
+            .iter()
+            .all(|latency| *latency < Duration::from_millis(80)),
+        "new connections waited on an idle accept cadence: {latencies:?}"
+    );
+    Ok(())
+}
+
 // Inject at the syscall boundary, without exhausting the test process's
 // descriptors. The listener and subsequent HTTP worker remain real.
 #[test]
@@ -1508,7 +1596,7 @@ fn accept_recovers_from_resource_and_connection_errors() -> io::Result<()> {
             if let Some(error) = errors.next() {
                 return Err(error);
             }
-            assert!(start.elapsed() >= POLL_INTERVAL * 3);
+            assert!(start.elapsed() >= ACCEPT_ERROR_BACKOFF * 3);
             listener.accept()
         })
     });
@@ -1543,7 +1631,7 @@ fn repeated_accept_errors_back_off_and_observe_shutdown() -> io::Result<()> {
         Err(io::Error::other("resource temporarily exhausted"))
     })?;
     assert_eq!(attempts, 3);
-    assert!(start.elapsed() >= POLL_INTERVAL * 3);
+    assert!(start.elapsed() >= ACCEPT_ERROR_BACKOFF * 3);
     Ok(())
 }
 
