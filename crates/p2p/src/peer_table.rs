@@ -201,9 +201,9 @@ impl PeerTable {
     /// Register an unidentified (anonymous) inbound session. Anonymous
     /// sessions coexist, are capacity-only, and never replace a known peer.
     ///
-    /// No production caller registers through this path: inbound Tor reserves
-    /// via `try_register_inbound_unidentified`. Cross-crate integration tests
-    /// enable `p2p/test-seam` in their development dependencies.
+    /// Production inbound Tor reserves through `try_register_inbound` with
+    /// `PeerRemote::AnonymousTor`; this helper remains for cross-crate test
+    /// seams that enable `p2p/test-seam` in their development dependencies.
     #[cfg(any(test, feature = "test-seam"))]
     pub fn register_unidentified(&self, lease: PeerLease) -> bool {
         let key = PeerRemote::AnonymousTor(lease.connection_id());
@@ -876,7 +876,7 @@ impl PeerTable {
     /// Removes and cancels the connection live at `addr` only when it has
     /// completed its handshake — the sessions `getpeerinfo` lists, which is
     /// what "connected nodes" means to an operator.
-    pub fn disconnect_ready(&self, addr: PeerEndpoint) -> bool {
+    pub fn disconnect_ready(&self, addr: impl Into<PeerRemote>) -> bool {
         self.remove_entry_if(addr.into(), |entry| entry.info.is_some())
     }
 
@@ -929,7 +929,7 @@ impl PeerTable {
     /// POST: `false` with no mutation when `addr` is vacant, its session has
     ///   published no [`PeerInfo`], or it holds a connection with a different
     ///   node id.
-    pub fn disconnect_ready_node_id_at(&self, addr: PeerEndpoint, node_id: u64) -> bool {
+    pub fn disconnect_ready_node_id_at(&self, addr: impl Into<PeerRemote>, node_id: u64) -> bool {
         self.remove_entry_if(addr.into(), |entry| {
             entry.info.is_some() && entry.lease.node_id() == node_id
         })

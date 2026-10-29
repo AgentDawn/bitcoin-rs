@@ -1244,21 +1244,9 @@ impl PeerTable {
     ) -> bool {
         let now = Instant::now();
         let key = Identity::Wtxid(subject.0);
-        let keys = {
-            let mut policy = self.tx_policy.lock();
-            if policy
-                .requests
-                .get(&key)
-                .is_some_and(|request| request.package_info)
-            {
-                policy.failed_with_parents(key, source, now)
-            } else {
-                Vec::new()
-            }
-        };
-        let released = !keys.is_empty();
+        let released = self.tx_policy.lock().failed_package_info(key, source, now);
         if released {
-            self.send_transaction_requests(now, Some(inventory), Some(&keys), Instant::now);
+            self.send_transaction_requests(now, Some(inventory), Some(&[key]), Instant::now);
         }
         released
     }
