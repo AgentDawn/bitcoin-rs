@@ -38,7 +38,7 @@ curl -s http://127.0.0.1:18443/api/blocks/tip/height
 # 0
 ```
 
-Contents: [Install](#install) · [Quick start](#quick-start) · [Why an independent architecture](#why-an-independent-architecture) · [Architecture](#architecture) · [Compatibility and limitations](#compatibility-and-limitations) · [Development](#development) · [License](#license)
+Contents: [Install](#install) · [Quick start](#quick-start) · [Why bitcoin-rs](#why-bitcoin-rs) · [Experimental BIP Adoption](#experimental-bip-adoption) · [Architecture](#architecture) · [Compatibility and limitations](#compatibility-and-limitations) · [Development](#development) · [License](#license)
 
 ---
 
@@ -124,15 +124,80 @@ Consult [docs/getting-started.md](docs/getting-started.md) for layered configura
 
 ---
 
-## Why an independent architecture
+## Why bitcoin-rs
 
-[Bitcoin Core](https://github.com/bitcoin/bitcoin) is the reference implementation of Bitcoin, and its conservatism and compatibility discipline are central to network stability. Those same priorities make large internal redesigns costly to explore inside one codebase.
+[Bitcoin Core](https://github.com/bitcoin/bitcoin) is the most successful
+implementation of Bitcoin. Its conservatism, stability, and compatibility
+discipline are major reasons for
+that success. Over time, however, those safeguards also shape which changes are
+practical: existing boundaries accumulate dependencies, and implementation
+choices harden into assumptions that Bitcoin consensus does not require.
 
-`bitcoin-rs` tests what a Bitcoin full node looks like when designed from scratch in Rust around explicit ownership boundaries:
+bitcoin-rs asks a simple question:
 
-- **Consensus and wire compatibility at the boundary, replaceable internals.** External protocol behavior is checked against Bitcoin Core, `libbitcoinkernel`, test vectors, and external consumers, while internal data structures, concurrency, and storage engines remain free to evolve ([ecosystem compatibility contract](docs/contracts/ecosystem-compatibility.md)).
-- **Canonical coin state and integrated indexing.** Instead of requiring separate Electrum or explorer indexers to duplicate chain state for common queries, the node owns the UTXO set and optional `txindex`, `blockfilterindex`, and `scriptindex` (`utxo` or `full`) consumers with explicit readiness gating ([indexing contract](docs/contracts/indexing.md)).
-- **In-process composition without an async runtime mandate.** Core services run on a synchronous crossbeam event loop and bounded worker threads. Embedders call `bitcoin_rs_node::Node` from their own executor without the node spawning a private Tokio runtime ([embedding contract](docs/contracts/embedding.md)).
+> **If a Bitcoin full node were designed again today, what would we keep, and
+> what would we change?**
+
+### Why now?
+
+Bitcoin is unusually well suited to independent implementation because its
+behavior can be checked against Bitcoin Core, `libbitcoinkernel`, historical
+chain data, consensus test vectors, fuzzing, and differential tests.
+
+However, Bitcoin Core prioritizes stability, compatibility, and minimizing
+change risk. While essential for the reference implementation, these priorities
+make large architectural changes difficult to explore within the same codebase.
+
+**That is why we built `bitcoin-rs`: to preserve Bitcoin's consensus while
+making architectural experimentation practical—build alternatives, verify them
+against reproducible evidence, and keep iterating on the implementation.**
+
+### What can be improved
+
+- **Performance is a first-class requirement.** `bitcoin-rs` is not aiming for
+  parity with Bitcoin Core simply by changing languages. Synchronization,
+  storage, memory ownership, concurrency, caching, I/O, and indexing can all be
+  reconsidered. Improvements must be demonstrated with matched whole-node
+  benchmarks against Core.
+- **The UTXO set is the node's authoritative coin state.** Much of the Bitcoin
+  application ecosystem grew by rebuilding or duplicating wallet-, Electrum-,
+  and explorer-specific views around the same chain data. `bitcoin-rs`
+  simplifies that boundary: the node owns the canonical UTXO set used for
+  validation and an integrated script index exposed through Esplora-compatible
+  APIs. Wallet-specific keys, policies, and metadata remain outside the node.
+- **Modularity keeps the core isolated and components composable.** Clear
+  dependency and failure boundaries keep extensions from destabilizing
+  validation or chainstate while allowing components to be reused independently.
+- **Rust-native integration is a primary path.** Applications and extensions in
+  the Rust Bitcoin ecosystem can attach to the node as typed, in-process
+  components instead of routing through serialized RPC or separate processes.
+
+Bitcoin is not defined by the continued preservation of one codebase. **The code
+can change; consensus is what must remain.** `bitcoin-rs` aims to provide an
+independently designed implementation that can be compared against Bitcoin Core
+and other implementations through reproducible evidence.
+
+
+---
+
+## Experimental BIP Adoption
+
+`bitcoin-rs` aims to make Bitcoin protocol experimentation easier. An
+independent implementation can prototype proposed P2P, relay, policy, and
+wallet-facing BIPs before they land in Bitcoin Core, giving BIP authors another
+implementation to test against and helping uncover interoperability issues
+early.
+
+Experiments start small, reversible, and opt-in. Active mainnet consensus stays
+unchanged; unactivated consensus proposals are tested only on regtest or
+explicitly isolated test networks. We evaluate adoption through reference
+vectors, external interoperability, and measured resource costs—not whether
+Core merged a proposal first.
+
+See the [BIP adoption policy](docs/policies/bip-adoption.md) for the
+research-to-shipped process, the [BIP support matrix](docs/bip-support.md) for
+current implementation status, and [contributing BIPs](CONTRIBUTING.md#proposing-and-implementing-bips)
+to propose an experiment.
 
 ---
 
