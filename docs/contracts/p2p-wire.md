@@ -62,6 +62,13 @@ This page assigns ownership and cites proof under the
   `crates/p2p/src/wire.rs`
   `block_message_roundtrip_preserves_wire_payload` (one decode carries the
   frame; raw bytes preserved end to end).
+- Handshake boundary proof: `peer::tests::bip434_send_window_uses_remote_version_and_local_verack`
+  and `bip434_send_window_closes_only_after_a_successful_verack_write`;
+  `connection::tests::bip434_features_never_enter_the_post_handshake_queue`;
+  `dispatch::tests::version_reply_sends_the_offered_sendpackages_once_before_verack`;
+  `listener::v2_transport_tests::bip434_windows_preserve_bip332_and_package_negotiation_on_v1_and_v2`
+  exercises both transports with BIP332/BIP331 enabled. These are local and
+  loopback proofs, not live interoperability evidence against a BIP434 Core.
 
 ### `P2P-02`: Connection lifecycle and peer lease ownership
 

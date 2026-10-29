@@ -262,7 +262,7 @@ fn read_handshake_message<S: Read>(
                 continue;
             }
             Ok(Some((message, raw))) => {
-                if matches!(message, Message::Version(_)) {
+                if matches!(message, Message::Version(_)) && peer.remote_version.is_none() {
                     peer.version_received_time = Some(
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
