@@ -46,7 +46,7 @@ cargo test --locked -p bitcoin-rs-primitives --test suite differential:: && carg
 ## 5. libbitcoinkernel oracle and scoped native parity
 Tier: in-tree oracle and differential evidence. Related: [validation-default](contracts/validation-default.md) (`Proven by` evidence; no `VAL-02` clause). Owners: `crates/consensus/tests/kernel_vector_parity.rs` (Core vectors via `verify_tx_scripts`; `BADTX` excluded; kernel-vs-vector oracle, not native-vs-kernel over the full corpus), `crates/consensus/tests/kernel_block_parity.rs` (kernel vs native accept/reject on six mainnet fixtures `legacy_p2pk/p2pkh`, `p2sh_spend`, `segwit_v0_spend`, `taproot_keypath/scriptpath_spend`, all `interpreter_parity: true`, plus Taproot script-path non-vacuity; provenance `crates/consensus/tests/vectors/scripts/README.md`). Prerequisites: `libboost-dev`, `cmake`, C++ toolchain.
 ```sh
-cargo test --locked -p bitcoin-rs-consensus --features kernel --test suite kernel_vector_parity:: --test suite kernel_block_parity:: -- --nocapture
+cargo test --locked -p bitcoin-rs-consensus --features kernel --test suite -- kernel_block_parity:: kernel_vector_parity:: --nocapture
 ```
 ## 6. Contextual consensus-rule tests
 Tier: in-tree consensus verification. Owners: `crates/chain/src/header_sync.rs` (`contextual_header_tests`: nBits, MTP, BIP94 timewarp, version floors), `crates/consensus/src/verify_block.rs` (BIP30 duplicate txids, BIP34 coinbase height, BIP68 locktimes, BIP141 commitments, weight limits), `crates/chainstate/src/tests/persistence_tests.rs` (mutation failure boundaries, undo atomicity, BIP30 overwrite undo-coin restoration).

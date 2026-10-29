@@ -141,10 +141,10 @@ cargo test -p bitcoin-rs-consensus --no-fail-fast -- --include-ignored
 
 # Run differential kernel parity verification (requires kernel feature)
 cargo test -p bitcoin-rs-consensus --features kernel \
-  --test suite kernel_block_parity:: --test suite kernel_vector_parity:: -- --nocapture
+  --test suite -- kernel_block_parity:: kernel_vector_parity:: --nocapture
 ```
 
-The two parity test targets are not ignored. Passing `--ignored` would skip
+The tests in both parity modules are not ignored. Passing `--ignored` would skip
 them rather than run the oracle checks.
 
 ### Benchmark compilation check
